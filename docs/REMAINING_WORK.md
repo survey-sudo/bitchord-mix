@@ -77,6 +77,34 @@ signed, installable APK, add four repository secrets:
 
 **Decision pending:** whether the keystore goes into GitHub secrets at all.
 
+The CI release job is now **proven green** on run `43767187882` (commit `5fbe776`,
+2026-11-15): `Unit tests` finished in `8m 48s` (`528 s`), `Release APK (arm64)`
+finished in `17m 41s` (`1,061 s`), and the parallel run concluded in `17m 45s`
+(`1,065 s`). `assembleProdRelease` alone took `14m 21s` (`861 s`).
+
+- **Payload parity (`docs/ci-parity-vc74.md`):** **1,584 of 1,592 entries** are
+  SHA-256 identical to the verified build-box `vc74` APK, including all three
+  `classes*.dex` files (`classes.dex`, `classes2.dex`, `classes3.dex`). The 8
+  differences are `META-INF/version-control-info.textproto` (records the git
+  commit: `dc78e0d` vs `5fbe776`) and 20 bytes inside `.note.gnu.build-id` in each
+  of the seven `libbitchord_*.so` — a host-path hash from `lld` that survives into
+  the build-id but does not touch `.text`, `.rodata`, `.data`, or symbols.
+- **Native audit of the CI artifact:** exactly one `libonnxruntime.so` at
+  `34,208,672 B` (SHA-256 identical to the box build), zero QNN/HTP libraries, all
+  seven `libbitchord_*` present, version `74` / `2.2.3-djmix32`.
+- **SDK caching overhead:** `Install SDK packages` took only `40 s` (release) /
+  `44 s` (unit tests), while Gradle cache restore is already `26 s` / `34 s` and
+  `Free disk space` costs `63 s` / `73 s`. Caching the Android SDK/NDK is not
+  worth it; the compile (`14m 21s`) is the cost.
+- **Signing status (verified fact):** the CI artifact (`67,411,246 B`, SHA-256
+  `00c877c55162fa2202a8b00aab2ae38afc58611ccbd5f8ff6e9cd9f34aa022db`) is
+  **unsigned** (zero `META-INF/*.RSA`/`*.SF` entries and no `APK Sig Block 42`), so
+  it cannot be installed on the phone, and a differently-signed APK cannot replace
+  the installed app (`adb install -r` fails on signature mismatch; uninstalling is
+  off the table). Adding the four repository signing secrets makes CI emit an
+  identical APK signed with the same keystore so it installs over the current one
+  with `-r`.
+
 ### Known debt: `compileSdk` 36 vs InnerTubeX's declared 37
 
 `innertubex-android` declares `minCompileSdk = 37`, so `app`, `shared` and
@@ -161,6 +189,15 @@ The vision playbook's Gate 2 and Gate 3 are unmet.
 ### Key accuracy
 
 `Bubble Tea` `4B`, `Crescendo` `10A` vs `10B` — still unconfirmed by ears or telemetry.
+
+### Last.fm credentials absent from the installed build
+
+`buildConfigField("String", "LASTFM_API_KEY", ...)` in app/build.gradle.kts reads
+`local.properties`, falling back to the `LASTFM_API_KEY` environment variable. The
+`vc74` APK installed on the phone has both fields empty (proven by dex parity: the
+CI build, which has no local.properties, produced byte-identical dex). So any
+Last.fm-backed feature is inert on the device right now, and nothing about it can be
+tested until those values are supplied to a build.
 
 ---
 
