@@ -41,9 +41,10 @@ import kotlin.math.pow
  */
 data class TrackAnalysis(
     /**
-     * Blank means "no status was reported", which counts as ready. Any other
-     * value must be [STATUS_READY] for the planner to trust the rest of the
-     * fields.
+     * Blank means "no status was reported": the planner treats blank as
+     * NOT ready (djmix10) so default fields can never authorize beat
+     * math. Any other value must be [STATUS_READY] for the planner to
+     * trust the rest of the fields.
      */
     val status: String = "",
     /** Guards against a stale analysis being paired with the wrong track. */
@@ -114,6 +115,27 @@ data class TrackAnalysis(
      * judge one bar's loudness, which the 240-point [energyCurve] is not.
      */
     val levelWindows: List<CurveWindow> = emptyList(),
+    /**
+     * How much of the track the analysis covers: none, head (provisional),
+     * or full (whole-track pass). Declared last so positional constructor
+     * sites stay valid.
+     */
+    val quality: String = QUALITY_NONE,
+    // djmix25 per-region keys (libkeyfinder-style): head = first half,
+    // tail = second half. Blank means "no regional evidence"; the global
+    // [key] stays the fallback. Declared after [quality] to keep
+    // positional constructor sites valid.
+    val keyHead: String = "",
+    val keyTail: String = "",
+    val keyHeadConfidence: Double = 0.0,
+    val keyTailConfidence: Double = 0.0,
+    /**
+     * Instrumental share over the same windows as [vocalWindows]
+     * (djmix25): 1 - vocal per frame, for "acapella-over-instrumental"
+     * handoffs. Empty when the vocal model did not run. Mirror of
+     * [vocalWindows], reusing [CurveWindow] so planners read one shape.
+     */
+    val instrumentalWindows: List<CurveWindow> = emptyList(),
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing
@@ -130,6 +152,9 @@ data class TrackAnalysis(
 
     companion object {
         const val STATUS_READY = "ready"
+        const val QUALITY_NONE = "none"
+        const val QUALITY_HEAD = "head"
+        const val QUALITY_FULL = "full"
     }
 }
 
@@ -221,3 +246,44 @@ fun levelFromRms(rms: Double): Double =
 
 /** The RMS a [levelFromRms] value stands for. */
 fun rmsFromLevel(level: Double): Double = if (level <= 0) 0.0 else 10.0.pow((level * 60 - 60) / 20)
+
+
+/** Outgoing exit key for mixing: tail key when confidently known, else global. */
+fun exitKeyForMix(analysis: TrackAnalysis): String =
+    if (analysis.keyTail.isNotBlank() && analysis.keyTailConfidence >= 0.25) analysis.keyTail else analysis.key
+
+/** Incoming entry key for mixing: head key when confidently known, else global. */
+fun entryKeyForMix(analysis: TrackAnalysis): String =
+    if (analysis.keyHead.isNotBlank() && analysis.keyHeadConfidence >= 0.25) analysis.keyHead else analysis.key
+
+/** Confidence matching [exitKeyForMix]: tail confidence when tail is trusted, else global. */
+fun exitKeyConfidence(analysis: TrackAnalysis): Double =
+    if (analysis.keyTail.isNotBlank() && analysis.keyTailConfidence >= 0.25) {
+        analysis.keyTailConfidence
+    } else if (analysis.key.isNotBlank()) {
+        analysis.keyConfidence
+    } else {
+        0.0
+    }
+
+/** Confidence matching [entryKeyForMix]: head confidence when head is trusted, else global. */
+fun entryKeyConfidence(analysis: TrackAnalysis): Double =
+    if (analysis.keyHead.isNotBlank() && analysis.keyHeadConfidence >= 0.25) {
+        analysis.keyHeadConfidence
+    } else if (analysis.key.isNotBlank()) {
+        analysis.keyConfidence
+    } else {
+        0.0
+    }
+
+/**
+ * Camelot steps between the outgoing tail and the incoming head, the two
+ * keys a transition actually sounds. Falls back to global keys when the
+ * regional keys are absent.
+ */
+fun regionalCamelotSteps(out: TrackAnalysis, inn: TrackAnalysis): Int? {
+    val left = exitKeyForMix(out)
+    val right = entryKeyForMix(inn)
+    if (left.isBlank() || right.isBlank()) return null
+    return camelotSteps(left, right)
+}

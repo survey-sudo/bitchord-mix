@@ -29,6 +29,7 @@ add_library(bitchord_analysis SHARED
     jni/analysis_jni.cpp
     jni/mel_jni.cpp
     jni/vocal_jni.cpp
+    jni/npu_jni.cpp
 )
 
 target_include_directories(bitchord_analysis PRIVATE

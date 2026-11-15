@@ -17,13 +17,13 @@ class RegionalLoudnessTest {
         val gain = assertNotNull(
             RegionalLoudness.matchGain(quiet, quiet, 0, n, loud, loud, 0, n, rate),
         )
-        // djmix9: symmetric +-3 dB clamp (0.1->0.2 is -6 dB, so -3 dB applies).
-        assertEquals(0.708, gain.toDouble(), 0.03)
+        // djmix19 intentionally changed: tightened -3.5..+4.5 dB clamp (0.1->0.2 is -6 dB, now floored at -3.5).
+        assertEquals(0.668, gain.toDouble(), 0.03)
         val huge = tone(n, rate, 0.8)
         val clamped = assertNotNull(
             RegionalLoudness.matchGain(quiet, quiet, 0, n, huge, huge, 0, n, rate),
         )
-        assertTrue(clamped >= 0.70 && clamped <= 0.72, "was $clamped")
+        assertTrue(clamped >= 0.66 && clamped <= 0.68, "was $clamped")
     }
 
     private fun tone(n: Int, rate: Int, amplitude: Double): FloatArray {

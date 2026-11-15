@@ -76,6 +76,10 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEnvelope(
       : kind == 2                    ? &deck->highPassHz
       : kind == 3                    ? &deck->lowPassHz
       : kind == 4                    ? &deck->echoSend
+      : kind == 5                    ? &deck->midDb
+      : kind == 6                    ? &deck->highDb
+      : kind == 7                    ? &deck->flangerWet
+      : kind == 8                    ? &deck->reverbSend
                                      : nullptr;
   if (envelope == nullptr) return;
   const jsize points = std::min(env->GetArrayLength(times), env->GetArrayLength(values));
@@ -102,6 +106,36 @@ JNIEXPORT void JNICALL
 Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEcho(
     JNIEnv*, jclass, jlong handle, jint index, jdouble delaySeconds, jfloat feedback, jfloat wet) {
   if (handle != 0) From(handle)->setEcho(index, delaySeconds, feedback, wet);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetFlanger(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble lfoHz, jdouble depthSeconds, jfloat feedback, jfloat wet) {
+  if (handle != 0) From(handle)->setFlanger(index, lfoHz, depthSeconds, feedback, wet);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoopRoll(
+    JNIEnv*, jclass, jlong handle, jint index, jboolean enabled, jdouble rollStartSec, jdouble beatSec, jdouble releaseSec, jdouble totalRollBeats) {
+  if (handle != 0) From(handle)->setLoopRoll(index, enabled == JNI_TRUE, rollStartSec, beatSec, releaseSec, totalRollBeats);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetReverb(
+    JNIEnv*, jclass, jlong handle, jint index, jfloat roomSize, jfloat damping, jfloat wet) {
+  if (handle != 0) From(handle)->setReverb(index, roomSize, damping, wet);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetSvfQ(
+    JNIEnv*, jclass, jlong handle, jint index, jfloat q) {
+  if (handle != 0) From(handle)->setSvfQ(index, q);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeExitGateViolations(
+    JNIEnv*, jclass, jlong handle) {
+  return handle != 0 ? From(handle)->exitGateViolations() : 0;
 }
 
 JNIEXPORT void JNICALL

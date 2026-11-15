@@ -44,12 +44,25 @@ namespace {
 
 // The analyzer's strings are its own literals -- key names like "C# minor"
 // and candidate types like "main_drop" -- so they are known ASCII with
-// nothing to escape. Anything unexpected is dropped rather than emitted
-// unescaped.
+// nothing to escape. djmix25: key names also arrive as UTF-8 sharps/flats
+// (U+266F/U+266D, bytes E2 99 AF / E2 99 AD) from the native analyzer, which
+// the old ASCII-only loop silently stripped ("C# major" -> "C major", a
+// wrong root that poisoned camelotSteps in shouldDeclineToMix). Preserve
+// valid UTF-8 bytes (>= 0x80) so the Kotlin side decodes the right pitch
+// class; the Kotlin camelotCode already maps both the unicode signs and
+// ASCII '#'/'b' to the same roots.
 void AppendString(std::string& out, const std::string& value) {
   out += '"';
-  for (const char character : value) {
-    if (character >= 32 && character < 127 && character != '"' && character != '\\') {
+  for (const unsigned char character : value) {
+    if (character == '"') {
+      out += "\\\"";
+    } else if (character == '\\') {
+      out += "\\\\";
+    } else if (character >= 32 && character < 127) {
+      out += character;
+    } else if (character >= 128) {
+      // UTF-8 continuation/lead bytes pass through untouched (JSON strings
+      // are UTF-8); control bytes below 32 are dropped.
       out += character;
     }
   }
@@ -156,6 +169,12 @@ Java_com_music_bitchord_playback_smart_TrackFeatures_nativeAnalyze(
 
   json += ",\"key\":";
   AppendString(json, result.key);
+  json += ",\"keyHead\":";
+  AppendString(json, result.key_head);
+  AppendField(json, "keyHeadConfidence", result.key_head_confidence);
+  json += ",\"keyTail\":";
+  AppendString(json, result.key_tail);
+  AppendField(json, "keyTailConfidence", result.key_tail_confidence);
   json += ",\"downbeats\":";
   AppendDoubles(json, result.downbeats);
   json += ",\"phraseBoundaries\":";

@@ -46,3 +46,14 @@ proprietary AI_DJ sources are not shipped either.
 
 The section labels, the Schroeder plate and the loop roll are original to
 this fork. They are not copied from those projects.
+
+## Qualcomm AI (QAIRT) HTP runtime
+
+The Snapdragon NPU stack is the QAIRT 2.51.0.260929 HTP runtime, bundled
+in the APK under lib/arm64-v8a (libQnnHtp*, plus one Skel per Hexagon
+generation), built against the ONNX Runtime 1.31.0 source build in
+npu-addon/. Qualcomm AI Runtime is the property of Qualcomm
+Technologies, Inc. and/or its subsidiaries and is governed by the
+license in app/src/main/assets/licenses/Qualcomm-AI-Runtime-LICENSE.pdf
+and the notices in Qualcomm-AI-Runtime-QNN-NOTICE.txt. All rights
+reserved; no rights are granted except as stated in that license.

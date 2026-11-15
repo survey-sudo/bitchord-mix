@@ -71,16 +71,19 @@ class AdvancedAutomixPlannerTest {
 
     @Test
     fun anUnmixablePairIsCrossfadedAtTheEndIntoTheIntro() {
-        // Tempo out of reach, clashing keys, both sung: every DJ gesture put two
-        // loud unsynced songs on top of each other. The plain crossfade wins.
+        // Tempo out of reach (post-fold delta >8%), clashing keys (>2 steps),
+        // both sung: Task 2B classic decline fallback uses a short sculpted
+        // 3.5-4.5s DJ_FILTER carve instead of 15s raw EQUAL_POWER overlap.
         val current = track("a", 120.0, "C major", vocal = 0.9)
         val next = track("b", 94.0, "F♯ major", vocal = 0.9)
         val plan = plan(current, next, advanced = true)
-        // djmix9: the unmixable veto is off - pairs fall to the DJ-assisted
-        // filter rung (short, key-aware) instead of a plain crossfade.
         assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
+        assertTrue(plan.fadeSeconds in 3.5..4.5, "fade=${plan.fadeSeconds}")
+        assertTrue(plan.filterSweep > 0.0)
+        assertTrue(plan.reason.contains("decline-to-mix"))
         assertTrue(plan.transitionEnd <= current.contentEndTime + 1e-6)
         assertEquals(TransitionStyle.DJ_FILTER, plan(current, next, advanced = false).transitionStyle)
+        assertEquals(next.audibleStartTime!!, plan.incomingCueTime, 1e-6)
     }
 
     @Test
@@ -101,17 +104,20 @@ class AdvancedAutomixPlannerTest {
         // down. Advanced mode leaves that to a filter ride rather than a
         // blend. The gesture still follows the low end. Past the stretch
         // limit the ride is an echo instead.
+        // djmix20: keys are left untrusted (keyConfidence 0.1) so the trusted-key
+        // decline gate does NOT fire on this 9% + clash pair; the DjMix clash
+        // filter (which reads the raw key) still produces the DJ_FILTER here.
         val kicks = plan(
-            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0),
-            track("b", 120.0, "F♯ major", vocal = 0.1, bass = 1.0),
+            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
+            track("b", 120.0, "F♯ major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
             advanced = true,
         )
         assertEquals(TransitionStyle.DJ_FILTER, kicks.transitionStyle)
         assertEquals(FilterTransitionVariant.BASS_HANDOFF, kicks.filterVariant)
         assertEquals(0.0, kicks.echoSeconds)
         val sparse = plan(
-            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0),
-            track("b", 120.0, "F♯ major", vocal = 0.1),
+            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
+            track("b", 120.0, "F♯ major", vocal = 0.1).copy(keyConfidence = 0.1),
             advanced = true,
         )
         assertEquals(FilterTransitionVariant.SWEEP, sparse.filterVariant)
@@ -128,10 +134,10 @@ class AdvancedAutomixPlannerTest {
             val plan = plan(current, next, advanced = true)
             assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
             assertEquals(FilterTransitionVariant.ECHO_RIDE, plan.filterVariant)
+            // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
             val effect = when (pairHash(current.trackId, next.trackId) % 3) {
-                0 -> DjEffect.ECHO
-                1 -> DjEffect.LOOP_ROLL
-                else -> DjEffect.REVERB
+                2 -> DjEffect.REVERB
+                else -> DjEffect.ECHO
             }
             assertEquals(effect, plan.djEffect)
             if (effect == DjEffect.ECHO) assertTrue(plan.echoSeconds > 0.2)
@@ -144,7 +150,9 @@ class AdvancedAutomixPlannerTest {
         // Within the stretch window, but the incoming grid is too weak to
         // beatmatch on, so this is a filter ride — with two singers on it.
         val current = track("vocal-out", 120.0, "C major", vocal = 0.9, bass = 1.0)
-        val next = track("vocal-in", 130.0, "C major", vocal = 0.9, bass = 1.0).copy(beatConfidence = 0.4)
+        // djmix20: 128 (6.7% delta) avoids the decline gate (130 was 8.3% + dual
+        // vocal); the weak incoming grid still forces the vocal-safe sweep.
+        val next = track("vocal-in", 128.0, "C major", vocal = 0.9, bass = 1.0).copy(beatConfidence = 0.4)
         val plan = plan(current, next, advanced = true)
         assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
         assertEquals(FilterTransitionVariant.SWEEP, plan.filterVariant)

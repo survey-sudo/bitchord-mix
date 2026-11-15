@@ -35,6 +35,7 @@ class DjColour {
     private var roll = FloatArray(0)
     private var rollPos = 0
     private var rollLen = 0
+    private var rollAnchor = 0
     private var rollCursor = 0
     private var rollSince = 0
     private var rolling = false
@@ -86,6 +87,12 @@ class DjColour {
             rollLen = beatFrames.coerceAtMost(roll.size / channels.coerceAtLeast(1))
             rollCursor = 0
             rollSince = 0
+            val frames = roll.size / channels.coerceAtLeast(1)
+            if (frames > 0) {
+                rollAnchor = ((rollPos - rollLen) % frames + frames) % frames
+            } else {
+                rollAnchor = 0
+            }
         }
     }
 
@@ -236,22 +243,23 @@ class DjColour {
         if (roll.isEmpty() || beatFrames <= 0) return
         val frames = roll.size / channels
         for (c in 0 until channels) roll[rollPos * channels + c] = samples[base + c]
-        if (rolling && rollLen > 1 && amount > 0.001f) {
-            val read = rollPos - rollLen + rollCursor
-            val index = ((read % frames) + frames) % frames
+        if (rolling && rollLen > 1 && amount > 0.001f && frames > 0) {
+            val index = (rollAnchor + rollCursor) % frames
             val fadeFrames = (sampleRate * 0.005f).toInt().coerceAtLeast(1)
             val fade = if (rollCursor < fadeFrames) rollCursor.toFloat() / fadeFrames else 1f
+            val wet = amount.coerceIn(0f, 1f) * fade
             for (c in 0 until channels) {
                 val looped = roll[index * channels + c]
                 val dry = samples[base + c]
-                samples[base + c] = dry * (1f - amount * fade) + looped * amount * fade
+                samples[base + c] = dry * (1f - wet) + looped * wet
             }
             rollCursor++
             rollSince++
             if (rollCursor >= rollLen) {
                 rollCursor = 0
-                if (rollSince >= beatFrames && rollLen > beatFrames / 8) {
-                    rollLen = (rollLen / 2).coerceAtLeast(beatFrames / 8)
+                val floor = (beatFrames / 2).coerceAtLeast(1)
+                if (rollSince >= beatFrames && rollLen > floor) {
+                    rollLen = (rollLen / 2).coerceAtLeast(floor)
                     rollSince = 0
                 }
             }

@@ -558,4 +558,17 @@ class LoopMixTest {
         assertFalse(plan.inLoops)
         assertTrue(plan.nativeIncoming)
     }
+
+    @Test
+    fun lateStepReasonBeforeDeadlineReportsEarlyAbortNotZeroMsOver() {
+        val span = LoopMix.PrepSpan("outgoing decode", 1_000L, 1_400L, 5_000L)
+        val reason = LoopMix.lateStepReason(listOf(span), nowMs = 1_500L, deadlineMs = 5_000L)
+        assertFalse(reason.contains("0 ms over"), "reason=$reason")
+        assertTrue(reason.contains("early-abort"), "reason=$reason")
+        assertTrue(reason.contains("3500 ms left"), "reason=$reason")
+
+        val emptyReason = LoopMix.lateStepReason(emptyList(), nowMs = 2_000L, deadlineMs = 5_000L)
+        assertFalse(emptyReason.contains("0 ms over"), "emptyReason=$emptyReason")
+        assertTrue(emptyReason.contains("early-abort"), "emptyReason=$emptyReason")
+    }
 }

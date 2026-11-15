@@ -89,8 +89,13 @@ class AnalysisStore(
             val stored = json.decodeFromString(Stored.serializer(), file.readText())
             // An entry from an older build may hold numbers computed a different
             // way, and a wrong beat grid is worse than none — so it is dropped
-            // and re-earned rather than migrated.
+            // and re-earned rather than migrated. Provenance is checked the
+            // same way: a model or pipeline change invalidates old entries
+            // wholesale instead of mixing eras. Missing fields decode as
+            // defaults, so old JSON fails these checks and is deleted,
+            // never crashed on (see onFailure below).
             require(stored.version == SCHEMA_VERSION) { "schema ${stored.version}" }
+            require(stored.provenance == PIPELINE_PROVENANCE) { "provenance ${stored.provenance}" }
             stored.toAnalysis(trackId)
         }
             .onFailure {
@@ -177,6 +182,9 @@ class AnalysisStore(
     @Serializable
     private data class Stored(
         val version: Int = SCHEMA_VERSION,
+        // Pipeline fingerprint, see PIPELINE_PROVENANCE. Old JSON without
+        // it decodes as "" and fails the load check (discarded, not crash).
+        val provenance: String = "",
         val duration: Double = 0.0,
         val bpm: Double = 0.0,
         val beatInterval: Double = 0.0,
@@ -186,6 +194,10 @@ class AnalysisStore(
         val phraseBoundaries: List<Double> = emptyList(),
         val key: String = "",
         val keyConfidence: Double = 0.0,
+        val keyHead: String = "",
+        val keyHeadConfidence: Double = 0.0,
+        val keyTail: String = "",
+        val keyTailConfidence: Double = 0.0,
         val audibleStartTime: Double? = null,
         val pickupTime: Double? = null,
         val introEndTime: Double = 0.0,
@@ -203,6 +215,9 @@ class AnalysisStore(
         val tailBeats: StoredBeats? = null,
         val vocalWindows: List<StoredCurve> = emptyList(),
         val levelWindows: List<StoredCurve> = emptyList(),
+        // djmix17: analysis coverage (none/head/full). Older JSON has no
+        // field; [toAnalysis] infers it from full-analysis markers.
+        val quality: String = "",
     ) {
         fun toAnalysis(trackId: String) = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
@@ -216,6 +231,10 @@ class AnalysisStore(
             phraseBoundaries = phraseBoundaries,
             key = key,
             keyConfidence = keyConfidence,
+            keyHead = keyHead,
+            keyHeadConfidence = keyHeadConfidence,
+            keyTail = keyTail,
+            keyTailConfidence = keyTailConfidence,
             audibleStartTime = audibleStartTime,
             pickupTime = pickupTime,
             introEndTime = introEndTime,
@@ -233,10 +252,24 @@ class AnalysisStore(
             tailBeats = tailBeats?.toSide(),
             vocalWindows = vocalWindows.map { it.toWindow() },
             levelWindows = levelWindows.map { it.toWindow() },
+            quality = inferredQuality(),
         )
+
+        /**
+         * Stored quality when present; else infer from full-analysis
+         * markers so JSON written before djmix17 (no field) still restores
+         * quality="full" instead of the "none" default.
+         */
+        private fun inferredQuality(): String {
+            if (quality.isNotBlank()) return quality
+            if (energyCurve.isNotEmpty() || tailBeats != null) return TrackAnalysis.QUALITY_FULL
+            return TrackAnalysis.QUALITY_NONE
+        }
 
         companion object {
             fun of(analysis: TrackAnalysis) = Stored(
+                version = SCHEMA_VERSION,
+                provenance = PIPELINE_PROVENANCE,
                 duration = analysis.duration,
                 bpm = analysis.bpm,
                 beatInterval = analysis.beatInterval,
@@ -246,6 +279,10 @@ class AnalysisStore(
                 phraseBoundaries = analysis.phraseBoundaries.map(::round),
                 key = analysis.key,
                 keyConfidence = analysis.keyConfidence,
+                keyHead = analysis.keyHead,
+                keyHeadConfidence = analysis.keyHeadConfidence,
+                keyTail = analysis.keyTail,
+                keyTailConfidence = analysis.keyTailConfidence,
                 audibleStartTime = analysis.audibleStartTime,
                 pickupTime = analysis.pickupTime,
                 introEndTime = analysis.introEndTime,
@@ -263,6 +300,7 @@ class AnalysisStore(
                 tailBeats = analysis.tailBeats?.let(StoredBeats::of),
                 vocalWindows = analysis.vocalWindows.map(StoredCurve::of),
                 levelWindows = analysis.levelWindows.map(StoredCurve::of),
+                quality = analysis.quality,
             )
         }
     }
@@ -330,8 +368,27 @@ class AnalysisStore(
          * Entries from an older schema are ignored rather than migrated: a
          * re-analysis costs seconds, and a beat grid interpreted under the wrong
          * assumptions is silently wrong for the life of the file.
+         *
+         * vc70: 3 -> 4 invalidates every pre-ORT-restore entry once (the
+         * vc69 reduced-ORT era produced DSP-era numbers with no model,
+         * served alongside older model-era ones under the same trackId).
+         * See PIPELINE_PROVENANCE for the per-entry fingerprint.
          */
-        const val SCHEMA_VERSION = 3
+        const val SCHEMA_VERSION = 5
+
+        /**
+         * Analyzer/model pipeline fingerprint stamped on every cache entry
+         * (Stored.provenance) and checked on read alongside SCHEMA_VERSION.
+         * Bump this string whenever the model weights, ORT build, or
+         * provider changes, so old entries are discarded wholesale rather
+         * than silently mixed with new ones. Short on purpose: it names the
+         * pipeline, it does not hash a model file.
+         *
+         * vc70 restore: full Maven ORT 1.31.0 CPU provider (reduced ORT +
+         * QNN removed from the APK). Old entries have version 3 or a blank
+         * provenance and are deleted on first load, then re-analysed.
+         */
+        const val PIPELINE_PROVENANCE = "full-ort-1.31.0-cpu-keyfix1"
 
         /** A few thousand tracks' worth, at tens of kilobytes each. */
         const val MAX_ENTRIES = 2_000

@@ -75,5 +75,27 @@ VocalSpectrogram ComputeVocalSpectrogram(
   const std::vector<std::vector<float>>& channels,
   double sample_rate
 );
+/**
+ * Windowed STFT+ISTFT Wiener stem separation for transition windows.
+ * Takes planar stereo left/right at sample_rate (kVocalSpectrogramSampleRate)
+ * and a target vocal magnitude in bin-major layout
+ * target_mag_bin_major[(c * kVocalSpectrogramBins + b) * target_frames + f].
+ * Applies Wiener gain w = r^2 / (r^2 + (1-r)^2 + 1e-8) with
+ * r = clamp(voc_mag / mix_mag, 0, 1), keeps keep_vocals (w) or complement
+ * (1-w), mirrors Hermitian conjugate, inverse-FFTs and overlap-adds with the
+ * same Hann window for exact input-length outputs. On mismatch both outputs
+ * are left empty. Caller runs this on a worker thread only.
+ */
+bool SeparateVocalWindow(
+  const std::vector<float>& left,
+  const std::vector<float>& right,
+  double sample_rate,
+  const std::vector<float>& target_mag_bin_major,
+  size_t target_frames,
+  bool keep_vocals,
+  std::vector<float>& out_left,
+  std::vector<float>& out_right
+);
+
 
 }  // namespace bitchord::smart

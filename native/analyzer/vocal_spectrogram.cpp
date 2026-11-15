@@ -22,6 +22,7 @@
 
 #include "vocal_spectrogram.h"
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <vector>
@@ -132,6 +133,98 @@ VocalSpectrogram ComputeVocalSpectrogram(
     }
   }
   return result;
+}
+
+bool SeparateVocalWindow(
+  const std::vector<float>& left,
+  const std::vector<float>& right,
+  double sample_rate,
+  const std::vector<float>& target_mag_bin_major,
+  size_t target_frames,
+  bool keep_vocals,
+  std::vector<float>& out_left,
+  std::vector<float>& out_right
+) {
+  out_left.clear();
+  out_right.clear();
+  if (std::abs(sample_rate - kVocalSpectrogramSampleRate) > 1.0) return false;
+  const size_t input_length = left.size();
+  if (right.size() != input_length) return false;
+  if (target_frames == 0) return false;
+  if (target_mag_bin_major.size() != kVocalSpectrogramChannels * kVocalSpectrogramBins * target_frames) return false;
+  const size_t pad = kVocalSpectrogramFft / 2;
+  if (input_length <= pad + 1) return false;
+  const auto window = HannWindow(kVocalSpectrogramFft);
+  const std::vector<float> inputs[2] = {left, right};
+  std::vector<float> outputs[2];
+  outputs[0].assign(input_length, 0.0f);
+  outputs[1].assign(input_length, 0.0f);
+  std::vector<std::vector<double>> ola(2);
+  std::vector<std::vector<double>> win_sq(2);
+  for (size_t c = 0; c < 2; ++c) {
+    ola[c].assign(input_length + 2 * pad, 0.0);
+    win_sq[c].assign(input_length + 2 * pad, 0.0);
+  }
+  std::vector<std::vector<float>> padded(kVocalSpectrogramChannels);
+  for (size_t channel = 0; channel < kVocalSpectrogramChannels; ++channel) {
+    auto& out = padded[channel];
+    const auto& in = inputs[channel];
+    out.reserve(input_length + 2 * pad);
+    for (size_t index = pad; index >= 1; --index) out.push_back(in[index]);
+    out.insert(out.end(), in.begin(), in.end());
+    for (size_t index = 1; index <= pad; ++index) out.push_back(in[input_length - 1 - index]);
+  }
+  const size_t padded_length = padded.front().size();
+  if (padded_length < kVocalSpectrogramFft) return false;
+  const size_t frames = (padded_length - kVocalSpectrogramFft) / kVocalSpectrogramHop + 1;
+  const size_t capped = std::min(frames, target_frames);
+  const size_t n = kVocalSpectrogramFft;
+  const size_t half = n / 2;
+  std::vector<std::complex<double>> spectrum(n);
+  for (size_t channel = 0; channel < kVocalSpectrogramChannels; ++channel) {
+    const auto& source = padded[channel];
+    for (size_t frame = 0; frame < capped; ++frame) {
+      const size_t start = frame * kVocalSpectrogramHop;
+      for (size_t index = 0; index < n; ++index) {
+        spectrum[index] = std::complex<double>(source[start + index] * window[index], 0.0);
+      }
+      Fft(spectrum);
+      for (size_t bin = 0; bin < kVocalSpectrogramBins; ++bin) {
+        const double mix_mag = std::abs(spectrum[bin]);
+        const double voc_mag = static_cast<double>(
+          target_mag_bin_major[(channel * kVocalSpectrogramBins + bin) * target_frames + frame]);
+        double r = 0.0;
+        if (mix_mag > 1e-6) {
+          r = voc_mag / mix_mag;
+          r = std::clamp(r, 0.0, 1.0);
+        }
+        const double w = (r * r) / (r * r + (1.0 - r) * (1.0 - r) + 1e-8);
+        const double mask = keep_vocals ? w : (1.0 - w);
+        spectrum[bin] *= mask;
+      }
+      for (size_t bin = 1; bin < half; ++bin) {
+        spectrum[n - bin] = std::conj(spectrum[bin]);
+      }
+      spectrum[0] = std::complex<double>(spectrum[0].real(), 0.0);
+      spectrum[half] = std::complex<double>(spectrum[half].real(), 0.0);
+      for (auto& v : spectrum) v = std::conj(v);
+      Fft(spectrum);
+      for (auto& v : spectrum) v = std::conj(v) / static_cast<double>(n);
+      for (size_t index = 0; index < n; ++index) {
+        const size_t pos = start + index;
+        ola[channel][pos] += spectrum[index].real() * window[index];
+        win_sq[channel][pos] += window[index] * window[index];
+      }
+    }
+  }
+  for (size_t channel = 0; channel < 2; ++channel) {
+    std::vector<float>& dst = (channel == 0) ? out_left : out_right;
+    for (size_t index = 0; index < input_length; ++index) {
+      const double denom = std::max(1e-6, win_sq[channel][pad + index]);
+      dst[index] = static_cast<float>(ola[channel][pad + index] / denom);
+    }
+  }
+  return true;
 }
 
 }  // namespace bitchord::smart

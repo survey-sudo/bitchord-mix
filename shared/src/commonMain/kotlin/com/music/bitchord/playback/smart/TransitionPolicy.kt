@@ -182,6 +182,7 @@ private const val HEURISTIC_VOCAL_THRESHOLD = 0.6
  * tail unplayed; it is not allowed to cut the song short.
  */
 const val MAX_DISCARDED_MUSIC_SECONDS = 12.0
+const val MIN_MIX_OUT_FRACTION = 0.78
 
 /**
  * Fraction of a track's own loud-end reference below which a sample counts as
@@ -210,6 +211,7 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
     "interior_mix_out" to 0.95,
     "break_outro" to 0.93,
     "outro_start" to 0.9,
+    "eof_holdback" to 0.81,
     "content_end" to 0.75,
 )
 
@@ -222,15 +224,22 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
     if (value.isFinite()) max(min, min(max, value)) else min
 
 /**
+ * The single shared octave fold (djmix12): the fold in {1, 2, 0.5} bringing
+ * [incomingBpm] nearest to [outgoingBpm] on the log domain. Every caller
+ * that halves or doubles tempo goes through here so thresholds agree.
+ */
+fun alignedFold(outgoingBpm: Double, incomingBpm: Double): Double {
+    if (outgoingBpm <= 0 || incomingBpm <= 0) return 1.0
+    return doubleArrayOf(1.0, 2.0, 0.5).minBy { abs(kotlin.math.ln((incomingBpm / it) / outgoingBpm)) }
+}
+
+/**
  * Halves or doubles [incomingBpm] until it is as close as possible to
  * [outgoingBpm], the way a DJ counts a 63 BPM track against a 126 BPM one.
  */
 fun alignTempoOctave(outgoingBpm: Double, incomingBpm: Double): Double {
     if (outgoingBpm <= 0 || incomingBpm <= 0) return incomingBpm
-    var aligned = incomingBpm
-    while (aligned / outgoingBpm > 1.5) aligned /= 2
-    while (aligned / outgoingBpm < 0.67) aligned *= 2
-    return aligned
+    return incomingBpm / alignedFold(outgoingBpm, incomingBpm)
 }
 
 /**
@@ -399,6 +408,44 @@ fun audibleSecondsBetween(analysis: TrackAnalysis, start: Double, end: Double): 
     return candidates.minOrNull() ?: 0.0
 }
 
+/** Relative tolerance for calling a tempo ratio an octave relationship. */
+const val OCTAVE_RATIO_TOLERANCE = 0.08
+
+/**
+ * A pair whose raw tempo ratio sits within [OCTAVE_RATIO_TOLERANCE] of a
+ * factor 2 either way — the shape of a half/double-time analysis reading,
+ * not a measured tempo gap. [fold] is the multiplier the planner's own fold
+ * applies to the incoming tempo, [rate] the stretch the fold would demand,
+ * and [inAudibleBand] whether that fold lands inside the audible window.
+ *
+ * Detection only: nothing here changes a tempo. Pairs whose fold lands
+ * outside the audible band are report-only — the detector names them so a
+ * doubled outgoing grid (164 that is really 82) is visible in device logs
+ * instead of flowing into bar math as a 9.8% far pair. The fold itself is
+ * the existing [alignTempoOctave], verified in-band here, never rewritten.
+ */
+data class OctaveRelationship(
+    val fold: Double,
+    val rate: Double,
+    val inAudibleBand: Boolean,
+)
+
+fun detectOctaveRelationship(outgoingBpm: Double, incomingBpm: Double): OctaveRelationship? {
+    if (outgoingBpm <= 0 || incomingBpm <= 0) return null
+    val raw = incomingBpm / outgoingBpm
+    val nearDouble = abs(raw - 2.0) / 2.0 <= OCTAVE_RATIO_TOLERANCE
+    val nearHalf = abs(raw - 0.5) / 0.5 <= OCTAVE_RATIO_TOLERANCE
+    if (!nearDouble && !nearHalf) return null
+    val aligned = alignTempoOctave(outgoingBpm, incomingBpm)
+    if (aligned <= 0) return null
+    val rate = outgoingBpm / aligned
+    return OctaveRelationship(
+        fold = incomingBpm / aligned,
+        rate = rate,
+        inAudibleBand = rate >= AUDIBLE_MIN_RATE - 1e-9 && rate <= AUDIBLE_MAX_RATE + 1e-9,
+    )
+}
+
 /** The value in [values] closest to [target] within [tolerance], or null when none qualifies. */
  fun nearestValue(values: List<Double>, target: Double, tolerance: Double): Double? =
     values.filter { it.isFinite() && abs(it - target) <= tolerance }
@@ -470,6 +517,21 @@ private fun mixOutCandidatesOf(analysis: TrackAnalysis, contentEnd: Double): Lis
     detectBreakOutro(analysis, contentEnd)?.let { candidate ->
         if (candidates.none { abs(it.time - candidate.time) < 0.05 }) candidates += candidate
     }
+    // djmix10 EOF holdback: with no interior/break cue the blind content_end
+    // is the only anchor and the outgoing blend rides straight into EOF.
+    // Hold back up to 8 bars (bounded by the 12s discard cap so the
+    // candidate survives ranking) so the overlap ends before the content
+    // does. Ranks above content_end (0.75+0.75) but below every real cue
+    // (energy_cliff 0.95, break_outro 0.93, outro_start 0.9).
+    val holdBar = analysis.beatInterval.takeIf { it > 0 }?.let { it * 4 }
+        ?: analysis.bpm.orZero().takeIf { it > 0 }?.let { 60.0 / it * 4 }
+    val noMeasuredTailBeforeEof = analysis.duration <= 0.0 || contentEnd >= analysis.duration - 1.5
+    if (noMeasuredTailBeforeEof && holdBar != null && holdBar > 0 && contentEnd > holdBar * 8) {
+        val held = contentEnd - minOf(1.0 * holdBar, 2.5)
+        if (held > 0.3 * contentEnd && candidates.none { abs(it.time - held) < 0.05 }) {
+            candidates += MixCandidate(held, 0.80, "eof_holdback")
+        }
+    }
     if (candidates.none { abs(it.time - contentEnd) < 0.05 }) {
         candidates += MixCandidate(contentEnd, 0.75, "content_end")
     }
@@ -523,6 +585,8 @@ fun detectBreakOutro(
     }
     val start = bestStart ?: return null
     if (contentEnd - start < BREAK_MIN_BARS * bar) return null
+    val vocal = vocalActivityBetween(analysis, start, contentEnd)
+    if (vocal != null && vocal >= 0.15) return null
     return MixCandidate(time = start, score = 0.93, type = "break_outro")
 }
 
@@ -553,18 +617,34 @@ fun rankMixOutCandidates(
     return mixOutCandidatesOf(analysis, end)
         .map { candidate ->
             val measured = audibleSecondsBetween(analysis, candidate.time, end)
+            // djmix12: scalar vocal adjustment on A's own curve (never
+            // cross-track): quieter overlap windows rank above louder ones.
+            val share = vocalActivityBetween(analysis, candidate.time, end) ?: 0.0
+            val adj = (0.5 - share.coerceIn(0.0, 1.0)) * 0.10
             // With no energy curve there is no way to tell skipped music from skipped silence, so
             // the raw gap is charged in full and the budget errs toward playing the track.
             RankedMixCandidate(
                 time = candidate.time,
                 score = candidate.score,
                 type = candidate.type,
-                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0),
+                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + adj,
                 discardedMusicSeconds = measured ?: max(0.0, end - candidate.time),
                 measured = measured != null,
             )
         }
-        .filter { it.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS }
+        .filter { candidate ->
+            val minTail = if (end > 90.0) maxOf(end * MIN_MIX_OUT_FRACTION, end - 30.0).coerceAtMost((end - 8.0).coerceAtLeast(0.0)) else minOf(end * MIN_MIX_OUT_FRACTION, maxOf(end * 0.65, end - 40.0))
+            val withinTail = candidate.time >= minTail - 1e-6 ||
+                candidate.time >= end - MAX_DISCARDED_MUSIC_SECONDS - 1e-6 ||
+                candidate.type == "content_end"
+            val genuineQuietOutro = candidate.time >= end * 0.68 - 1e-6 &&
+                (candidate.type == "break_outro" || candidate.type == "outro_start") &&
+                (vocalActivityBetween(analysis, candidate.time, end) ?: 0.0) < 0.05
+            val sungOutroRejected = candidate.type in setOf("outro_start", "break_outro", "interior_mix_out") &&
+                candidate.time < end - 2.0 &&
+                vocalActivityBetween(analysis, candidate.time, end)?.let { it >= 0.15 } == true
+            !sungOutroRejected && candidate.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS && (withinTail || genuineQuietOutro)
+        }
         .sortedWith(compareByDescending<RankedMixCandidate> { it.rankScore }.thenByDescending { it.time })
 }
 
@@ -620,9 +700,18 @@ fun assessTransitionTier(
         )
     }
 
-    if (!stretchReachable(outgoingBpm, incomingBpm)) reasons += "tempo-distance"
-    if (outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE) {
-        reasons += "beat-confidence"
+    val stretchOk = stretchReachable(outgoingBpm, incomingBpm)
+    if (!stretchOk) reasons += "tempo-distance"
+    val lowConf = outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE
+    if (lowConf) {
+        // djmix10 taste rescue: a stable grid (many downbeats) with a folded
+        // ratio inside 4% is beatmatchable even when Beat This confidence
+        // reads low on pop/rap. Without the rescue these demote to a filter
+        // ride and read as wasted chances; with it they blend at half length
+        // via the coarse path in PhrasePlanner.
+        val stableGrid = analysis.downbeats.size >= 8 && nextAnalysis.downbeats.size >= 8
+        val closeRatio = abs(incomingRateBetween(outgoingBpm, incomingBpm) - 1.0) <= PhraseConfig.TEMPO_HARD_DELTA
+        if (!(stretchOk && stableGrid && closeRatio)) reasons += "beat-confidence"
     }
 
     return TransitionPolicyVerdict(

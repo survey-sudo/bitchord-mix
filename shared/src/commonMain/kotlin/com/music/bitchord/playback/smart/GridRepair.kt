@@ -119,23 +119,27 @@ object GridRepair {
     }
 
     /**
-     * Moves every beat by the median onset error, and only when that error
-     * is within [windowSec] and at least half the beats have an onset that
-     * close. Otherwise the beats come back unchanged.
+     * djmix24 bkmasterplayer snap_to_onsets (±35 ms): each beat/downbeat
+     * candidate moves to the nearest local onset peak within [windowSec]
+     * (default 35 ms). Beats without a clear attack keep their grid time,
+     * so breakdowns (no drums) are not dragged. Needs >= 8 beats and a
+     * clear onset for at least half the beats, else unchanged.
+     * Scalar times only: no audio, no cross-track correlation.
      */
     fun snapToOnsets(beats: List<Double>, onsets: List<Double>, windowSec: Double = 0.035): List<Double> {
         if (beats.size < 8 || onsets.isEmpty()) return beats
-        val shifts = ArrayList<Double>()
-        for (beat in beats) {
-            val onset = nearest(onsets, beat) ?: continue
+        val sortedOnsets = onsets.sorted()
+        var hits = 0
+        val snapped = beats.map { beat ->
+            val onset = nearest(sortedOnsets, beat) ?: return@map beat
             val delta = onset - beat
-            if (abs(delta) <= windowSec) shifts += delta
+            if (abs(delta) <= windowSec) {
+                hits++
+                onset
+            } else beat
         }
-        if (shifts.size < 8 || shifts.size * 2 < beats.size) return beats
-        shifts.sort()
-        val median = shifts[shifts.size / 2]
-        if (abs(median) < 0.0005) return beats
-        return beats.map { it + median }
+        if (hits < 8 || hits * 2 < beats.size) return beats
+        return snapped
     }
 
     /**

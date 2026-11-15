@@ -65,12 +65,36 @@ object PhraseConfig {
     const val TEMPO_POLICY = "b"
     const val TEMPO_POLICY_BRIDGE = "a"
     const val TEMPO_STEP_PER_BAR = 0.005
+    const val MAX_BPM_PCT_PER_BAR = TEMPO_STEP_PER_BAR
     const val TEMPO_PREP_BARS = 16
     const val B_UNITY_BARS_BEFORE_LANDING = 2
 
     /** Bass-swap raised cosine. Drops, cuts and lifts use the short ramp. */
     const val SWAP_RAMP_MS = 40
     const val SWAP_RAMP_BLEND_MS = 120
+
+    /**
+     * Graceful-exit guarantee (djmix11): the outgoing deck may never go
+     * audible→silence faster than the planned dissolve, and even emergency
+     * paths (bail, fallback settle) take the shortened version. Planned
+     * length is 2 beats with an 800 ms floor and a 2 s cap.
+     */
+    const val EXIT_TAIL_MIN_MS = 800.0
+    const val EXIT_TAIL_EMERGENCY_MS = 350.0
+    const val EXIT_TAIL_BEATS = 2.0
+    const val EXIT_TAIL_MAX_SEC = 2.0
+
+    /** Shared tempo discipline (djmix12, after bkmasterplayer): beyond this post-fold
+     * delta a long blend is never rampable -- downgrade to short/echo. */
+    const val TEMPO_HARD_DELTA = 0.08
+    /** Short-rung overlap cap for the downgraded rung. */
+    const val TEMPO_HARD_MAX_BARS = 4
+    /** Prep overrun tolerance (ms): a missed bar within this still arms. */
+    const val PREP_TOLERANCE_MS = 50L
+
+    /** Planned exit-dissolve length in seconds (800 ms floor, 2 s cap). */
+    fun exitTailSeconds(beatSec: Double): Double =
+        (EXIT_TAIL_BEATS * beatSec).coerceIn(EXIT_TAIL_MIN_MS / 1000.0, EXIT_TAIL_MAX_SEC)
 
     const val PHASE_GATE_LONG_MS = 15
     const val PHASE_GATE_SHORT_MS = 25
@@ -84,8 +108,30 @@ object PhraseConfig {
     const val ECHO_HPF_HZ = 300.0
     const val ECHO_LPF_HZ = 6000.0
     const val ECHO_TAIL_CAP_SEC = 4.0
-    const val ECHO_FEEDBACK = 0.45f
+    const val ECHO_FEEDBACK = 0.52f
+    /** djmix25 P1.11: feedback tuning by fade length + template density. */
+    const val ECHO_FEEDBACK_LONG = 0.55f
+    const val ECHO_FEEDBACK_SHORT = 0.45f
     const val ECHO_SEND_PEAK = 0.6f
+    /** djmix25 P1.11: reverb tuning for EDM buildups (plate). */
+    const val REVERB_DAMPING_EDM = 0.48f
+    const val REVERB_WET_EDM = 0.42f
+    const val REVERB_DAMPING = 0.55f
+    const val REVERB_WET = 0.35f
+
+    /**
+     * djmix25 echo density: long fades (>12s) ring fuller (0.55), short
+     * (<=8s) sit tighter (0.45), mid keeps 0.52. CUT/ten-cut templates
+     * get half the feedback (the cut itself is the gesture).
+     */
+    fun echoFeedbackFor(templateName: String, fadeSec: Double): Float {
+        val base = when {
+            fadeSec > 12.0 -> ECHO_FEEDBACK_LONG
+            fadeSec <= 8.0 -> ECHO_FEEDBACK_SHORT
+            else -> ECHO_FEEDBACK
+        }
+        return if (templateName == "M10" || templateName == "CUT_ON_ONE") base * 0.5f else base
+    }
 
     const val ENERGY_DIP_LEVELS = 2
     const val ENERGY_JUMP_LEVELS = 3
@@ -93,6 +139,15 @@ object PhraseConfig {
     const val LIFT_MIN_CHORUSES = 2
     const val LIFT_MIN_ENERGY = 5
     const val BALLAD_ENERGY = 0.3f
+
+    /** djmix21 vocal continuity: a seam may not play more than this many
+     * continuous no-vocal bars without trimming the entry or shortening. */
+    const val VOCAL_GAP_SOFT_BARS = 8
+    const val VOCAL_GAP_HARD_BARS = 16
+    /** djmix21 mid-line guard: extend to the line/section end by at most this. */
+    const val LYRIC_EXTENSION_MAX_SEC = 6.0
+    /** djmix21 buildup: late/early energy ratio that counts as rising. */
+    const val BUILDUP_RISE_MIN = 1.12
 
     const val PLAN_LEAD_SEC = 60.0
     const val REPLAN_SEC = 5.0
@@ -103,13 +158,18 @@ object PhraseConfig {
     const val HEAD_STRUCTURE_BARS = 64
     const val VOCAL_MASK_SEC = 120.0
 
-    const val STRUCT_TIMEOUT_MS = 2_000L
-    const val PLAN_TIMEOUT_MS = 40L
+    // vc74 (djmix32): was 5_000 (djmix14; before that 2000). Timeout checkpoints are
+    // coarse (fromPcm after frames(), novelty after the O(n^2) similarity()), so a
+    // contended pass overshoots the nominal value by 4-6x; at 5 s a merely-busy phone
+    // published NO SongMap and the phrase/loop planner had nothing, whereas a
+    // slow-but-complete map degrades gracefully (coarse grid) instead of vanishing.
+    const val STRUCT_TIMEOUT_MS = 20_000L
+    const val PLAN_TIMEOUT_MS = 120L
     const val ACTIVATION_FLOOR = 0.15f
     const val GRID_COARSE = 0.45f
     const val FADE_USABLE_BARS = 8
     const val FADE_MAX_DROP_DB = 6.0
-    const val MIN_PLAY_FRACTION = 0.6
+    const val MIN_PLAY_FRACTION = 0.78
 
     const val FLANGER_MIN_MS = 1.0
     const val FLANGER_MAX_MS = 6.0

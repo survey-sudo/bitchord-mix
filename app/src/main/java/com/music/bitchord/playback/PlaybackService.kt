@@ -963,6 +963,33 @@ class PlaybackService : MediaLibraryService() {
             // pause the listener asked for from one another app imposed, and
             // [Player] does not keep the answer around to be asked later.
             partySync?.onPlayWhenReadyChanged(playWhenReady, reason)
+            // djmix22 (vc64): track the listener's own intent. A USER_REQUEST
+            // pause is sticky across handoffs and must NEVER be auto-resumed;
+            // any play (or non-user pause) clears it, so the focus-swap restore
+            // below only ever resurrects a player that was playing when the
+            // swap paused it.
+            if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) {
+                userPausedPlayback = true
+            } else if (playWhenReady) {
+                userPausedPlayback = false
+            }
+            // djmix22: restore a player paused solely by the focus swap
+            // (AUDIO_FOCUS_LOSS), within the armed window after adoption, only
+            // if it was playing before the swap and the listener did not pause
+            // it. Anything else (a foreign loss outside the window, a user
+            // pause) is left exactly as it was.
+            if (!playWhenReady &&
+                reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS &&
+                SystemClock.elapsedRealtime() < focusSwapArmedUntilMs &&
+                player != null && player === focusSwapPlayer &&
+                shouldRestorePlayAfterFocusSwap(
+                    wasPlaying = focusSwapWasPlaying,
+                    userPaused = userPausedPlayback,
+                    focusHeld = focusSwapFocusHeld,
+                )
+            ) {
+                player?.play()
+            }
         }
 
         /**
@@ -1871,6 +1898,7 @@ class PlaybackService : MediaLibraryService() {
         reportProgress()
         watchDirectWindow()
 
+        AutomixTelemetry.init(this)
         val controller = createCrossfadeController()
         crossfade = controller
         QueueShuffle.isCrossfadeTransitioning = { crossfade?.isTransitioning() == true }
@@ -1961,6 +1989,10 @@ class PlaybackService : MediaLibraryService() {
                 override fun outgoing(lowPassHz: Float, highPassHz: Float) =
                     spareFilter.setCutoffs(lowPassHz, highPassHz)
 
+                override fun incomingMidDb(gainDb: Float) = activeFilter.setMidGainDb(gainDb)
+
+                override fun outgoingMidDb(gainDb: Float) = spareFilter.setMidGainDb(gainDb)
+
                 override fun incomingLeadMs(): Long = activeFilter.leadUs / 1000
 
                 override fun outgoingLeadMs(): Long = spareFilter.leadUs / 1000
@@ -2045,6 +2077,16 @@ class PlaybackService : MediaLibraryService() {
                         crossfade?.markDeckStep(step)
                     }
                 }
+            },
+            loopRegionCached = { trackId, rate, from, to ->
+                trackAnalyzer.loopRegionCached(trackId, rate, from, to)
+            },
+            separateTransitionWindow = { left, right, rate, keep ->
+                trackAnalyzer.separateTransitionWindow(left, right, rate, keep)
+            },
+            wholeTrackBusy = { trackAnalyzer.wholeTrackBusy() },
+            separateTransitionBothWindows = { left, right, rate ->
+                trackAnalyzer.separateTransitionBothWindows(left, right, rate)
             },
             syncedLines = ::loopMixLyrics,
             loudnessGain = ::loudnessGainFor,
@@ -3521,9 +3563,15 @@ class PlaybackService : MediaLibraryService() {
      * incoming track on. This is the whole of the handoff: no seek, no
      * re-buffer, and no audio rendered twice.
      *
-     * Order matters in one place — focus is released on the outgoing player
-     * *before* the incoming one asks for it, so the app never holds two focus
-     * requests at once and never briefly holds none.
+     * Focus transfer (djmix22, vc64): the outgoing player abandons focus at
+     * once, but the incoming player's acquisition is scheduled in
+     * [setSessionOwner] to land after that abandon is processed — for the same
+     * reason the app never holds two focus requests at once. The two flips are
+     * posted to different player threads, so two back-to-back flips race in
+     * Media3: the incoming player's request could land before the outgoing
+     * abandon (stealing the tail out from under the listener, or, as vc63 did
+     * live, arriving when Android had nothing to grant under and jamming the
+     * second song paused for ~70 s until a manual play).
      */
     private fun adoptPlayer(outgoing: ExoPlayer, incoming: ExoPlayer) {
         setSessionOwner(outgoing, owns = false)
@@ -3570,6 +3618,32 @@ class PlaybackService : MediaLibraryService() {
     }
 
     /**
+     * The last playWhenReady-change state was a listener pause (reason
+     * USER_REQUEST). A user pause is sticky across handoffs and must NEVER be
+     * auto-resumed by the focus-swap restore; any play (or a non-user pause)
+     * clears it. Read by the armed restore in [playbackListener].
+     */
+    private var userPausedPlayback: Boolean = false
+
+    /** The adopting player was audibly playing before the focus swap (djmix22). */
+    private var focusSwapWasPlaying: Boolean = false
+
+    /** True once the delayed focus acquisition has landed and Media3 is
+     * (re)acquiring focus for the session player (djmix22). */
+    private var focusSwapFocusHeld: Boolean = false
+
+    /** Wall (SystemClock.elapsedRealtime) until which a focus-swap pause may be
+     * restored; 0 when disarmed (djmix22). */
+    private var focusSwapArmedUntilMs: Long = 0L
+
+    /** The player adopted by the last focus swap; restore must target it (djmix22). */
+    private var focusSwapPlayer: ExoPlayer? = null
+
+    /** Monotonic ownership-flip token so a stale delayed acquisition cannot
+     * grant focus to a player that a later adopt already replaced (djmix22). */
+    private var focusOwnerFlipToken: Int = 0
+
+    /**
      * Only one player may handle audio focus at a time.
      *
      * Two focus-handling players in one process fight each other: the standby
@@ -3577,10 +3651,51 @@ class PlaybackService : MediaLibraryService() {
      * cutting the outgoing track dead instead of fading it. Focus follows the
      * session, and so does "becoming noisy" — unplugging headphones should pause
      * the song you are listening to, which is whichever one the session is on.
+     *
+     * djmix22 (vc64): an abandon (owns = false) lands at once, but an
+     * acquisition (owns = true) is scheduled [FOCUS_ACQUISITION_DELAY_MS] later.
+     * Both flavours of `setAudioAttributes` are posted to the player's own
+     * playback thread, so two immediate flips race in Media3: vc63's Calvin pair
+     * proved the result — a bare abandon with no holder for ~70 s and the second
+     * song paused until the listener pressed play. Scheduling the acquisition
+     * after the abandon is processed makes the grant deterministic. A second
+     * adopt supersedes the first (token + player identity), so a stale
+     * acquisition can never re-own a retired player.
      */
     private fun setSessionOwner(target: ExoPlayer, owns: Boolean) {
-        target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
-        target.setHandleAudioBecomingNoisy(owns)
+        if (!owns) {
+            target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
+            target.setHandleAudioBecomingNoisy(owns)
+            return
+        }
+        // Snapshot play state before the swap lands (same main turn as the
+        // adoption): only a player that was audibly playing before the handoff
+        // may be restored by a swap-pause (see [userPausedPlayback]).
+        focusSwapWasPlaying = target.playWhenReady && target.playbackState == Player.STATE_READY
+        focusSwapFocusHeld = false
+        focusSwapArmedUntilMs = SystemClock.elapsedRealtime() + FOCUS_SWAP_ARM_MS
+        focusSwapPlayer = target
+        val token = ++focusOwnerFlipToken
+        scope.launch {
+            delay(FOCUS_ACQUISITION_DELAY_MS)
+            if (token != focusOwnerFlipToken) return@launch
+            if (target !== player) return@launch
+            target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
+            target.setHandleAudioBecomingNoisy(true)
+            focusSwapFocusHeld = true
+            // If the swap already landed as a pause, restore a player that was
+            // playing through the handoff (the listener also closes this from
+            // onPlayWhenReadyChanged for the async-arriving pause).
+            if (target.playWhenReady) return@launch
+            if (shouldRestorePlayAfterFocusSwap(
+                    wasPlaying = focusSwapWasPlaying,
+                    userPaused = userPausedPlayback,
+                    focusHeld = focusSwapFocusHeld,
+                )
+            ) {
+                target.play()
+            }
+        }
     }
 
     /**
@@ -9555,6 +9670,22 @@ class PlaybackService : MediaLibraryService() {
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
+
+        /**
+         * djmix22 (vc64): delay before the adopting player acquires audio
+         * focus in [setSessionOwner]. The abandon it follows is a single
+         * control message on the outgoing player's thread; this margin is
+         * several renderer blocks so the grant is never denied against a
+         * still-held focus.
+         */
+        const val FOCUS_ACQUISITION_DELAY_MS = 150L
+
+        /**
+         * djmix22 (vc64): window after an adoption in which a focus-swap pause
+         * may be restored. Matches the 3 s post-handoff pause watch in
+         * CrossfadeController.
+         */
+        const val FOCUS_SWAP_ARM_MS = 3_000L
 
         /** Length of a FLAC STREAMINFO block, which the format fixes at 34 bytes. */
         const val STREAM_INFO_BYTES = 34

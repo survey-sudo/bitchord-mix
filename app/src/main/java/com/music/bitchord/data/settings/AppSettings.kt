@@ -277,6 +277,17 @@ object AppSettings {
      */
     val smartFadeEnabled = MutableStateFlow(false)
 
+    /**
+     * djmix25 windowed-stem opt-in (P1.5): allow the instrumental-share
+     * windows (mix - vocal) on high-RAM devices. On by default (vc73) so
+     * on-device umxhq stem separation is active out of the box on capable
+     * devices; the gate in TrackAnalyzer additionally requires a
+     * non-low-RAM device with >= 6 GB total RAM (or a >=256 MB memory
+     * class). When off, no instrumental evidence exists and planners
+     * behave exactly as before.
+     */
+    val automixWindowedStemsEnabled = MutableStateFlow(true)
+
     /** The CPU budget used by Beat This! and vocal analysis for Automix. */
     val automixPerformanceMode = MutableStateFlow(AutomixPerformanceMode.BALANCED)
     val skipSilence = MutableStateFlow(false)

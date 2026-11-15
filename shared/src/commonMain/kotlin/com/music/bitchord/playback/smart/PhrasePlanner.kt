@@ -45,6 +45,7 @@ data class PhraseChoice(
     val cost: Double,
     val legacyLoop: LoopMix.Plan? = null,
     val detail: String = "",
+    val keyClash: Boolean = false,
 ) {
     /** Incoming deck rate at [beat] on the master clock, landing at 0. */
     fun incomingRate(beat: Double): Double = if (beat >= -PhraseConfig.B_UNITY_BARS_BEFORE_LANDING * 1.0) 1.0 else incomingRateBefore(beat)
@@ -61,6 +62,7 @@ data class PhraseChoice(
  */
 object PhrasePlanner {
     class Timeout(message: String) : RuntimeException(message)
+    @Volatile var lastVetoSummary: String = ""
 
     /**
      * Holds a chosen template once the countdown is inside the lock window.
@@ -92,7 +94,15 @@ object PhrasePlanner {
         fun consider(nowSec: Double, secondsToRelease: Double, fresh: PhraseChoice?): PhraseChoice? {
             val held = choice
             if (held != null && (locked || shown)) {
-                if (fresh != null && fresh.template == held.template) choice = fresh
+                // djmix26: once locked or shown, never overwrite choice with a
+                // fresh plan whose release time jumped by > 1.5 s or slipped
+                // behind the held release (e.g. HEAD -> FULL or earliestBar drift).
+                if (fresh != null && fresh.template == held.template &&
+                    abs(fresh.exit.releaseSec - held.exit.releaseSec) <= 1.5 &&
+                    fresh.exit.releaseSec >= held.exit.releaseSec - 0.5
+                ) {
+                    choice = fresh
+                }
                 return choice
             }
             if (fresh == null) {
@@ -137,6 +147,10 @@ object PhrasePlanner {
         legacyLoop: LoopMix.Plan? = null,
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
+        earliestExitSec: Double = 0.0,
+        playableOutDurationSec: Double = 0.0,
+        outAnalysis: TrackAnalysis? = null,
+        inAnalysis: TrackAnalysis? = null,
     ): PhraseChoice? {
         if (!PhraseConfig.PHRASE_PLANNER_ENABLED) return null
         if (out == null) return null
@@ -145,7 +159,7 @@ object PhrasePlanner {
         }
         if (inn == null) return null
         return try {
-            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now)
+            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now, earliestExitSec, playableOutDurationSec, outAnalysis, inAnalysis)
         } catch (_: Timeout) {
             null
         } catch (_: RuntimeException) {
@@ -192,32 +206,141 @@ object PhrasePlanner {
         inBpm: Double,
         startedMs: Long,
         now: () -> Long,
+        earliestExitSec: Double = 0.0,
+        playableOutDurationSec: Double = 0.0,
+        outAnalysis: TrackAnalysis? = null,
+        inAnalysis: TrackAnalysis? = null,
     ): PhraseChoice? {
         val limited = limitedTo(out, inn)
-        val exits = CuePoints.exits(out)
-        val entries = CuePoints.entries(inn)
+        // djmix14-review: rescue (and strict search) must not pick a past
+        // exit. Filter to future exits; if none remain, strict/rescue both die.
+        val effectivePlayable = if (playableOutDurationSec > 1.0) playableOutDurationSec else out.durationSec
+        val exitsAll = CuePoints.exits(out, effectivePlayable, outAnalysis)
+        val exits = if (earliestExitSec > 0.0) exitsAll.filter { it.releaseSec >= earliestExitSec } else exitsAll
+        val entries = CuePoints.entries(inn, inAnalysis)
         var best: PhraseChoice? = null
+        val vetoCounts = HashMap<String, Int>()
+        var tried = 0
+        var ratioSkip = 0
         for (exit in exits) {
             for (entry in entries) {
                 checkPlanTime(startedMs, now)
                 for (template in candidates(exit, entry, out, inn, steps)) {
                     if (limited != null && template !in limited) continue
+                    tried++
                     val ratio = foldedRatio(outBpm, inBpm)
                     if (abs(ratio - 1.0) > 0.12 && template !in setOf(
                             MixTemplate.M6, MixTemplate.M10, MixTemplate.RELAXED,
                         )
                     ) {
+                        ratioSkip++
                         continue
                     }
                     val veto = veto(template, exit, entry, out, inn, steps, outBpm, inBpm)
-                    if (veto != null) continue
+                    if (veto != null) {
+                        vetoCounts[veto] = (vetoCounts[veto] ?: 0) + 1
+                        continue
+                    }
                     val choice = score(template, exit, entry, out, inn, steps, outBpm, inBpm)
                     if (best == null || choice.score > best.score + 1e-6) best = choice
                 }
             }
         }
-        if (best == null || best.score < PhraseConfig.S_MIN) return null
+        if (best == null || best.score < PhraseConfig.S_MIN) {
+            lastVetoSummary = "no-choose tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}" +
+                if (best != null) " lowScore=${"%.3f".format(best.score)}" else ""
+            // djmix14 musical fallback rung: strict templates all vetoed, but
+            // both grids are usable (BPM + downbeats). Synthesize a clean
+            // 4-bar rescue at the latest outro exit + head entry instead of
+            // handing the pair back empty-handed. Beat blend (M1) when the
+            // post-fold delta is <=8% and no dual-vocal clash; Echo (M6)
+            // otherwise (tempo lurch or vocal/harmonic clash).
+            val rescue = musicalRescue(out, inn, steps, outBpm, inBpm, exits, entries)
+            if (rescue != null) {
+                lastVetoSummary = "rescue ${rescue.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
+                return rescue
+            }
+            return null
+        }
+        lastVetoSummary = "chose ${best.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
         return best
+    }
+
+    /**
+     * Clean 4-bar musical rescue when every strict template vetoed.
+     * Requires usable BPM + downbeats on both sides. M1 (Beat blend,
+     * 4 bars, half-bar bass swap) for close tempos; M6 (Echo, 4 bars,
+     * beat-synced echo-out + bass swap) for far tempos or clashes.
+     */
+    private fun musicalRescue(
+        out: SongMap,
+        inn: SongMap,
+        steps: Int?,
+        outBpm: Double,
+        inBpm: Double,
+        exits: List<ExitCue>,
+        entries: List<EntryCue>,
+    ): PhraseChoice? {
+        if (outBpm <= 0 || inBpm <= 0) return null
+        if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
+        val exit = exits.lastOrNull() ?: return null
+        val entry = entries.firstOrNull() ?: return null
+        // Respect the musical tension veto: tension only resolves to a
+        // release. A rescue must not route tension into ambient.
+        val aRole = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))?.role ?: exit.role
+        val bRole = inn.sectionAt(entry.landingBar)?.role ?: entry.landingRole
+        if (aRole == SectionRole.TENSION && bRole != SectionRole.RELEASE) return null
+        // djmix14-review: coarse+coarse with extreme tempo is better left to
+        // LoopMix.bridge / classic DJ_FILTER than a forced 4-bar rescue.
+        if (out.coarse && inn.coarse && abs(foldedRatio(outBpm, inBpm) - 1.0) > 0.15) return null
+        val ratio = foldedRatio(outBpm, inBpm)
+        val delta = abs(ratio - 1.0)
+        val dualVocal = (out.sungBars.any { it } && inn.sungBars.any { it }) &&
+            entry.leadInVocal >= 0.2f
+        val harmonicClash = (steps ?: 0) > 2
+        val useEcho = delta > 0.08 || dualVocal
+        val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
+        val steadyGrids = out.downbeats.size >= 8 && inn.downbeats.size >= 8
+        val rescueOverlap = when {
+            template != MixTemplate.M1 -> 4
+            harmonicClash -> if (steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8) 8 else 4
+            steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8 -> 8
+            else -> 4
+        }
+        val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
+        val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
+        return PhraseChoice(
+            template = template,
+            rung = rungOf(template),
+            score = PhraseConfig.S_MIN,
+            exit = exit,
+            entry = entry,
+            overlapBars = rescueOverlap,
+            // Match score(): M1/M3 swap at -overlap/2, all others at 0.0.
+            swapBar = if (template == MixTemplate.M1) -rescueOverlap / 2.0 else 0.0,
+            tailBeats = if (template == MixTemplate.M1) 1.0 else 0.0,
+            loopK = 0,
+            echoGated = template == MixTemplate.M6,
+            vocalProduct = 0f,
+            tempoPrepBars = 0,
+            echoDelayBeats = delayBeats,
+            echoDelayName = delayName,
+            swapRampMs = rampMs,
+            swapRampName = rampName,
+            tempoPolicy = if (PhraseConfig.TEMPO_POLICY == "b") "TEMPO_POLICY=b" else "TEMPO_POLICY=a",
+            vocalOverlapBeats = 0.0,
+            energyDelta = 0f,
+            struct = 0.6,
+            vocalScore = 0.6,
+            phraseScore = 0.6,
+            energyScore = 0.6,
+            lengthScore = 0.6,
+            keyScore = 0.6,
+            tempoScore = 0.6,
+            cost = 0.0,
+            detail = "rescue-${template.name} ${rescueOverlap}bar",
+            keyClash = harmonicClash && template == MixTemplate.M1,
+        )
     }
 
     private fun checkPlanTime(startedMs: Long, now: () -> Long) {
@@ -261,7 +384,26 @@ object PhrasePlanner {
             }
             ExitKind.FADE_START -> list.add(MixTemplate.M9)
             ExitKind.PRE_CHORUS_END -> list.add(MixTemplate.ENERGY_LIFT)
+            // djmix25 P1.3/P1.4: VERSE_END strongly preferred over CONTENT_END
+            // for pop/rap; BRIDGE_END preferred for ECHO/CUT_ON_ONE.
+            ExitKind.VERSE_END -> {
+                // Beat blend when the entry is instrumental, otherwise echo.
+                if (entry.leadInVocal < 0.2f) list.add(MixTemplate.M1)
+                list.add(MixTemplate.M6)
+                list.add(MixTemplate.CUT_ON_ONE)
+            }
+            ExitKind.BRIDGE_END -> {
+                list.add(MixTemplate.M6)
+                list.add(MixTemplate.CUT_ON_ONE)
+                list.add(MixTemplate.M10)
+                list.add(MixTemplate.M11)
+            }
             ExitKind.HARD_END, ExitKind.CONTENT_END -> {
+                val vocalEntryEnd = inn.startKind == StartKind.VOCAL_PICKUP || inn.startKind == StartKind.COLD_VOCAL
+                val extendLike = exit.loopableRoom && exit.roomBars < entry.leadInBars && entry.leadInBars >= 8
+                if (exit.kind == ExitKind.CONTENT_END && exit.roomBars >= 4 && entry.leadInVocal < 0.2f && !vocalEntryEnd && !extendLike) {
+                    list.add(MixTemplate.M1)
+                }
                 list.add(MixTemplate.M6)
                 list.add(MixTemplate.CUT_ON_ONE)
                 list.add(MixTemplate.M10)
@@ -276,7 +418,11 @@ object PhrasePlanner {
         list.add(MixTemplate.M6)
         list.add(MixTemplate.M11)
         if (out.coarse || inn.coarse) {
-            return list.filter { it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
+            // djmix10: a noisy grid still earns a beat blend (M1) when the
+            // fold-corrected ratio is close; echo/cut-only turned every
+            // low-confidence streamed pair into a wasted chance. The overlap
+            // length is shaped by lengthScore, not by vetoing M1 here.
+            return list.filter { it == MixTemplate.M1 || it == MixTemplate.M2 || it == MixTemplate.ROLLING || it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
         }
         return list.distinct()
     }
@@ -316,7 +462,12 @@ object PhrasePlanner {
         }
         val vocal = inn.firstVocalBar
         if (!PhraseConfig.ALLOW_RADIO_EDIT && vocal != null && entry.startBar > vocal) return "cuts the verse"
-        if (out.sungBars.getOrElse(exit.releaseBar) { false }) return "cuts a sung bar"
+        val allowSungExit = (exit.kind == ExitKind.CONTENT_END || exit.kind == ExitKind.HARD_END || exit.kind == ExitKind.FADE_START ||
+            exit.kind == ExitKind.VERSE_END || exit.kind == ExitKind.BRIDGE_END || exit.cutsBars <= 2) &&
+            (carve(template) || template in setOf(MixTemplate.M1, MixTemplate.M6, MixTemplate.M10, MixTemplate.M11, MixTemplate.RELAXED, MixTemplate.CUT_ON_ONE))
+        // djmix25 P1.10: reverb+echo (M6/M10/CUT_ON_ONE) is never an illegal
+        // combo; the FX rotation must never be vetoed for producing it.
+        if (out.sungBars.getOrElse(exit.releaseBar) { false } && !allowSungExit) return "cuts a sung bar"
         if (!out.isPhraseDownbeat(exit.releaseBar) && out.anchors.none { it == exit.releaseBar }) return "A off the phrase"
         if (!inn.isPhraseDownbeat(entry.landingBar) && inn.anchors.none { it == entry.landingBar }) return "B off the phrase"
         val ratio = foldedRatio(outBpm, inBpm)
@@ -340,11 +491,42 @@ object PhrasePlanner {
             return "energy jump"
         }
         if (template == MixTemplate.VOCAL_OVER_OUTRO && ((steps ?: 9) > 1 || inn.gridConfidence < 0.8f)) return "vocal outro fit"
+        // djmix21 vocal continuity: no long empty beatmatch across the seam.
+        // Long blends hear the gap; short rungs (echo/cut/vocal-carve) do not,
+        // so vetoing here re-routes to a trimmed entry or a short rung instead
+        // of riding an awkward no-vocal dead zone. Pure instrumental pairs
+        // (no sung-bar evidence either side) are never gapped.
+        if (template in LONG_BLENDS && (out.firstVocalBar != null || inn.firstVocalBar != null)) {
+            val overlap = overlapOf(template, exit, entry, outBpm, steps)
+            val gap = StructureMix.vocalGap(out, inn, exit, entry, overlap).totalBars
+            if (gap > PhraseConfig.VOCAL_GAP_HARD_BARS) return "vocal gap"
+            // Quiet-part waste guard: a long blend into a >50% quiet lead-in
+            // with no buildup/drop/vocal event inside the overlap does nothing.
+            if (StructureMix.quietLeadFraction(inn, entry) > 0.5f) {
+                val eventBar = StructureMix.firstEventBarFromEntry(inn, entry)
+                if (eventBar == null || eventBar - entry.startBar > overlap) return "quiet intro"
+            }
+        }
+        // djmix12 (BK tempo discipline): the relaxed long blend is not exempt
+        // from the 8% cap. Post-fold deltas beyond it downgrade to echo/cut
+        // (M6/M10/M11/CUT_ON_ONE), never a long lurching ramp.
+        if (template == MixTemplate.RELAXED && abs(ratio - 1.0) > PhraseConfig.TEMPO_HARD_DELTA) {
+            return "tempo"
+        }
         return null
     }
 
     private fun carve(template: MixTemplate) = template == MixTemplate.M4 || template == MixTemplate.M5 ||
         template == MixTemplate.ROLLING || template == MixTemplate.VOCAL_OVER_OUTRO
+
+    /**
+     * djmix21: long blends that hear a no-vocal seam. Echo/cuts/crossfades and
+     * the vocal-carve templates never hear it the same way.
+     */
+    private val LONG_BLENDS = setOf(
+        MixTemplate.M1, MixTemplate.M3, MixTemplate.ROLLING, MixTemplate.M2,
+        MixTemplate.M7, MixTemplate.RELAXED, MixTemplate.M9,
+    )
 
     private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double {
         val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
@@ -359,10 +541,7 @@ object PhrasePlanner {
 
     private fun foldedRatio(outBpm: Double, inBpm: Double): Double {
         if (outBpm <= 1.0 || inBpm <= 1.0) return 1.0
-        var ratio = inBpm / outBpm
-        while (ratio > 1.5) ratio /= 2.0
-        while (ratio < 0.75) ratio *= 2.0
-        return ratio
+        return (inBpm / alignedFold(outBpm, inBpm)) / outBpm
     }
 
     private fun score(
@@ -376,7 +555,7 @@ object PhrasePlanner {
         inBpm: Double,
     ): PhraseChoice {
         val overlap = overlapOf(template, exit, entry, outBpm)
-        val struct = structScore(template, exit, entry)
+        val struct = structScore(template, exit, entry, out)
         val clash = vocalClashBeats(out, inn, exit, entry)
         val vocalScore = if (carve(template)) 0.8 else 1.0 - (clash / 4.0).coerceIn(0.0, 1.0)
         val phrase = phraseScore(out, inn, exit.releaseBar, entry.landingBar)
@@ -392,9 +571,61 @@ object PhrasePlanner {
             val extra = ((need - exit.roomBars).coerceAtLeast(0) / 4.0).roundToInt()
             (extra - 2).coerceAtLeast(0)
         } else 0
-        val cost = 0.04 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats
-        val total = 0.25 * struct + 0.20 * vocalScore + 0.15 * phrase + 0.15 * energy +
-            0.10 * length + 0.10 * key + 0.05 * tempo - cost
+        val discardedSections = out.sections.filter { it.endBar > exit.releaseBar && it.fn != SectionFn.OUTRO && it.fn != SectionFn.FADE_OUT && it.fn != SectionFn.SILENCE }
+        val vocalSectionPenalty = if (discardedSections.any { it.vocal > 0.20f }) 0.25 else 0.0
+        val chorusReleasePenalty = if (discardedSections.any { it.fn == SectionFn.CHORUS || it.role == SectionRole.RELEASE }) 0.35 else 0.0
+        // djmix21 structure scoring (scalars only, each from its own track):
+        // - vocal gap above the soft budget costs, so a trimmable entry or a
+        //   short rung beats a long empty beatmatch;
+        // - a vocal handoff seam (A's last sung bar 1-2 before B's first) pays;
+        // - a cue at the head buildup start pays, a cue missing the buildup
+        //   (started inside it) costs, and a quiet non-spotlight landing costs.
+        // Pure instrumental pairs (no sung-bar evidence either side) are never
+        // gapped: vocal-gap costs/bonuses only apply when at least one side
+        // has sung evidence (djmix21 instrumental-evidence guard).
+        val hasVocalEvidence = out.firstVocalBar != null || inn.firstVocalBar != null
+        val gapBars = if (hasVocalEvidence) StructureMix.vocalGap(out, inn, exit, entry, overlap).totalBars else 0
+        // djmix21: gap above the soft budget is a tie-breaker only (capped at
+        // 0.05) — the hard veto above does the real work for truly long seams.
+        // Uncapped, the cost would cut A's own outro spotlight early to chase
+        // a shorter (but same-landing) overlap.
+        val gapCost = (0.02 * (gapBars - PhraseConfig.VOCAL_GAP_SOFT_BARS).coerceAtLeast(0)).coerceAtMost(0.05)
+        val seam = if (hasVocalEvidence) StructureMix.vocalSeamBars(out, inn, exit, entry) else null
+        val seamBonus = if (seam != null && seam in 1..2) 0.10 else 0.0
+        val buildup = StructureMix.headBuildup(inn)
+        val atBuildupStart = buildup != null && entry.startBar == buildup.startBar
+        val insideBuildup = buildup != null && entry.startBar > buildup.startBar && entry.startBar < buildup.endBar
+        val landingAtPeak = buildup != null && entry.landingBar in buildup.endBar..buildup.endBar + 1
+        val buildupBonus = (if (atBuildupStart) 0.08 else 0.0) + (if (landingAtPeak) 0.05 else 0.0)
+        val quietLanding = !StructureMix.isSpotlight(entry) && StructureMix.quietLeadFraction(inn, entry) > 0.5f
+        // djmix25 P1.2: an exit at a repeated-bar index costs less (the
+        // phrase can be loop-extended seamlessly), and P1.4: section
+        // alignment (exit at a section boundary, entry landing at one) is
+        // a stackable bonus.
+        val repeatedExit = InterpolationAnalyzer.repeatedBars(out, exit.releaseBar) > 0
+        val interpDiscount = if (repeatedExit) 0.04 else 0.0
+        val exitAtBoundary = out.sections.any { it.endBar == exit.releaseBar }
+        val entryAtBoundary = inn.sections.any { it.startBar == entry.startBar || it.startBar == entry.landingBar }
+        val alignBonus = (if (exitAtBoundary) 0.03 else 0.0) + (if (entryAtBoundary) 0.03 else 0.0)
+        // VERSE_END strongly preferred over CONTENT_END (pop/rap default);
+        // BRIDGE_END preferred for ECHO/CUT (the echo-out seam).
+        val bridgeVerseChop = (
+            (exit.kind == ExitKind.VERSE_END || exit.kind == ExitKind.BRIDGE_END) &&
+                exit.cutsBars > 8 && exit.cutsSungBars > 2 &&
+                out.sections.lastOrNull()?.endBar != exit.releaseBar
+            )
+        val kindBonus = when {
+            exit.kind == ExitKind.VERSE_END && template == MixTemplate.M1 && entry.leadInVocal < 0.2f && !bridgeVerseChop -> 0.08
+            exit.kind == ExitKind.VERSE_END && template == MixTemplate.M6 && !bridgeVerseChop -> 0.05
+            exit.kind == ExitKind.BRIDGE_END && template in setOf(MixTemplate.M6, MixTemplate.CUT_ON_ONE, MixTemplate.M10) && !bridgeVerseChop -> 0.06
+            else -> 0.0
+        }
+        val cost = 0.12 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats +
+            vocalSectionPenalty + chorusReleasePenalty + gapCost +
+            (if (insideBuildup && !atBuildupStart) 0.15 else 0.0) +
+            (if (quietLanding) 0.15 else 0.0) - interpDiscount
+        val total = 0.25 * struct + 0.20 * MixWeightTuner.vocalWeight * vocalScore + 0.15 * phrase + 0.15 * MixWeightTuner.energyWeight * energy +
+            0.10 * length + 0.10 * MixWeightTuner.keyWeight * key + 0.05 * MixWeightTuner.tempoWeight * tempo - cost + seamBonus + buildupBonus + alignBonus + kindBonus
         val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, ramp) = PhraseConfig.swapRampMs(template.name)
         val swap = when (template) {
@@ -450,26 +681,46 @@ object PhrasePlanner {
             tempoScore = tempo,
             cost = cost,
             detail = "${template.name} ${exit.kind}→${entry.kind} O=$overlap",
+            keyClash = (steps ?: 0) > 2,
         )
     }
 
-    private fun overlapOf(template: MixTemplate, exit: ExitCue, entry: EntryCue, bpm: Double): Int {
+    private fun overlapOf(template: MixTemplate, exit: ExitCue, entry: EntryCue, bpm: Double, steps: Int? = null): Int {
         val natural = minOf(exit.roomBars, entry.leadInBars).coerceAtLeast(0)
-        val snapped = listOf(32, 16, 8, 4).firstOrNull { it <= natural } ?: natural.coerceAtMost(4)
+        val clash = (steps ?: 0) > 2
+        val snapped = if (clash) {
+            listOf(8, 4).firstOrNull { it <= natural } ?: natural.coerceIn(4, 8)
+        } else {
+            listOf(32, 16, 8, 4).firstOrNull { it <= natural } ?: natural.coerceAtMost(4)
+        }
         return when (template) {
-            MixTemplate.M7 -> 16
-            MixTemplate.M4 -> entry.leadInBars.coerceAtLeast(0)
-            MixTemplate.M2 -> entry.leadInBars.coerceAtMost(16).coerceAtLeast(exit.roomBars)
+            MixTemplate.M7 -> if (clash) 8 else 16
+            MixTemplate.M4 -> if (clash) entry.leadInBars.coerceIn(4, 8) else entry.leadInBars.coerceAtLeast(0)
+            MixTemplate.M2 -> if (clash) entry.leadInBars.coerceIn(4, 8) else entry.leadInBars.coerceAtMost(16).coerceAtLeast(exit.roomBars)
             MixTemplate.M6, MixTemplate.CUT_ON_ONE, MixTemplate.M10 -> 0
-            MixTemplate.M9, MixTemplate.RELAXED -> minOf(16, entry.leadInBars.coerceAtLeast(8))
+            MixTemplate.M9, MixTemplate.RELAXED -> if (clash) minOf(8, entry.leadInBars.coerceAtLeast(4)) else minOf(16, entry.leadInBars.coerceAtLeast(8))
             else -> snapped.coerceAtLeast(if (template == MixTemplate.M11) 0 else 4)
         }
     }
 
-    private fun structScore(template: MixTemplate, exit: ExitCue, entry: EntryCue): Double {
+    private fun structScore(template: MixTemplate, exit: ExitCue, entry: EntryCue, out: SongMap? = null): Double {
         val outro = exit.kind == ExitKind.OUTRO_START || exit.kind == ExitKind.OUTRO_PHRASE
+        // vc73 A3: never let VERSE_END/BRIDGE_END chop a full final
+        // chorus/outro (>8 bars, >2 sung bars) early just to fire the kind
+        // bonus. When the cut discards more than a phrase of sung music,
+        // fall through to the neutral else so CONTENT_END/OUTRO_START wins.
+        val chopsFinal = (
+            (exit.kind == ExitKind.VERSE_END || exit.kind == ExitKind.BRIDGE_END) &&
+                exit.cutsBars > 8 && exit.cutsSungBars > 2 &&
+                out?.sections?.lastOrNull()?.endBar != exit.releaseBar
+            )
+        // djmix25 P1.4: BRIDGE_END is the natural echo/cut seam; VERSE_END
+        // outranks a CONTENT_END fade for pop/rap-style vocal entries.
+        if (!chopsFinal && exit.kind == ExitKind.BRIDGE_END && template in setOf(MixTemplate.M6, MixTemplate.CUT_ON_ONE, MixTemplate.M10, MixTemplate.M11)) return 0.95
+        if (!chopsFinal && exit.kind == ExitKind.VERSE_END && template == MixTemplate.M1 && entry.leadInVocal < 0.2f) return 0.92
+        if (!chopsFinal && exit.kind == ExitKind.VERSE_END && template == MixTemplate.M6) return 0.82
         return when {
-            template == MixTemplate.M1 && outro && entry.leadInVocal < 0.2f -> 1.0
+            template == MixTemplate.M1 && (outro || (exit.kind == ExitKind.CONTENT_END && exit.roomBars >= 4)) && entry.leadInVocal < 0.2f -> 1.0
             template == MixTemplate.M4 && (entry.kind == EntryKind.HEAD) && exit.roomBars >= 4 -> 0.8
             template == MixTemplate.M6 -> 0.7
             template == MixTemplate.M9 && exit.kind == ExitKind.FADE_START -> 0.8

@@ -112,23 +112,32 @@ object StructureAnalyzer {
         partial: Boolean = false,
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
+        fullTrackDurationSec: Double = 0.0,
     ): SongMap {
         val mono = if (sampleRate == RATE) pcm else resample(pcm, sampleRate, RATE)
         val frames = frames(mono)
         checkTime(startedMs, now)
+        val pcmDurationSec = mono.size / RATE.toDouble()
+        val effectiveDuration = if (fullTrackDurationSec > 0.0) maxOf(pcmDurationSec, fullTrackDurationSec) else pcmDurationSec
+        val effectivePartial = partial || (fullTrackDurationSec > pcmDurationSec + 1.0)
         val beatSec = 60.0 / bpm.coerceAtLeast(1.0)
         val barSec = beatSec * 4.0
-        val barsN = max(1, (mono.size / RATE.toDouble() / barSec).toInt())
+        val barsN = max(1, (pcmDurationSec / barSec).toInt())
         val downbeats = DoubleArray(barsN) { it * barSec }
         val bars = beatSync(frames, downbeats, beatSec)
         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
         val activation = if (fluxPeak <= 1e-6f) 0f else (frames.map { it.flux }.average() / fluxPeak).toFloat()
-        return analyseBars(
-            trackKey, mono.size / RATE.toDouble(), bpm, 4, downbeats, bars,
+        val map = analyseBars(
+            trackKey, effectiveDuration, bpm, 4, downbeats, bars,
             mask, lyricPrior, gridConfidence = if (activation < PhraseConfig.ACTIVATION_FLOOR) 0.3f else 0.8f,
-            tempoStable = true, activation = activation, speechLike = false, partial = partial,
+            tempoStable = true, activation = activation, speechLike = false, partial = effectivePartial,
             startedMs = startedMs, now = now,
         )
+        return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
+            map.copy(contentEndSec = effectiveDuration)
+        } else {
+            map
+        }
     }
 
     private fun empty(
@@ -502,11 +511,31 @@ object StructureAnalyzer {
                 conf[s + 1] = 0.55f
             }
         }
+        // djmix24 DROP painting: phrase-aligned (>=4 bars) high-energy
+        // arrival with delta-energy >= +0.16 (energyRel jump) or
+        // top-quartile energy + strong bass/kick, following BUILD/INTRO/
+        // BREAK. Overwrites POST_CHORUS where the arrival is a true drop.
+        val sortedRel = energyRel.toList().sorted()
+        val q75Rel = sortedRel[min(sortedRel.lastIndex, (sortedRel.size * 0.75).toInt())]
         for (s in 0 until segs) {
             val len = bounds[s + 1] - bounds[s]
-            if (len in 4..16 && slope[s] >= 0.4f) {
+            if (len < 4) continue
+            val prevRel = if (s > 0) energyRel[s - 1] else energyRel[s]
+            val delta = energyRel[s] - prevRel
+            val strongBass = bass[s] >= 0.45f && onsets[s] >= 4f
+            val dropEnergy = (delta >= 0.16f && energyRel[s] >= q75Rel * 0.9f) ||
+                (energyRel[s] >= q75Rel * 1.15f && delta >= 0.08f && strongBass)
+            val afterBuildOrBreak = s > 0 && (fn[s - 1] == SectionFn.BUILD || fn[s - 1] == SectionFn.INTRO || fn[s - 1] == SectionFn.BREAK || fn[s - 1] == SectionFn.BUILD)
+            if (dropEnergy && strongBass && (afterBuildOrBreak || fn[s] == SectionFn.POST_CHORUS || fn[s] == SectionFn.INSTRUMENTAL)) {
+                if (fn[s] != SectionFn.CHORUS && fn[s] != SectionFn.FADE_OUT && fn[s] != SectionFn.SILENCE) {
+                    fn[s] = SectionFn.DROP
+                    conf[s] = 0.62f
+                }
+            }
+            // BUILD: 4-16 bars, positive slope, low vocal, preceding jump.
+            if (len in 4..16 && slope[s] >= 0.30f && vocal[s] < 0.28f) {
                 val nextRel = if (s + 1 < segs) energyRel[s + 1] else energyRel[s]
-                if (nextRel >= 0.4f && fn[s] != SectionFn.CHORUS) {
+                if ((nextRel >= 0.4f || (s + 1 < segs && fn[s + 1] == SectionFn.DROP)) && fn[s] != SectionFn.CHORUS) {
                     fn[s] = SectionFn.BUILD
                     conf[s] = 0.6f
                 }

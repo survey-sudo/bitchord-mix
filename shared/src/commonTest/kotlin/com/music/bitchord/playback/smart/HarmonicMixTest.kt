@@ -139,6 +139,54 @@ class HarmonicMixTest {
         assertEquals(1.0, plan.incomingPlaybackRate, 1e-6)
     }
 
+
+    @Test
+    fun onsetSnapped75BpmGridWithIrregularEdgeBeatsIsNotDrifting() {
+        val period = 60.0 / 75.949
+        val jitter = doubleArrayOf(0.0, 0.012, -0.030, 0.028, 0.0, -0.010, 0.026, -0.025)
+        val beats = ArrayList<Double>()
+        // Irregular intro edge beat (1.20 s > old 0.75 s margin)
+        beats += 10.0
+        var base = 11.20
+        for (i in 0 until 24) {
+            beats += base + jitter[i % jitter.size]
+            base += period
+        }
+        // Irregular outro edge beat (1.20 s after last steady beat)
+        beats += beats.last() + 1.20
+
+        val tailBpm = fittedBpm(beats, atEnd = true)
+        val headBpm = fittedBpm(beats, atEnd = false)
+        assertTrue(tailBpm != null && abs(tailBpm - 75.949) < 2.0, "tailBpm=$tailBpm")
+        assertTrue(headBpm != null && abs(headBpm - 75.949) < 2.0, "headBpm=$headBpm")
+
+        val out = track(75.949, "Ab major", beats).copy(
+            tailBeats = BeatSide(beats, beats.filterIndexed { i, _ -> i % 4 == 0 }, 75.949, 0.9),
+        )
+        val next = track(75.949, "Ab major", List(32) { it * period })
+        val plan = planTransition(
+            analysis = out,
+            nextAnalysis = next,
+            currentTrack = TransitionTrackInfo("a", 180_000, "A", "X"),
+            nextTrack = TransitionTrackInfo("b", 180_000, "B", "Y"),
+            currentTime = 10.0,
+            duration = 180.0,
+            mode = CrossfadeMode.SMART,
+            advanced = true,
+        )
+        assertTrue(plan.policyReasons.none { "drift" in it }, "reasons=${plan.policyReasons}")
+    }
+
+    @Test
+    fun camelotPinsCoverReportedMajorAndMinorKeys() {
+        assertEquals("4B", camelotCode("Ab major"))
+        assertEquals("5A", camelotCode("C minor"))
+        assertEquals("10A", camelotCode("B minor"))
+        assertEquals("11B", camelotCode("A major"))
+        assertEquals("10B", camelotCode("D major"))
+        assertEquals("4A", camelotCode("F minor"))
+    }
+
     private fun track(bpm: Double, key: String, beats: List<Double>) = TrackAnalysis(
         status = TrackAnalysis.STATUS_READY,
         duration = 180.0,

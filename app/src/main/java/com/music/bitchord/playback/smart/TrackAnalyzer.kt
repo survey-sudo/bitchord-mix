@@ -64,8 +64,91 @@ import java.util.Locale
  * track simply reads as no evidence, which the policy ladder answers with a
  * plain fade.
  */
+/** vc74 (djmix32): whole-track analysis pool - exactly one pass at a time.
+ * Whole-track passes share [modelLock] and ORT's per-model threads, and on a
+ * hot or backgrounded phone concurrent passes produced a uniform 6x slowdown in
+ * both mel (native DSP) and infer. Pinned as an internal factory so the pool
+ * size is unit-testable in Djmix32AppTest. */
+internal fun wholeTrackExecutor(): java.util.concurrent.ExecutorService =
+    Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "bitchord-smart-analysis").apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY
+        }
+    }
+
 @UnstableApi
 class TrackAnalyzer(private val context: Context, private val cache: AudioCache) {
+
+    // vc69 NPU: Snapdragon QNN for beat and vocal models with CPU fallback.
+    // Auto-detected from the device; nothing to configure. The context cache
+    // lives in noBackupFilesDir so OS updates never invalidate it wrongly.
+    private val npuVendor: com.music.bitchord.playback.smart.NpuSupport.Vendor =
+        com.music.bitchord.playback.smart.NpuSupport.detectVendor(
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) android.os.Build.SOC_MANUFACTURER else "",
+            android.os.Build.HARDWARE,
+            android.os.Build.MODEL,
+            android.os.Build.MANUFACTURER,
+        )
+    private val npuCacheDir: java.io.File
+        get() = java.io.File(context.noBackupFilesDir, "npu/cache").apply { mkdirs() }
+    // vc70 NPU FIX (launch NPE in TrackAnalyzer.<init>): PlaybackService
+    // constructs this analyzer from a property initializer
+    // (PlaybackService.kt: trackAnalyzer = TrackAnalyzer(this, ...)), i.e.
+    // while the Service is still unattached -- ContextWrapper.mBase is null
+    // until ActivityThread.attach() runs after Class.newInstance(). Any
+    // direct `context.applicationInfo.nativeLibraryDir` read in that window
+    // dereferences a null ApplicationInfo and NPEs (captured vc70 crash:
+    // TrackAnalyzer.<init>:239, which maps to source line 122). The init
+    // catch below kept the service alive but swallowed that NPE, so NPU
+    // preflight died before its first BitChordNPU log line on every
+    // launch. Resolution is therefore lazy and defensive: the dir is read
+    // through applicationContext (always attached once the service starts)
+    // and any failure maps to null instead of throwing. This getter must
+    // keep recomputing on every access -- never cache it -- because the
+    // first access happens before attach and would otherwise freeze a
+    // null forever. Once attached, applicationInfo is always non-null for
+    // an installed app, so a null here honestly means "no bundled
+    // backend", and callers stay on CPU.
+    private val npuLibDir: String?
+        get() = runCatching {
+            context.applicationContext.applicationInfo.nativeLibraryDir
+        }.getOrNull()
+
+    private val npuPreflightLock = Any()
+    @Volatile private var npuPreflightDone = false
+
+    /**
+     * Runs the ADSP preflight (dlopen of the bundled HTP backend) once a
+     * real library dir is visible, and returns that dir, or null when it
+     * is unavailable (pre-attach construction; defensive read failures).
+     * Called from the init block and from [npuBackendPath], so preflight
+     * is guaranteed to precede any QNN session open even though the
+     * init-time call is deferred while the service is unattached.
+     * NpuNative never throws, so neither does this.
+     */
+    private fun ensureNpuPreflight(): String? {
+        // Dormant by default: QNN_ENABLED=false means no dlopen and no
+        // backend path, so both trackers stay on the CPU provider.
+        if (!NpuSupport.QNN_ENABLED) return null
+        val dir = npuLibDir ?: return null
+        synchronized(npuPreflightLock) {
+            if (!npuPreflightDone) {
+                com.music.bitchord.playback.smart.NpuNative.initBundledQnn(dir)
+                npuPreflightDone = true
+            }
+        }
+        return dir
+    }
+
+    // vc70 NPU: QNN backend is bundled in this APK nativeLibraryDir (QAIRT
+    // libQnnHtp.so). Only Qualcomm attempts QNN; everything else stays
+    // on the CPU execution provider, exactly as the fallback contract says.
+    private val npuBackendPath: String?
+        get() = if (!NpuSupport.QNN_ENABLED || npuVendor != com.music.bitchord.playback.smart.NpuSupport.Vendor.QUALCOMM) null
+        else ensureNpuPreflight()?.let {
+            com.music.bitchord.playback.smart.NpuSupport.bundledBackendPath(it)
+        }?.takeIf { java.io.File(it).exists() }
 
     private val tracker = BeatTracker(
         modelPath = {
@@ -73,10 +156,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             unpackedAsset(BeatTracker.MODEL_ASSET)
         },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
+        npuVendor = { npuVendor },
+        npuBackendPath = { npuBackendPath },
+        npuCacheDir = { npuCacheDir },
     )
     private val vocals = VocalTracker(
         modelPath = { unpackedAsset(VocalTracker.MODEL_ASSET) },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
+        npuVendor = { npuVendor },
+        npuBackendPath = { npuBackendPath },
+        npuCacheDir = { npuCacheDir },
     )
 
     init {
@@ -84,6 +173,55 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // this; with no sink they went nowhere on the phone, which is how a
         // beat model that found nothing went unnoticed.
         AnalysisLog.install { message, error -> Log.w(TAG, message, error) }
+        // vc70 NPU: point the DSP library search at the bundled QAIRT libs
+        // (mirrors the Orchard qnn_runner ADSP_LIBRARY_PATH setup). Best
+        // effort: no NPU on the device, everything still runs on CPU.
+        // Last-resort guard: NPU init must never crash service
+        // construction (which happens at launch). The null that used to
+        // NPE here is now handled at its source (see npuLibDir /
+        // ensureNpuPreflight), so this boundary should never fire; it
+        // stays as a final barrier, not the fix.
+        try {
+            if (!NpuSupport.QNN_ENABLED) {
+                Log.i(TAG, "BitChordNPU disabled (QNN_ENABLED=false): CPU execution provider")
+            } else if (npuVendor == com.music.bitchord.playback.smart.NpuSupport.Vendor.QUALCOMM) {
+                // Deferred while this Service is unattached (null); the
+                // ADSP preflight then runs at first post-attach access via
+                // ensureNpuPreflight (see npuBackendPath) instead of
+                // throwing here.
+                val libDir = ensureNpuPreflight()
+                val soc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) android.os.Build.SOC_MODEL else android.os.Build.HARDWARE
+                if (libDir == null) {
+                    Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " libDir=unattached preflight=deferred")
+                } else {
+                    // NPU observability (one line): the SoC string, the
+                    // backend path, and the bundled Skel file(s) present in
+                    // nativeLibraryDir. QNN resolves the arch from the SoC
+                    // at backend open, so the present Skel(s) are the only
+                    // candidates the DSP can load; this line proves which
+                    // arch actually loaded. Dumped once at init, never
+                    // throwing.
+                    runCatching {
+                        val skels = java.io.File(libDir).list { _, name ->
+                            name.startsWith("libQnnHtpV") && name.endsWith("Skel.so")
+                        }?.joinToString(",") ?: "none"
+                        Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " backend=" + (npuBackendPath ?: "missing") + " skels=" + skels)
+                    }
+                }
+            } else {
+                Log.i(TAG, "BitChordNPU vendor=" + npuVendor + ": CPU execution provider")
+            }
+        } catch (failure: Throwable) {
+            Log.w(TAG, "BitChordNPU init failed; staying on CPU", failure)
+        }
+        // Bounded one-shot NPU self-test on a background thread (owned by
+        // NpuSelfTest): proves QNN dispatch without playback. Never
+        // throws, never blocks the UI, runs once per process.
+        com.music.bitchord.playback.smart.NpuSelfTest.schedule(
+            context,
+            { npuVendor },
+            { ensureNpuPreflight() },
+        )
     }
 
     /**
@@ -119,6 +257,29 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * flight, rather than latched when the party starts, so joining one stops
      * the work already running instead of only the work not yet queued.
      */
+    /**
+     * djmix25 windowed-stem gate (P1.5): only non-low-RAM devices with
+     * >= 6 GB total RAM (or a >=256 MB memory class) AND the user opt-in
+     * [com.music.bitchord.data.settings.AppSettings.automixWindowedStemsEnabled]
+     * may run the instrumental-share windows. Everything else stays on the
+     * single umxhq vocal stem; the planner never sees instrumental evidence
+     * there, so nothing degrades.
+     */
+    private fun canUseWindowedStems(): Boolean {
+        if (!AppSettings.automixWindowedStemsEnabled.value) return false
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+                ?: return false
+            val info = android.app.ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(info)
+            !activityManager.isLowRamDevice &&
+                (info.totalMem >= 6L * 1024L * 1024L * 1024L ||
+                    activityManager.memoryClass >= 256)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private val stopped: Boolean get() = ListenTogether.state.value.inParty
 
     /** The last thermal status the system reported; see [overheated]. */
@@ -240,12 +401,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private fun discardsOf(key: String): Int = discarded[key] ?: 0
 
-    private val executor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "bitchord-smart-analysis").apply {
-            isDaemon = true
-            priority = Thread.NORM_PRIORITY
-        }
-    }
+    // vc74 (djmix32): single-threaded. vc73 on-device acceptance measured three
+    // concurrent whole-track passes sharing [modelLock] (on top of ORT's per-model
+    // threads) at a uniform 6x slowdown in both mel (native DSP) and infer, on a
+    // hot backgrounded phone. One pass at a time keeps the model pipeline at full
+    // speed and shortens total queue time for the pair that actually needs it.
+    // The djmix14 rationale (next track no longer waits 15 s) is unchanged, but a
+    // contended phone runs slower than a serial one, not faster.
+    // Thermal guard ([overheated]) and [yieldUntilElapsed] are still honored at request time.
+    private val executor = wholeTrackExecutor()
 
     /**
      * The next track's opening. It does not wait behind a whole-song decode.
@@ -266,6 +430,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * Written from the playback tick, read from the analysis threads.
      */
     @Volatile private var yieldUntilElapsed = 0L
+
+    // djmix14: in-RAM PCM region cache (4 entries, ~24 MB). Loop decks decode
+    // over the network; a cached region covering the request is sub-sliced
+    // here in <2 ms instead of decoding again after a scrub.
+    private val loopCache = LoopRegionCache()
+    /** Exposed for the controller's cold-lead budget gate. */
+    fun loopRegionCached(trackId: String, sampleRate: Int, fromSec: Double, toSec: Double): Boolean =
+        loopCache.contains(trackId, sampleRate, fromSec, toSec)
+    /** The cache itself (tests + budget gate). */
+    fun loopRegionCache(): LoopRegionCache = loopCache
 
     private val modelLock = Any()
 
@@ -310,6 +484,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * taking the several seconds it takes.
      */
     fun isAnalysing(trackId: String): Boolean = trackId in running
+
+    /**
+     * True while a whole-track (or head) analysis pass is queued or running;
+     * loop-deck stem work waits on this and falls back to the dry region.
+     * The honest available signal is [running]: there is no separately
+     * observable queue depth, and head passes share the same [modelLock] as
+     * whole-track ones, so gating on any in-flight pass is the conservative
+     * (and correct) choice. Allocation-light and non-blocking.
+     */
+    fun wholeTrackBusy(): Boolean = running.isNotEmpty()
 
     /**
      * Queues [trackId] (playing at [uri]) for analysis if it is not already
@@ -799,6 +983,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             status = TrackAnalysis.STATUS_READY,
             trackId = trackId,
             duration = durationSeconds,
+            quality = TrackAnalysis.QUALITY_HEAD,
             bpm = grid?.bpm ?: entry?.bpm ?: 0.0,
             beatInterval = grid?.beatInterval ?: entry?.beatInterval ?: 0.0,
             beatConfidence = grid?.beatConfidence ?: entry?.beatConfidence ?: 0.0,
@@ -812,6 +997,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             mixInTime = entry?.mixInTime ?: 0.0,
             mixInCandidates = entry?.mixInCandidates.orEmpty(),
             headBeats = grid?.let { BeatSide(it.beats, it.downbeats, it.bpm, it.beatConfidence) },
+            levelWindows = listOfNotNull(head.levelWindow),
         )
     }
 
@@ -945,6 +1131,37 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val rendition = chooseRendition(trackId, uri, durationSeconds) ?: return null
         return Copy(key = rendition.key, rendition = rendition) { cache.renditionDataSource(uri, rendition) }
+    }
+
+    /**
+     * djmix25 streaming fallback for [loopRegion]: best-effort decode with no
+     * complete-rendition gate. Tries, in order: the resolved YouTube
+     * analysis URI (source-backed tracks), any cached prefix on the
+     * playback URI (ignoring isComplete/badRenditions), and the resolved
+     * URI's prefix. The actual region decode still goes through
+     * AudioDecoder.decodeRegionStereo (the streaming decodeRaw path in
+     * AudioDecoder.streamRegion shares this extractor loop), so a track
+     * that is only prefixes-cached still arms a loop deck.
+     */
+    private fun streamingCopyForLoop(trackId: String, uri: Uri, durationSeconds: Double): Copy? {
+        if (LocalAudioSource.isLocal(uri)) return null
+        // Source-backed playback: read the pinned YouTube analysis copy.
+        val analysisUri = analysisUriFor(trackId, uri)
+        if (analysisUri != null && analysisUri != uri) {
+            val viaAnalysis = runCatching { copyToRead(trackId, analysisUri, durationSeconds) }.getOrNull()
+            if (viaAnalysis != null) return viaAnalysis
+            val prefix = cache.renditionsOf(analysisUri)
+                .filter { it.cachedPrefix > 0L && it.key !in badRenditions }
+                .maxByOrNull { it.cachedPrefix }
+            if (prefix != null) {
+                return Copy(key = prefix.key, rendition = prefix) { cache.renditionDataSource(analysisUri, prefix) }
+            }
+        }
+        val prefix = cache.renditionsOf(uri)
+            .filter { it.cachedPrefix > 0L && it.key !in badRenditions }
+            .maxByOrNull { it.cachedPrefix }
+            ?: return null
+        return Copy(key = prefix.key, rendition = prefix) { cache.renditionDataSource(uri, prefix) }
     }
 
     /**
@@ -1110,25 +1327,39 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val features = TrackFeatures.analyze(samples, effectiveDuration)
         if (features != null && !skipPhraseStructure()) {
             val started = SystemClock.elapsedRealtime()
-            val cap = (structRate * PhraseConfig.HEAD_STRUCTURE_SEC).toInt().coerceAtLeast(1)
-            val head = if (samples.size > cap) samples.copyOf(cap) else samples
+            // djmix18 (Bug 3): the full-track mono PCM is already in memory (decoded for
+            // TrackFeatures). Let StructureAnalyzer see it — up to 360s / 160 bars — so
+            // SongMap has real OUTRO sections in the final 22% of the song. The beat-sync
+            // DSP is ~<50ms at 360s. The 120s cap only ever truncated the duration flag,
+            // producing SongMap(durationSec=120, partial) on 210s tracks and early exits.
+            // partial is derived from fullTrackDurationSec (shared: full > pcm + 1.0).
+            val fullCap = (structRate * 360.0).toInt().coerceAtLeast(1)
+            val fullPcm = if (samples.size > fullCap) samples.copyOf(fullCap) else samples
             val map = runCatching {
                 StructureAnalyzer.fromPcm(
                     trackKey = trackId,
-                    pcm = head,
+                    pcm = fullPcm,
                     sampleRate = structRate.toInt(),
                     bpm = features.bpm.coerceAtLeast(1.0),
-                    partial = samples.size > cap,
+                    partial = samples.size > fullCap,
                     startedMs = started,
                     now = { SystemClock.elapsedRealtime() },
+                    fullTrackDurationSec = effectiveDuration,
                 )
             }.onFailure { Log.i("BitChordPhrase", "structure skipped: ${it.message}") }.getOrNull()
-            if (map != null) {
-                PhraseMaps.put(trackId, map)
+            // djmix18: when the head path truncates (pcm < effectiveDuration), the map
+            // is partial by definition — assert it so a 120s buffer can never publish a
+            // 120s-duration non-partial map on a longer track.
+            val correctedMap = if (map != null && !map.partial && effectiveDuration > (fullPcm.size / structRate) + 1.0) {
+                map.copy(partial = true)
+            } else map
+            if (correctedMap != null) {
+                PhraseMaps.put(trackId, correctedMap)
                 Log.i(
                     "BitChordPhrase",
-                    "structMs=${map.structMs} structWallMs=${SystemClock.elapsedRealtime() - started} " +
-                        "bars=${map.sections.lastOrNull()?.endBar ?: 0} partial=${map.partial}",
+                    "structMs=${correctedMap.structMs} structWallMs=${SystemClock.elapsedRealtime() - started} " +
+                        "bars=${correctedMap.sections.lastOrNull()?.endBar ?: 0} partial=${correctedMap.partial} " +
+                        "duration=${correctedMap.durationSec} contentEnd=${correctedMap.contentEndSec}",
                 )
             }
         }
@@ -1246,6 +1477,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     status = TrackAnalysis.STATUS_READY,
                     trackId = trackId,
                     duration = effectiveDuration,
+                    quality = TrackAnalysis.QUALITY_FULL,
                     contentEndTime = features.contentEndTime.takeIf { it > 0 } ?: effectiveDuration,
                     bpm = leading?.bpm ?: features.bpm,
                 beatInterval = leading?.beatInterval ?: features.beatInterval,
@@ -1257,6 +1489,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 phraseBoundaries = features.phraseBoundaries,
                 key = features.key,
                 keyConfidence = features.keyConfidence,
+                // djmix25: per-region keys from the dual-profile native pass.
+                keyHead = features.keyHead,
+                keyTail = features.keyTail,
+                keyHeadConfidence = features.keyHeadConfidence,
+                keyTailConfidence = features.keyTailConfidence,
                 audibleStartTime = features.audibleStartTime,
                 pickupTime = features.pickupTime,
                 introEndTime = features.introEndTime,
@@ -1278,6 +1515,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 tailBeats = tailSide,
                 vocalWindows = regions.mapNotNull { it.vocalWindow },
                 levelWindows = regions.mapNotNull { it.levelWindow },
+                // djmix25: instrumental share windows (empty unless the
+                // >=8GB + opt-in gate passed; see canUseWindowedStems).
+                instrumentalWindows = regions.mapNotNull { it.instrumentalWindow },
             ),
         )
     }
@@ -1299,6 +1539,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val vocalWindow: CurveWindow? = null,
         /** RMS level over this window, for the loop mix's loudness check. */
         val levelWindow: CurveWindow? = null,
+        /** djmix25 instrumental share (1 - vocal) over this window, for acapella handoffs. */
+        val instrumentalWindow: CurveWindow? = null,
     )
 
     /**
@@ -1451,7 +1693,13 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             features = inputs.derived,
             start = actualStart,
             vocalWindow = vocalValues?.let { CurveWindow(actualStart, VocalSpectrogram.frameRate, it) },
-            levelWindow = if (features != null) levelCurve(stereo, actualStart) else null,
+            levelWindow = if (features != null || deriveFeatures) levelCurve(stereo, actualStart) else null,
+            // djmix25: instrumental = mix - vocal share, derived from the same
+            // umxhq vocal tensor (single-stem scalar complement, no second pass).
+            // Only meaningful when windowed stems are allowed on this device.
+            instrumentalWindow = if (vocalValues != null && canUseWindowedStems()) {
+                CurveWindow(actualStart, VocalSpectrogram.frameRate, FloatArray(vocalValues.size) { 1f - vocalValues[it] })
+            } else null,
         )
     }
 
@@ -1627,7 +1875,29 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * below the policy's own VOCAL_ACTIVE_THRESHOLD, so unmeasured material can never trip vocal
      * logic in either direction.
      */
-    private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
+        fun separateTransitionWindow(
+        left: FloatArray,
+        right: FloatArray,
+        sampleRate: Int,
+        keepVocals: Boolean,
+    ): Pair<FloatArray, FloatArray>? {
+        if (yieldOrStopped()) return null
+        return synchronized(modelLock) {
+            if (yieldOrStopped()) null else vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
+        }
+    }
+
+        fun separateTransitionBothWindows(
+        left: FloatArray,
+        right: FloatArray,
+        sampleRate: Int,
+    ): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
+        return synchronized(modelLock) {
+            if (yieldOrStopped()) null else vocals.separateBothWindows(left, right, sampleRate.toDouble())
+        }
+    }
+ 
+private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         if (!VocalSpectrogram.available) return null
         // [VocalTracker.track] refuses anything wider than its graph, so a window that came back a
         // little long is trimmed. Two frames of margin absorb the ±1 sample a rate conversion can
@@ -1698,10 +1968,26 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         /** Called on this thread at the start of each slice, so a late one can be named. */
         onStep: ((String) -> Unit)? = null,
     ): com.music.bitchord.playback.loopmix.LoopRegion? {
-        if (uri.getQueryParameter("v") == null && uri.authority == "source") return null
+        // djmix25: source-backed URIs (Radio, podcasts, uploads, YouTube Music
+        // radio) used to return null here, disabling loop mixes for a huge
+        // share of lazy crossfades. They now flow through the same path:
+        // copyToRead on the playback URI, else the resolved YouTube analysis
+        // URI, else a streaming (partial-rendition) decode below.
+        // djmix14: RAM cache first — a covering entry is sub-sliced, no network.
+        loopCache.get(trackId, sampleRate, max(0.0, fromSeconds), toSeconds)?.let { slice ->
+            Log.d(TAG, "Loop region $trackId cache hit ${slice.startSec}s..${slice.endSec}s at ${sampleRate}Hz")
+            return com.music.bitchord.playback.loopmix.LoopRegion(slice.left, slice.right, slice.startSec)
+        }
         val began = SystemClock.elapsedRealtime()
         onStep?.invoke("stream")
-        val copy = runCatching { copyToRead(trackId, uri, durationSeconds) }.getOrNull() ?: return null
+        // djmix25: streaming fallback (no complete-rendition gate). copyToRead
+        // requires isComplete, which fails ~40 ms into a transfer; the loop
+        // deck only needs the asked region, so any cached prefix (or the
+        // resolved analysis URI's prefix) is decoded with the header-based
+        // extractor instead of returning cold-loop-headroom-using-classic.
+        val copy = runCatching { copyToRead(trackId, uri, durationSeconds) }.getOrNull()
+            ?: runCatching { streamingCopyForLoop(trackId, uri, durationSeconds) }.getOrNull()
+            ?: return null
         onStep?.invoke("decode")
         val (stereo, start) = copy.open()?.use { source ->
             AudioDecoder.decodeRegionStereo(source, max(0.0, fromSeconds), toSeconds) { yieldOrStopped() }
@@ -1724,6 +2010,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 "got ${"%.3f".format(Locale.ROOT, start)}s + ${"%.2f".format(Locale.ROOT, left.size / rate)}s " +
                 "at ${stereo.sampleRate.toInt()}->$sampleRate Hz in ${SystemClock.elapsedRealtime() - began}ms",
         )
+        loopCache.put(trackId, sampleRate, start, start + left.size / rate, left, right)
         return com.music.bitchord.playback.loopmix.LoopRegion(left, right, start)
     }
 

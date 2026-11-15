@@ -10,7 +10,10 @@ package com.music.bitchord.playback.smart
  */
 object PrepLead {
     const val BASE_MS = 20_000L
-    const val MAX_MS = 35_000L
+    // 2B readiness: plausible 35–45 s pre-arming. The worst-case cold prime +
+    // classic standby must fully buffer inside this; forcing a larger lead
+    // than 45 s would thrash cold builds with no extra benefit.
+    const val MAX_MS = 45_000L
     const val SLOW_MS = 8_000L
 
     fun next(previousLeadMs: Long, previousPrepMs: Long): Long {

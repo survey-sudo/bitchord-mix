@@ -73,6 +73,45 @@ struct TptLowpass {
   }
 };
 
+/**
+ * djmix24 Cytomic TPT SVF high-pass (Simper zero-delay-feedback topology,
+ * allocation-free, stable to Nyquist). Q configurable (0.707 default,
+ * ~0.95 musical DJM resonance during buildup sweeps).
+ */
+struct TptHighpass {
+  float g = 0;
+  float a1 = 0, a2 = 0, a3 = 0;
+  float k = 1.414f;
+  float ic1eq[2] = {0, 0};
+  float ic2eq[2] = {0, 0};
+
+  void set(double sampleRate, double frequency, double q);
+  void bypass() { g = 0; k = 1.414f; }
+  inline float tick(int channel, float v0) {
+    if (g <= 0.f) return v0;
+    const float v3 = v0 - ic2eq[channel];
+    const float v1 = a1 * ic1eq[channel] + a2 * v3;
+    const float v2 = ic2eq[channel] + a2 * ic1eq[channel] + a3 * v3;
+    ic1eq[channel] = 2.f * v1 - ic1eq[channel];
+    ic2eq[channel] = 2.f * v2 - ic2eq[channel];
+    // High output: input minus low minus band*k.
+    return v3 - v2 - k * v1;
+  }
+};
+
+/** djmix24 pre-allocated stereo plate reverb wash (Freeverb-class comb/allpass). */
+struct ReverbWash {
+  std::vector<float> combL0, combL1, combL2, combL3, combR0, combR1, combR2, combR3;
+  std::vector<float> apL0, apL1, apR0, apR1;
+  int combIdxL[4]{}; int combIdxR[4]{}; int apIdxL[2]{}; int apIdxR[2]{};
+  float damping = 0.55f;
+  float wet = 0.f;
+  float hpL = 0.f, hpR = 0.f;
+  bool enabled = false;
+  void setup(double sampleRate, float roomSize, float dampingIn, float wetIn);
+  void apply(float inL, float inR, float send, float& wetL, float& wetR, double sampleRate);
+};
+
 /** Tempo-synced stereo ping-pong echo. The wet signal is not gated by the deck's gain. */
 struct PingPong {
   std::vector<float> left;
@@ -91,6 +130,31 @@ struct PingPong {
    * already in the line, so a tail can ring after the dry input stops.
    */
   void tap(float inL, float inR, float send, float& wetL, float& wetR, double sampleRate);
+};
+
+/**
+ * djmix24 stereo Jet Flanger (DJM-style): true stereo quadrature LFO
+ * (90 deg / 0.25 cycle offset, wide jet while mono-compatible), delay
+ * sweep 0.65 ms .. 5.2 ms, metallic resonant feedback 0.64 with 1-pole
+ * ~10 kHz HF damping + denormal guard + hard clamp [-0.78, 0.78], wet
+ * 0.48 energy-balanced. History is cleared at prepare() (worker thread).
+ */
+struct Flanger {
+  std::vector<float> left;
+  std::vector<float> right;
+  int pos = 0;
+  float depthSeconds = 0.0f;
+  float feedback = 0.0f;
+  float wet = 0.0f;
+  double lfoHz = 0.0;
+  bool enabled = false;
+  float dampL = 0.f, dampR = 0.f;
+
+  void setup(double sampleRate, double lfoHzIn, double depthSecondsIn, float feedbackGain, float wetGain);
+  /** Wet comb output for one frame pair, given absolute mix-frame time. */
+  void apply(float inL, float inR, float& wetL, float& wetR, double frameTimeSec, double sampleRate);
+  /** Wet with envelope multiplier (KIND_FLANGER_WET) + tail ring. */
+  void applyEnv(float inL, float inR, float wetMul, float& wetL, float& wetR, double frameTimeSec, double sampleRate);
 };
 
 struct Deck {
@@ -119,10 +183,29 @@ struct Deck {
 
   Envelope gain;
   Envelope lowDb;
+  Envelope midDb;
+  Envelope highDb;
   Envelope highPassHz;
   Envelope lowPassHz;
   /** 0..1 send into the echo. Empty means shut during pre-roll and open after the first knot. */
   Envelope echoSend;
+  /** djmix24 0..1 multiplier on flanger wet (rising ramp into releaseAt + tail). */
+  Envelope flangerWet;
+  /** djmix24 0..1 send into the reverb wash. */
+  Envelope reverbSend;
+  /** djmix24 beat-quantized tightening EDM buildup loop roll. */
+  bool loopRoll = false;
+  double rollStartMixSec = 0.0;
+  double rollBeatSec = 0.5;
+  double rollReleaseMixSec = 0.0;
+  double rollTotalBeats = 16.0;
+  /** djmix24 Cytomic SVF Q (0.707 default, 0.95 buildup). */
+  float svfQ = 0.707f;
+  /** djmix24 effective loop end for the current block (samples); -1 = use loopEnd. */
+  int64_t effectiveLoopEnd = -1;
+  double effectiveLoopLenSamples = -1.0;
+  int64_t sampleAtEffective(int64_t unwrapped) const;
+  void readEffective(int64_t unwrapped, int seamSamples, double mixSec, float& leftOut, float& rightOut) const;
 
   /**
    * Unwrapped region-sample position at which the deck fades out over
@@ -141,10 +224,13 @@ struct Deck {
   double readPos = 0;      // unwrapped region samples, the next input sample to feed
   double heardPos = 0;     // unwrapped region samples heard at the end of the last block
   double lastKnotHeard = 0;
+  double activeStartFrame = 0;
   Biquad shelf;
-  Biquad highPass;
+  TptHighpass tptHighPass;
   TptLowpass lowPass;
   PingPong echo;
+  ReverbWash reverb;
+  Flanger flanger;
   /** Phrase mixes run the LR4 isolator. The djmix6 path leaves this off. */
   bool isolate = false;
   PhraseIsolator isolator;
@@ -181,11 +267,26 @@ class Renderer {
   /** Tempo-synced echo on [index]. A non-positive delay turns it off. */
   void setEcho(int index, double delaySeconds, float feedback, float wet);
   void setIsolate(int index, bool on);
+  /** djmix24 beat-quantized tightening loop roll. */
+  void setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats);
+  /** djmix24 stereo plate reverb wash. */
+  void setReverb(int index, float roomSize, float damping, float wet);
+  /** djmix24 Cytomic SVF Q. */
+  void setSvfQ(int index, float q);
 
   /** Call once both decks are filled in, before the first [render]. */
   void prepare();
 
   /** The earliest mix frame anything renders at (negative: before t0). */
+  /**
+   * Beat-synced flanger on [index]'s tail (djmix11 graceful exit).
+   * Depth is the delay's sweep in seconds (max 4 ms); lfoHz is one cycle
+   * per 8 beats, so the phasing reads as a dissolve, never a wobble.
+   */
+  void setFlanger(int index, double lfoHz, double depthSeconds, float feedback, float wet);
+  /** How many times a deck went silent while still audible at stopAt (the exit gate's trip counter). */
+  int exitGateViolations() const { return exitGateViolations_.load(std::memory_order_relaxed); }
+
   int64_t firstFrame() const;
 
   /**
@@ -202,8 +303,12 @@ class Renderer {
   bool highQuality_ = true;
   float limitGain_ = 1;
   Deck decks_[2];
+  std::atomic<int> exitGateViolations_{0};
   std::vector<float> inLeft_, inRight_, outLeft_, outRight_;
   std::vector<float> mixLeft_, mixRight_;
+  // djmix24 1.5 ms true-peak lookahead ring (pre-allocated in prepare).
+  std::vector<float> limitRingL_, limitRingR_;
+  int limitRingPos_ = 0;
 };
 
 }  // namespace bitchord::loopmix

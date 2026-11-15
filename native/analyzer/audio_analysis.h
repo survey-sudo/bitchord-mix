@@ -89,6 +89,14 @@ struct AnalysisResult {
   std::vector<Phrase> phrases;
   std::string key;
   double key_confidence = 0;
+  // Per-region keys (djmix25, libkeyfinder-style): head (first half) and
+  // tail (second half) chroma, so the planner can score the outgoing tail
+  // against the incoming head instead of two whole-track keys. Empty when
+  // no chroma was accepted; the whole-track key above stays the fallback.
+  std::string key_head;
+  double key_head_confidence = 0;
+  std::string key_tail;
+  double key_tail_confidence = 0;
   // Sum-normalized C through B pitch-class energy in chromatic order.
   std::vector<double> chroma;
   double audible_start_time = 0;

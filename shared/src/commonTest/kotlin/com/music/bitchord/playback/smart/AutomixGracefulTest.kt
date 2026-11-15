@@ -44,7 +44,8 @@ class AutomixGracefulTest {
     }
 
     @Test fun headroomTrimStaysAboveFloor() {
-        assertEquals(0.85f, MixGain.headroomTrim(1f, 1f), 0.001f)
+        // djmix19 intentionally changed: HEADROOM_FLOOR 0.85 -> 0.94.
+        assertEquals(0.94f, MixGain.headroomTrim(1f, 1f), 0.001f)
         assertEquals(1f, MixGain.headroomTrim(0.4f, 0.4f), 0.001f)
     }
 
@@ -61,10 +62,12 @@ class AutomixGracefulTest {
         val g1 = RegionalLoudness.matchGain(loud, loud, 0, sr, quiet, quiet, 0, sr, sr)
         val g2 = RegionalLoudness.matchGain(quiet, quiet, 0, sr, loud, loud, 0, sr, sr)
         assertNotNull(g1); assertNotNull(g2)
-        // Within +-3 dB: 0.708..1.412.
-        assertEquals(true, g1 > 0.70f && g1 < 1.42f, "g1=$g1")
-        assertEquals(true, g2 > 0.70f && g2 < 1.42f, "g2=$g2")
-        assertEquals(true, abs(g1 * g2 - 1.0f) < 0.08f, "g1*g2 should be ~1: ${g1 * g2}")
+        // djmix19 intentionally changed: asymmetric -3.5..+4.5 dB (was -6.0..+4.5); boost 1.679, cut 0.668.
+        assertEquals(true, g1 > 1.60f && g1 < 1.70f, "g1=$g1")
+        assertEquals(true, g2 > 0.66f && g2 < 0.68f, "g2=$g2")
+        // Asymmetric by design (loud masters capped by peak headroom in the
+        // caller); the product is ~1.12, not 1.
+        assertEquals(true, abs(g1 * g2 - 1.122f) < 0.08f, "g1*g2 should be ~1.12: ${g1 * g2}")
     }
 
     @Test fun shortTrackStillPlans() {

@@ -16,9 +16,10 @@ import kotlin.math.pow
 import kotlin.math.tan
 
 object RegionalLoudness {
-    // djmix9: symmetric +-3 dB so a loudness match never drags B +-7 dB.
-    private const val MIN_DB = -3.0
-    private const val MAX_DB = 3.0
+    // djmix19: tightened to -3.5..+4.5 dB so a louder incoming is not pulled down -6 dB.
+    // Quiet masters match energy; loud masters are capped by peak headroom in the caller.
+    private const val MIN_DB = -3.5
+    private const val MAX_DB = 4.5
 
     /**
      * Gain for the incoming window so its loudness matches [out], or null when

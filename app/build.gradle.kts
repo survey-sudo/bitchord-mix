@@ -127,7 +127,19 @@ android {
     // The phone <-> watch protocol, one file shared with the watch app so the
     // two cannot drift. See wearos/protocol/.../WearProtocol.kt.
     sourceSets {
-        getByName("main") { java.srcDir("../wearos/protocol") }
+        getByName("main") {
+            java.srcDir("../wearos/protocol")
+            // QNN disabled in vc70 (see NpuSupport.QNN_ENABLED): the
+            // reduced-ORT build in npu-addon/prebuilt cannot see the ops
+            // ORT's optimizer introduces at load time, so both models fail
+            // on both backends since vc69, and QAIRT fails before
+            // partitioning. The Maven full libonnxruntime.so ships instead,
+            // so this dir is NOT a jniLibs source set and the ~100 MB of
+            // QAIRT libs no longer enter the APK. npu-addon/ is kept on
+            // disk for future QNN work; do not re-add it without fixing
+            // ops.config generation and the QAIRT device config. See
+            // npu-addon/README.md.
+        }
     }
 
     externalNativeBuild {
@@ -224,6 +236,19 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     packaging {
+        // Full Maven ORT ships (no pickFirsts override): the reduced-ORT
+        // pickFirsts trick is gone, so the AAR's full libonnxruntime.so is
+        // the only copy. QAIRT libs no longer ship either (see sourceSets:
+        // npu-addon is not a jniLibs source set), so the legacy-compressed
+        // rationale (shrinking 88 MB + 2x13 MB) is gone too: modern
+        // uncompressed aligned packaging, loaded via System.loadLibrary
+        // (no dlopen-by-path remains). extractNativeLibs=true in the
+        // manifest still works with this (it just extracts on install);
+        // flipping it to false is a separate cleanup, not needed for the
+        // ORT restore.
+        jniLibs {
+            useLegacyPackaging = false
+        }
         resources {
             // SMBJ's BouncyCastle and jspecify both ship this descriptor.
             excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
@@ -430,7 +455,11 @@ dependencies {
     // The full android artifact, not onnxruntime-mobile: mobile only loads .ort
     // files, which would put an offline conversion step between the model and
     // the app for a saving that does not matter in a self-distributed APK.
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
+    // Version mirrors Orchard (mobile/android/app/build.gradle): 1.31.0. This
+    // full AAR's libonnxruntime.so ships as-is (no pickFirsts override);
+    // QNN is disabled via NpuSupport.QNN_ENABLED (vc70 ORT restore), so the
+    // from-source reduced build in npu-addon/ does not enter the APK.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.31.0")
 
     // ---- Casting: Google Cast sender + the route discovery it sits on ----
     // The framework and the router only. media3-cast is left out on purpose:

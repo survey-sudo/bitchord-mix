@@ -107,6 +107,12 @@ object TrackFeatures {
         val lowEnergyCurve: List<EnergySample>,
         val mixInCandidates: List<MixCandidate>,
         val mixOutCandidates: List<MixCandidate>,
+        // djmix25 per-region keys (native keyHead/keyTail); blank = absent.
+        // Declared last so positional constructor sites stay valid.
+        val keyHead: String = "",
+        val keyHeadConfidence: Double = 0.0,
+        val keyTail: String = "",
+        val keyTailConfidence: Double = 0.0,
     )
 
     fun parse(root: JsonObject): Features = Features(
@@ -117,6 +123,10 @@ object TrackFeatures {
         beatConfidence = root.number("beatConfidence"),
         key = root.text("key"),
         keyConfidence = root.number("keyConfidence"),
+        keyHead = root.text("keyHead"),
+        keyHeadConfidence = root.number("keyHeadConfidence"),
+        keyTail = root.text("keyTail"),
+        keyTailConfidence = root.number("keyTailConfidence"),
         audibleStartTime = root.number("audibleStartTime"),
         pickupTime = root.number("pickupTime"),
         introEndTime = root.number("introEndTime"),

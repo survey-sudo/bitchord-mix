@@ -62,6 +62,7 @@
 
     <application
         android:name=".BitChordApplication"
+        android:extractNativeLibs="true"
         android:allowBackup="true"
         android:appCategory="audio"
         android:usesCleartextTraffic="false"

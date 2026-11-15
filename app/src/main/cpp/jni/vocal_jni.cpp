@@ -89,4 +89,39 @@ Java_com_music_bitchord_playback_smart_VocalSpectrogram_nativeFftSize(
   return static_cast<jint>(bitchord::smart::kVocalSpectrogramFft);
 }
 
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_music_bitchord_playback_smart_VocalSpectrogram_nativeSeparate(
+    JNIEnv* env,
+    jclass /* clazz */,
+    jfloatArray left,
+    jfloatArray right,
+    jdouble sample_rate,
+    jfloatArray target_mag,
+    jint target_frames,
+    jboolean keep_vocals) {
+  const jsize left_count = env->GetArrayLength(left);
+  const jsize right_count = env->GetArrayLength(right);
+  const jsize target_count = env->GetArrayLength(target_mag);
+  std::vector<float> in_left(static_cast<size_t>(left_count));
+  std::vector<float> in_right(static_cast<size_t>(right_count));
+  std::vector<float> target(static_cast<size_t>(target_count));
+  if (left_count > 0) env->GetFloatArrayRegion(left, 0, left_count, in_left.data());
+  if (right_count > 0) env->GetFloatArrayRegion(right, 0, right_count, in_right.data());
+  if (target_count > 0) env->GetFloatArrayRegion(target_mag, 0, target_count, target.data());
+  std::vector<float> out_left;
+  std::vector<float> out_right;
+  const bool ok = bitchord::smart::SeparateVocalWindow(in_left, in_right, static_cast<double>(sample_rate),
+    target, static_cast<size_t>(target_frames), keep_vocals != 0, out_left, out_right);
+  if (!ok || out_left.size() != in_left.size() || out_right.size() != in_right.size()) {
+    return env->NewFloatArray(0);
+  }
+  const jsize total = static_cast<jsize>(out_left.size() + out_right.size());
+  jfloatArray result = env->NewFloatArray(total);
+  if (result == nullptr) return nullptr;
+  if (!out_left.empty()) env->SetFloatArrayRegion(result, 0, static_cast<jsize>(out_left.size()), out_left.data());
+  if (!out_right.empty()) env->SetFloatArrayRegion(result, static_cast<jsize>(out_left.size()), static_cast<jsize>(out_right.size()), out_right.data());
+  return result;
+}
+
 }  // extern "C"

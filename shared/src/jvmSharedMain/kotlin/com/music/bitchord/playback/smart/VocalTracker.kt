@@ -58,6 +58,24 @@ object VocalSpectrogram {
      * ordering is not the natural one for an STFT computed a frame at a time; it is chosen to
      * match the model's `[1, 2, bins, frames]` tensor exactly, so nothing has to transpose.
      */
+    /**
+     * Windowed Wiener stem separation at 44.1 kHz. Returns planar outLeft+outRight
+     * (length 2 * left.size), or empty when native is unavailable or shapes mismatch.
+     */
+    fun separate(
+        left: FloatArray,
+        right: FloatArray,
+        rate: Double,
+        targetMag: FloatArray,
+        targetFrames: Int,
+        keepVocals: Boolean,
+    ): FloatArray {
+        if (!available || left.isEmpty() || left.size != right.size) return FloatArray(0)
+        val out = nativeSeparate(left, right, rate, targetMag, targetFrames, keepVocals)
+        if (out.size != 2 * left.size) return FloatArray(0)
+        return out
+    }
+ 
     data class Spectrogram(val values: FloatArray, val frames: Int, val bins: Int) {
         override fun equals(other: Any?): Boolean =
             this === other || (other is Spectrogram && frames == other.frames &&
@@ -69,6 +87,7 @@ object VocalSpectrogram {
     const val CHANNELS = 2
 
     @JvmStatic private external fun nativeCompute(left: FloatArray, right: FloatArray, rate: Double): FloatArray
+    @JvmStatic private external fun nativeSeparate(left: FloatArray, right: FloatArray, rate: Double, targetMag: FloatArray, targetFrames: Int, keepVocals: Boolean): FloatArray
     @JvmStatic private external fun nativeBins(): Int
     @JvmStatic private external fun nativeSampleRate(): Double
     @JvmStatic private external fun nativeHop(): Int
@@ -101,6 +120,11 @@ class VocalTracker(
     private val modelPath: () -> String,
     /** How many threads inference may use; the vocal-activity pass is the expensive one. */
     private val inferenceThreads: () -> Int,
+    /** NPU (vc69): QNN configuration, vendor detection, backend path, and context cache dir. Defaults are CPU-safe. */
+    private val npuConfig: () -> NpuSupport.NpuConfig = { NpuSupport.NpuConfig() },
+    private val npuVendor: () -> NpuSupport.Vendor = { NpuSupport.Vendor.NONE },
+    private val npuBackendPath: () -> String? = { null },
+    private val npuCacheDir: () -> File? = { null },
 ) {
 
     @Volatile private var session: OrtSession? = null
@@ -116,16 +140,8 @@ class VocalTracker(
             session = null
             return runCatching {
                 val file = File(modelPath())
-                val options = OrtSession.SessionOptions().apply {
-                    // CPU execution provider. NNAPI is not used. The weights are umxhq (MIT), not umxl.
-                    setIntraOpNumThreads(threads)
-                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                    // Same reasoning as BeatTracker: the arena retains every block it allocates for
-                    // the life of the session, which a backgrounded music player cannot justify.
-                    setCPUArenaAllocator(false)
-                    setMemoryPatternOptimization(false)
-                }
-                OrtEnvironment.getEnvironment().createSession(file.absolutePath, options)
+                // vc69 NPU: QNN when supported, CPU otherwise (automatic CPU fallback inside NpuSession).
+                NpuSession.open(file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir())
                     .also {
                         session = it
                         sessionThreads = threads
@@ -257,6 +273,121 @@ class VocalTracker(
             curve[frame] = if (count > 0) (sum / count).toFloat() else 0f
         }
         return curve
+    }
+
+    /**
+     * True on-device umxhq Wiener stem separation over one transition window.
+     * Returns separated pair, or null (safe fallback: caller keeps dry signal).
+     */
+    fun separateWindow(
+        left: FloatArray,
+        right: FloatArray,
+        rate: Double,
+        keepVocals: Boolean,
+    ): Pair<FloatArray, FloatArray>? {
+        if (!VocalSpectrogram.available || left.isEmpty() || left.size != right.size) return null
+        val sr = VocalSpectrogram.sampleRate
+        val resLeft = MelSpectrogram.resample(left, rate, sr) ?: return null
+        val resRight = MelSpectrogram.resample(right, rate, sr) ?: return null
+        val spec = VocalSpectrogram.compute(resLeft, resRight, sr) ?: return null
+        if (spec.frames > FIXED_FRAMES) return null
+        val bins = spec.bins
+        val frames = spec.frames
+        val active = session() ?: return null
+        return runCatching {
+            val backing = ByteBuffer
+                .allocateDirect(VocalSpectrogram.CHANNELS * bins * FIXED_FRAMES * Float.SIZE_BYTES)
+                .order(ByteOrder.nativeOrder())
+            fillFixedFrames(backing.asFloatBuffer(), spec.values, bins, frames)
+            val environment = OrtEnvironment.getEnvironment()
+            val shape = longArrayOf(1, VocalSpectrogram.CHANNELS.toLong(), bins.toLong(), FIXED_FRAMES.toLong())
+            OnnxTensor.createTensor(environment, backing.asFloatBuffer(), shape).use { tensor ->
+                active.run(mapOf(active.inputNames.first() to tensor)).use { outputs ->
+                    val target = (outputs.get(0) as OnnxTensor).floatBuffer
+                    val compact = FloatArray(VocalSpectrogram.CHANNELS * bins * frames)
+                    for (c in 0 until VocalSpectrogram.CHANNELS) {
+                        for (b in 0 until bins) {
+                            val srcBase = (c * bins + b) * FIXED_FRAMES
+                            val dstBase = (c * bins + b) * frames
+                            for (f in 0 until frames) {
+                                compact[dstBase + f] = target.get(srcBase + f)
+                            }
+                        }
+                    }
+                    val out = VocalSpectrogram.separate(resLeft, resRight, sr, compact, frames, keepVocals)
+                    if (out.isEmpty()) return@runCatching null
+                    val outLeft44 = out.copyOfRange(0, resLeft.size)
+                    val outRight44 = out.copyOfRange(resLeft.size, out.size)
+                    if (rate == sr) {
+                        outLeft44 to outRight44
+                    } else {
+                        val backLeft = MelSpectrogram.resample(outLeft44, sr, rate) ?: return@runCatching null
+                        val backRight = MelSpectrogram.resample(outRight44, sr, rate) ?: return@runCatching null
+                        fun fixed(a: FloatArray): FloatArray = if (a.size == left.size) a else a.copyOf(left.size)
+                        fixed(backLeft) to fixed(backRight)
+                    }
+                }
+            }
+        }.getOrNull()
+    }
+ 
+    /**
+     * Sample-exact dual-stem separation: vocals + instrumental from one
+     * ONNX pass. Resampled at the model rate, two VocalSpectrogram.separate
+     * calls (keepVocals true/false) on the same compact target, resampled
+     * back and padded/trimmed to left.size.
+     */
+    fun separateBothWindows(
+        left: FloatArray,
+        right: FloatArray,
+        rate: Double,
+    ): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
+        if (!VocalSpectrogram.available || left.isEmpty() || left.size != right.size) return null
+        val sr = VocalSpectrogram.sampleRate
+        val resLeft = MelSpectrogram.resample(left, rate, sr) ?: return null
+        val resRight = MelSpectrogram.resample(right, rate, sr) ?: return null
+        val spec = VocalSpectrogram.compute(resLeft, resRight, sr) ?: return null
+        if (spec.frames > FIXED_FRAMES) return null
+        val bins = spec.bins
+        val frames = spec.frames
+        val active = session() ?: return null
+        return runCatching {
+            val backing = java.nio.ByteBuffer
+                .allocateDirect(VocalSpectrogram.CHANNELS * bins * FIXED_FRAMES * Float.SIZE_BYTES)
+                .order(java.nio.ByteOrder.nativeOrder())
+            fillFixedFrames(backing.asFloatBuffer(), spec.values, bins, frames)
+            val environment = OrtEnvironment.getEnvironment()
+            val shape = longArrayOf(1, VocalSpectrogram.CHANNELS.toLong(), bins.toLong(), FIXED_FRAMES.toLong())
+            OnnxTensor.createTensor(environment, backing.asFloatBuffer(), shape).use { tensor ->
+                active.run(mapOf(active.inputNames.first() to tensor)).use { outputs ->
+                    val target = (outputs.get(0) as OnnxTensor).floatBuffer
+                    val compact = FloatArray(VocalSpectrogram.CHANNELS * bins * frames)
+                    for (c in 0 until VocalSpectrogram.CHANNELS) {
+                        for (b in 0 until bins) {
+                            val srcBase = (c * bins + b) * FIXED_FRAMES
+                            val dstBase = (c * bins + b) * frames
+                            for (f in 0 until frames) {
+                                compact[dstBase + f] = target.get(srcBase + f)
+                            }
+                        }
+                    }
+                    fun stem(keepVocals: Boolean): Pair<FloatArray, FloatArray>? {
+                        val out = VocalSpectrogram.separate(resLeft, resRight, sr, compact, frames, keepVocals)
+                        if (out.isEmpty()) return null
+                        val outLeft44 = out.copyOfRange(0, resLeft.size)
+                        val outRight44 = out.copyOfRange(resLeft.size, out.size)
+                        if (rate == sr) return outLeft44 to outRight44
+                        val backLeft = MelSpectrogram.resample(outLeft44, sr, rate) ?: return null
+                        val backRight = MelSpectrogram.resample(outRight44, sr, rate) ?: return null
+                        fun fixed(a: FloatArray): FloatArray = if (a.size == left.size) a else a.copyOf(left.size)
+                        return fixed(backLeft) to fixed(backRight)
+                    }
+                    val vocals = stem(true) ?: return@runCatching null
+                    val instrumental = stem(false) ?: return@runCatching null
+                    vocals to instrumental
+                }
+            }
+        }.getOrNull()
     }
 
     fun release() {

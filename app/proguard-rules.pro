@@ -16,11 +16,10 @@
 # log several times a second. Nobody reads logcat on a user's phone: what a bug
 # report needs is Copy Log in the player, which reads TrackLog's own buffer and
 # never touched logcat to begin with (see TrackLog's class doc).
+# vc70 NPU: i and w are NOT stripped here. The NPU dispatch verdict exists only as Log.i/w lines; stripping i/w made every NPU log call vanish from release, so logcat could never prove QNN dispatch. v/d stay stripped (per-frame chatter); i/w sites are sporadic (startup, crash dumps, error paths).
 -assumenosideeffects class android.util.Log {
     public static int v(...);
     public static int d(...);
-    public static int i(...);
-    public static int w(...);
     public static int e(...);
     public static int wtf(...);
     public static int println(...);
@@ -45,6 +44,9 @@
 -keep class net.engio.mbassy.** { *; }
 -keep class org.bouncycastle.** { *; }
 -keepclasseswithmembernames,includedescriptorclasses class * { native <methods>; }
+# vc70 NPU: the QNN pre-flight native method must survive R8, else
+# nativeInitAdspPath throws UnsatisfiedLinkError at startup.
+-keep class com.music.bitchord.playback.smart.NpuNative { *; }
 # The vendored FFmpeg extension's JNI calls back into this by name to grow
 # its output buffer (native/ffmpeg/ffmpeg_jni.cc, JNI_OnLoad).
 -keep,includedescriptorclasses class androidx.media3.decoder.ffmpeg.FfmpegAudioDecoder {

@@ -58,6 +58,11 @@ class BeatTracker(
     private val modelPath: () -> String,
     /** How many threads inference may use; the beat and downbeat pass is the expensive one. */
     private val inferenceThreads: () -> Int,
+    /** NPU (vc69): QNN configuration, vendor detection, backend path, and context cache dir. Defaults are CPU-safe. */
+    private val npuConfig: () -> NpuSupport.NpuConfig = { NpuSupport.NpuConfig() },
+    private val npuVendor: () -> NpuSupport.Vendor = { NpuSupport.Vendor.NONE },
+    private val npuBackendPath: () -> String? = { null },
+    private val npuCacheDir: () -> File? = { null },
 ) {
 
     /** A tracked grid on the analysed audio's own timeline, in seconds. */
@@ -84,19 +89,8 @@ class BeatTracker(
             session = null
             return runCatching {
                 val file = File(modelPath())
-                val options = OrtSession.SessionOptions().apply {
-                    // CPU execution provider. NNAPI is not used.
-                    setIntraOpNumThreads(threads)
-                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                    // ORT's arena allocator keeps every block it has ever needed, which for this
-                    // graph is tens of megabytes of native heap retained for the life of the
-                    // session, far past the model's own size, on a process that also has to
-                    // survive in the background. Analysis runs a handful of times per track, so
-                    // allocating per run is the right trade.
-                    setCPUArenaAllocator(false)
-                    setMemoryPatternOptimization(false)
-                }
-                OrtEnvironment.getEnvironment().createSession(file.absolutePath, options)
+                // vc69 NPU: QNN when supported, CPU otherwise (automatic CPU fallback inside NpuSession).
+                NpuSession.open(file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir())
                     .also {
                         session = it
                         sessionThreads = threads

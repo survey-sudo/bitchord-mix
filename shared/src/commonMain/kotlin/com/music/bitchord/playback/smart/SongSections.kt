@@ -1,5 +1,7 @@
 package com.music.bitchord.playback.smart
 
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -16,6 +18,11 @@ enum class SectionKind {
     BRIDGE,
     INST,
     OUTRO,
+    // djmix21: appended so existing ordinals (and the slot coding below)
+    // never shift. djmix24: now actively painted by labelSections (EDM
+    // buildup -> bass-drop; see paintBuildDrop below).
+    BUILD,
+    DROP,
 }
 
 data class Section(val kind: SectionKind, val start: Double, val end: Double)
@@ -119,7 +126,151 @@ fun labelSections(analysis: TrackAnalysis, lyrics: List<LyricCue> = emptyList())
         }
     }
 
+    paintBuildDrop(analysis, end, slots)
     return collapse(slots, end)
+}
+
+/**
+ * djmix24 BUILD / DROP painting (single-track scalars only, patent-safe).
+ *
+ * BUILD: 4-16 bar span with positive energy/flux slope, reduced low-end
+ * weight or rising centroid/high-band (proxied by energy curvature + flux
+ * acceleration), low vocal share (< 0.28), immediately preceding a
+ * high-energy section jump.
+ * DROP: phrase-aligned (>= 4 bars, priority 7) high-energy arrival
+ * (delta-energy >= +0.16 or top-quartile energy + strong bass/kick)
+ * following a BUILD, INTRO, or breakdown (BREAK/INST).
+ *
+ * Flat pop ballads (no rising flux, no bass surge) never paint — the
+ * 0.28 vocal gate + slope gates reject them.
+ */
+private fun paintBuildDrop(analysis: TrackAnalysis, end: Double, slots: IntArray) {
+    if (analysis.energyCurve.size < 8) return
+    val curve = analysis.energyCurve
+    val sortedEnergies = curve.map { it.energy }.filter { it.isFinite() }.sorted()
+    if (sortedEnergies.isEmpty()) return
+    val q75 = sortedEnergies[minOf(sortedEnergies.lastIndex, (sortedEnergies.size * 0.75).toInt())]
+    val median = sortedEnergies[sortedEnergies.size / 2].coerceAtLeast(1e-6)
+    // Bar grid: derive barSec from BPM (scalar); fall back to 2s.
+    val beatSec = if (analysis.beatInterval > 0.05) analysis.beatInterval else if (analysis.bpm > 1.0) 60.0 / analysis.bpm else 0.5
+    val barSec = (beatSec * 4.0).coerceAtLeast(0.5)
+    fun barEnergy(bar: Int): Double {
+        val from = bar * barSec
+        val until = (bar + 1) * barSec
+        return meanEnergy(curve, from, until)
+    }
+    fun barVocal(bar: Int): Double {
+        val from = bar * barSec
+        val until = (bar + 1) * barSec
+        return vocalShare(analysis, from, until)
+    }
+    val totalBars = (end / barSec).toInt().coerceAtMost(512)
+    if (totalBars < 8) return
+    val barE = DoubleArray(totalBars) { barEnergy(it) }
+    // Flux proxy: absolute energy difference per bar (rising edge = positive slope).
+    // Energy slope over a window: (late - early) / early.
+    fun slopePct(fromBar: Int, untilBar: Int): Double {
+        val n = (untilBar - fromBar).coerceAtLeast(1)
+        val mid = fromBar + n / 2
+        var early = 0.0; var ec = 0
+        for (b in fromBar until mid) { early += barE[b]; ec++ }
+        var late = 0.0; var lc = 0
+        for (b in mid until untilBar) { late += barE[b]; lc++ }
+        if (ec == 0 || lc == 0) return 0.0
+        early /= ec; late /= lc
+        if (early <= 1e-6) return if (late > 1e-6) 0.5 else 0.0
+        return (late - early) / early
+    }
+    // Find high-energy arrivals (DROP candidates): bar with energy >= q75
+    // and delta vs previous 4-bar mean >= +0.16 (normalized) or top-quartile.
+    // Then look back 4-16 bars for a low-vocal, rising BUILD before it.
+    fun paint(kind: SectionKind, fromBar: Int, untilBar: Int) {
+        if (untilBar - fromBar < 4) return
+        val from = fromBar * barSec
+        val until = untilBar * barSec
+        // Reuse priority paint: delegate to slots by code.
+        val code = kind.ordinal + 1
+        val rank = PRIORITY[code]
+        var i = (from / SLOT).toInt().coerceAtLeast(0)
+        val last = ((until / SLOT) - 1e-6).toInt().coerceAtMost(slots.lastIndex)
+        while (i <= last) {
+            if (rank >= PRIORITY[slots[i]]) slots[i] = code
+            i++
+        }
+    }
+    for (dropBar in 4 until totalBars - 4) {
+        // Check DROP arrival at dropBar (4-bar phrase).
+        var prevMean = 0.0; var pc = 0
+        for (b in maxOf(0, dropBar - 4) until dropBar) { prevMean += barE[b]; pc++ }
+        if (pc == 0) continue
+        prevMean /= pc
+        var curMean = 0.0
+        for (b in dropBar until dropBar + 4) { curMean += barE[b] }
+        curMean /= 4.0
+        val deltaNorm = if (prevMean > 1e-6) (curMean - prevMean) / maxOf(prevMean, median) else 0.0
+        val isDropEnergy = (deltaNorm >= 0.16 && curMean >= q75 * 0.9) || (curMean >= q75 * 1.15 && deltaNorm >= 0.05)
+        // Strong bass/kick presence proxy: bass/lowEnergy curve or level at drop > median*1.2.
+        // Fall back to energy curvature when no bass curve exists.
+        val bassStrong = run {
+            if (analysis.lowEnergyCurve.isNotEmpty()) {
+                val b = meanEnergy(analysis.lowEnergyCurve, dropBar * barSec, (dropBar + 4) * barSec)
+                val pm = meanEnergy(analysis.lowEnergyCurve, (dropBar - 4) * barSec, dropBar * barSec)
+                b > pm * 1.10 || b > median * 1.1
+            } else {
+                // No bass curve: require clear energy jump + low vocal arrival.
+                deltaNorm >= 0.25 || curMean >= q75 * 1.2
+            }
+        }
+        if (!isDropEnergy || !bassStrong) continue
+        // Arrival vocal must be low at the start (instrumental drop) or
+        // musical (chorus/drop overlap allowed). Reject sung arrivals
+        // unless bass is very strong (EDM vocal drop still counts).
+        val arrivalVocal = (0 until 4).map { barVocal(dropBar + it) }.average()
+        if (arrivalVocal > 0.55 && !bassStrong) continue
+        // Look back for BUILD: 4-16 bars before dropBar, rising slope,
+        // vocal < 0.28, preceding the jump.
+        var bestBuild: Pair<Int, Int>? = null
+        for (len in 4..16) {
+            val from = maxOf(0, dropBar - len)
+            if (dropBar - from < 4) continue
+            // BUILD must end at/just before the drop (within 2 bars).
+            val buildFrom = from
+            val buildUntil = dropBar
+            if (buildUntil - buildFrom < 4 || buildUntil - buildFrom > 16) continue
+            val slope = slopePct(buildFrom, buildUntil)
+            // Rising: need positive energy slope (flux proxy). Bell-ballads have ~0.
+            if (slope < 0.12) continue
+            // djmix24 gradual (not a step): a cold 0.2->1.0 edge has one
+            // jump; a true EDM buildup rises bar-by-bar. Require >=2
+            // increments of >=5% so DjMixTest step intros (0.2 flat then
+            // 1.0 flat) never paint BUILD.
+            var rises = 0
+            for (b in buildFrom until buildUntil - 1) {
+                if (barE[b] > 1e-6 && barE[b + 1] > barE[b] * 1.05) rises++
+            }
+            if (rises < 2) continue
+            // Low vocal share in BUILD.
+            var vSum = 0.0; var vc = 0
+            for (b in buildFrom until buildUntil) { vSum += barVocal(b); vc++ }
+            if (vc == 0) continue
+            val vMean = vSum / vc
+            if (vMean >= 0.28) continue
+            // Reduced low-end or rising centroid proxy: BUILD energy below
+            // DROP energy (build is quieter) — always true for a real build.
+            var bMean = 0.0
+            for (b in buildFrom until buildUntil) bMean += barE[b]
+            bMean /= (buildUntil - buildFrom)
+            if (bMean >= curMean * 0.98) continue
+            // Pick the longest qualifying build.
+            if (bestBuild == null || (buildUntil - buildFrom) > (bestBuild.second - bestBuild.first)) {
+                bestBuild = buildFrom to buildUntil
+            }
+        }
+        if (bestBuild != null) {
+            paint(SectionKind.BUILD, bestBuild.first, bestBuild.second)
+            paint(SectionKind.DROP, dropBar, dropBar + 4)
+        }
+    }
 }
 
 fun sectionAt(sections: List<Section>, time: Double): Section? =
@@ -179,6 +330,8 @@ private val PRIORITY = intArrayOf(
     6, // BRIDGE, same rank as pre-chorus; painted later so it can sit in a gap
     3, // INST
     4, // OUTRO
+    6, // BUILD (djmix21, never painted)
+    7, // DROP (djmix21, never painted)
 )
 
 private data class LyricBlock(val start: Double, val end: Double, val signature: String)

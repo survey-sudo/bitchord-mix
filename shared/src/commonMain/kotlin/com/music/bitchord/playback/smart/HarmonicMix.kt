@@ -123,7 +123,17 @@ fun fitBeatSegments(beats: List<Double>): List<FittedGrid> {
             if (gap !in 0.28..1.4) break
             if (gaps.isNotEmpty()) {
                 val med = gaps.sorted()[gaps.size / 2]
-                if (gaps.size >= 4 && abs(gap / med - 1.0) > 0.06) break
+                if (gaps.size >= 4 && abs(gap / med - 1.0) > 0.06) {
+                    val dev = gap - med
+                    val fwdOk = j + 2 < beats.size &&
+                        abs((beats[j + 2] - beats[j]) / (2.0 * med) - 1.0) <= 0.06 &&
+                        dev * ((beats[j + 2] - beats[j + 1]) - med) < 0.0
+                    val bwdOk = j - 1 >= i &&
+                        abs((beats[j + 1] - beats[j - 1]) / (2.0 * med) - 1.0) <= 0.06 &&
+                        dev * ((beats[j] - beats[j - 1]) - med) < 0.0
+                    val isolatedSnap = abs(dev) <= 0.075 && (fwdOk || bwdOk)
+                    if (!isolatedSnap) break
+                }
             }
             gaps += gap
             j++
@@ -133,8 +143,12 @@ fun fitBeatSegments(beats: List<Double>): List<FittedGrid> {
             val sorted = gaps.sorted()
             val med = sorted[sorted.size / 2]
             out += FittedGrid(beats[i], beats[j], med, gaps.size + 1)
+            i = j
+        } else if (gaps.isNotEmpty() && abs(gaps[0] / gaps.sorted()[gaps.size / 2] - 1.0) > 0.15) {
+            i += 1
+        } else {
+            i = if (j > i) j else i + 1
         }
-        i = if (j > i) j else i + 1
     }
     return out
 }
@@ -164,7 +178,12 @@ fun joinBpm(local: Double?, global: Double): Double {
 fun fittedBpm(beats: List<Double>, atEnd: Boolean): Double? {
     if (beats.size < 8) return null
     val at = if (atEnd) beats.last() else beats.first()
-    val seg = fitBeatSegments(beats).firstOrNull { at >= it.start - 0.75 && at <= it.end + 0.75 }
+    val segments = fitBeatSegments(beats)
+    val pred: (FittedGrid) -> Boolean = {
+        val margin = maxOf(0.75, it.period * 2.5)
+        at >= it.start - margin && at <= it.end + margin
+    }
+    val seg = (if (atEnd) segments.lastOrNull(pred) else segments.firstOrNull(pred))
         ?: return null
     return 60.0 / seg.period
 }

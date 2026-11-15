@@ -69,7 +69,9 @@ fun buildupFits(
         inSection == SectionKind.CHORUS ||
         inSection == SectionKind.INST ||
         inSection == SectionKind.INTRO ||
-        inSection == SectionKind.PRE_CHORUS
+        inSection == SectionKind.PRE_CHORUS ||
+        inSection == SectionKind.BUILD ||
+        inSection == SectionKind.DROP
     if (!intoLift) return false
     if (outSection == SectionKind.PRE_CHORUS) return true
     if (outSection == SectionKind.INST && energyRise >= 1.12) return true
@@ -126,6 +128,15 @@ object DjMix {
                 plan
             }
         }
+        // Alternative families carry their own spans (muffle lead + return,
+        // drop-in anchor, beatless bridge duration). Structural remapping
+        // must never resize them, so they pass through untouched. Consults
+        // the family registry: a new family needs no edit here.
+        if (TransitionAlternatives.isAlternativeStyle(plan.transitionStyle) ||
+            TransitionAlternatives.isAlternativeKind(plan.alternativeKind)
+        ) {
+            return plan
+        }
         var next = plan
         val outSections = labelSections(analysis, lyricsOut)
         val inSections = labelSections(nextAnalysis, lyricsIn)
@@ -136,6 +147,8 @@ object DjMix {
         next = colour(next, outgoingId, incomingId)
         val handoff = vocalHandoff(next, analysis, nextAnalysis)
         val extend = phraseExtend(next, analysis, lyricsOut, outSections)
+        // djmix20: phrase extension never overwrites a chosen FLANGER (or
+        // any non-NONE colour); it only fills a NONE slot with LOOP_ROLL.
         if (extend > 0 && next.djEffect == DjEffect.NONE) {
             next = next.copy(djEffect = DjEffect.LOOP_ROLL, phraseExtendBars = extend)
         } else if (extend > 0) {
@@ -143,7 +156,7 @@ object DjMix {
         }
         val outAt = sectionAt(outSections, next.transitionEnd)?.kind
         val inAt = sectionAt(inSections, next.incomingCueTime)?.kind
-        val build = buildupFits(
+        var build = buildupFits(
             next.transitionStyle,
             next.vocalOverlap,
             handoff,
@@ -151,6 +164,17 @@ object DjMix {
             inAt,
             energyRise(analysis, next.transitionStart, next.transitionEnd),
         )
+        // djmix21 buildup-aware: the incoming track's own rise counts too. A
+        // cue inside B's buildup/pre-chorus — or inside a quiet INTRO that
+        // then rises (mirrors the A-side INST branch in buildupFits) — is a
+        // buildup blend even when A's side alone would not read as one.
+        if (!build && next.transitionStyle == TransitionStyle.DJ_BLEND && !handoff &&
+            next.vocalOverlap < 0.35 &&
+            (inAt == SectionKind.PRE_CHORUS || inAt == SectionKind.BUILD || inAt == SectionKind.INTRO)
+        ) {
+            val inRise = energyRise(nextAnalysis, next.incomingCueTime, next.incomingCueTime + next.fadeSeconds)
+            if (inRise >= PhraseConfig.BUILDUP_RISE_MIN) build = true
+        }
         if (build && next.djEffect != DjEffect.LOOP_ROLL && next.djEffect != DjEffect.REVERB) {
             next = next.copy(djEffect = DjEffect.FLANGER)
         }
@@ -177,14 +201,30 @@ object DjMix {
         outSections: List<Section>,
         inSections: List<Section>,
     ): TransitionPlan {
+        // djmix15-pilot: catch-up timing is playhead-anchored (0.6-1.5 s lead
+        // sized to the room left). Never snap it onto lyrics/sections — that
+        // would move transitionEnd/fade/cue off the anchor. Metadata helpers
+        // (vocalHandoff, phraseExtend, colour, tempoGap, summary) still run.
+        if (plan.reason.endsWith(":catch-up")) return plan
         var end = plan.transitionEnd
         var start = plan.transitionStart
         var cue = plan.incomingCueTime
         if (lyricsOut.isNotEmpty()) {
+            // djmix21 mid-vocal guard: never end A mid-line on a blend. Extend
+            // to the line end when it is within LYRIC_EXTENSION_MAX_SEC, else
+            // move the exit to before the line instead of amputating it.
             val cut = lyricsOut.firstOrNull { end > it.startSec + 0.4 && end < it.endSec - 0.4 }
-            if (cut != null && cut.endSec > start + 1.0) end = cut.endSec
+            if (cut != null) {
+                if (cut.endSec - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC && cut.endSec > start + 1.0) {
+                    end = cut.endSec
+                } else if (cut.startSec > start + 1.0 && cut.startSec >= start) {
+                    end = cut.startSec
+                }
+            }
             val chorus = outSections.lastOrNull { it.kind == SectionKind.CHORUS && end > it.start + 1.0 && end < it.end - 1.0 }
-            if (chorus != null && chorus.end > start + 1.0 && chorus.end <= analysis.contentEndTime + 1.0) {
+            if (chorus != null && chorus.end > start + 1.0 && chorus.end <= analysis.contentEndTime + 1.0 &&
+                chorus.end - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC
+            ) {
                 end = chorus.end
             }
             // Leave at the end of the phrase we are in: a verse, a pre-chorus,
@@ -192,7 +232,8 @@ object DjMix {
             val here = sectionAt(outSections, end)
             if (here != null && here.kind != SectionKind.INTRO && here.kind != SectionKind.OUTRO &&
                 end > here.start + 0.8 && end < here.end - 0.4 &&
-                here.end > start + 1.0 && here.end <= analysis.contentEndTime + 1.0
+                here.end > start + 1.0 && here.end <= analysis.contentEndTime + 1.0 &&
+                here.end - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC
             ) {
                 end = here.end
             }
@@ -239,10 +280,14 @@ object DjMix {
         analysis: TrackAnalysis,
         nextAnalysis: TrackAnalysis,
     ): TransitionPlan {
+        // djmix15-pilot: catch-up timing is playhead-anchored; clashFilter
+        // would re-anchor a DJ_BLEND catch-up to a key-clash filter window
+        // (transitionStart/fade), destroying the re-anchor. No re-timing.
+        if (plan.reason.endsWith(":catch-up")) return plan
         if (plan.transitionStyle != TransitionStyle.DJ_BLEND) return plan
         if (plan.reason.contains("phrase")) return plan
-        val left = camelotCode(analysis.key)
-        val right = camelotCode(nextAnalysis.key)
+        val left = camelotCode(exitKeyForMix(analysis))
+        val right = camelotCode(entryKeyForMix(nextAnalysis))
         if (left == null || right == null || camelotCompatible(left, right)) return plan
         if (!stretchReachable(analysis.bpm, nextAnalysis.bpm)) return plan
         val beat = plan.beatSeconds.takeIf { it > 0 } ?: (if (analysis.bpm > 0) 60.0 / analysis.bpm else 0.5)
@@ -267,6 +312,17 @@ object DjMix {
      * that much music left before [TransitionPlan.transitionEnd].
      */
     private fun ensureOverlap(plan: TransitionPlan, analysis: TrackAnalysis): TransitionPlan {
+        // djmix15: catch-up quick dissolves (1.2-3.5 s in <2.5 s of room)
+        // are intentionally shorter than the 4-bar club minimum. Lengthening
+        // them moves the start behind the playhead and recreates the dead
+        // stale window. Never re-size a catch-up.
+        if (plan.reason.endsWith(":catch-up")) return plan
+        // 2B bounded decline (TransitionPlanner): the 4 s DJ_FILTER length is
+        // intentional — the 4-bar club minimum would stretch it to ~8 bars
+        // and recreate the exposed overlap. Never resize a decline plan.
+        // DECLINE is the variant that carries the carve; the reason check
+        // stays as a belt-and-braces for plans built without it.
+        if (plan.reason.contains("decline-to-mix") || plan.filterVariant == FilterTransitionVariant.DECLINE) return plan
         if (plan.transitionStyle != TransitionStyle.DJ_BLEND && plan.transitionStyle != TransitionStyle.DJ_FILTER) {
             return plan
         }
@@ -274,7 +330,17 @@ object DjMix {
             ?: analysis.beatInterval.takeIf { it > 0 }
             ?: if (analysis.bpm > 0) 60.0 / analysis.bpm else return plan
         val blend = plan.transitionStyle == TransitionStyle.DJ_BLEND
-        val minBars = if (blend) 8 else 4
+        val defaultMinBars = if (blend) 8 else 4
+        val defaultMinFade = defaultMinBars * 4 * beat
+        val minBars = if (blend &&
+            plan.incomingHandoffTime > 0.0 &&
+            plan.incomingCueTime <= 0.5 &&
+            plan.incomingHandoffTime < defaultMinFade * plan.incomingPlaybackRate - 0.5
+        ) {
+            4
+        } else {
+            defaultMinBars
+        }
         val maxBars = if (blend) 16 else 8
         val minFade = minBars * 4 * beat
         val maxFade = maxBars * 4 * beat
@@ -288,17 +354,17 @@ object DjMix {
         return plan.copy(transitionStart = start, fadeSeconds = fade, handoffDuration = fade)
     }
 
-    /** Past the stretch limit: echo, a loop roll, or a reverb wash. Echo stays the default. */
+    /** Past the stretch limit: echo (2/3) or a reverb wash (1/3). Echo stays the default. */
     private fun tempoGap(plan: TransitionPlan, outgoingId: String, incomingId: String): TransitionPlan {
         val gap = plan.filterVariant == FilterTransitionVariant.ECHO_RIDE || plan.echoSeconds > 0.0
         if (!gap || plan.transitionStyle == TransitionStyle.EQUAL_POWER) return plan
         if (outgoingId.isEmpty() || incomingId.isEmpty()) {
             return plan.copy(djEffect = DjEffect.ECHO)
         }
-        return when (pairHash(outgoingId, incomingId) % 3) {
-            0 -> plan.copy(djEffect = DjEffect.ECHO)
-            1 -> plan.copy(djEffect = DjEffect.LOOP_ROLL, echoSeconds = 0.0)
-            else -> plan.copy(djEffect = DjEffect.REVERB, echoSeconds = 0.0)
+        return if (pairHash(outgoingId, incomingId) % 3 == 2) {
+            plan.copy(djEffect = DjEffect.REVERB, echoSeconds = 0.0)
+        } else {
+            plan.copy(djEffect = DjEffect.ECHO)
         }
     }
 
@@ -369,8 +435,8 @@ object DjMix {
         if (outAt != null || inAt != null) {
             parts += "out ${outAt?.name?.lowercase() ?: "—"} → in ${inAt?.name?.lowercase() ?: "—"}"
         }
-        val left = camelotCode(analysis.key)
-        val right = camelotCode(nextAnalysis.key)
+        val left = camelotCode(exitKeyForMix(analysis))
+        val right = camelotCode(entryKeyForMix(nextAnalysis))
         if (left != null && right != null) {
             parts += if (camelotCompatible(left, right)) "$left→$right" else "$left→$right clash"
         }

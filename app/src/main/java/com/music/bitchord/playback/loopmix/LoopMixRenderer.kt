@@ -58,6 +58,13 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         fun setEcho(index: Int, delaySeconds: Double, feedback: Float, wet: Float) =
         nativeSetEcho(handle, index, delaySeconds, feedback, wet)
 
+    /** Beat-synced flanger on [index]'s exit tail (wet comb rides the deck's gain, so it dissolves with it). */
+    fun setFlanger(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float) =
+        nativeSetFlanger(handle, index, lfoHz, depthSeconds, feedback, wet)
+
+    /** How many times a deck went silent while still audible at its stopAt (djmix11 exit gate). */
+    fun exitGateViolations(): Int = nativeExitGateViolations(handle)
+
     /** LR4 isolator on a phrase mix. Off for the djmix6 envelopes. */
     fun setIsolate(index: Int, on: Boolean) = nativeSetIsolate(handle, index, on)
 
@@ -82,6 +89,17 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         if (h != 0L) nativeDestroy(h)
     }
 
+    /** djmix24 beat-quantized loop roll (native tightening). */
+    fun setLoopRoll(index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double, totalRollBeats: Double) =
+        nativeSetLoopRoll(handle, index, enabled, rollStartSec, beatSec, releaseSec, totalRollBeats)
+
+    /** djmix24 stereo plate reverb wash (pre-allocated in prepare). */
+    fun setReverb(index: Int, roomSize: Float, damping: Float, wet: Float) =
+        nativeSetReverb(handle, index, roomSize, damping, wet)
+
+    /** djmix24 Cytomic SVF Q (0.707 default, ~0.95 musical buildup). */
+    fun setSvfQ(index: Int, q: Float) = nativeSetSvfQ(handle, index, q)
+
     companion object {
         const val OUT = 0
         const val IN = 1
@@ -91,6 +109,14 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         const val KIND_LOW_PASS_HZ = 3
         /** 0..1 into the echo. Kind 4. Shut until the envelope says otherwise. */
         const val KIND_ECHO_SEND = 4
+        /** djmix24 LR4 isolator mid gain (dB). Used for vocal handoff carve. */
+        const val KIND_MID_DB = 5
+        /** djmix24 LR4 isolator high gain (dB). */
+        const val KIND_HIGH_DB = 6
+        /** djmix24 flanger wet ramp (0..1 multiplier) + tail ring. */
+        const val KIND_FLANGER_WET = 7
+        /** djmix24 reverb wash send (0..1). */
+        const val KIND_REVERB_SEND = 8
 
         val available: Boolean = runCatching { System.loadLibrary("bitchord_loopmix") }
             .onFailure { Log.w("BitChordLoopMix", "Loop mix renderer unavailable", it) }
@@ -114,6 +140,11 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         @JvmStatic private external fun nativeRender(handle: Long, frame: Long, interleaved: FloatArray, offset: Int, frames: Int)
         @JvmStatic private external fun nativeSetFadeOut(handle: Long, index: Int, trackSeconds: Double)
         @JvmStatic private external fun nativeHeard(handle: Long, index: Int): Double
+        @JvmStatic private external fun nativeSetFlanger(handle: Long, index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float)
+        @JvmStatic private external fun nativeSetLoopRoll(handle: Long, index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double, totalRollBeats: Double)
+        @JvmStatic private external fun nativeSetReverb(handle: Long, index: Int, roomSize: Float, damping: Float, wet: Float)
+        @JvmStatic private external fun nativeSetSvfQ(handle: Long, index: Int, q: Float)
+        @JvmStatic private external fun nativeExitGateViolations(handle: Long): Int
     }
 }
 

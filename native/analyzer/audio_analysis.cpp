@@ -330,7 +330,16 @@ void AnalyzeKeyAndTimbre(
   const size_t first_sample = std::min(samples.size(), static_cast<size_t>(start_time * sample_rate));
   const size_t final_sample = std::min(samples.size(), static_cast<size_t>(end_time * sample_rate));
   std::array<double, 12> chroma{};
+  // djmix25 per-region chroma (libkeyfinder-style head/tail split): the
+  // midpoint of the analysed span separates head (entry) from tail (exit).
+  std::array<double, 12> head_chroma{};
+  std::array<double, 12> tail_chroma{};
+  double head_weight = 0;
+  double tail_weight = 0;
+  const double midpoint_sec = (start_time + end_time) * 0.5;
   std::vector<std::complex<double>> spectrum(frame_size);
+  std::vector<double> mags(frame_size / 2 + 1, 0.0);
+  std::vector<double> band_mags;
   double chroma_weight = 0;
   double low_energy = 0;
   double vocal_energy = 0;
@@ -348,6 +357,8 @@ void AnalyzeKeyAndTimbre(
     }
     const double rms = std::sqrt(square_sum / frame_size);
     if (rms < 0.0025) continue;
+    const double frame_sec = (start + frame_size / 2.0) / sample_rate;
+    const bool frame_is_head = frame_sec < midpoint_sec;
     Fft(spectrum);
 
     double frame_chroma = 0;
@@ -369,12 +380,61 @@ void AnalyzeKeyAndTimbre(
         arithmetic_sum += power;
         ++flatness_bins;
       } else frame_high += perceptual_power;
-      if (frequency > 5000) continue;
-      const int midi = static_cast<int>(std::round(69.0 + 12.0 * std::log2(frequency / 440.0)));
-      const int pitch_class = (midi % 12 + 12) % 12;
-      const double weight = std::log1p(power);
-      chroma[pitch_class] += weight * rms;
-      frame_chroma += weight;
+    }
+
+    // Peak-picked spectral chroma (Orchard): only local peaks >= 2x the band
+    // median magnitude contribute, at parabolically interpolated pitch, split
+    // across adjacent pitch classes with cos^2 / sin^2 weights.
+    const double bin_hz = sample_rate / frame_size;
+    const size_t min_bin = std::max<size_t>(2, static_cast<size_t>(std::ceil(65.0 / bin_hz)));
+    const size_t max_bin = std::min<size_t>(
+      frame_size / 2 - 2,
+      static_cast<size_t>(std::floor(std::min(2100.0, sample_rate * 0.45) / bin_hz))
+    );
+    if (max_bin >= min_bin) {
+      for (size_t bin = min_bin - 1; bin <= max_bin + 1; ++bin) {
+        mags[bin] = std::sqrt(std::norm(spectrum[bin]));
+      }
+      band_mags.assign(mags.begin() + min_bin, mags.begin() + max_bin + 1);
+      const size_t mid_idx = band_mags.size() / 2;
+      std::nth_element(band_mags.begin(), band_mags.begin() + mid_idx, band_mags.end());
+      const double floor = band_mags[mid_idx] * 2.0;
+      for (size_t bin = min_bin; bin <= max_bin; ++bin) {
+        const double left = mags[bin - 1];
+        const double middle = mags[bin];
+        const double right = mags[bin + 1];
+        if (middle <= floor || middle <= left || middle < right) continue;
+        const double l0 = std::log(std::max(left, 1e-12));
+        const double l1 = std::log(std::max(middle, 1e-12));
+        const double l2 = std::log(std::max(right, 1e-12));
+        const double denom = l0 - 2.0 * l1 + l2;
+        const double delta = (denom < 0.0 && std::abs(denom) > 1e-9)
+          ? Clamp(0.5 * (l0 - l2) / denom, -0.5, 0.5)
+          : 0.0;
+        const double peak_hz = (static_cast<double>(bin) + delta) * bin_hz;
+        if (peak_hz <= 0.0) continue;
+        const double pitch = 69.0 + 12.0 * std::log2(peak_hz / 440.0);
+        const double lower = std::floor(pitch);
+        const double frac = pitch - lower;
+        const double weight = std::sqrt(middle);
+        const double near = std::cos(frac * (kPi * 0.5));
+        const double w0 = near * near;
+        const double w1 = 1.0 - w0;
+        const int base_pc = ((static_cast<int>(lower) % 12) + 12) % 12;
+        const int next_pc = (base_pc + 1) % 12;
+        chroma[base_pc] += weight * w0 * rms;
+        chroma[next_pc] += weight * w1 * rms;
+        if (frame_is_head) {
+          head_chroma[base_pc] += weight * w0 * rms;
+          head_chroma[next_pc] += weight * w1 * rms;
+          head_weight += weight * rms;
+        } else {
+          tail_chroma[base_pc] += weight * w0 * rms;
+          tail_chroma[next_pc] += weight * w1 * rms;
+          tail_weight += weight * rms;
+        }
+        frame_chroma += weight;
+      }
     }
     const double frame_flatness = flatness_bins && arithmetic_sum > 0
       ? std::exp(log_sum / flatness_bins) / (arithmetic_sum / flatness_bins)
@@ -391,7 +451,7 @@ void AnalyzeKeyAndTimbre(
       (start + frame_size / 2.0) / sample_rate,
       VocalProbabilityFrom(frame_low, frame_vocal, frame_high, frame_flatness)
     });
-    chroma_weight += std::max(1e-9, frame_chroma * rms);
+    chroma_weight += frame_chroma * rms;
     ++accepted_frames;
   }
 
@@ -399,31 +459,89 @@ void AnalyzeKeyAndTimbre(
   const double chroma_sum = std::accumulate(result.chroma.begin(), result.chroma.end(), 0.0);
   if (chroma_sum > 0) for (double& value : result.chroma) value /= chroma_sum;
 
-  constexpr std::array<double, 12> major = {6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88};
-  constexpr std::array<double, 12> minor = {6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17};
+  // Zero-mean Pearson correlation against Krumhansl-Kessler profiles across
+  // all 24 keys. Names are ASCII '#' / 'b' so the JNI string stays byte-safe
+  // and Kotlin camelotCode resolves every pitch class consistently.
+  constexpr std::array<double, 12> k_major = {6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88};
+  constexpr std::array<double, 12> k_minor = {6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17};
   constexpr std::array<const char*, 12> names = {
-    "C", "C\xE2\x99\xAF", "D", "E\xE2\x99\xAD", "E", "F",
-    "F\xE2\x99\xAF", "G", "A\xE2\x99\xAD", "A", "B\xE2\x99\xAD", "B"
+    "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"
   };
-  std::vector<std::pair<double, std::string>> candidates;
-  for (size_t root = 0; root < 12; ++root) {
-    double major_score = 0;
-    double minor_score = 0;
+  auto pearson = [](const std::array<double, 12>& x, const std::array<double, 12>& profile, size_t root) -> double {
+    double mean_x = 0.0;
+    double mean_y = 0.0;
     for (size_t pitch = 0; pitch < 12; ++pitch) {
-      major_score += result.chroma[pitch] * major[(pitch + 12 - root) % 12];
-      minor_score += result.chroma[pitch] * minor[(pitch + 12 - root) % 12];
+      mean_x += x[pitch];
+      mean_y += profile[pitch];
     }
-    candidates.emplace_back(major_score, std::string(names[root]) + " major");
-    candidates.emplace_back(minor_score, std::string(names[root]) + " minor");
+    mean_x /= 12.0;
+    mean_y /= 12.0;
+    double cov = 0.0;
+    double var_x = 0.0;
+    double var_y = 0.0;
+    for (size_t pitch = 0; pitch < 12; ++pitch) {
+      const size_t rel = (pitch + 12 - root) % 12;
+      const double dx = x[pitch] - mean_x;
+      const double dy = profile[rel] - mean_y;
+      cov += dx * dy;
+      var_x += dx * dx;
+      var_y += dy * dy;
+    }
+    if (var_x <= 1e-18 || var_y <= 1e-18) return 0.0;
+    return cov / std::sqrt(var_x * var_y);
+  };
+  auto detect_key = [&](const std::array<double, 12>& norm) -> std::pair<std::string, double> {
+    const double sum = std::accumulate(norm.begin(), norm.end(), 0.0);
+    if (sum <= 1e-12) return {"", 0.0};
+    const double mean_x = sum / 12.0;
+    double var_x = 0.0;
+    for (double v : norm) {
+      const double dx = v - mean_x;
+      var_x += dx * dx;
+    }
+    if (var_x <= 1e-18) return {"", 0.0};
+    std::vector<std::pair<double, std::string>> candidates;
+    candidates.reserve(24);
+    for (size_t root = 0; root < 12; ++root) {
+      candidates.emplace_back(pearson(norm, k_major, root), std::string(names[root]) + " major");
+      candidates.emplace_back(pearson(norm, k_minor, root), std::string(names[root]) + " minor");
+    }
+    std::sort(candidates.begin(), candidates.end(), std::greater<>());
+    if (candidates.size() < 2) return {"", 0.0};
+    const double max_val = *std::max_element(norm.begin(), norm.end());
+    const double contrast = max_val / mean_x;
+    // Flat chroma (noise / pure percussion, contrast < 1.5 per Orchard) cannot
+    // produce a high-confidence key solely via Pearson variance normalization.
+    const double tonal_gate = Clamp((contrast - 1.4) / 0.35, 0.0, 1.0);
+    const double conf = Clamp((candidates[0].first - candidates[1].first) * 4.0, 0.0, 1.0) * tonal_gate;
+    return {candidates[0].second, conf};
+  };
+  if (chroma_weight > 1e-9 && chroma_sum > 1e-12 && !result.chroma.empty()) {
+    std::array<double, 12> global_norm{};
+    for (size_t i = 0; i < 12; ++i) global_norm[i] = result.chroma[i];
+    const auto best = detect_key(global_norm);
+    result.key = best.first;
+    result.key_confidence = best.second;
   }
-  std::sort(candidates.begin(), candidates.end(), std::greater<>());
-  if (chroma_weight > 0 && !candidates.empty()) {
-    result.key = candidates[0].second;
-    result.key_confidence = Clamp(
-      (candidates[0].first - candidates[1].first) / std::max(0.01, candidates[0].first) * 4.0,
-      0,
-      1
-    );
+  if (head_weight > 1e-6) {
+    const double sum = std::accumulate(head_chroma.begin(), head_chroma.end(), 0.0);
+    if (sum > 1e-12) {
+      std::array<double, 12> norm{};
+      for (size_t i = 0; i < 12; ++i) norm[i] = head_chroma[i] / sum;
+      const auto best = detect_key(norm);
+      result.key_head = best.first;
+      result.key_head_confidence = best.second;
+    }
+  }
+  if (tail_weight > 1e-6) {
+    const double sum = std::accumulate(tail_chroma.begin(), tail_chroma.end(), 0.0);
+    if (sum > 1e-12) {
+      std::array<double, 12> norm{};
+      for (size_t i = 0; i < 12; ++i) norm[i] = tail_chroma[i] / sum;
+      const auto best = detect_key(norm);
+      result.key_tail = best.first;
+      result.key_tail_confidence = best.second;
+    }
   }
 
   // The track-wide summary keeps its existing meaning -- the same logistic over

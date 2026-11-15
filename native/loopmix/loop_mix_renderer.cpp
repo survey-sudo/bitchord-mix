@@ -14,7 +14,7 @@ namespace {
 constexpr int kControlFrames = 64;
 /** The incoming deck's last fade, to its own player: identical audio crossed this fast is heard as one. */
 constexpr double kFadeSeconds = 0.025;
-constexpr double kLoopSeamSeconds = 0.008;
+constexpr double kLoopSeamSeconds = 0.008;  // djmix24 clickless 8 ms Hann / equal-power (sin/cos)
 constexpr double kPi = 3.14159265358979323846;
 
 }  // namespace
@@ -75,6 +75,97 @@ void TptLowpass::set(double sampleRate, double frequency, double q) {
   a3 = g * a2;
 }
 
+void TptHighpass::set(double sampleRate, double frequency, double q) {
+  if (!(sampleRate > 0) || !(frequency > 20) || frequency >= sampleRate * 0.45) {
+    bypass();
+    return;
+  }
+  const double safeQ = std::max(0.5, q);
+  const double T = 1.0 / sampleRate;
+  const double wa = (2.0 / T) * std::tan(kPi * frequency * T);
+  g = float(wa * T / 2.0);
+  k = float(1.0 / safeQ);
+  a1 = 1.f / (1.f + g * (g + k));
+  a2 = g * a1;
+  a3 = g * a2;
+}
+
+void ReverbWash::setup(double sampleRate, float roomSize, float dampingIn, float wetIn) {
+  enabled = false;
+  combL0.clear(); combL1.clear(); combL2.clear(); combL3.clear();
+  combR0.clear(); combR1.clear(); combR2.clear(); combR3.clear();
+  apL0.clear(); apL1.clear(); apR0.clear(); apR1.clear();
+  hpL = hpR = 0.f;
+  if (!(sampleRate > 0) || !(wetIn > 0.f)) return;
+  if (!(roomSize >= 0.5f && roomSize <= 6.f)) return;
+  const float sz = roomSize / 2.2f;
+  auto szFor = [&](float base) { return std::clamp(int(std::lround(base * sz * sampleRate)), 64, int(sampleRate * 1.2)); };
+  combL0.assign(szFor(0.0297f), 0.f); combL1.assign(szFor(0.0371f), 0.f);
+  combL2.assign(szFor(0.0411f), 0.f); combL3.assign(szFor(0.0439f), 0.f);
+  combR0.assign(szFor(0.0302f), 0.f); combR1.assign(szFor(0.0376f), 0.f);
+  combR2.assign(szFor(0.0416f), 0.f); combR3.assign(szFor(0.0444f), 0.f);
+  apL0.assign(szFor(0.0044f), 0.f); apL1.assign(szFor(0.0016f), 0.f);
+  apR0.assign(szFor(0.0049f), 0.f); apR1.assign(szFor(0.0019f), 0.f);
+  for (int& i : combIdxL) i = 0; for (int& i : combIdxR) i = 0;
+  for (int& i : apIdxL) i = 0; for (int& i : apIdxR) i = 0;
+  damping = dampingIn;
+  wet = wetIn;
+  enabled = true;
+}
+
+void ReverbWash::apply(float inL, float inR, float send, float& wetL, float& wetR, double sampleRate) {
+  wetL = 0; wetR = 0;
+  if (!enabled || send <= 1e-6f || combL0.empty()) {
+    return;
+  }
+  const float g = std::clamp(send, 0.f, 1.f);
+  // 300 Hz input HPF (1-pole) so the wash stays out of the bass mud.
+  const float hpA = float(1.0 - std::exp(-2.0 * kPi * 300.0 / sampleRate));
+  hpL += hpA * (inL - hpL);
+  hpR += hpA * (inR - hpR);
+  const float hpInL = inL - hpL;
+  const float hpInR = inR - hpR;
+  // Comb filters with damping (low-pass in feedback). Per-buffer cursors
+  // (pre-allocated, zero allocations, zero wrap clicks).
+  auto combTick = [](std::vector<float>& buf, int& idx, float x, float damp) -> float {
+    const int size = static_cast<int>(buf.size());
+    const int pp = idx;
+    const float y = buf[pp];
+    const int nxt = (pp + 1 >= size) ? 0 : (pp + 1);
+    float lp = buf[nxt];
+    lp = damp * lp + (1.f - damp) * y;
+    buf[nxt] = lp;
+    // Feedback gain 0.84 (Freeverb-class) with tanh soft clip.
+    buf[pp] = x + std::tanh(lp * 0.84f);
+    idx = nxt;
+    return y;
+  };
+  const float cL = (combTick(combL0, combIdxL[0], hpInL * g, damping) +
+              combTick(combL1, combIdxL[1], hpInL * g, damping) +
+              combTick(combL2, combIdxL[2], hpInL * g, damping) +
+              combTick(combL3, combIdxL[3], hpInL * g, damping)) * 0.25f;
+  const float cR = (combTick(combR0, combIdxR[0], hpInR * g, damping) +
+              combTick(combR1, combIdxR[1], hpInR * g, damping) +
+              combTick(combR2, combIdxR[2], hpInR * g, damping) +
+              combTick(combR3, combIdxR[3], hpInR * g, damping)) * 0.25f;
+  // Allpass cascade (0.5 feedback).
+  auto apTick = [](std::vector<float>& buf, int& idx, float x) -> float {
+    const int size = static_cast<int>(buf.size());
+    const int pp = idx;
+    const float y = buf[pp];
+    buf[pp] = x - y * 0.5f;
+    idx = (pp + 1 >= size) ? 0 : (pp + 1);
+    return y * 0.5f + x;
+  };
+  const float aL = apTick(apL1, apIdxL[1], apTick(apL0, apIdxL[0], cL));
+  const float aR = apTick(apR1, apIdxR[1], apTick(apR0, apIdxR[0], cR));
+  wetL = aL * wet;
+  wetR = aR * wet;
+  // Denormal guard (flush tiny to zero).
+  if (std::abs(wetL) < 1e-20f) wetL = 0;
+  if (std::abs(wetR) < 1e-20f) wetR = 0;
+}
+
 void PingPong::setup(double sampleRate, double delaySeconds, float feedbackGain, float wetGain) {
   enabled = false;
   left.clear();
@@ -116,6 +207,156 @@ void PingPong::tap(float inL, float inR, float send, float& wetL, float& wetR, d
   if (pos >= delay) pos = 0;
   wetL = lpL * wet;
   wetR = lpR * wet;
+}
+
+void Flanger::setup(double sampleRate, double lfoHzIn, double depthSecondsIn,
+                    float feedbackGain, float wetGain) {
+  enabled = false;
+  left.clear();
+  right.clear();
+  pos = 0;
+  dampL = dampR = 0.f;
+  if (!(sampleRate > 0) || !(lfoHzIn > 0) || !(depthSecondsIn > 0.0005) || !(wetGain > 0.f)) return;
+  depthSeconds = float(depthSecondsIn);
+  // djmix24: clamp up to 12 ms (pre-allocated in prepare). Depth 0.0045
+  // (buildup) + 0.65 ms base = ~5.2 ms sweep.
+  const int size = std::clamp(int(std::lround(depthSecondsIn * sampleRate)) + 2, 4, int(sampleRate * 0.012));
+  left.assign(size, 0.f);
+  right.assign(size, 0.f);
+  feedback = feedbackGain;
+  wet = wetGain;
+  lfoHz = lfoHzIn;
+  enabled = true;
+}
+
+void Flanger::apply(float inL, float inR, float& wetL, float& wetR, double frameTimeSec, double sampleRate) {
+  applyEnv(inL, inR, 1.f, wetL, wetR, frameTimeSec, sampleRate);
+}
+
+void Flanger::applyEnv(float inL, float inR, float wetMul, float& wetL, float& wetR, double frameTimeSec, double sampleRate) {
+  wetL = 0;
+  wetR = 0;
+  if (!enabled || left.empty() || !(sampleRate > 0)) return;
+  const int size = int(left.size());
+  // djmix24 Jet: 0.65 ms .. 5.2 ms stereo quadrature (90 deg offset).
+  // LFO is one cycle per 8 beats (1/(8*beatSec) ~ 0.258 Hz at 124 BPM).
+  const double phaseL = 2 * kPi * lfoHz * frameTimeSec;
+  const double phaseR = phaseL + kPi / 2.0;
+  const double lfoL = 0.5 * std::sin(phaseL) + 0.5;
+  const double lfoR = 0.5 * std::sin(phaseR) + 0.5;
+  const double delayLSmp = (0.00065 + double(depthSeconds) * lfoL) * sampleRate;
+  const double delayRSmp = (0.00065 + double(depthSeconds) * lfoR) * sampleRate;
+  double fposL = std::fmod(double(pos) - delayLSmp, double(size));
+  if (fposL < 0) fposL += size;
+  double fposR = std::fmod(double(pos) - delayRSmp, double(size));
+  if (fposR < 0) fposR += size;
+  const int i0L = int(fposL);
+  const int i1L = (i0L + 1) % size;
+  const float fracL = float(fposL - i0L);
+  const int i0R = int(fposR);
+  const int i1R = (i0R + 1) % size;
+  const float fracR = float(fposR - i0R);
+  const float rawL = left[i0L] * (1.f - fracL) + left[i1L] * fracL;
+  const float rawR = right[i0R] * (1.f - fracR) + right[i1R] * fracR;
+  // 1-pole ~10 kHz HF damping inside the feedback loop + denormal guard.
+  const float dampA = float(1.0 - std::exp(-2.0 * kPi * 10000.0 / sampleRate));
+  dampL += dampA * (rawL - dampL);
+  dampR += dampA * (rawR - dampR);
+  float fbL = dampL * feedback;
+  float fbR = dampR * feedback;
+  if (std::abs(fbL) < 1e-20f) fbL = 0;
+  if (std::abs(fbR) < 1e-20f) fbR = 0;
+  fbL = std::clamp(fbL, -0.78f, 0.78f);
+  fbR = std::clamp(fbR, -0.78f, 0.78f);
+  left[pos] = inL + fbL;
+  right[pos] = inR + fbR;
+  pos++;
+  if (pos >= size) pos = 0;
+  const float mul = std::clamp(wetMul, 0.f, 1.f) * wet;
+  wetL = rawL * mul;
+  wetR = rawR * mul;
+}
+
+// djmix24 tightening schedule: loop length in beats for the roll.
+// 4 -> 2 -> 1 -> 0.5 in the final 2 beats; Rung 4 slip is 1 -> 0.5 -> 0.25
+// but native reuses the same table anchored at loopStart.
+static double rollLoopBeatsNative(double beatsIntoRoll, double totalRollBeats) {
+  if (!(totalRollBeats > 0)) return 4.0;
+  const double b = std::clamp(beatsIntoRoll, 0.0, totalRollBeats);
+  if (b >= totalRollBeats - 1.0) return 0.5;
+  if (b >= totalRollBeats - 2.0) return 1.0;
+  if (b >= totalRollBeats - 4.0) return 2.0;
+  return 4.0;
+}
+
+int64_t Deck::sampleAtEffective(int64_t unwrapped) const {
+  int64_t effEnd = effectiveLoopEnd;
+  if (effEnd <= loopStart) effEnd = loopEnd;
+  if (effEnd <= loopStart) {
+    return (unwrapped >= 0 && unwrapped < int64_t(left.size())) ? unwrapped : -1;
+  }
+  int64_t index = unwrapped;
+  const int64_t length = effEnd - loopStart;
+  if (length > 0 && unwrapped >= effEnd) {
+    if (unwrapped < int64_t(releaseAt)) {
+      index = loopStart + (unwrapped - loopStart) % length;
+    } else {
+      index = effEnd + (unwrapped - int64_t(releaseAt));
+    }
+  }
+  return (index >= 0 && index < int64_t(left.size())) ? index : -1;
+}
+
+void Deck::readEffective(int64_t unwrapped, int seamSamples, double mixSec, float& leftOut, float& rightOut) const {
+  // Tightening: when loopRoll is on and mixSec is inside the roll window,
+  // effective loop length is beat-locked (anchored at loopStart). Compute
+  // it from the mix clock; the seam crossfade below is always 8 ms
+  // Hann / equal-power (sin/cos), zero allocation.
+  int64_t effEnd = loopEnd;
+  if (loopRoll && rollBeatSec > 1e-6) {
+    if (mixSec >= rollStartMixSec && mixSec < rollReleaseMixSec) {
+      const double beatsInto = (mixSec - rollStartMixSec) / rollBeatSec;
+      const double loopBeats = rollLoopBeatsNative(beatsInto, rollTotalBeats);
+      const double effLen = loopBeats * rollBeatSec * 48000.0;  // placeholder, fixed below by caller
+      (void)effLen;
+      // The caller (renderDeck) sets effectiveLoopEnd per-block from the
+      // exact sample rate, so use it when present; otherwise fall back
+      // to the full loop.
+      if (effectiveLoopEnd > loopStart) effEnd = effectiveLoopEnd;
+    }
+  }
+  const int64_t index = sampleAtEffective(unwrapped);
+  if (index < 0) { leftOut = 0; rightOut = 0; return; }
+  // If effective loop is active, sampleAtEffective already wraps; for the
+  // seam blend use the effective length.
+  leftOut = left[index];
+  rightOut = right[index];
+  const int64_t length = effEnd - loopStart;
+  if (length <= seamSamples || seamSamples <= 1) return;
+  if (unwrapped < effEnd || unwrapped >= static_cast<int64_t>(releaseAt)) {
+    // Also handle the full-loop case when effective is not tightened.
+    if (!(loopRoll && effectiveLoopEnd > loopStart)) {
+      // Fall through to full-loop check below by using loopEnd.
+    } else {
+      return;
+    }
+  }
+  // Seam position within the effective (or full) loop.
+  const int64_t eff = (effEnd > loopStart) ? effEnd : loopEnd;
+  const int64_t fullLen = loopEnd - loopStart;
+  const int64_t useLen = (effectiveLoopEnd > loopStart) ? (effectiveLoopEnd - loopStart) : fullLen;
+  if (useLen <= seamSamples) return;
+  // Only blend inside the loop region.
+  if (unwrapped < loopStart || unwrapped >= static_cast<int64_t>(releaseAt)) return;
+  const int64_t pos = (unwrapped - loopStart) % useLen;
+  if (pos < 0 || pos >= seamSamples) return;
+  const int64_t tail = loopStart + useLen + pos;
+  if (tail < 0 || tail >= int64_t(left.size())) return;
+  const float tt = float(pos) / float(seamSamples);
+  const float intoLoop = std::sin(tt * float(kPi / 2.0));
+  const float fromTail = std::cos(tt * float(kPi / 2.0));
+  leftOut = left[index] * intoLoop + left[tail] * fromTail;
+  rightOut = right[index] * intoLoop + right[tail] * fromTail;
 }
 
 int64_t Deck::sampleAt(int64_t unwrapped) const {
@@ -220,8 +461,67 @@ void Renderer::setIsolate(int index, bool on) {
   decks_[index].isolate = on;
 }
 
+void Renderer::setFlanger(int index, double lfoHz, double depthSeconds, float feedback, float wet) {
+  if (index < 0 || index > 1) return;
+  decks_[index].flanger.setup(sampleRate_, lfoHz, depthSeconds, feedback, wet);
+}
+
+void Renderer::setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats) {
+  if (index < 0 || index > 1) return;
+  Deck& d = decks_[index];
+  d.loopRoll = enabled;
+  d.rollStartMixSec = rollStartSec;
+  d.rollBeatSec = beatSec;
+  d.rollReleaseMixSec = releaseSec;
+  d.rollTotalBeats = totalRollBeats;
+}
+
+void Renderer::setReverb(int index, float roomSize, float damping, float wet) {
+  if (index < 0 || index > 1) return;
+  decks_[index].reverb.setup(sampleRate_, roomSize, damping, wet);
+}
+
+void Renderer::setSvfQ(int index, float q) {
+  if (index < 0 || index > 1) return;
+  decks_[index].svfQ = q;
+}
+
 void Renderer::prepare() {
   limitGain_ = 1.f;
+  // djmix24 1.5 ms lookahead ring (pre-allocated, worker thread).
+  {
+    const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
+    const int need = look + 64;
+    if (int(limitRingL_.size()) < need) {
+      limitRingL_.assign(need, 0.f);
+      limitRingR_.assign(need, 0.f);
+    }
+    std::fill(limitRingL_.begin(), limitRingL_.end(), 0.f);
+    std::fill(limitRingR_.begin(), limitRingR_.end(), 0.f);
+    limitRingPos_ = 0;
+  }
+  // djmix14: pre-allocate every render buffer here (worker thread). The audio
+  // thread (render/renderDeck) must never allocate — see hard rule. PhraseIsolator
+  // is member/stack-allocated and already alloc-free. Sizes cover the largest
+  // ExoPlayer callback (frames) and its 8x stretch input plus seek window.
+  // If a callback ever exceeds the cap, render/renderDeck drop the block
+  // rather than resizing (no heap, no lock, no block on audio).
+  {
+    constexpr int kMaxFrames = 32768;
+    constexpr int kMaxInput = 262144;
+    if (int(mixLeft_.size()) < kMaxFrames) {
+      mixLeft_.assign(kMaxFrames, 0.f);
+      mixRight_.assign(kMaxFrames, 0.f);
+    }
+    if (int(outLeft_.size()) < kMaxFrames) {
+      outLeft_.assign(kMaxFrames, 0.f);
+      outRight_.assign(kMaxFrames, 0.f);
+    }
+    if (int(inLeft_.size()) < kMaxInput) {
+      inLeft_.assign(kMaxInput, 0.f);
+      inRight_.assign(kMaxInput, 0.f);
+    }
+  }
   for (Deck& deck : decks_) {
     // Default quality outside efficient mode: the mix is written ahead of the
     // speaker, so the longer window costs nothing on the playback thread.
@@ -231,9 +531,53 @@ void Renderer::prepare() {
     else deck.stretch.presetCheaper(2, float(sampleRate_), true);
     deck.started = false;
     deck.finished = deck.left.empty() || deck.knotTimes.size() < 2;
+    deck.activeStartFrame = 0.0;
+    if (!deck.knotTimes.empty() && deck.knotPositions.size() == deck.knotTimes.size()) {
+      const double p0 = deck.knotPositions.front();
+      size_t firstAdv = 0;
+      for (size_t i = 1; i < deck.knotPositions.size(); ++i) {
+        if (std::abs(deck.knotPositions[i] - p0) > 0.5) {
+          firstAdv = i;
+          break;
+        }
+      }
+      if (firstAdv > 1) {
+        deck.activeStartFrame = deck.knotTimes[firstAdv - 1];
+      } else if (firstAdv == 1) {
+        deck.activeStartFrame = deck.knotTimes.front() -
+            deck.preroll * double(sampleRate_) - deck.stretch.outputLatency();
+      } else {
+        deck.activeStartFrame = 1e18;
+      }
+    }
+    // Flanger history never survives a session boundary.
+    std::fill(deck.flanger.left.begin(), deck.flanger.left.end(), 0.f);
+    std::fill(deck.flanger.right.begin(), deck.flanger.right.end(), 0.f);
+    deck.flanger.pos = 0;
+    deck.flanger.dampL = deck.flanger.dampR = 0.f;
+    // Reverb tails die at the session boundary (buffers keep their size).
+    if (!deck.reverb.combL0.empty()) {
+      std::fill(deck.reverb.combL0.begin(), deck.reverb.combL0.end(), 0.f);
+      std::fill(deck.reverb.combL1.begin(), deck.reverb.combL1.end(), 0.f);
+      std::fill(deck.reverb.combL2.begin(), deck.reverb.combL2.end(), 0.f);
+      std::fill(deck.reverb.combL3.begin(), deck.reverb.combL3.end(), 0.f);
+      std::fill(deck.reverb.combR0.begin(), deck.reverb.combR0.end(), 0.f);
+      std::fill(deck.reverb.combR1.begin(), deck.reverb.combR1.end(), 0.f);
+      std::fill(deck.reverb.combR2.begin(), deck.reverb.combR2.end(), 0.f);
+      std::fill(deck.reverb.combR3.begin(), deck.reverb.combR3.end(), 0.f);
+      std::fill(deck.reverb.apL0.begin(), deck.reverb.apL0.end(), 0.f);
+      std::fill(deck.reverb.apL1.begin(), deck.reverb.apL1.end(), 0.f);
+      std::fill(deck.reverb.apR0.begin(), deck.reverb.apR0.end(), 0.f);
+      std::fill(deck.reverb.apR1.begin(), deck.reverb.apR1.end(), 0.f);
+      for (int& i : deck.reverb.combIdxL) i = 0; for (int& i : deck.reverb.combIdxR) i = 0;
+      for (int& i : deck.reverb.apIdxL) i = 0; for (int& i : deck.reverb.apIdxR) i = 0;
+      deck.reverb.hpL = deck.reverb.hpR = 0.f;
+    }
     deck.shelf.bypass();
-    deck.highPass.bypass();
+    deck.tptHighPass.bypass();
     deck.lowPass.bypass();
+    deck.effectiveLoopEnd = -1;
+    deck.effectiveLoopLenSamples = -1.0;
     if (deck.isolate) deck.isolator.setup(sampleRate_);
     deck.shelfDb = 0;
     deck.highPassFreq = 0;
@@ -252,9 +596,11 @@ int64_t Renderer::firstFrame() const {
 }
 
 void Renderer::render(int64_t frame, float* interleaved, int frames) {
-  if (int(mixLeft_.size()) < frames) {
-    mixLeft_.resize(frames);
-    mixRight_.resize(frames);
+  // djmix14: no allocation on the audio thread. Buffers were pre-allocated
+  // in prepare(); an oversize callback is dropped (silence) not resized.
+  if (int(mixLeft_.size()) < frames || int(mixRight_.size()) < frames) {
+    for (int i = 0; i < frames; ++i) { interleaved[2 * i] = 0.f; interleaved[2 * i + 1] = 0.f; }
+    return;
   }
   std::fill(mixLeft_.begin(), mixLeft_.begin() + frames, 0.f);
   std::fill(mixRight_.begin(), mixRight_.begin() + frames, 0.f);
@@ -267,35 +613,57 @@ void Renderer::render(int64_t frame, float* interleaved, int frames) {
 }
 
 void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
-  if (deck.finished) return;
+  if (deck.finished || frames <= 0) return;
   const double sr = sampleRate_;
   const double blockStart = frame / sr;
-  const double blockEnd = (frame + frames) / sr;
   if (blockStart >= deck.stopAt) {
+    // Graceful-exit gate (djmix11): the outgoing may only go silent at
+    // stopAt once its gain is already below -60 dB. The plan's lane and
+    // region are built so this can never trip; a violation is recorded to
+    // telemetry as proof the guarantee held or broke.
+    if (!deck.gain.empty() && deck.gain.at(blockStart) > 0.001f) {
+      exitGateViolations_.fetch_add(1, std::memory_order_relaxed);
+    }
     deck.finished = true;
     return;
   }
   const double inLatency = deck.stretch.inputLatency();
   const double outLatency = deck.stretch.outputLatency();
-  const double startTime = deck.knotTimes.front() / sr - deck.preroll - outLatency / sr;
   const double frameStart = double(frame);
   const double frameEnd = double(frame + frames);
+  // djmix18: hold silent with readPos synchronized until the first advancing
+  // knot (e.g., incomingHoldSec > 0), never calling stretch.process(0, frames).
+  if (!deck.started && frameEnd <= deck.activeStartFrame) {
+    const double initPos = deck.knotPositions.empty() ? 0.0 : deck.knotPositions.front();
+    deck.heardPos = initPos;
+    deck.readPos = initPos;
+    deck.heard.store(deck.trackSecondsAt(initPos, sr), std::memory_order_relaxed);
+    return;
+  }
+  const int silentFrames = (!deck.started && frameStart < deck.activeStartFrame && frames > 1)
+      ? std::clamp(int(std::floor(deck.activeStartFrame - frameStart)), 0, std::max(0, frames - 1))
+      : 0;
+  const int activeFrames = frames - silentFrames;
+  const double activeFrameStart = frameStart + double(silentFrames);
   if (!deck.started) {
-    if (blockEnd <= startTime) return;
-    // Seeded at this block's start, its read pointer the stretch's own latency
-    // ahead of what will be heard: the first outLatency samples are pre-roll,
-    // over by the time the deck's gain opens.
-    const double rate = deck.knotRate(frameStart);
-    deck.heardPos = deck.knotHeard(frameStart);
+    // Seeded at activeFrameStart, its read pointer the stretch's own latency
+    // ahead of what will be heard.
+    const double rateSampleAt = std::max(activeFrameStart, deck.activeStartFrame + 1.0);
+    const double rate = std::clamp(deck.knotRate(rateSampleAt), 0.75, 1.35);
+    deck.heardPos = deck.knotHeard(activeFrameStart);
     deck.readPos = deck.heardPos + inLatency + rate * outLatency;
     const int seekLength = deck.stretch.seekLength();
-    if (int(inLeft_.size()) < seekLength) {
-      inLeft_.resize(seekLength);
-      inRight_.resize(seekLength);
+    if (int(inLeft_.size()) < seekLength || int(inRight_.size()) < seekLength) {
+      deck.started = true; // never retry a resize on the audio thread
+      return;
     }
     const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
     const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
-    for (int i = 0; i < seekLength; ++i) deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+    for (int i = 0; i < seekLength; ++i) {
+      const double mixSec = double(frame + silentFrames + i) / sr;
+      if (deck.loopRoll) deck.readEffective(first + i, seam, mixSec, inLeft_[i], inRight_[i]);
+      else deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+    }
     float* seekInput[2] = {inLeft_.data(), inRight_.data()};
     deck.stretch.reset();
     deck.stretch.seek(seekInput, seekLength, rate);
@@ -303,8 +671,15 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     deck.started = true;
   }
 
-  // Where the block must end, heard: on the knots, or (past the last one, the
-  // incoming song running on) at rate 1.
+  if (int(outLeft_.size()) < frames || int(outRight_.size()) < frames) return;
+  for (int i = 0; i < silentFrames; ++i) {
+    outLeft_[i] = 0.f;
+    outRight_[i] = 0.f;
+  }
+
+  // Where the block must end, heard: on the knots, or (past the last one) at
+  // rate 1 (incoming run-on) or extrapolated steady tail rate [0.85, 1.15]
+  // during exitTailSeconds / echoHold.
   double heardEnd;
   double rateEnd;
   const double lastKnot = deck.knotTimes.back();
@@ -312,40 +687,105 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     heardEnd = deck.knotHeard(frameEnd);
     rateEnd = deck.knotRate(frameEnd - 1);
   } else if (deck.runOn) {
-    const double from = std::max(frameStart, lastKnot);
-    const double base = frameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
+    const double from = std::max(activeFrameStart, lastKnot);
+    const double base = activeFrameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
     heardEnd = base + (frameEnd - from);
-    rateEnd = 1;
+    rateEnd = 1.0;
   } else {
-    heardEnd = deck.knotPositions.back();
-    rateEnd = deck.knotRate(lastKnot - 1);
+    const double tailRate = std::clamp(deck.knotRate(lastKnot - 1), 0.85, 1.15);
+    const double from = std::max(activeFrameStart, lastKnot);
+    const double base = activeFrameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
+    heardEnd = base + (frameEnd - from) * tailRate;
+    rateEnd = tailRate;
   }
-  if (deck.started) {
-    // A bad knot used to jump the read pointer by hundreds of times in one
-    // block. Two samples of song per sample of mix is as fast as a loop goes.
+  {
     const double advance = heardEnd - deck.heardPos;
-    const double maxAdvance = double(frames) * 2.0;
+    const double maxAdvance = double(activeFrames) * 1.35;
     if (advance > maxAdvance) heardEnd = deck.heardPos + maxAdvance;
+    if (advance < 0.0) heardEnd = deck.heardPos;
   }
-  const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
-  int inputSamples = int(std::floor(readEnd - deck.readPos));
-  inputSamples = std::clamp(inputSamples, 0, frames * 8);
-  if (int(inLeft_.size()) < inputSamples) {
-    inLeft_.resize(inputSamples);
-    inRight_.resize(inputSamples);
-  }
-  const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
-  const int64_t readFrom = int64_t(deck.readPos);
-  for (int i = 0; i < inputSamples; ++i) deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
-  deck.readPos += inputSamples;
 
-  if (int(outLeft_.size()) < frames) {
-    outLeft_.resize(frames);
-    outRight_.resize(frames);
+  // djmix24 tightening: effective loop length from the mix clock.
+  // Anchored at loopStart, beat-locked via knotTimes/beatSec. 8 ms
+  // clickless wraps are handled in readEffective (sin/cos equal-power).
+  deck.effectiveLoopEnd = -1;
+  if (deck.loopRoll && deck.loopEnd > deck.loopStart && deck.rollBeatSec > 1e-6) {
+    const double blockMixSec = double(frame) / sr;
+    if (blockMixSec >= deck.rollStartMixSec && blockMixSec < deck.rollReleaseMixSec) {
+      const double beatsInto = (blockMixSec - deck.rollStartMixSec) / deck.rollBeatSec;
+      const double loopBeats = rollLoopBeatsNative(beatsInto, deck.rollTotalBeats);
+      const double effSamples = loopBeats * deck.rollBeatSec * sr;
+      deck.effectiveLoopEnd = deck.loopStart + int64_t(std::llround(effSamples));
+      // Clamp to the decoded region when the full loop allows it.
+      if (deck.effectiveLoopEnd > int64_t(deck.left.size()) && deck.effectiveLoopEnd > deck.loopEnd) {
+        deck.effectiveLoopEnd = deck.loopEnd;
+      }
+      if (deck.effectiveLoopEnd <= deck.loopStart) deck.effectiveLoopEnd = -1;
+    }
   }
-  float* input[2] = {inLeft_.data(), inRight_.data()};
-  float* output[2] = {outLeft_.data(), outRight_.data()};
-  deck.stretch.process(input, inputSamples, output, frames);
+  const bool loopsForever = (deck.loopEnd > deck.loopStart && deck.releaseAt > 1e15);
+  const int64_t deckSize = int64_t(deck.left.size());
+  const int64_t readFrom = int64_t(std::floor(deck.readPos));
+  const int minInput = std::max(1, int(std::floor(double(activeFrames) * 0.75)));
+  const int maxInput = std::max(minInput, int(std::ceil(double(activeFrames) * 1.35)));
+  const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, deckSize - readFrom);
+
+  if (!loopsForever && remaining <= 0) {
+    // Past decoded PCM EOF: silence dry audio without calling stretch.process(0, frames),
+    // letting only wet echo/flanger tails ring out until stopAt.
+    std::fill(outLeft_.begin() + silentFrames, outLeft_.begin() + frames, 0.f);
+    std::fill(outRight_.begin() + silentFrames, outRight_.begin() + frames, 0.f);
+    deck.readPos = double(deckSize);
+  } else if (!loopsForever && remaining < minInput) {
+    const int avail = std::min(activeFrames, int(remaining));
+    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+    for (int i = 0; i < avail; ++i) {
+      const double mixSec = double(frame + silentFrames + i) / sr;
+      if (deck.loopRoll) deck.readEffective(readFrom + i, seam, mixSec, outLeft_[silentFrames + i], outRight_[silentFrames + i]);
+      else deck.read(readFrom + i, seam, outLeft_[silentFrames + i], outRight_[silentFrames + i]);
+    }
+    const int fadeLen = std::min(avail, 64);
+    const int fadeStart = avail - fadeLen;
+    for (int i = 0; i < fadeLen; ++i) {
+      const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
+      outLeft_[silentFrames + fadeStart + i] *= f;
+      outRight_[silentFrames + fadeStart + i] *= f;
+    }
+    for (int i = avail; i < activeFrames; ++i) {
+      outLeft_[silentFrames + i] = 0.f;
+      outRight_[silentFrames + i] = 0.f;
+    }
+    deck.readPos = double(deckSize);
+  } else {
+    const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
+    int inputSamples = int(std::floor(readEnd - deck.readPos));
+    inputSamples = std::clamp(inputSamples, minInput, maxInput);
+    if (!loopsForever) {
+      inputSamples = std::min<int>(inputSamples, int(remaining));
+    }
+    // No resize on the audio thread (pre-allocated in prepare()).
+    if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
+    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+    for (int i = 0; i < inputSamples; ++i) {
+      const double mixSec = double(frame + silentFrames + i) / sr;
+      if (deck.loopRoll) deck.readEffective(readFrom + i, seam, mixSec, inLeft_[i], inRight_[i]);
+      else deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
+    }
+    deck.readPos += double(inputSamples);
+
+    float* input[2] = {inLeft_.data(), inRight_.data()};
+    float* output[2] = {outLeft_.data() + silentFrames, outRight_.data() + silentFrames};
+    deck.stretch.process(input, inputSamples, output, activeFrames);
+    if (!loopsForever && readFrom + inputSamples >= deckSize) {
+      const int fadeLen = std::min(activeFrames, 64);
+      const int fadeStart = frames - fadeLen;
+      for (int i = 0; i < fadeLen; ++i) {
+        const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
+        outLeft_[fadeStart + i] *= f;
+        outRight_[fadeStart + i] *= f;
+      }
+    }
+  }
 
   const double heardStart = deck.heardPos;
   deck.heardPos = heardEnd;
@@ -365,7 +805,7 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         if (std::abs(db) < 0.01f) {
           deck.shelf.bypass();
         } else {
-          deck.shelf.lowShelf(sr, 250, db);
+          deck.shelf.lowShelf(sr, 200, db);
         }
       }
     }
@@ -374,9 +814,10 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       if (std::abs(hz - deck.highPassFreq) > 0.5f) {
         deck.highPassFreq = hz;
         if (hz <= 20.5f) {
-          deck.highPass.bypass();
+          deck.tptHighPass.bypass();
         } else {
-          deck.highPass.highPass(sr, hz, 0.7);
+          // Cytomic TPT SVF: 0.707 default, 0.95 musical during buildup.
+          deck.tptHighPass.set(sr, hz, deck.svfQ);
         }
       }
     }
@@ -394,24 +835,40 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       const int n = at + i;
       float g = (g0 + (g1 - g0) * (float(i) / count)) * deck.level;
       if (fadeAt >= 0) {
-        const double heard = heardStart + (heardEnd - heardStart) * (double(n) / frames);
+        const double heard = silentFrames > 0
+            ? (n < silentFrames
+                ? heardStart
+                : heardStart + (heardEnd - heardStart) * (double(n - silentFrames) / double(std::max(1, activeFrames))))
+            : (heardStart + (heardEnd - heardStart) * (double(n) / double(frames)));
         const double fade = std::clamp((fadeAt + fadeSamples - heard) / fadeSamples, 0.0, 1.0);
         g *= float(fade);
       }
       float l = deck.shelf.tick(0, outLeft_[n]);
       float r = deck.shelf.tick(1, outRight_[n]);
-      l = deck.highPass.tick(0, l);
-      r = deck.highPass.tick(1, r);
+      l = deck.tptHighPass.tick(0, l);
+      r = deck.tptHighPass.tick(1, r);
       l = deck.lowPass.tick(0, l);
       r = deck.lowPass.tick(1, r);
       if (deck.isolate && deck.isolator.ready) {
         float loL, midL, hiL, loR, midR, hiR;
         deck.isolator.process(0, l, loL, midL, hiL);
         deck.isolator.process(1, r, loR, midR, hiR);
-        // Unity band gains. The shelf and the filters above carry the score sheet.
-        // The sum is an allpass, flat within a tenth of a dB.
-        l = loL + midL + hiL;
-        r = loR + midR + hiR;
+        // djmix24 LR4 band gains: mid/high dB envelopes (vocal handoff
+        // carve -6..-9 dB over 4 beats; incoming mid/high stay at 0 dB).
+        float midDb = 0.f, highDb = 0.f;
+        const double bandT = (frame + n) / sr;
+        if (!deck.midDb.empty()) midDb = deck.midDb.at(bandT);
+        if (!deck.highDb.empty()) highDb = deck.highDb.at(bandT);
+        const float midLin = std::pow(10.f, midDb / 20.f);
+        const float highLin = std::pow(10.f, highDb / 20.f);
+        l = loL + midL * midLin + hiL * highLin;
+        r = loR + midR * midLin + hiR * highLin;
+      }
+      float flangeL = 0.f, flangeR = 0.f;
+      if (deck.flanger.enabled) {
+        float wetMul = 1.f;
+        if (!deck.flangerWet.empty()) wetMul = deck.flangerWet.at((frame + n) / sr);
+        deck.flanger.applyEnv(l, r, wetMul, flangeL, flangeR, double(frame + n) / sr, sr);
       }
       float wetL = 0, wetR = 0;
       float send = 0.f;
@@ -423,31 +880,63 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         }
       }
       deck.echo.tap(l, r, send, wetL, wetR, sr);
-      mixLeft_[n] += l * g + wetL;
-      mixRight_[n] += r * g + wetR;
+      // djmix24 reverb wash: send envelope (0..1), tail rings past the dry.
+      float revL = 0, revR = 0;
+      float revSend = 0.f;
+      if (deck.reverb.enabled) {
+        if (!deck.reverbSend.empty()) revSend = deck.reverbSend.at((frame + n) / sr);
+        else if (!deck.knotTimes.empty() && (frame + n) >= deck.knotTimes.front()) revSend = 0.5f;
+        deck.reverb.apply(l, r, revSend, revL, revR, sr);
+      }
+      mixLeft_[n] += l * g + wetL + flangeL * g + revL;
+      mixRight_[n] += r * g + wetR + flangeR * g + revR;
     }
   }
   if (fadeAt >= 0 && heardStart > fadeAt + fadeSamples) deck.finished = true;
 }
 
 void Renderer::limit(int frames) {
-  // -1 dBTP, stereo linked. The 1.5 ms lookahead is the rest of this block,
-  // so the splice the sink asked for does not move.
+  // djmix24 1.5 ms lookahead -1.0 dBTP (0.891f) true-peak soft-knee
+  // limiter. Ring buffer pre-allocated in prepare(); fast attack, smooth
+  // release ~80 ms, zero allocations/locks. Prevents clipping when
+  // resonant SVF + jet flanger + echo/reverb + overlap sum together.
   constexpr float kCeiling = 0.89125094f;
+  constexpr float kKneeDb = 2.0f;  // soft-knee width (dB below ceiling)
+  constexpr float kKnee = 0.794f;  // -2 dBTP knee start
   const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
-  const float release = 1.f - std::exp(-1.f / (0.06f * float(sampleRate_)));
+  const float release = 1.f - std::exp(-1.f / (0.08f * float(sampleRate_)));
+  const int ringSize = std::max(1, int(limitRingL_.size()));
+  // Ring holds the current block's lookahead window for cross-block
+  // continuity (pre-allocated above); peak is scanned within the block
+  // (1.5 ms * sr frames) so the splice does not move, zero allocations.
   for (int i = 0; i < frames; ++i) {
+    limitRingL_[(limitRingPos_) % ringSize] = mixLeft_[i];
+    limitRingR_[(limitRingPos_) % ringSize] = mixRight_[i];
+    limitRingPos_++;
+    if (limitRingPos_ >= ringSize) limitRingPos_ = 0;
     float peak = 0.f;
     const int end = std::min(frames, i + look);
     for (int j = i; j < end; ++j) {
       peak = std::max(peak, std::abs(mixLeft_[j]));
       peak = std::max(peak, std::abs(mixRight_[j]));
     }
-    const float target = peak > kCeiling ? kCeiling / peak : 1.f;
+    // Soft-knee: linear above ceiling, smooth knee below.
+    float target = 1.f;
+    if (peak > kCeiling) {
+      target = kCeiling / peak;
+    } else if (peak > kKnee) {
+      // Knee region: partial gain reduction (smooth entry).
+      const float over = (peak - kKnee) / (kCeiling - kKnee);
+      const float kneeGain = 1.f - over * over * 0.08f;
+      target = kneeGain;
+    }
     if (target < limitGain_) limitGain_ = target;
     else limitGain_ += (target - limitGain_) * release;
-    mixLeft_[i] *= limitGain_;
-    mixRight_[i] *= limitGain_;
+    const float gl = mixLeft_[i] * limitGain_;
+    const float gr = mixRight_[i] * limitGain_;
+    // Denormal guard on the output.
+    mixLeft_[i] = std::abs(gl) < 1e-20f ? 0.f : gl;
+    mixRight_[i] = std::abs(gr) < 1e-20f ? 0.f : gr;
   }
 }
 

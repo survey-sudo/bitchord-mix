@@ -91,16 +91,21 @@ class DjMixTest {
     }
 
     @Test
-    fun aKnownPairEchoesAndTheNextHashCanRoll() {
+    fun aKnownPairEchoesAndTheNextHashReverbs() {
+        // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
         assertEquals(0, pairHash("a", "b") % 3)
         val echoed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
         assertEquals(DjEffect.ECHO, echoed.djEffect)
         assertTrue(echoed.echoSeconds > 0.2)
-        val rolledId = (0 until 12).first { pairHash("a", "roll-$it") % 3 == 1 }
-        val rolled = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "roll-$rolledId")
-        assertEquals(DjEffect.LOOP_ROLL, rolled.djEffect)
-        assertEquals(0.0, rolled.echoSeconds)
-        assertTrue(rolled.mixSummary.contains("loop roll"))
+        val echoId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 1 }
+        val stillEcho = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$echoId")
+        assertEquals(DjEffect.ECHO, stillEcho.djEffect)
+        assertTrue(stillEcho.echoSeconds > 0.2)
+        val reverbId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 2 }
+        val reverbed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$reverbId")
+        assertEquals(DjEffect.REVERB, reverbed.djEffect)
+        assertEquals(0.0, reverbed.echoSeconds)
+        assertTrue(reverbed.mixSummary.contains("reverb wash"))
     }
 
     @Test
