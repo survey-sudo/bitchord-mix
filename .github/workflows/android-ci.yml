@@ -149,13 +149,24 @@ jobs:
           echo "apk=$APK"
           stat -c '%s bytes' "$APK"
           sha256sum "$APK"
-          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2" dump badging "$APK" | head -2
+          # sed, not head: with `pipefail` aapt2 gets SIGPIPE when head exits
+          # early, and the audit step would fail after a successful build.
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2" dump badging "$APK" | sed -n '1,2p'
           echo "--- onnxruntime copies (expect 1) ---"
           unzip -l "$APK" | grep -c 'libonnxruntime.so'
           echo "--- QNN/HTP libs (expect 0) ---"
           unzip -l "$APK" | grep -icE 'libQnn|libHtp' || true
           echo "--- native libs ---"
           unzip -l "$APK" | grep 'libbitchord_' || true
+          {
+            echo "### Release APK"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| file | \`$(basename "$APK")\` |"
+            echo "| size | $(stat -c %s "$APK") bytes |"
+            echo "| sha256 | \`$(sha256sum "$APK" | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

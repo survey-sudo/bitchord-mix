@@ -117,8 +117,31 @@ compose.resources {
 }
 
 
-// The AAR metadata check is deliberately NOT disabled here. Only the app module
-// needs that workaround (InnerTubeX's Android AAR declares minCompileSdk 37,
-// see app/build.gradle.kts). Disabling `checkReleaseAarMetadata` in a library
-// module leaves the directory that `bundleReleaseLocalLintAar` consumes missing,
-// and Gradle fails input validation on a clean checkout.
+/*
+ * InnerTubeX's Android AAR declares `minCompileSdk = 37`; this project compiles
+ * against 36 (AGP 8.13.1's maximum recommended value, and the target the release
+ * was verified against). The check is disabled for the same reason as in :shared
+ * and :app — see the long comment in shared/build.gradle.kts.
+ *
+ * The bundle tasks need the check's output directory to exist, so it is created
+ * by a task they depend on. Without that, a clean checkout fails Gradle input
+ * validation; a stale directory on the build box used to hide it.
+ */
+tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
+
+val prepareAarMetadataCheckDirs = tasks.register("prepareAarMetadataCheckDirs") {
+    val dirs = listOf("debug", "release").map { variant ->
+        layout.buildDirectory.dir(
+            "intermediates/aar_metadata_check/$variant/" +
+                "check${variant.replaceFirstChar { it.uppercase() }}AarMetadata"
+        )
+    }
+    outputs.dirs(dirs)
+    doLast { dirs.forEach { it.get().asFile.mkdirs() } }
+}
+
+tasks.configureEach {
+    if (name.startsWith("bundle") && name.endsWith("Aar")) {
+        dependsOn(prepareAarMetadataCheckDirs)
+    }
+}

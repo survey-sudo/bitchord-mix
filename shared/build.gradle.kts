@@ -68,10 +68,35 @@ android {
     compileSdk = 36
 }
 
-// The AAR metadata check is deliberately NOT disabled here. Only the app module
-// needs that workaround (InnerTubeX's Android AAR declares minCompileSdk 37,
-// see app/build.gradle.kts). This module has no such dependency, and disabling
-// `checkReleaseAarMetadata` would leave its output directory missing while
-// `bundleReleaseLocalLintAar` still declares that directory as an input — which
-// fails Gradle input validation on any clean checkout. A stale directory from an
-// earlier build hides that on the build box; CI has none.
+/*
+ * InnerTubeX's Android AAR (`innertubex-android`) declares `minCompileSdk = 37`.
+ * This project compiles against 36: that is AGP 8.13.1's maximum recommended
+ * compileSdk, and 36 is the target the release was built and verified against.
+ * The bytecode uses no API-37 symbols, so the dependency check is disabled here,
+ * in :sharedUi and in :app — `innertubex` is an `api` dependency of this module,
+ * so it reaches the other two transitively.
+ *
+ * AGP's BundleAar tasks declare the check's output directory as an input, and a
+ * disabled check never creates it, so a clean checkout fails Gradle input
+ * validation before the bundle runs. The build box never noticed because a stale
+ * directory from an earlier build was still on disk. The directory is therefore
+ * created by a task that every bundle task depends on.
+ */
+tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
+
+val prepareAarMetadataCheckDirs = tasks.register("prepareAarMetadataCheckDirs") {
+    val dirs = listOf("debug", "release").map { variant ->
+        layout.buildDirectory.dir(
+            "intermediates/aar_metadata_check/$variant/" +
+                "check${variant.replaceFirstChar { it.uppercase() }}AarMetadata"
+        )
+    }
+    outputs.dirs(dirs)
+    doLast { dirs.forEach { it.get().asFile.mkdirs() } }
+}
+
+tasks.configureEach {
+    if (name.startsWith("bundle") && name.endsWith("Aar")) {
+        dependsOn(prepareAarMetadataCheckDirs)
+    }
+}

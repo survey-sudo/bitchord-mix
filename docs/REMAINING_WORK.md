@@ -79,16 +79,22 @@ signed, installable APK, add four repository secrets:
 
 ### Known debt: `compileSdk` 36 vs InnerTubeX's declared 37
 
-`app/build.gradle.kts` disables every `*AarMetadata` task because InnerTubeX's
-Android AAR declares `minCompileSdk = 37` while this project compiles against 36.
-Its bytecode uses no API-37 symbols, so the app runs, but the check is a real
-safety net that is off. The proper fix is a working `android-37` platform on both
-the build box and CI, then delete the disable line.
+`innertubex-android` declares `minCompileSdk = 37`, so `app`, `shared` and
+`sharedUi` all disable their `*AarMetadata` tasks. This project compiles against
+36: AGP 8.13.1's maximum recommended value, and the target the release was built
+and verified against. InnerTubeX's bytecode uses no API-37 symbols, so the app
+runs, but the check is a real safety net that is off.
 
-Do **not** copy that disable into a library module: `bundleReleaseLocalLintAar`
-declares the check's output directory as an input, so disabling the producer fails
-Gradle input validation on a clean checkout. That is exactly what broke the first
-CI release run (`:shared:bundleReleaseLocalLintAar`, 2026-11-16).
+**The platform is no longer the blocker.** `bk-android` now has `android-37` and
+`android-37.0` installed, and CI can install `platforms;android-37`. The proper
+fix is therefore available: bump `compileSdk` to 37 in all three modules, delete
+the disables, and re-verify on device. It is deferred only because it changes the
+build target, and the current APK is the one awaiting a listening test.
+
+Because the checks are disabled, each library build script registers
+`prepareAarMetadataCheckDirs`, which creates the directory AGP's bundle tasks
+declare as an input. Without it, a clean checkout fails Gradle input validation —
+that broke the first two CI release runs (2026-11-16).
 
 ---
 

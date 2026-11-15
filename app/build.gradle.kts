@@ -592,13 +592,14 @@ if (providers.gradleProperty("bitchord.bundleWear").orNull != "false" && findPro
 
 /*
  * InnerTubeX's Android AAR declares `minCompileSdk = 37`; this project compiles
- * against 36, because neither the build box nor the CI image has a usable
- * `android-37` platform. Its bytecode uses no API-37 symbols (checked when the
- * dependency was introduced, see docs/bitchord-djmix9-BUILD-REPORT.md), so the
- * dependency check is disabled here.
+ * against 36, AGP 8.13.1's maximum recommended compileSdk and the target the
+ * release was verified against. Its bytecode uses no API-37 symbols (checked when
+ * the dependency was introduced, see docs/bitchord-djmix9-BUILD-REPORT.md), so
+ * the dependency check is disabled here.
  *
- * Only the app module does this. Do not copy this into a library module: there
- * `bundleReleaseLocalLintAar` declares the check's output directory as an input,
- * so disabling the producer fails Gradle input validation on a clean checkout.
+ * :shared and :sharedUi disable it too — `innertubex` is an `api` dependency of
+ * :shared, so it reaches all three modules. Their build scripts also create the
+ * check's output directory, which AGP's bundle tasks declare as an input; without
+ * that, a clean checkout fails Gradle input validation.
  */
 tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
