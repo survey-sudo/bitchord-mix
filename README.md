@@ -5,9 +5,9 @@
 
 <img src="Logo.png" alt="BitChord app icon" width="200" />
 
-# BitChord
+# BitChord Mix
 
-### Aesthetic YouTube Music Client
+### Aesthetic YouTube Music Client — with a real AutoMix
 
 <br/>
 
@@ -31,9 +31,9 @@
 > BitChord is not affiliated with, endorsed by, or connected to YouTube or Google in any way. Use it at your own discretion.
 
 > [!NOTE]
-> This tree is a private fork of [BitChord](https://github.com/kushagrasinghx/BitChord) **v1.9.1** (commit `7f45c768a461fd7e68bf4613f71e8a767e643d4c`) by Kushagra Singh, under the same GPL-3.0-or-later license (see `LICENSE`). It is not the official app: the package is `com.music.bitchord.loopfix`, the label is "BitChord loop fix", and the in-app updater does not offer the official release. The phone change is an Automix fix — a loop mix whose decks are still decoding at the planned bar shifts to the next valid bar instead of falling back to a filter mix, and the Automix line names the late step and how many milliseconds it overran. Build the arm64 phone release with `./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false`.
-
----
+> **This is a private fork** of [BitChord](https://github.com/kushagrasinghx/BitChord) **v1.9.1** (commit `7f45c768a461fd7e68bf4613f71e8a767e643d4c`) by Kushagra Singh, under the same **GPL-3.0-or-later** license (see `LICENSE`). It is not the official app: the package is `com.music.bitchord.loopfix` and the label is **"BitChord Mix"**. The upstream in-app updater does not offer these builds.
+>
+> Everything upstream ships is here. What this fork adds is one thing done properly: **AutoMix** — the transition engine was rebuilt so songs mix at musically correct points, beatmatch on both decks, skip silent intros, and separate vocals instead of filtering them.
 
 ---
 
@@ -86,6 +86,56 @@
   </tr>
 </table>
 
+---
+
+<div align="center">
+
+<h1><a id="automix"></a>AutoMix</h1>
+
+</div>
+
+Upstream ships Automix as a beta that beatmatches and tempo-stretches. This fork replaces the transition engine end to end. Every item below is implemented in this tree, not aspirational.
+
+### Transitions land where the music actually ends
+
+- **Outro-aware exit selection** — candidates are scored across the whole tail of the track, latest-first, so a mix never abandons a final chorus to jump at a bridge or verse marker.
+- **A real floor on exit points** — exits are clamped to the last ~30 s (or last 22 % on tracks over 90 s) instead of the old `musicEnd - 40` clamp that *lowered* the floor and cut songs early.
+- **Final-chorus protection** — bridge/verse exits are only chosen when the outro is genuinely short and mostly unsung; otherwise the mix waits for the content end.
+- **Bounded fade spans** — `CONTENT_END` transitions cap their ramp and total span so a long outro doesn't drag the fade start backwards.
+
+### Song B enters on music, never on silence
+
+- Leading **silence sections are detected and skipped** at both cue-selection and playback time, so the incoming deck starts at the first audible bar rather than fading in over a silent intro.
+- Incoming cues honour `audibleStartTime`; a track that starts at `0.0` no longer stops the planner dead.
+
+### Both decks beatmatch
+
+- The incoming playback rate is **derived from the actual tempo ratio**, not hardcoded to `1.0`.
+- **Parallel decode** of the outgoing and incoming regions replaced the sequential path that was dying with `decode 0 ms over` and falling back to unbeatmatched crossfades.
+- Alignment converges inside the settle window, and `finishLoop` records the aligned phase instead of verifying a cancelled job (previously `-911.22 ms`).
+
+### Vocals are separated, not muffled
+
+- Bundled **`umxhq` ONNX stem separation** runs on the transition windows and produces a vocal and instrumental stem per deck.
+- **Dual-stem cosine rides** cross the two decks on stems (`OUT` vocal `1.0 → 0.08`, `IN` vocal `0.10 → 1.0`), replacing the low-pass/high-pass "muffle then demuffle" trick.
+- A **zero-allocation 1500 Hz Q=0.707 peaking dip** handles the vocal band when a ride needs a touch more room.
+- **Clean low-end handover** — `OPEN_HZ` low-pass with a ≤200 Hz bass swap, so the bass moves between tracks instead of both decks fighting under a filter.
+
+### Analysis that keeps up
+
+- **Single-threaded whole-track analysis** — three concurrent passes were sharing one model lock and ORT's threads, producing a measured 6× slowdown on a hot, backgrounded phone.
+- **20 s structure timeout** — the old 5 s limit tripped on coarse checkpoints and published *no* song map at all; a slow map now degrades to a coarse grid instead of vanishing.
+- **Stem separation yields to analysis** — deck separation is skipped while a whole-track pass is in flight, and the deck falls back to the dry region.
+- **Telemetry** — every plan, fire, arm death, verify and fallback is written to `automix-telemetry.jsonl`, with `docs/tools/analyze_telemetry.py` to correlate a listening session.
+
+### Build
+
+```bash
+./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false
+```
+
+The arm64 phone release is the supported target. Native analysis and loop-mix libraries are built by CMake with NDK `27.2.12479018`; ONNX Runtime is the full Maven `onnxruntime-android:1.31.0` AAR. QNN/HTP is disabled (`QNN_ENABLED = false`), so the build carries exactly one `libonnxruntime.so` and no Qualcomm NPU libraries.
+
 </div>
 
 ---
@@ -94,9 +144,9 @@
 
 <h1><a id="download"></a>Download</h1>
 
-<a href="https://github.com/kushagrasinghx/BitChord/releases" target="_blank" rel="noopener noreferrer"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/supported/android/cozy.svg" alt="Download for Android" height="55"/></a>
+<a href="https://github.com/survey-sudo/bitchord-mix/releases" target="_blank" rel="noopener noreferrer"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/supported/android/cozy.svg" alt="Download for Android" height="55"/></a>
 
-Grab the latest signed APK from the [Releases](https://github.com/kushagrasinghx/BitChord/releases) page. Sideloading requires enabling "Install unknown apps" for whichever app you download it with.
+Grab the latest signed APK from this fork's [Releases](https://github.com/survey-sudo/bitchord-mix/releases) page. Upstream builds are at [kushagrasinghx/BitChord](https://github.com/kushagrasinghx/BitChord/releases). Sideloading requires enabling "Install unknown apps" for whichever app you download it with.
 
 
 </div>
