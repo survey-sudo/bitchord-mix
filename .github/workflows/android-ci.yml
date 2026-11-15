@@ -1,0 +1,166 @@
+name: Android CI
+
+# Upstream shipped a workflow that triggers on `main` and runs a bare
+# `assembleProdRelease`. This fork's branch is `master`, the phone build needs
+# `-Pbitchord.bundleWear=false`, and the exact NDK/CMake versions the release
+# was verified against are not on the runner image. All three are fixed here.
+#
+# Signing is deliberately optional: app/build.gradle.kts nulls the release
+# signingConfig when the keystore is absent, so this workflow produces
+# app-release-unsigned.apk with no secrets configured. Add the four signing
+# secrets and it produces the signed APK instead, with no workflow change.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned to the toolchain the release was built and verified with on
+  # bk-android. Do not float these: a different NDK changes native output.
+  ANDROID_COMPILE_SDK: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK: "27.2.12479018"
+  ANDROID_CMAKE: "3.22.1"
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image is ~14 GB free and the NDK alone is ~2 GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+                      /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Install SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-$ANDROID_COMPILE_SDK" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK" \
+            "cmake;$ANDROID_CMAKE"
+
+      - name: shared jvmTest
+        run: ./gradlew :shared:jvmTest --stacktrace
+
+      - name: app unit tests
+        run: ./gradlew :app:testProdDebugUnitTest --stacktrace
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            shared/build/reports/tests/
+            app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Release APK (arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+                      /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Install SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-$ANDROID_COMPILE_SDK" \
+            "build-tools;$ANDROID_BUILD_TOOLS" \
+            "ndk;$ANDROID_NDK" \
+            "cmake;$ANDROID_CMAKE"
+
+      # Optional signing. Absent secrets leave the release unsigned rather than
+      # failing, because signingConfig is null when the keystore is missing.
+      #
+      # The emptiness check lives in the shell on purpose: GitHub does not allow
+      # the `secrets` context inside a step-level `if:`, so an `if` here would
+      # evaluate to false and the signing step would silently never run.
+      - name: Configure signing (optional)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "No signing secrets configured — the release will be unsigned."
+            echo "Add KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD"
+            echo "as repository secrets to produce a signed, installable APK."
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > bitchord-loopfix.jks
+          {
+            echo "storeFile=bitchord-loopfix.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+          chmod 600 bitchord-loopfix.jks keystore.properties
+
+      - name: assembleProdRelease
+        run: ./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false --stacktrace
+
+      - name: Audit APK
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/prod/release/*.apk | head -1)
+          echo "apk=$APK"
+          stat -c '%s bytes' "$APK"
+          sha256sum "$APK"
+          "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2" dump badging "$APK" | head -2
+          echo "--- onnxruntime copies (expect 1) ---"
+          unzip -l "$APK" | grep -c 'libonnxruntime.so'
+          echo "--- QNN/HTP libs (expect 0) ---"
+          unzip -l "$APK" | grep -icE 'libQnn|libHtp' || true
+          echo "--- native libs ---"
+          unzip -l "$APK" | grep 'libbitchord_' || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitchord-prod-arm64
+          path: app/build/outputs/apk/prod/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
