@@ -117,4 +117,8 @@ compose.resources {
 }
 
 
-tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
+// The AAR metadata check is deliberately NOT disabled here. Only the app module
+// needs that workaround (InnerTubeX's Android AAR declares minCompileSdk 37,
+// see app/build.gradle.kts). Disabling `checkReleaseAarMetadata` in a library
+// module leaves the directory that `bundleReleaseLocalLintAar` consumes missing,
+// and Gradle fails input validation on a clean checkout.

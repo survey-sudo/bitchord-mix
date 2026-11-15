@@ -77,6 +77,19 @@ signed, installable APK, add four repository secrets:
 
 **Decision pending:** whether the keystore goes into GitHub secrets at all.
 
+### Known debt: `compileSdk` 36 vs InnerTubeX's declared 37
+
+`app/build.gradle.kts` disables every `*AarMetadata` task because InnerTubeX's
+Android AAR declares `minCompileSdk = 37` while this project compiles against 36.
+Its bytecode uses no API-37 symbols, so the app runs, but the check is a real
+safety net that is off. The proper fix is a working `android-37` platform on both
+the build box and CI, then delete the disable line.
+
+Do **not** copy that disable into a library module: `bundleReleaseLocalLintAar`
+declares the check's output directory as an input, so disabling the producer fails
+Gradle input validation on a clean checkout. That is exactly what broke the first
+CI release run (`:shared:bundleReleaseLocalLintAar`, 2026-11-16).
+
 ---
 
 ## P2 — NPU (why it is off, and what it would take)
