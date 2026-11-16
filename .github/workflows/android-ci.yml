@@ -38,6 +38,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Native checks first: they need nothing but g++ and take seconds, so a
+      # broken DSP translation unit fails before we spend 8 minutes installing
+      # an SDK. This job exists because no gate ever called the native success
+      # path — a deterministic null store shipped in vc73/vc74 and every gate
+      # stayed green, since both JVM tests short-circuit before the patched code.
+      - name: Native analyzer tests
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -I native/analyzer \
+              native/analyzer/vocal_spectrogram_test.cpp \
+              native/analyzer/vocal_spectrogram.cpp \
+              -o /tmp/vocal_spectrogram_test
+          /tmp/vocal_spectrogram_test
+          echo "--- same test under ASan/UBSan ---"
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -I native/analyzer \
+              native/analyzer/vocal_spectrogram_test.cpp \
+              native/analyzer/vocal_spectrogram.cpp \
+              -o /tmp/vocal_spectrogram_test_asan
+          /tmp/vocal_spectrogram_test_asan
+
       # The runner image is ~14 GB free and the NDK alone is ~2 GB.
       - name: Free disk space
         run: |
@@ -86,6 +106,18 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      # Gated here too, not just in the test job: this job can be dispatched on
+      # its own (workflow_dispatch), and an artifact must never exist unless the
+      # native success path actually ran.
+      - name: Native analyzer tests
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -I native/analyzer \
+              native/analyzer/vocal_spectrogram_test.cpp \
+              native/analyzer/vocal_spectrogram.cpp \
+              -o /tmp/vocal_spectrogram_test
+          /tmp/vocal_spectrogram_test
 
       - name: Free disk space
         run: |

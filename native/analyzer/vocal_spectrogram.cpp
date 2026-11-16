@@ -156,9 +156,11 @@ bool SeparateVocalWindow(
   if (input_length <= pad + 1) return false;
   const auto window = HannWindow(kVocalSpectrogramFft);
   const std::vector<float> inputs[2] = {left, right};
-  std::vector<float> outputs[2];
-  outputs[0].assign(input_length, 0.0f);
-  outputs[1].assign(input_length, 0.0f);
+  // Size the two outputs after every early return and before the overlap-add
+  // loop, which writes into them by index. Leaving them empty makes the first
+  // store land on the null data() of an empty vector and takes the process down.
+  out_left.assign(input_length, 0.0f);
+  out_right.assign(input_length, 0.0f);
   std::vector<std::vector<double>> ola(2);
   std::vector<std::vector<double>> win_sq(2);
   for (size_t c = 0; c < 2; ++c) {
@@ -175,7 +177,15 @@ bool SeparateVocalWindow(
     for (size_t index = 1; index <= pad; ++index) out.push_back(in[input_length - 1 - index]);
   }
   const size_t padded_length = padded.front().size();
-  if (padded_length < kVocalSpectrogramFft) return false;
+  // Unreachable while input_length > pad + 1 above, since padding always clears
+  // one FFT frame. Kept as a guard, and it clears first: once the outputs are
+  // sized, a bare `return false` would hand back full-length zeroed buffers,
+  // which contradicts the header's "both outputs are left empty" on failure.
+  if (padded_length < kVocalSpectrogramFft) {
+    out_left.clear();
+    out_right.clear();
+    return false;
+  }
   const size_t frames = (padded_length - kVocalSpectrogramFft) / kVocalSpectrogramHop + 1;
   const size_t capped = std::min(frames, target_frames);
   const size_t n = kVocalSpectrogramFft;
