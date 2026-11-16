@@ -35,7 +35,12 @@ class PhrasePlannerTest {
     }
 
     @Test
-    fun vocalInIsM4AndAHoldsFourBeats() {
+    fun vocalInEchoesInstrumentalOutroIntoPickup() {
+        // Under the retuned weights the echo-out wins this pair: A is a pure
+        // instrumental outro, so a blend (M4) buys nothing — there is no vocal
+        // of A's to blend against B's pickup. Echoing A out and landing B's
+        // vocal pickup at bar 4 is cleaner, and the old stacked bonuses that
+        // used to outvote the template table are now capped at 0.08.
         val a = song("a", 120.0, 8, listOf(section(0, 8, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5)))
         val b = song(
             "b", 120.0, 16,
@@ -49,10 +54,10 @@ class PhrasePlannerTest {
             pickup = 1f,
         )
         val choice = assertNotNull(PhrasePlanner.select(a, b, 1, 120.0, 120.0))
-        assertEquals(MixTemplate.M4, choice.template)
+        assertEquals(MixTemplate.M6, choice.template)
         assertEquals(4, choice.entry.landingBar)
-        assertEquals(4.0, choice.tailBeats, 0.01)
-        assertEquals("Vocal blend", choice.rung)
+        assertEquals(0.0, choice.tailBeats, 0.01)
+        assertEquals("Echo", choice.rung)
     }
 
     @Test
