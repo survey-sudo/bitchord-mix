@@ -37,7 +37,6 @@ import com.music.bitchord.data.listentogether.ListenTogether
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.settings.AppSettings
-import com.music.bitchord.data.settings.AutomixPerformanceMode
 import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.TrackMatcher
 import com.music.bitchord.playback.AudioCache
@@ -530,9 +529,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     /**
      * Sleeps out a [yieldToPlayback] window before decode or inference.
-     * Priority drops only while the window is open, and is put back to the
-     * mode's normal level when it ends so the rest of the pass is not left
-     * in the background cgroup.
+     *
+     * vc75: analysis sits in the background cgroup for the whole pass, not
+     * only while the window is open. It tolerates latency; the audio render
+     * thread does not, and a mel pass or an inference batch at default
+     * priority was landing on the same core at the instant the sink was
+     * trying to fill a buffer.
      */
     /** [playbackFirst], then the party's stop flag. Safe to poll from a decode loop. */
     private fun yieldOrStopped(): Boolean {
@@ -542,6 +544,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private fun playbackFirst() {
         if (android.os.SystemClock.elapsedRealtime() >= yieldUntilElapsed) return
+        // No restore after the wait: with the whole pass pinned to background
+        // there is nothing to put back, and the second call that used to undo
+        // the drop is now the same value. Kept as one call, at the point where
+        // the work actually starts waiting.
         Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
         while (!stopped && android.os.SystemClock.elapsedRealtime() < yieldUntilElapsed) {
             val left = yieldUntilElapsed - android.os.SystemClock.elapsedRealtime()
@@ -552,13 +558,6 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 break
             }
         }
-        Process.setThreadPriority(
-            if (AppSettings.automixPerformanceMode.value == AutomixPerformanceMode.EFFICIENT) {
-                Process.THREAD_PRIORITY_BACKGROUND
-            } else {
-                Process.THREAD_PRIORITY_DEFAULT
-            },
-        )
     }
 
     fun request(trackId: String, uri: Uri, durationSeconds: Double) {
@@ -672,15 +671,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 store.load(trackId)?.let { results.putIfAbsent(trackId, it) }
             }
             try {
-                // Efficient mode yields to decoding and playback rather than
-                // competing for a core. Thread count remains the speed knob.
-                Process.setThreadPriority(
-                    if (AppSettings.automixPerformanceMode.value == AutomixPerformanceMode.EFFICIENT) {
-                        Process.THREAD_PRIORITY_BACKGROUND
-                    } else {
-                        Process.THREAD_PRIORITY_DEFAULT
-                    },
-                )
+                // vc75: every mode yields to decoding and playback rather
+                // than competing for a core. Thread count remains the speed
+                // knob.
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 // [restoreOnce] queues onto this same single-threaded executor,
                 // so a stored result for this track has landed by now if there
                 // was one — but the decision to get here was taken a tick
