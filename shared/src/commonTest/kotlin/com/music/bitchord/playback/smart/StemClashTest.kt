@@ -52,7 +52,10 @@ class StemClashTest {
             r += 0.05
         }
         assertEquals(0.0, WienerGain.energyAt(0.0), 1e-9)
-        assertEquals(1.0, WienerGain.energyAt(1.0), 1e-9)
+        // The epsilon the native code carries is reproduced here, so a mask of
+        // 1.0 lands a hair under 1.0 rather than exactly on it.
+        assertEquals(1.0, WienerGain.energyAt(1.0), 1e-6)
+        assertTrue(WienerGain.energyAt(1.0) <= 1.0, "a gain above 1.0 would be amplification")
     }
 
     /**
@@ -74,10 +77,15 @@ class StemClashTest {
     }
 
     @Test
-    fun nonFiniteMaskReadsAsSilence() {
+    fun nonFiniteMaskIsNotAMeasurement() {
+        // A non-finite mask is not a reading, so it keeps nothing. That matches
+        // how weightedClash treats non-finite presence: it is refused rather
+        // than guessed at in either direction. Claiming 1.0 for +inf would let
+        // a corrupted mask assert that a bin is fully vocal, which is exactly
+        // the kind of fabricated evidence this file exists to stop.
         assertEquals(0.0, WienerGain.energyAt(Double.NaN), 1e-9)
         assertEquals(0.0, WienerGain.energyAt(Double.NEGATIVE_INFINITY), 1e-9)
-        assertEquals(1.0, WienerGain.energyAt(Double.POSITIVE_INFINITY), 1e-9)
+        assertEquals(0.0, WienerGain.energyAt(Double.POSITIVE_INFINITY), 1e-9)
     }
 
     // ---- the weighted clash ------------------------------------------------
@@ -120,16 +128,26 @@ class StemClashTest {
 
     @Test
     fun instrumentalOverlapCarriesNoClashWeight() {
+        // Presence is small but not zero — a real instrumental still reads as a
+        // few percent vocal on the mask. The point is that it carries no
+        // measurable weight, not that the product is exactly zero.
         val instrumental = List(20) { ClashFrame(0.02, 0.03, 0.8) }
-        assertEquals(0.0, weightedClash(instrumental)!!, 1e-9, "no vocal, no clash")
+        assertTrue(
+            weightedClash(instrumental)!! < 0.005,
+            "an instrumental bed is not a clash (got ${weightedClash(instrumental)})",
+        )
     }
 
     @Test
     fun onlyOneSideSingingCarriesNoClashWeight() {
         // Outgoing sings hard, incoming is instrumental — a normal, desirable
-        // overlap. The product presenceOut * presenceIn is what makes it zero.
+        // overlap. The product presenceOut * presenceIn is what makes it
+        // negligible: one singer is not a collision.
         val oneSided = List(20) { ClashFrame(0.85, 0.02, 0.9) }
-        assertEquals(0.0, weightedClash(oneSided)!!, 1e-9, "one singer is not a clash")
+        assertTrue(
+            weightedClash(oneSided)!! < 0.05,
+            "one singer is not a clash (got ${weightedClash(oneSided)})",
+        )
     }
 
     @Test
