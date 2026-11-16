@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc77 (2.2.3-djmix35). File kept as vc75-gate.sh for history; it now gates vc77. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build gate for vc78 (2.2.3-djmix36). File kept as vc75-gate.sh for history; it now gates vc78. Needs only g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
@@ -32,7 +32,7 @@ say()  { printf '%s\n' "$*"; }
 # false failure this gate produced once and should never produce again.
 WORK="${VC75_GATE_TMP:-${HOME}/.cache/vc75-gate}"
 mkdir -p "$WORK" 2>/dev/null || WORK="${TMPDIR:-/tmp}"
-trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log" "$WORK/lm_bin" "$WORK/lm.out" "$WORK/lm.build.log"' EXIT
+trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log" "$WORK/lm_bin" "$WORK/lm.out" "$WORK/lm.probe.out" "$WORK/lm.build.log"' EXIT
 
 say "=== tree: $(pwd) ==="
 say "HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
@@ -70,10 +70,10 @@ fi
 # --- HARD: version stamp -----------------------------------------------------
 # versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
 # no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 77' build.gradle.kts \
-  && ok "versionCode is 77" || bad "versionCode is not 77"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix35"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix35" || bad "versionName is not 2.2.3-djmix35"
+grep -q 'extra\["bitchordVersionCode"\] = 78' build.gradle.kts \
+  && ok "versionCode is 78" || bad "versionCode is not 78"
+grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix36"' build.gradle.kts \
+  && ok "versionName is 2.2.3-djmix36" || bad "versionName is not 2.2.3-djmix36"
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""
@@ -141,7 +141,7 @@ else
   fi
 fi
 
-# --- HARD: loopmix A/B selftest (vc77 reverb-tail) ---------------------------
+# --- HARD: loopmix A/B selftest + reverb-stop probe (vc78 reverb-tail) --------
 say ""
 LM_IMPL="native/loopmix/loop_mix_renderer.cpp"
 LM_MAIN="native/loopmix/loop_mix_renderer_ab_main.cpp"
@@ -156,6 +156,16 @@ else
       rc=$?
       bad "loopmix A/B selftest FAILED (exit $rc)"
       sed -n '1,25p' "$WORK/lm.out"
+    fi
+    # vc78 HARD: production-faithful reverb-stop probe (same binary).
+    # Thresholds live in the harness and are unchanged; this invocation
+    # exists so the hard-cut defect cannot silently regress.
+    if "$WORK/lm_bin" --reverb-stop-probe >"$WORK/lm.probe.out" 2>&1; then
+      ok "loopmix reverb-stop probe passed"
+    else
+      rc=$?
+      bad "loopmix reverb-stop probe FAILED (exit $rc)"
+      sed -n '1,40p' "$WORK/lm.probe.out"
     fi
   else
     bad "loopmix A/B selftest did not compile — see $WORK/lm.build.log"

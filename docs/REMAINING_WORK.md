@@ -1,9 +1,86 @@
 # Remaining work
 
-Status snapshot, 2026-11-16. Everything below is either **blocked**, **measured**, or
-**not started** — no item is claimed done without evidence.
+## vc78 candidate — reproduced wet-stop defect
 
-Current build: `vc76` / `2.2.3-djmix34`, signed APK `67,433,006 B`,
+Pending candidate: **78 / 2.2.3-djmix36**, based on installed `vc77`.
+The `vc77` listening failure remains authoritative; this candidate has not
+yet been built or heard on device.
+
+- Added native `--reverb-stop-probe` using the production send/release/stop
+  geometry and deterministic broadband transients, with no artificial decay gap.
+  Unmodified `vc77` fails: standard wash late-50 ms RMS **−49.174 dBFS**, only
+  **26.239 dB** below the active window, boundary step **0.003066**. The dry-gain
+  exit gate still reports zero violations. This demonstrates a wet cutoff, but
+  does not establish that every reported abrupt transition has this cause.
+- Candidate retires actual reverb output with a smooth envelope ending at
+  `stopAt`; zero send stops new input rather than instantly zeroing stored wet
+  output. Original probe passes: standard late RMS **−99.897 dBFS**, drop
+  **76.962 dB**, step below threshold. Removing retirement makes the probe fail.
+- Wet-only preservation passes: early post-release RMS **−28.985 / −29.844 dBFS**,
+  within 0.5 dB of the old renderer. Deliberately muting reverb fails preservation;
+  removing retirement restores the boundary failure. Scheduled echo behavior
+  remains unchanged. Focused review found no remaining blocker for the reproduced
+  reverb geometry; full native gate passed after reconciliation (exit 0).
+  Production probe is required by both Actions jobs and `tools/vc75-gate.sh`.
+  Android CI/build, signing, install, and listening checks are still pending.
+- Pause-reason hypothesis withdrawn: shipped Media3 1.11.0 bytecode confirms
+  `USER_REQUEST=1`, `END_OF_MEDIA_ITEM=5`. The replay pause is not evidence of
+  an internal end-of-item pause. No auto-resume or user-pause behavior change
+  is planned for this candidate.
+
+---
+
+Status snapshot, 2026-11-17 (local date). **Candidate: vc77 / 2.2.3-djmix35;
+signed and installed; transition/listening verification pending.** Earlier records below
+are historical where they conflict with this snapshot.
+
+- Source: branch `vc77-ci`, commit `39290def8024a66840d1caa993a83f4d1c440f97`.
+- [Actions run 43912914370](https://github.com/survey-sudo/bitchord-mix/actions/runs/43912914370)
+  passed both jobs, including the actual release assemble/audit/upload steps
+  (the job's `continue-on-error` did not mask a failure).
+- Downloaded HTML reports independently checked: shared **495 tests, 0 failures,
+  0 ignored**; app **1,373 tests, 0 failures, 1 ignored** (live Genius test).
+  No XML was uploaded by this workflow.
+- Latest unsigned APK SHA-256:
+  `2cc665fac3fc6b4161eec897c02e703fcb7fd03d1becd9078382ac871d57e66f`.
+  Artifact and reports are outside the repo under
+  `~/Bitchord/work/vc77-followup-ci/43912914370/`.
+- Follow-ups include prime stem retention, accepted-only phrase script/detail
+  commits, abnormal-exit survivor filter recovery, stale-tail cleanup, a
+  buffering watchdog, and native-floor stem sizing with bounded endpoint
+  completion. These passed CI; audible behavior remains unverified.
+- Remaining review items: active-sweep flush continuity, shift retry lead,
+  per-build timing isolation, inference deadline after a model-lock wait, and
+  a production-envelope reverb-tail test. The timing fix is a proposal only.
+- Signed on `bk-android` after its cooldown, without uploading the key to GitHub.
+  Certificate SHA-256 matches
+  `20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c`;
+  v2/v3 signature verification, 16 KiB alignment check, and APK audit passed.
+  Signed APK: **67,548,469 B**, SHA-256
+  `485dd2aa978902d6a6887b958f34c6a5524cd78903c6458f9221d239d6752909`,
+  retained under the artifact directory's `signed/` folder.
+- Wi-Fi ADB update on `1439ebea`: `adb install -r` succeeded; package manager
+  confirms **77 / 2.2.3-djmix35**; launched successfully (PID 17782 at check).
+  Existing app data/23-item queue retained and pre-update telemetry saved outside
+  the repo. First 15-minute capture completed: **2 loop transitions**, both
+  `mix.verify.ok=true` and `exitGateViolations=0`; handover heard minus expected
+  offsets **+58 ms / +60 ms**. One `stem-duck` decision logged measured
+  `clashE=0.14529196781328904` (0 null-clash decisions in this small sample).
+  This proves a measured duck decision, not successful ONNX separation or
+  perceptual stem quality. No `mix.arm.death`, `shift-bar-null`, or fatal exception
+  was observed. Neither targeted reverb-tail coverage nor a rare-failure rate
+  is established by two transitions. Playback was paused at the final check;
+  it was left paused. Logs/fresh telemetry are under the artifact's `device-after/`.
+  `vc76` reproduced the demuffle/reverb zap and null stem-clash metric;
+  **Listening result: user reports the zap is still present, abrupt and not
+  graceful. The vc77 audible-fix claim is refuted; release remains blocked.**
+  A subsequent manual replay logged a user-request pause during a live loop,
+  then `mix.exit.guard` / 350 ms emergency tail at full retiree gain. Its
+  causal relationship to the heard zap is not established. A focused lifecycle
+  trace and production-envelope native probe are in progress. Blind A/B and
+  targeted seek/reverb/abnormal-exit checks remain open; Apple Music parity is unproven.
+
+Historical baseline: `vc76` / `2.2.3-djmix34`, signed APK `67,433,006 B`,
 SHA-256 `02920d8278003c5fe9b492a3f0a0dc052ddb4b48a93d8e8ff2e2b84cb1e0ca79`,
 signed with cert SHA-256
 `20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c` on
@@ -11,8 +88,8 @@ signed with cert SHA-256
 `~/Bitchord/work/vc76-release/`. Prior `vc75` (`78d006d7...`, `b7375e8`)
 remains superseded before device verification.
 
-**`vc76` is not yet installed on `1439ebea`** (no device on `adb`), so the
-mid-playback verification below is still open and `vc76` is unproven on device.
+The earlier pre-install baseline below is retained for reference; the latest
+device findings and pending candidate are recorded above.
 
 Test & gate record on `bk-android` at `vc76`: `:shared:jvmTest` **479/479**
 pass; `:app:testProdDebugUnitTest` **1358/1359** pass (1 skipped), with only
@@ -46,9 +123,9 @@ detector on the analyzer's calibrated scale (chorus `0.57–0.71`, soft verse
 and blind the planner to the soft verse the whole overhaul exists to catch.
 Pinned in `StemClashTest.detectorThresholdMustStayOnTheDetectorScale`.
 
-Build rule: APKs are built on instabox `bk-android`, not on this PC. `vc76`
-(`2.2.3-djmix34`) is built and pulled to `~/Bitchord/work/vc76-release/`, and
-awaits device install and listening verification.
+Build rule: Gradle runs on GitHub Actions or `bk-android`, never on this PC.
+The current path builds unsigned on Actions and signs with the existing key
+on `bk-android`; APKs and keystores stay outside the repository.
 
 ---
 
@@ -145,7 +222,9 @@ Signing is optional — with no secrets it emits `app-release-unsigned.apk`. To 
 signed, installable APK, add four repository secrets:
 `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`.
 
-**Decision pending:** whether the keystore goes into GitHub secrets at all.
+**Current decision:** use unsigned Actions output and sign on `bk-android`;
+no signing secrets need to be uploaded to GitHub. The latest run is recorded
+in the status snapshot above; older timing records below are historical.
 
 Latest CI record: run `43847603785` at `0157ee5` (`Unit tests` passed in `8m 24s`; `Release APK (arm64)` failed at `51m 1s` when the hosted runner lost communication). `.github/workflows/android-ci.yml` has since been hardened (`-Xmx3g`, `--max-workers=2 --no-daemon`, pre-build `df -h`, failure diagnostics upload, and `continue-on-error: true` on `release` until two consecutive green runs).
 

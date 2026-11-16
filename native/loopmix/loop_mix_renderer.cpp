@@ -16,6 +16,97 @@ constexpr int kControlFrames = 64;
 constexpr double kFadeSeconds = 0.025;
 constexpr double kLoopSeamSeconds = 0.008;  // djmix24 clickless 8 ms Hann / equal-power (sin/cos)
 constexpr double kPi = 3.14159265358979323846;
+/** Bounded fallback wet-retirement window when no send/gain geometry exists. Ends at stopAt, so it adds no handoff delay. */
+constexpr double kWetRetireFallbackSeconds = 1.0;
+constexpr double kNoRetire = 1e18;
+
+/**
+ * Start (mix seconds) of the smooth reverb-output retirement. Scheduled
+ * retirement is reverb-only in this release (echo keeps its preexisting
+ * normal output shape except for emergency `cancel` in renderDeck).
+ * Signal: outReverb(t) = rev(t) * w(t) * cancel(t), with
+ *   w(t) = 1                          t <= start
+ *        = 0.5*(1+cos(pi*(t-start)/(stopAt-start)))  start < t < stopAt
+ *        = 0                          t >= stopAt
+ * so w is continuous with zero slope at both ends: no sudden onset at
+ * `start`, and wet reaches exactly 0 at stopAt regardless of comb
+ * ringing. The window is the reverb send-envelope release geometry,
+ * used only when an actual positive-to-lower/zero final release exists:
+ * `start` is then the last peak of the final non-increasing suffix (the
+ * release point, e.g. releaseAt for the production
+ * [open,releaseAt,outStop]->[0,0.65,0] send), not the dry-gain zero time
+ * — the wash therefore rings through [releaseAt, stopAt] instead of
+ * being muted with the dry at releaseAt. A constant or increasing
+ * positive suffix has no such release, so it falls through below instead
+ * of fading from the first send point (e.g. a constant {0,0.65} send with
+ * stopAt=10 must not fade over [0,10]). Empty/non-releasing sends fall
+ * back to the dry gain's first sustained zero, then to a bounded 1 s
+ * window ending at stopAt; this fallback retires only reverb.
+ * runOn (incoming) decks and decks with no finite stopAt get kNoRetire
+ * (w==1): no premature fading.
+ * Stack-only scan of a handful of envelope points; no allocation/lock.
+ */
+double wetRetireStart(const Envelope& sendEnv, const Envelope& gainEnv, double stopAt, bool runOn) {
+  if (runOn) return kNoRetire;
+  if (!(stopAt < 1e15) || !std::isfinite(stopAt)) return kNoRetire;
+  if (!sendEnv.empty()) {
+    const size_t n = std::min(sendEnv.times.size(), sendEnv.values.size());
+    if (n > 0) {
+      size_t s = n - 1;
+      while (s > 0 && sendEnv.values[s - 1] >= sendEnv.values[s]) --s;
+      if (sendEnv.values[s] > 1e-6f) {
+        // Send-derived start only on an actual positive-to-lower final
+        // release with valid (finite, strictly increasing) suffix times.
+        // Constant/increasing positive suffixes (no strict fall) fall
+        // through to gain/bounded fallback below.
+        bool hasRelease = (s + 1 < n && sendEnv.values[n - 1] < sendEnv.values[s]);
+        if (hasRelease) {
+          for (size_t i = s; i + 1 < n; ++i) {
+            const double ta = sendEnv.times[i], tb = sendEnv.times[i + 1];
+            if (!std::isfinite(ta) || !std::isfinite(tb) || !(tb > ta)) {
+              hasRelease = false;
+              break;
+            }
+          }
+        }
+        if (hasRelease) {
+          size_t p = s;
+          while (p + 1 < n && sendEnv.values[p + 1] == sendEnv.values[s]) ++p;
+          const double start = sendEnv.times[p];
+          if (std::isfinite(start) && start < stopAt) return start;
+        }
+      } else {
+        return kNoRetire;  // send never meaningful: no stored wet to retire
+      }
+    }
+  }
+  if (!gainEnv.empty()) {
+    const size_t n = std::min(gainEnv.times.size(), gainEnv.values.size());
+    for (size_t i = 0; i < n; ++i) {
+      if (gainEnv.values[i] > 1e-6f) continue;
+      bool sustained = true;
+      for (size_t j = i; j < n; ++j) {
+        if (gainEnv.values[j] > 1e-6f) { sustained = false; break; }
+      }
+      if (!sustained) continue;
+      const double gz = gainEnv.times[i];
+      if (std::isfinite(gz) && gz < stopAt) return gz;
+      break;
+    }
+  }
+  const double start = stopAt - kWetRetireFallbackSeconds;
+  return start < 0.0 ? 0.0 : start;
+}
+
+inline float wetRetireMul(double t, double fadeStart, double stopAt) {
+  if (fadeStart >= 1e17) return 1.f;
+  if (t >= stopAt) return 0.f;
+  if (t <= fadeStart) return 1.f;
+  const double denom = stopAt - fadeStart;
+  if (!(denom > 0.0)) return 0.f;
+  const double u = std::clamp((t - fadeStart) / denom, 0.0, 1.0);
+  return float(std::clamp(0.5 * (1.0 + std::cos(kPi * u)), 0.0, 1.0));
+}
 
 }  // namespace
 
@@ -115,7 +206,11 @@ void ReverbWash::setup(double sampleRate, float roomSize, float dampingIn, float
 
 void ReverbWash::apply(float inL, float inR, float send, float& wetL, float& wetR, double sampleRate) {
   wetL = 0; wetR = 0;
-  if (!enabled || send <= 1e-6f || combL0.empty()) {
+  // Send gates only the comb *input* (clamped g below), not the output:
+  // at send==0 the combs keep ticking on zero input so the stored tail
+  // rings and is retired smoothly by renderDeck's wet multiplier at
+  // stopAt, rather than being hard-zeroed on the send==0 sample.
+  if (!enabled || combL0.empty() || !(sampleRate > 0)) {
     return;
   }
   const float g = std::clamp(send, 0.f, 1.f);
@@ -794,6 +889,10 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   // Gain, bass shelf and high-pass, in control blocks; the gain ramps per sample.
   const double fadeAt = deck.fadeOutAt.load(std::memory_order_relaxed);
   const double fadeSamples = kFadeSeconds * sr;
+  // Reverb-only scheduled wet-output retirement (stopAt), from the reverb
+  // send release geometry. runOn decks get kNoRetire (see helper). Echo
+  // has no scheduled fade in this release.
+  const double revFadeStart = wetRetireStart(deck.reverbSend, deck.gain, deck.stopAt, deck.runOn);
   for (int at = 0; at < frames; at += kControlFrames) {
     const int count = std::min(kControlFrames, frames - at);
     const double t0 = (frame + at) / sr;
@@ -833,7 +932,10 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     const float g1 = deck.gain.empty() ? 1.f : deck.gain.at(t1);
     for (int i = 0; i < count; ++i) {
       const int n = at + i;
-      float g = (g0 + (g1 - g0) * (float(i) / count)) * deck.level;
+      // Emergency cancellation fade (fadeOutAt): linear 1->0 over
+      // kFadeSeconds of heard position. It scales the dry (via g) AND the
+      // whole wet mix below, so an emergency exit cannot leak echo/reverb.
+      float cancel = 1.f;
       if (fadeAt >= 0) {
         const double heard = silentFrames > 0
             ? (n < silentFrames
@@ -841,8 +943,9 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
                 : heardStart + (heardEnd - heardStart) * (double(n - silentFrames) / double(std::max(1, activeFrames))))
             : (heardStart + (heardEnd - heardStart) * (double(n) / double(frames)));
         const double fade = std::clamp((fadeAt + fadeSamples - heard) / fadeSamples, 0.0, 1.0);
-        g *= float(fade);
+        cancel = float(fade);
       }
+      float g = (g0 + (g1 - g0) * (float(i) / count)) * deck.level * cancel;
       float l = deck.shelf.tick(0, outLeft_[n]);
       float r = deck.shelf.tick(1, outRight_[n]);
       l = deck.tptHighPass.tick(0, l);
@@ -888,8 +991,15 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         else if (!deck.knotTimes.empty() && (frame + n) >= deck.knotTimes.front()) revSend = 0.5f;
         deck.reverb.apply(l, r, revSend, revL, revR, sr);
       }
-      mixLeft_[n] += l * g + wetL + flangeL * g + revL;
-      mixRight_[n] += r * g + wetR + flangeR * g + revR;
+      // Fade the actual reverb output (not just the send): rev sits
+      // outside dry gain g, so without w(t)*cancel it hard-cuts at stopAt.
+      // Echo keeps its preexisting normal shape (wetL/R unscaled) except
+      // for emergency `cancel`, so an emergency exit cannot leak it either.
+      // Flanger already rides g (hence cancel) and its own envelope.
+      const double tMix = double(frame + n) / sr;
+      const float revMul = wetRetireMul(tMix, revFadeStart, deck.stopAt) * cancel;
+      mixLeft_[n] += l * g + wetL * cancel + flangeL * g + revL * revMul;
+      mixRight_[n] += r * g + wetR * cancel + flangeR * g + revR * revMul;
     }
   }
   if (fadeAt >= 0 && heardStart > fadeAt + fadeSamples) deck.finished = true;

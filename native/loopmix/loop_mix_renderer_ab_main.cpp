@@ -14,6 +14,18 @@
 //     bed + vocal sine) and renders them through Renderer::prepare()/render()
 //     in duck-off / fixed-0.15 / duck-gain(0.18) / duck-gain(0.60) / null-clash
 //     modes, checking overlap RMS ordering and exit-gate violations.
+//   --reverb-stop-probe:
+//     Production-faithful vc77 reverb-stop regression probe (OUT deck only).
+//     Recreates LoopMixSession.kt's reverbWash envelope
+//     (reverbSend [releaseAt-beatSec, releaseAt, outStop] -> [0, 0.65, 0],
+//     KIND_GAIN MixGain fallPoints to 0 at releaseAt,
+//     outStop = releaseAt + 0.05 + echoHold(0) + exitTail) with a broadband
+//     transient PCM (LCG white noise, no sine) and no artificial silence gap
+//     (send reaches 0 exactly at stopAt; gain is 0 from releaseAt while the
+//     native wet is still fed, because renderDeck adds revL outside gain).
+//     Measures late wet RMS and the single-sample discontinuity at the stop
+//     boundary and prints the numbers. Exit 1 if the hard cut is present.
+//     Objective numbers only; a PASS here does not prove subjective grace.
 //   File A/B mode:
 //     /tmp/loopmix_ab --out-bed out_bed.wav --out-voc out_voc.wav
 //       --in-bed in_bed.wav --in-voc in_voc.wav --out-prefix /tmp/ab
@@ -801,6 +813,397 @@ int runSelfTest() {
 }
 
 // ---------------------------------------------------------------------------
+// --reverb-stop-probe (vc77 production-faithful regression probe).
+//
+// Why the --selftest reverb block above cannot see the zap: it uses
+// reverbSend {0,2,3}->{0,0.65,0} with gain 0 at 4 s and stopAt 5 s, i.e. a
+// 2.0 s silence gap between send=0 and stopAt (plus 1.0 s between gain=0 and
+// stopAt). The reverb tail has long decayed by stopAt, so RMS in
+// [stop-0.2, stop] is silent and the check passes on any smooth decay.
+//
+// Production (LoopMixSession.kt, non-echo reverbWash branch) is:
+//   reverbSend = [open, releaseAt, outStop] -> [0, 0.65, 0],
+//     open = releaseAt - beatSec, outStop = releaseAt + 0.05 + echoHold + exitTail
+//   KIND_GAIN = [-HANDOVER, 0, enterEnd, *MixGain.fallPoints(rampEnd, releaseAt)]
+//     (equal-power cos, 0 at releaseAt, stays 0 through outStop)
+//   Deck stopAt = outStop; setReverb roomSize=2.2, damping/wet from PhraseConfig
+//     (standard 0.55/0.35, EDM buildup 0.48/0.42).
+// The send reaches 0 exactly at stopAt: zero gap. During
+// [releaseAt, outStop] the dry gain is 0 but the native wet is still fed:
+// renderDeck does mix += l*g + ... + revL (rev outside gain, input l/r
+// pre-gain) and ReverbWash::apply gates only the comb INPUT by send
+// (send<=1e-6 => wet=0), not the tail. The stored comb energy therefore
+// rings until the per-sample send gate and/or the stopAt early return
+// (finished, zero contribution) hard-cut it to 0 in one sample/block.
+//
+// This probe recreates that envelope exactly (rate-1 straight knots with the
+// tail knot at outStop, as buildDeckKnots emits), feeds broadband transient
+// PCM (deterministic LCG white noise, no sine), keeps PCM loud through
+// outStop (production decoded audio continues; only the gain fades), and
+// measures: (a) boundary cut: late wet RMS vs active RMS and the cut deltas
+// at stop (thresholds unchanged: >40 dB drop, <0.001 step), and (b) wet
+// preservation: wet-only RMS in [releaseAt,+0.1]/[+0.1,+0.2] (dry gain is
+// already 0 there, so OUT==wet) must stay above -60 dB, so a muted reverb
+// cannot pass by silence. RMS windows (4800 frames each) are robust to
+// broadband sample luck; no claim of subjective grace is made either way.
+// ---------------------------------------------------------------------------
+
+namespace probe {
+
+// Deterministic LCG uniform in [-1, 1].
+struct Lcg {
+  uint32_t s;
+  explicit Lcg(uint32_t seed) : s(seed) {}
+  float next() {
+    s = s * 1664525u + 1013904223u;
+    return static_cast<float>(static_cast<int32_t>(s)) / 2147483648.0f;
+  }
+};
+
+// Broadband transient PCM: white noise gated by a beat-synced crash
+// envelope. No sine content (contrast --selftest). Decorrelated stereo.
+void synthTransientNoise(std::vector<float>& outL, std::vector<float>& outR,
+                         size_t frames, double beatSec) {
+  outL.assign(frames, 0.0f);
+  outR.assign(frames, 0.0f);
+  Lcg lcgl(0x9E3779B9u), lcgr(0x85EBCA6Bu);
+  const double sr = static_cast<double>(kSampleRate);
+  for (size_t i = 0; i < frames; ++i) {
+    const double t = static_cast<double>(i) / sr;
+    const double lastBeat = std::floor(t / beatSec) * beatSec;
+    const double dt = t - lastBeat;
+    const double crash = std::exp(-dt / 0.07);
+    const float env = static_cast<float>(0.35 + 0.55 * crash);
+    outL[i] = lcgl.next() * env;
+    outR[i] = lcgr.next() * env;
+  }
+}
+
+// MixGain.fallPoints(from, to, 16): equal-power cos samples.
+void fallPoints(double from, double to, std::vector<double>& times,
+                std::vector<float>& vals) {
+  times.clear();
+  vals.clear();
+  constexpr int n = 16;
+  for (int k = 0; k <= n; ++k) {
+    times.push_back(from + (to - from) * static_cast<double>(k) / n);
+    vals.push_back(static_cast<float>(std::cos(kPi * static_cast<double>(k) /
+                                              (static_cast<double>(n) * 2.0))));
+  }
+}
+
+double rmsDbWindow(const std::vector<float>& buf, int64_t firstFrame,
+                   int64_t tailEnd, double s, double e) {
+  int64_t fs = static_cast<int64_t>(std::llround(s * static_cast<double>(kSampleRate)));
+  int64_t fe = static_cast<int64_t>(std::llround(e * static_cast<double>(kSampleRate)));
+  fs = std::clamp<int64_t>(fs, firstFrame, tailEnd);
+  fe = std::clamp<int64_t>(fe, fs, tailEnd);
+  double sumSq = 0.0;
+  int64_t count = 0;
+  for (int64_t frame = fs; frame < fe; ++frame) {
+    const size_t idx = static_cast<size_t>(frame - firstFrame) * 2;
+    const double l = buf[idx];
+    const double r = buf[idx + 1];
+    sumSq += l * l + r * r;
+    ++count;
+  }
+  const double rms = count > 0 ? std::sqrt(sumSq / (static_cast<double>(count) * 2.0))
+                               : std::numeric_limits<double>::quiet_NaN();
+  return (rms > 0.0 && std::isfinite(rms)) ? 20.0 * std::log10(rms) : -240.0;
+}
+
+double peakWindow(const std::vector<float>& buf, int64_t firstFrame,
+                  int64_t tailEnd, double s, double e) {
+  int64_t fs = static_cast<int64_t>(std::llround(s * static_cast<double>(kSampleRate)));
+  int64_t fe = static_cast<int64_t>(std::llround(e * static_cast<double>(kSampleRate)));
+  fs = std::clamp<int64_t>(fs, firstFrame, tailEnd);
+  fe = std::clamp<int64_t>(fe, fs, tailEnd);
+  double peak = 0.0;
+  for (int64_t frame = fs; frame < fe; ++frame) {
+    const size_t idx = static_cast<size_t>(frame - firstFrame) * 2;
+    peak = std::max(peak, std::abs(static_cast<double>(buf[idx])));
+    peak = std::max(peak, std::abs(static_cast<double>(buf[idx + 1])));
+  }
+  return peak;
+}
+
+double maxStepWindow(const std::vector<float>& buf, int64_t firstFrame,
+                     int64_t tailEnd, double s, double e,
+                     int64_t* atFrameOut) {
+  int64_t fs = static_cast<int64_t>(std::llround(s * static_cast<double>(kSampleRate)));
+  int64_t fe = static_cast<int64_t>(std::llround(e * static_cast<double>(kSampleRate)));
+  fs = std::clamp<int64_t>(fs, firstFrame + 1, tailEnd);
+  fe = std::clamp<int64_t>(fe, fs, tailEnd);
+  double best = 0.0;
+  int64_t at = fs;
+  for (int64_t frame = fs; frame <= fe; ++frame) {
+    const size_t idx = static_cast<size_t>(frame - firstFrame) * 2;
+    const size_t pidx = static_cast<size_t>(frame - 1 - firstFrame) * 2;
+    const double dL = std::abs(static_cast<double>(buf[idx]) - buf[pidx]);
+    const double dR = std::abs(static_cast<double>(buf[idx + 1]) - buf[pidx + 1]);
+    const double d = std::max(dL, dR);
+    if (d > best) { best = d; at = frame; }
+  }
+  if (atFrameOut) *atFrameOut = at;
+  return best;
+}
+
+bool runCase(const char* caseName, float damping, float wet,
+             bool* preservationOut /*optional*/) {
+  // Production-faithful clock (representative 120 BPM straight blend).
+  // Only envelope-relative gaps matter: send-zero->stop = 0 s, gain-zero->stop
+  // = 0.05 + exitTail. Absolute releaseAt selects PCM length only.
+  constexpr double beatSec = 0.5;                 // 60/120
+  constexpr double exitTail = 1.0;                // clamp(2*0.5, 0.8, 2.0)
+  constexpr double releaseAt = 6.0;               // 12 beats at 0.5 s
+  constexpr double open = releaseAt - beatSec;    // 5.5
+  constexpr double outStop = releaseAt + 0.05 + 0.0 + exitTail; // 7.05 (echoHold=0)
+  constexpr double enterEnd = 2.0, rampEnd = 4.0; // fallPoints(4.0, 6.0)
+  constexpr double handover = 0.025;              // LoopMix.HANDOVER_SEC
+
+  const size_t regionFrames = static_cast<size_t>(9.0 * kSampleRate);
+  std::vector<float> pcmL, pcmR;
+  synthTransientNoise(pcmL, pcmR, regionFrames, beatSec);
+
+  Renderer renderer(kSampleRate);
+  renderer.setHighQuality(false); // as --selftest; rate-1 knots, stretch ~transparent
+  renderer.setReverb(0, 2.2f, damping, wet);
+
+  auto& d0 = renderer.deck(0);
+  d0.left = pcmL;
+  d0.right = pcmR;
+  d0.regionStart = 0.0;
+  d0.loopStart = 0;
+  d0.loopEnd = 0;
+  d0.releaseAt = 1e18;
+  // Straight knots at rate 1 with the tail knot at outStop (buildDeckKnots
+  // with tailRate 1.0); linear so [0, outStop] is exact.
+  d0.knotTimes = {0.0, outStop * static_cast<double>(kSampleRate)};
+  d0.knotPositions = {0.0, outStop * static_cast<double>(kSampleRate)};
+  d0.runOn = false;
+  d0.stopAt = outStop;
+  d0.preroll = 0.4;
+  d0.level = 1.0f;
+  // KIND_REVERB_SEND: LoopMixSession.kt reverbWash branch (vc77 taper).
+  d0.reverbSend.times = {open, releaseAt, outStop};
+  d0.reverbSend.values = {0.0f, 0.65f, 0.0f};
+  // KIND_GAIN: [-h, 0, enterEnd, *fallPoints(rampEnd, releaseAt)].
+  {
+    std::vector<double> ft;
+    std::vector<float> fv;
+    fallPoints(rampEnd, releaseAt, ft, fv);
+    d0.gain.times = {-handover, 0.0, enterEnd};
+    d0.gain.values = {0.0f, 1.0f, 1.0f};
+    for (size_t k = 0; k < ft.size(); ++k) {
+      d0.gain.times.push_back(ft[k]);
+      d0.gain.values.push_back(fv[k]);
+    }
+  }
+  // Deck 1 (IN) left empty/finished: OUT-only isolates the wet tail (dry gain
+  // is 0 past releaseAt, so OUT == wet there). Production IN would sum on top
+  // and dilute late RMS; the step would remain in the sum.
+  renderer.prepare();
+
+  const int64_t firstFrame = renderer.firstFrame();
+  const double renderEnd = outStop + 1.0;
+  const int64_t tailEnd =
+      static_cast<int64_t>(std::llround(renderEnd * static_cast<double>(kSampleRate)));
+  const int64_t tailTotal = tailEnd - firstFrame;
+  std::vector<float> tailOut(static_cast<size_t>(tailTotal) * 2, 0.0f);
+  constexpr int64_t kBlock = 4096;
+  int64_t done = 0;
+  while (done < tailTotal) {
+    const int64_t chunk = std::min<int64_t>(kBlock, tailTotal - done);
+    renderer.render(firstFrame + done, tailOut.data() + static_cast<size_t>(done) * 2,
+                    static_cast<int>(chunk));
+    done += chunk;
+  }
+  const int violations = renderer.exitGateViolations();
+
+  const int64_t stopFrame = static_cast<int64_t>(std::llround(outStop * static_cast<double>(kSampleRate)));
+  const double activeDb = rmsDbWindow(tailOut, firstFrame, tailEnd, open, releaseAt);
+  const double activeLateDb =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, releaseAt - 0.25, releaseAt);
+  const double late200Db =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, outStop - 0.2, outStop);
+  const double late50Db =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, outStop - 0.05, outStop);
+  const double late10Db =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, outStop - 0.01, outStop);
+  const double postDb =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, outStop + 0.05, outStop + 0.5);
+  // Wet-only preservation windows: dry gain is 0 from releaseAt on (fall
+  // envelope stays 0), OUT-only render, so OUT==rev wet (times the
+  // candidate's retire multiplier, ~1.0 in this early band). RMS over 4800
+  // frames is broadband-robust (not single-sample luck).
+  const double wet100Db =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, releaseAt, releaseAt + 0.1);
+  const double wet100bDb =
+      rmsDbWindow(tailOut, firstFrame, tailEnd, releaseAt + 0.1, releaseAt + 0.2);
+  const double wet200Peak =
+      peakWindow(tailOut, firstFrame, tailEnd, releaseAt, releaseAt + 0.2);
+  const double late50Peak =
+      peakWindow(tailOut, firstFrame, tailEnd, outStop - 0.05, outStop);
+  int64_t stepAt = stopFrame;
+  const double boundaryStep =
+      maxStepWindow(tailOut, firstFrame, tailEnd, outStop - 0.025, outStop + 0.025, &stepAt);
+  int64_t activeStepAt = static_cast<int64_t>(open * kSampleRate);
+  const double activeStep =
+      maxStepWindow(tailOut, firstFrame, tailEnd, open, releaseAt, &activeStepAt);
+
+  double ampBeforeL = 0, ampBeforeR = 0, ampAfterL = 0, ampAfterR = 0;
+  const int64_t cutIdx = stopFrame - firstFrame;
+  if (cutIdx >= 1 && cutIdx < tailTotal) {
+    ampBeforeL = tailOut[static_cast<size_t>(cutIdx - 1) * 2];
+    ampBeforeR = tailOut[static_cast<size_t>(cutIdx - 1) * 2 + 1];
+    ampAfterL = tailOut[static_cast<size_t>(cutIdx) * 2];
+    ampAfterR = tailOut[static_cast<size_t>(cutIdx) * 2 + 1];
+  }
+  // Verdict steps are the actual cut deltas, not the window max:
+  //  (a) per-sample send gate at stopFrame (ReverbWash apply: send<=1e-6 => wet=0);
+  //  (b) block early-return at first blockStart>=stopAt (renderDeck finished).
+  // Window max / active-window max are diagnostics only: broadband noise has
+  // large natural sample-to-sample steps (active max ~0.65), so they cannot
+  // isolate the cut. The RMS drop above is averaged over 2400 samples and is
+  // the robust loudness check; the two cut deltas are the discontinuity check.
+  auto deltaAt = [&](int64_t frame) -> double {
+    const int64_t idx = frame - firstFrame;
+    if (idx < 1 || idx >= tailTotal) return 0.0;
+    const double dL = std::abs(static_cast<double>(tailOut[static_cast<size_t>(idx) * 2]) -
+                                 tailOut[static_cast<size_t>(idx - 1) * 2]);
+    const double dR = std::abs(static_cast<double>(tailOut[static_cast<size_t>(idx) * 2 + 1]) -
+                                 tailOut[static_cast<size_t>(idx - 1) * 2 + 1]);
+    return std::max(dL, dR);
+  };
+  const double cutStepStop = deltaAt(stopFrame);
+  const int64_t span = stopFrame - firstFrame;
+  const int64_t blockBlocks = (span + kBlock - 1) / kBlock;
+  const int64_t blockCutFrame = firstFrame + blockBlocks * kBlock;
+  const double cutStepBlock = (blockCutFrame != stopFrame) ? deltaAt(blockCutFrame) : cutStepStop;
+  const double verdictStep = std::max(cutStepStop, cutStepBlock);
+  // Envelope vs measured output: send is 0 exactly at stop by construction,
+  // but the measured late RMS proves the stored comb tail is still non-zero.
+  const double taperDur = outStop - releaseAt;
+  const double sendAtMinus50m = 0.65 * 0.05 / taperDur;
+  const double sendAtMinus10m = 0.65 * 0.01 / taperDur;
+
+  std::printf("probe case=%s damping=%.2f wet=%.2f\n", caseName,
+              static_cast<double>(damping), static_cast<double>(wet));
+  std::printf("  production params beatSec=%.4f releaseAt=%.4f open=%.4f outStop(stopAt)=%.4f "
+              "exitTail=%.4f echoHold=0.0\n",
+              beatSec, releaseAt, open, outStop, exitTail);
+  std::printf("  gaps: send-zero->stop=%.4f s (selftest %.4f) gain-zero->stop=%.4f s "
+              "(selftest %.4f)\n",
+              outStop - outStop, 5.0 - 3.0, outStop - releaseAt, 5.0 - 4.0);
+  std::printf("  render firstFrame=%lld stopFrame=%lld (%.4f s) violations=%d\n",
+              static_cast<long long>(firstFrame), static_cast<long long>(stopFrame),
+              outStop, violations);
+  std::printf("  RMS active[open,release]=%.3f dB active-late[release-0.25,release]=%.3f dB\n",
+              activeDb, activeLateDb);
+  std::printf("  RMS late200=%.3f late50=%.3f late10=%.3f post[stop+0.05,stop+0.5]=%.3f dB\n",
+              late200Db, late50Db, late10Db, postDb);
+  std::printf("  wet preservation W1[release,+0.1]=%.3f dB W2[+0.1,+0.2]=%.3f dB peak=%.6f "
+              "(dry gain 0 here, OUT==wet; stored wash must still ring)\n",
+              wet100Db, wet100bDb, wet200Peak);
+  std::printf("  drops active-late200=%.3f active-late50=%.3f active-late10=%.3f dB (need >40)\n",
+              activeDb - late200Db, activeDb - late50Db, activeDb - late10Db);
+  std::printf("  late50 peak=%.6f\n", late50Peak);
+  std::printf("  envelope send(stop-50ms)=%.6f send(stop-10ms)=%.6f send(stop)=0 "
+              "but measured late50 RMS=%.3f dB (residual nonzero; envelope=0 does not mean tail=0)\n",
+              sendAtMinus50m, sendAtMinus10m, late50Db);
+  std::printf("  diagnostic window max|dx| [stop-25ms,stop+25ms]=%.6f at frame %lld (offset %+lld) "
+              "active-window max|dx|=%.6f at %lld (natural broadband steps; not the verdict)\n",
+              boundaryStep, static_cast<long long>(stepAt),
+              static_cast<long long>(stepAt - stopFrame), activeStep,
+              static_cast<long long>(activeStepAt));
+  std::printf("  cut delta at stopFrame=%lld is %.6f; at block-start %lld is %.6f; verdict step=max=%.6f\n",
+              static_cast<long long>(stopFrame), cutStepStop,
+              static_cast<long long>(blockCutFrame), cutStepBlock, verdictStep);
+  std::printf("  sample before-stop L=%.6f R=%.6f after-stop L=%.6f R=%.6f (stopFrame idx %lld)\n",
+              ampBeforeL, ampBeforeR, ampAfterL, ampAfterR,
+              static_cast<long long>(cutIdx));
+
+  constexpr double kDropDb = 40.0;        // same contract as --selftest, true boundary (unchanged)
+  constexpr double kStep = 0.001;         // ~-60 dBFS single-sample jump (unchanged)
+  // Preservation floor (new, additive): the stored wash output must still
+  // ring just after releaseAt. Stored wash = comb buffers fed at send 0.65
+  // through [open,releaseAt], output *wet (~0.35-0.42). Measured (harness+HEAD
+  // renderer, git 2026-11-17): baseline W1/W2=-28.901/-29.422 dB,
+  // candidate (live) -28.985/-29.844 dB (preserved <0.5 dB), zero-wet
+  // mutation -104.76/-336.58 dB (W1 is 64-frame gain-ramp dry leak, W2
+  // silence). Cosine retire multiplier is ~1.0 in this early band, so a
+  // proper candidate stays near baseline. Floor -60 dB sits 31 dB below
+  // baseline (allows dimming) and 45/277 dB above muting (rejects muting).
+  constexpr double kPreserveDb = -60.0;
+  bool ok = true;
+  const bool preserveOk = (wet100Db > kPreserveDb) && (wet100bDb > kPreserveDb);
+  if (preservationOut) *preservationOut = preserveOk;
+  if (violations == 0) {
+    std::printf("  note exitGateViolations=0 (gate checks KIND_GAIN only: gain=0 at stop, "
+                "so wet hard-cut is invisible to it)\n");
+  }
+  if (activeDb - late50Db > kDropDb) {
+    std::printf("  ok late-50ms RMS drop %.3f dB > %.1f dB\n", activeDb - late50Db, kDropDb);
+  } else {
+    std::printf("FAIL late-50ms RMS drop %.3f dB <= %.1f dB (wet still loud at stop)\n",
+                activeDb - late50Db, kDropDb);
+    ok = false;
+  }
+  if (verdictStep < kStep) {
+    std::printf("  ok cut-step %.6f < %.6f\n", verdictStep, kStep);
+  } else {
+    std::printf("FAIL cut-step %.6f >= %.6f (hard cut at stop: send gate / early-return to 0)\n",
+                verdictStep, kStep);
+    ok = false;
+  }
+  if (preserveOk) {
+    std::printf("  ok wet preservation W1=%.3f W2=%.3f dB > %.1f dB (effect preserved)\n",
+                wet100Db, wet100bDb, kPreserveDb);
+  } else {
+    std::printf("FAIL wet preservation W1=%.3f W2=%.3f dB <= %.1f dB (effect too quiet / muted)\n",
+                wet100Db, wet100bDb, kPreserveDb);
+    ok = false;
+  }
+  std::printf("  %s case %s\n",
+              ok ? "PASS" : "FAIL (hard-cut/regression detected)",
+              caseName);
+  return ok;
+}
+
+}  // namespace probe
+
+int runReverbStopProbe() {
+  std::printf("reverb-stop-probe (vc77): production envelope + broadband transient, "
+              "no silence gap; objective numbers only, no subjective grace claim\n");
+  std::printf("  verdict = boundary (drop>40 dB + step<0.001, unchanged) AND wet preservation "
+              "(W1/W2>-60 dB). Diagnostic mut-zero-wet must fail preservation.\n");
+  bool ok = true;
+  bool presStd = false, presEdm = false;
+  ok = probe::runCase("std-0.55/0.35", 0.55f, 0.35f, &presStd) && ok;
+  ok = probe::runCase("edm-0.48/0.42", 0.48f, 0.42f, &presEdm) && ok;
+  // Sensitivity diagnostic (not a pass/fail case): silenced reverb must be
+  // caught by the preservation gate even though boundary drop/step "pass" in
+  // silence. Only the sensitivity-helds bit affects the exit (a properly
+  // fixed candidate passes std/edm boundary+preservation AND this bit).
+  bool mutPres = true;
+  (void)probe::runCase("mut-zero-wet", 0.55f, 0.0f, &mutPres);
+  const bool sensitivityOk = !mutPres;
+  std::printf("  mut-zero-wet sensitivity: preservation %s (expected: FAIL/muted) -> %s\n",
+              mutPres ? "PASSed (gate broken)" : "FAILed as expected",
+              sensitivityOk ? "sensitivity ok" : "SENSITIVITY ERROR");
+  if (!sensitivityOk) ok = false;
+  if (!presStd || !presEdm) {
+    std::printf("  NOTE: preservation failed on candidate (effect too quiet) - notify production writer\n");
+  }
+  if (ok) {
+    std::printf("ok reverb-stop-probe passed\n");
+    return 0;
+  }
+  std::printf("reverb-stop-probe failed (see FAIL numbers above)\n");
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // File A/B mode
 // ---------------------------------------------------------------------------
 
@@ -813,9 +1216,13 @@ struct FileOpts {
 void printUsage(std::ostream& os, const char* argv0) {
   os << "Usage:\n"
      << "  " << argv0 << " [--selftest]\n"
+     << "  " << argv0 << " --reverb-stop-probe\n"
      << "  " << argv0
      << " --out-bed <wav> --out-voc <wav> --in-bed <wav> --in-voc <wav>"
         " --out-prefix <path> [--clashE <val>] [--csv <gain.csv>]\n"
+     << "\n"
+     << "--reverb-stop-probe runs the vc77 production-faithful reverb-stop\n"
+     << "regression probe (see header comment). Exit 1 on hard cut.\n"
      << "\n"
      << "File mode renders duck-off, fixed-0.15, and duck-gain WAVs through\n"
      << "bitchord::loopmix::Renderer. Inputs are PCM16/float32 WAVs (mono or\n"
@@ -954,6 +1361,7 @@ int runFileMode(const FileOpts& opt) {
 int main(int argc, char** argv) {
   if (argc == 1) return runSelfTest();
   bool wantSelftest = false;
+  bool wantProbe = false;
   FileOpts opt;
   bool haveFileArgs = false;
   for (int i = 1; i < argc; ++i) {
@@ -967,6 +1375,8 @@ int main(int argc, char** argv) {
     };
     if (arg == "--selftest") {
       wantSelftest = true;
+    } else if (arg == "--reverb-stop-probe") {
+      wantProbe = true;
     } else if (arg == "--out-bed") {
       opt.outBed = needValue("--out-bed");
       haveFileArgs = true;
@@ -1016,6 +1426,7 @@ int main(int argc, char** argv) {
     }
     return runFileMode(opt);
   }
+  if (wantProbe) return runReverbStopProbe();
   if (wantSelftest || argc == 1) return runSelfTest();
   printUsage(std::cerr, argv[0]);
   return 2;
