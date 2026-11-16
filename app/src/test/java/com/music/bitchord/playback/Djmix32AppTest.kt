@@ -44,13 +44,15 @@ class Djmix32AppTest {
     @Test
     fun `stem skip gate true when analysis busy`() {
         val now = 1_000_000L
-        // Far from the splice with no deadline: only the busy gate can skip.
+        // Far from the splice with no deadline: only the busy gate can skip,
+        // and only at arm time (vc77: a prime retains stem separation).
         assertTrue(
             shouldSkipStemAtLaunch(
                 remainingToSpliceMs = 30_000L,
                 deadlineMs = DeckBudget.NO_DEADLINE_MS,
                 nowMs = now,
                 analysisBusy = true,
+                armWhenReady = true,
             ),
         )
         assertFalse(
@@ -59,6 +61,7 @@ class Djmix32AppTest {
                 deadlineMs = DeckBudget.NO_DEADLINE_MS,
                 nowMs = now,
                 analysisBusy = false,
+                armWhenReady = true,
             ),
         )
         // Near the splice, skip even when idle.
@@ -68,6 +71,54 @@ class Djmix32AppTest {
                 deadlineMs = DeckBudget.NO_DEADLINE_MS,
                 nowMs = now,
                 analysisBusy = false,
+                armWhenReady = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `prime build retains stems while analysis busy`() {
+        val now = 1_000_000L
+        // vc77 regression: a prime (armWhenReady=false) with 20-45 s of lead
+        // must not permanently null stemFn/vocalFn/pairFn just because a
+        // whole-track pass is in flight.
+        assertFalse(
+            shouldSkipStemAtLaunch(
+                remainingToSpliceMs = 30_000L,
+                deadlineMs = DeckBudget.NO_DEADLINE_MS,
+                nowMs = now,
+                analysisBusy = true,
+                armWhenReady = false,
+            ),
+        )
+        // The same busy state at arm time still skips.
+        assertTrue(
+            shouldSkipStemAtLaunch(
+                remainingToSpliceMs = 30_000L,
+                deadlineMs = DeckBudget.NO_DEADLINE_MS,
+                nowMs = now,
+                analysisBusy = true,
+                armWhenReady = true,
+            ),
+        )
+        // Prime deadline protection remains: near the splice, skip even
+        // when the prime was allowed to retain stems at launch.
+        assertTrue(
+            shouldSkipStemAtLaunch(
+                remainingToSpliceMs = 2_000L,
+                deadlineMs = DeckBudget.NO_DEADLINE_MS,
+                nowMs = now,
+                analysisBusy = false,
+                armWhenReady = false,
+            ),
+        )
+        assertTrue(
+            shouldSkipStemAtLaunch(
+                remainingToSpliceMs = 30_000L,
+                deadlineMs = now + 1_000L,
+                nowMs = now,
+                analysisBusy = false,
+                armWhenReady = false,
             ),
         )
     }

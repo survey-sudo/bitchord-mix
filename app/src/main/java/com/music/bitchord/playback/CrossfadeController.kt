@@ -243,6 +243,32 @@ internal fun idleStallDecision(stalledMs: Long, outExhausted: Boolean, alreadyPr
     else -> IdleStallAction.WAIT_AND_FREEZE
 }
 
+/**
+ * vc77 FADING-stall bound: [FADE_STEP_MS] ticks in [CrossfadeController.driveFade]
+ * can hold `progress == 1` forever when the incoming player sits in
+ * `STATE_BUFFERING` (elapsed frozen, so `incomingAt < 0.999` never reaches
+ * `incomingReady`) and the outgoing file still has more than
+ * [HANDOFF_GUARD_MS] left (so `outAboutToEof` never fires either). The outgoing
+ * fader is already 0 at progress 1, so waiting changes nothing audible but
+ * also never unblocks. At [FADING_STALL_BAIL_MS] of continuous buffering the
+ * caller force-bails through the existing abnormal-exit path (survivor kept,
+ * survivor filters reopened only once the retiree is silent — Seam A).
+ * A user pause parks in `STATE_READY`, never `STATE_BUFFERING`, so an
+ * intentional hold can never trip this. Pure scalar; unit-tested in
+ * `FadingStallWatchdogTest`.
+ */
+internal const val FADING_STALL_BAIL_MS = 2_500L
+
+internal fun fadingStallShouldBail(
+    stalledMs: Long,
+    progressAtLeastOne: Boolean,
+    incomingReady: Boolean,
+    outAboutToEof: Boolean,
+    incomingBuffering: Boolean,
+): Boolean =
+    progressAtLeastOne && !incomingReady && !outAboutToEof && incomingBuffering &&
+        stalledMs >= FADING_STALL_BAIL_MS
+
 internal fun freezeDedupKey(phaseName: String, outgoingId: String?, incomingId: String?): String =
     "$phaseName|${outgoingId ?: ""}->${incomingId ?: ""}"
 
@@ -343,13 +369,21 @@ internal fun shouldSkipStemNearSplice(
  * launch. The analysis that the planner needs is worth more than an optional
  * stem split on a contended phone; the deck falls back to the dry region
  * exactly as it already does when separation returns null.
+ *
+ * vc77: a primed build (`armWhenReady` false) has 35-45 s of lead and no
+ * immediate takeover, so contention alone must not permanently null the stem
+ * functions for that build — the per-window [shouldSkipStemNearSplice] check
+ * live at separation time still enforces the splice/deadline protection. The
+ * busy gate applies only to an arm-time build (`armWhenReady` true), which
+ * must finish before takeover.
  */
 internal fun shouldSkipStemAtLaunch(
     remainingToSpliceMs: Long,
     deadlineMs: Long,
     nowMs: Long,
     analysisBusy: Boolean,
-): Boolean = shouldSkipStemNearSplice(remainingToSpliceMs, deadlineMs, nowMs) || analysisBusy
+    armWhenReady: Boolean,
+): Boolean = shouldSkipStemNearSplice(remainingToSpliceMs, deadlineMs, nowMs) || (analysisBusy && armWhenReady)
 
 /**
  * D3b: phrase planner (M6) must never hijack a declined pair in [nativeBridge];
@@ -359,6 +393,30 @@ internal fun shouldRunPhrasePlannerForBridge(
     currentAnalysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
 ): Boolean = !shouldDeclineToMix(currentAnalysis, nextAnalysis)
+
+/**
+ * A compiled phrase candidate that has NOT been committed yet.
+ *
+ * [CrossfadeController.compilePhrase] builds this without touching the
+ * committed phrase detail, the log dedup key, telemetry or logcat: the
+ * caller runs `commitPhrase` only after the candidate's plan has been
+ * accepted, alongside the accepted `loopScript`. A too-near / geometry
+ * rejection (nativeBridge "bridge too near", the shift retry) therefore
+ * leaves the previous committed detail, dedup key and log output
+ * untouched, so the UI never shows a rejected candidate's line and a
+ * later acceptance of the same candidate still logs it.
+ */
+internal class PhraseCandidate(
+    val plan: LoopMix.Plan,
+    val script: PhraseScript,
+    val detail: String,
+    val logKey: String,
+    val locked: Boolean,
+    val slides: Int,
+    val lockedAtSec: Double?,
+    val out: TrackAnalysis,
+    val inn: TrackAnalysis,
+)
 
 internal fun isConsecutiveAlbumTrack(
     albumA: String, albumIdA: String, trackNumA: Int,
@@ -854,6 +912,8 @@ class CrossfadeController(
     private var idleStallSinceMs = 0L
     /** True once a stalled incoming player was asked to re-prepare(). */
     private var idleStallPrepared = false
+    /** vc77: wall of the progress==1 BUFFERING stall in driveFade (0 when not stalled). */
+    private var fadingStallSinceMs = 0L
     /** djmix13: wall of the most recent (re)plan, for arm-death accounting. */
     private var lastPlanStartedAtMs = 0L
     /** djmix13: shown loop pair that just failed; the loop is skipped for it. */
@@ -927,6 +987,15 @@ class CrossfadeController(
      * out starts from where it actually is rather than from full volume.
      */
     private var bailFromGain = 0f
+
+    /**
+     * Abnormal-exit survivor recovery: a [driveFade] blend that ended via
+     * settingSwitchedOff (or a forced [bail]) before progress 1 leaves the
+     * survivor parked mid-ride while audible. Set at the [driveFade]/[bail]
+     * exit so [finish] returns the survivor to full-band once the retiree
+     * is silent, without touching the retiring spare filter.
+     */
+    private var survivorRecoveryPending = false
 
     /** Dedupes the per-tick plan log down to one line per distinct verdict. */
     private var lastPlanVerdict = ""
@@ -3195,11 +3264,57 @@ class CrossfadeController(
         val incomingReady = incomingAt >= 0.999f
         val done = settingSwitchedOff ||
             (progress >= 1f && tailDone && (incomingReady || outAboutToEof))
+        // vc77 hang bound: progress==1 blocked by incomingReady while the
+        // incoming player sits in STATE_BUFFERING and the outgoing file is
+        // not near EOF. The outgoing fader is already 0 here, so the blend
+        // is inaudibly silent either way; after FADING_STALL_BAIL_MS of
+        // continuous buffering, force-bail through the existing
+        // abnormal-exit path (survivor kept, its filters reopened only by
+        // finish() once the retiree is silent — Seam A). A pause parks in
+        // STATE_READY, never BUFFERING, so an intentional hold never trips
+        // this, and a stall that recovers first completes normally.
+        if (!done) {
+            val nowMs = SystemClock.elapsedRealtime()
+            val buffering = player.playbackState == Player.STATE_BUFFERING
+            val blockedAtOne = progress >= 1f && !incomingReady && !outAboutToEof && buffering
+            if (blockedAtOne) {
+                if (fadingStallSinceMs == 0L) fadingStallSinceMs = nowMs
+            } else {
+                fadingStallSinceMs = 0L
+            }
+            if (fadingStallSinceMs != 0L) {
+                val stalledMs = nowMs - fadingStallSinceMs
+                if (fadingStallShouldBail(stalledMs, progress >= 1f, incomingReady, outAboutToEof, buffering)) {
+                    fadingStallSinceMs = 0L
+                    AutomixTelemetry.event(
+                        "mix.stall.forceBail",
+                        mapOf(
+                            "stalledMs" to stalledMs,
+                            "progress" to progress,
+                            "incomingAt" to incomingAt,
+                            "playbackState" to player.playbackState,
+                            "bufferedPercentage" to player.bufferedPercentage,
+                            "outRemainingMs" to (outRemaining ?: -1L),
+                            "handoff" to handedOff,
+                        ),
+                    )
+                    bail(force = true)
+                    return
+                }
+            }
+        }
         if (done) {
             // Clamp both sides to progress 1 before teardown: a stranded
             // incoming filter otherwise survives into the next blend at a
             // parked cutoff.
-            if (progress >= 1f) rideFilters(1f, 1f)
+            if (progress >= 1f) {
+                rideFilters(1f, 1f)
+            } else {
+                // Abnormal exit (setting switched off) before progress 1:
+                // defer survivor-only recovery to finish() once the retiree
+                // is silent; the spare filter is left untouched.
+                survivorRecoveryPending = true
+            }
             // A blend cut short before its midpoint still ends on the incoming
             // track — it is the one playing on, and what [finish] keeps.
             handOff(out, player)
@@ -4121,7 +4236,9 @@ class CrossfadeController(
             }
         }
         if (shouldRunPhrasePlannerForBridge(currentAnalysis, nextAnalysis)) {
-            phrasePlanFor(player, current, next, currentAnalysis, nextAnalysis, durationMs)?.let { phrase ->
+            phrasePlanFor(player, current, next, currentAnalysis, nextAnalysis, durationMs)?.let { candidate ->
+                val phrase = candidate.plan
+                val phraseScript = candidate.script
                 val stamped = stamp(phrase, currentAnalysis, nextAnalysis)
                 val alreadyPlanned = loopPlanned?.let {
                     loopPlanKey?.startsWith("$pair|") == true && abs(it.out.loopStart - stamped.out.loopStart) < 0.05
@@ -4131,12 +4248,16 @@ class CrossfadeController(
                     val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
                     val lead = fastLeadSec(stamped, current, next, sampleRate)
                     if (stamped.out.loopStart < posSec + lead) {
+                        // Rejected: neither loopScript nor phraseDetail is
+                        // committed, so the UI never shows this candidate.
                         noteLoopVerdict(pair, null, "bridge too near")
                         return@let
                     }
                 }
                 loopPlanKey = "$pair|${stamped.rung}|${stamped.out.loopStart}"
                 loopPlanned = stamped
+                loopScript = phraseScript
+                commitPhrase(candidate)
                 loopRefusal = null
                 noteLoopVerdict(pair, stamped, null)
                 return stamped
@@ -4206,6 +4327,13 @@ class CrossfadeController(
     /**
      * The phrase planner, or null so [LoopMix.bridge] runs. Exceptions stay
      * inside this function: a structure bug must not take down playback.
+     * Returns the plan paired atomically with its [PhraseScript] and its
+     * not-yet-committed [phraseDetail] so a rejected candidate cannot leave
+     * a stale [loopScript] or phrase detail behind for a later plan; the
+     * caller assigns [loopScript] and commits the detail only on
+     * acceptance. A null return (no fresh choice, lyrics pending, or
+     * [PhrasePlanner.Lock.consider] holding nothing) produces no candidate
+     * and leaves any committed script and detail untouched.
      */
     private fun phrasePlanFor(
         player: ExoPlayer,
@@ -4214,7 +4342,7 @@ class CrossfadeController(
         out: TrackAnalysis,
         inn: TrackAnalysis,
         durationMs: Long,
-    ): LoopMix.Plan? {
+    ): PhraseCandidate? {
         if (!PhraseConfig.PHRASE_PLANNER_ENABLED) return null
         val pair = "${current.mediaId}->${next.mediaId}"
         if (phrasePair != pair) {
@@ -4265,60 +4393,92 @@ class CrossfadeController(
         return compilePhrase(chosen, out, inn, current.mediaId, next.mediaId)
     }
 
+    /**
+     * Compiles [choice] into an uncommitted [PhraseCandidate]. This is
+     * side-effect free with respect to the committed detail/log state:
+     * [phraseDetail], [phraseLogKey], telemetry and logcat are only
+     * written by [commitPhrase], once the caller has accepted the
+     * candidate's plan. A candidate that is compiled but never committed
+     * (too-near / geometry rejection) leaves the committed UI line, the
+     * dedup key and the log output exactly as they were.
+     */
     private fun compilePhrase(
         choice: com.music.bitchord.playback.smart.PhraseChoice,
         out: TrackAnalysis,
         inn: TrackAnalysis,
         outId: String = loopOutItem?.mediaId.orEmpty(),
         inId: String = loopInItem?.mediaId.orEmpty(),
-    ): LoopMix.Plan {
+    ): PhraseCandidate {
         val script = TransitionMoves.compile(choice, out.bpm, inn.bpm, outgoingId = outId, incomingId = inId)
-        loopScript = script
         val line = TransitionMoves.phraseLine(choice) + " · " + TransitionMoves.sectionLine(choice) +
             " · exit tail %.1fs".format(Locale.US, script.plan.exitTailSeconds)
-        phraseDetail = line
         val logKey = "${choice.template}|${phraseLock.locked}|${phraseLock.slides}|${choice.exit.releaseBar}"
-        if (logKey != phraseLogKey) {
-            phraseLogKey = logKey
-            AutomixTelemetry.event("mix.plan", mapOf("template" to choice.template, "locked" to phraseLock.locked, "slides" to phraseLock.slides, "bpmA" to out.bpm, "bpmB" to inn.bpm, "statusA" to out.status, "statusB" to inn.status, "qualityA" to out.quality, "qualityB" to inn.quality, "exitTailSec" to script.plan.exitTailSeconds,
-                // djmix25 P2.13 telemetry completeness.
-                "reason" to "phrase-${choice.template.name}",
-                "rung" to choice.rung,
-                "style" to choice.template.name,
-                "transitionStyle" to "PHRASE",
-                "decline" to shouldDeclineToMix(out, inn),
-                "declineToMix" to shouldDeclineToMix(out, inn),
-                "camelotLeft" to (camelotCode(com.music.bitchord.playback.smart.exitKeyForMix(out)) ?: ""),
-                "camelotRight" to (camelotCode(com.music.bitchord.playback.smart.entryKeyForMix(inn)) ?: ""),
-                "fxSlot" to com.music.bitchord.playback.smart.TransitionMoves.fxSlot(out.trackId, inn.trackId),
-                "vocalOverlapBars" to choice.vocalOverlapBeats,
-                "styleFamily" to "PHRASE",
-                "exitKind" to choice.exit.kind.name,
-                "entryKind" to choice.entry.kind.name,
-                "sameAlbum" to false,
-                "gapless" to false,
-                "filterVariant" to "",
-                "djEffect" to "",
-            ))
-            val counts = MixDebug.counts()
-            val json = TransitionMoves.scriptJson(
-                script, counts[0], counts[1], counts[2],
-                bpmA = out.bpm, bpmB = inn.bpm,
-                camelot = regionalCamelotSteps(out, inn),
-                lockedAt = phraseLock.lockedAtSec,
-                slides = phraseLock.slides,
+        return PhraseCandidate(
+            plan = script.plan,
+            script = script,
+            detail = line,
+            logKey = logKey,
+            locked = phraseLock.locked,
+            slides = phraseLock.slides,
+            lockedAtSec = phraseLock.lockedAtSec,
+            out = out,
+            inn = inn,
+        )
+    }
+
+    /**
+     * Commits an accepted [PhraseCandidate]: [phraseDetail] moves to the
+     * candidate's line together with the accepted plan/script, and the
+     * `mix.plan` telemetry plus the BitChordPhrase/AutomixScript logs
+     * fire once per distinct [PhraseCandidate.logKey] — exactly as they
+     * did when [compilePhrase] emitted them. A log key that was never
+     * committed (rejected candidate) has not advanced [phraseLogKey],
+     * so a later acceptance of that same candidate still logs.
+     */
+    private fun commitPhrase(candidate: PhraseCandidate) {
+        phraseDetail = candidate.detail
+        if (candidate.logKey == phraseLogKey) return
+        phraseLogKey = candidate.logKey
+        val choice = candidate.script.choice
+        val out = candidate.out
+        val inn = candidate.inn
+        AutomixTelemetry.event("mix.plan", mapOf("template" to choice.template, "locked" to candidate.locked, "slides" to candidate.slides, "bpmA" to out.bpm, "bpmB" to inn.bpm, "statusA" to out.status, "statusB" to inn.status, "qualityA" to out.quality, "qualityB" to inn.quality, "exitTailSec" to candidate.script.plan.exitTailSeconds,
+            // djmix25 P2.13 telemetry completeness.
+            "reason" to "phrase-${choice.template.name}",
+            "rung" to choice.rung,
+            "style" to choice.template.name,
+            "transitionStyle" to "PHRASE",
+            "decline" to shouldDeclineToMix(out, inn),
+            "declineToMix" to shouldDeclineToMix(out, inn),
+            "camelotLeft" to (camelotCode(com.music.bitchord.playback.smart.exitKeyForMix(out)) ?: ""),
+            "camelotRight" to (camelotCode(com.music.bitchord.playback.smart.entryKeyForMix(inn)) ?: ""),
+            "fxSlot" to com.music.bitchord.playback.smart.TransitionMoves.fxSlot(out.trackId, inn.trackId),
+            "vocalOverlapBars" to choice.vocalOverlapBeats,
+            "styleFamily" to "PHRASE",
+            "exitKind" to choice.exit.kind.name,
+            "entryKind" to choice.entry.kind.name,
+            "sameAlbum" to false,
+            "gapless" to false,
+            "filterVariant" to "",
+            "djEffect" to "",
+        ))
+        val counts = MixDebug.counts()
+        val json = TransitionMoves.scriptJson(
+            candidate.script, counts[0], counts[1], counts[2],
+            bpmA = out.bpm, bpmB = inn.bpm,
+            camelot = regionalCamelotSteps(out, inn),
+            lockedAt = candidate.lockedAtSec,
+            slides = candidate.slides,
+        )
+        if (candidate.locked) {
+            Log.i("BitChordPhrase", candidate.detail)
+            Log.i("AutomixScript", json)
+        } else {
+            Log.i(
+                "BitChordPhrase",
+                "plan ${choice.tempoPolicy} ${choice.swapRampName}=${choice.swapRampMs} ${choice.echoDelayName}",
             )
-            if (phraseLock.locked) {
-                Log.i("BitChordPhrase", line)
-                Log.i("AutomixScript", json)
-            } else {
-                Log.i(
-                    "BitChordPhrase",
-                    "plan ${choice.tempoPolicy} ${choice.swapRampName}=${choice.swapRampMs} ${choice.echoDelayName}",
-                )
-            }
         }
-        return script.plan
     }
 
     private fun stamp(plan: LoopMix.Plan, out: TrackAnalysis, inn: TrackAnalysis): LoopMix.Plan {
@@ -4512,6 +4672,7 @@ class CrossfadeController(
             deckTiming.deadlineMs,
             SystemClock.elapsedRealtime(),
             wholeTrackBusy(),
+            armWhenReady,
         )
         val job = scope.launch {
             val began = SystemClock.elapsedRealtime()
@@ -4722,7 +4883,8 @@ class CrossfadeController(
         // missed.out.loopStart + epsilon; for straight phrase blends (M1/M6,
         // !outLoops && !inLoops, not an instrumental crown-loop) one relaxed
         // PhrasePlanner.select at the live playhead can still rescue a later
-        // bar. Exactly one attempt, updating loopScript via compilePhrase;
+        // bar. Exactly one attempt, assigning loopScript from the
+        // compilePhrase candidate only on acceptance;
         // still null falls through to loopFallBack immediately (no loop).
         if (candidate == null && !plan.outLoops && !plan.inLoops) {
             val retryOutDurMs = out.duration.takeIf { it != C.TIME_UNSET && it > 1_000L }
@@ -4741,16 +4903,22 @@ class CrossfadeController(
                     inAnalysis = inAnalysis,
                 )
             }.getOrNull()
-            val retryPlan = if (choiceRetry != null) {
+            val retryCandidate = if (choiceRetry != null) {
                 runCatching { compilePhrase(choiceRetry, outAnalysis, inAnalysis, outItem.mediaId, inItem.mediaId) }.getOrNull()
             } else null
-            if (retryPlan != null) {
+            if (retryCandidate != null) {
+                val retryPlan = retryCandidate.plan
+                val retryScript = retryCandidate.script
                 val outDurSec = loopOutDurationMs / 1000.0
                 if (retryPlan.out.loopStart >= positionSec + 0.15 &&
                     (outDurSec <= 0.0 || retryPlan.out.loopStart <= outDurSec)
                 ) {
                     candidate = retryPlan
+                    loopScript = retryScript
+                    commitPhrase(retryCandidate)
                 } else {
+                    // Rejected: neither loopScript nor phraseDetail is
+                    // committed for this retry.
                     loopScript = null
                 }
             }
@@ -5724,6 +5892,29 @@ class CrossfadeController(
         filters.outgoingMidDb(0f)
     }
 
+    /**
+     * Abnormal-exit survivor recovery. When a blend ends before progress 1
+     * (setting switched off or forced bail), the survivor session deck can be
+     * left parked mid-ride while audible at 1 — [finish] would otherwise only
+     * open the spare. Opens only the survivor's track via [tracks] (the
+     * session physical in both [handedOff] states) once its retiree is
+     * silent, leaving the retiring spare filter untouched: moving the spare
+     * while its deck is audible would be a second Seam-A step and it is
+     * retired silently anyway. Survivor open while the survivor is audible
+     * is the deliberate exception — a permanent muffle is worse than the
+     * ~30 ms glide step, and the step is not compounded by a spare move.
+     */
+    private fun openSurvivorFiltersWhenRetireeSilent() {
+        if (retireeAudible()) return
+        if (handedOff) {
+            tracks.incoming(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+            tracks.incomingMidDb(0f)
+        } else {
+            tracks.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+            tracks.outgoingMidDb(0f)
+        }
+    }
+
     private fun bail(force: Boolean = false) {
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
         // djmix10 freeze-once-armed: once the blend is audible (FADING,
@@ -5767,6 +5958,9 @@ class CrossfadeController(
         // Whichever track is *not* the session's is the one ramped away: the
         // outgoing tail after the handoff, the incoming track before it.
         if (handedOff) incoming?.volume = 1f else outgoing?.volume = 1f
+        // Forced exit from an audible blend before its ride completed:
+        // the survivor would strand parked if finish() only opened the spare.
+        survivorRecoveryPending = true
         bailFromGain = leavingOnBail()?.volume ?: 0f
         bailStartedAt = SystemClock.elapsedRealtime()
         phase = Phase.BAILING
@@ -5877,7 +6071,16 @@ class CrossfadeController(
         // smoothly before echoes are parked.
         if (handedOff) outgoing?.volume = 0f
         openFiltersWhenSilent()
-        openSpareFiltersWhenSilent()
+        if (survivorRecoveryPending) {
+            survivorRecoveryPending = false
+            // Abnormal exit: return the survivor to full-band via the role
+            // mapping and leave the retiring spare filter untouched (Seam A:
+            // never open both while one is audible). The spare stays parked
+            // until its next arm, when begin() reopens it while silent.
+            openSurvivorFiltersWhenRetireeSilent()
+        } else {
+            openSpareFiltersWhenSilent()
+        }
         filters.releaseColour()
         filters.parkEchoes()
         onBlendHeadroom(1f)
@@ -5930,6 +6133,14 @@ class CrossfadeController(
 
         outgoing = null
         incoming = null
+        // Clear the dissolved-tail reference only after retire and after the
+        // Seam A gates above have run. An active tail is preserved until
+        // driveTail has silenced it, and finish's early returns (emergency
+        // tail / finishLoop) never reach here, so a new tailTarget is never
+        // cleared early. Without this, retire's volume=1 reset leaves a stale
+        // audible reference that blocks openFiltersWhenSilent/
+        // openSpareFiltersWhenSilent and the next begin.
+        tailTarget = null
         handedOff = false
         outgoingItemIndex = C.INDEX_UNSET
         queuedItemCount = 0
@@ -5952,6 +6163,7 @@ class CrossfadeController(
             handoverTargetMs = 0L
             idleStallSinceMs = 0L
             idleStallPrepared = false
+            fadingStallSinceMs = 0L
             lastFreezeLogKey = null
             onSettled()
         }

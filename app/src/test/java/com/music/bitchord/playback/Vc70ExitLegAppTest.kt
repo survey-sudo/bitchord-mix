@@ -415,4 +415,168 @@ class Vc70ExitLegAppTest {
             AppSettings.crossfadeSeconds.value = savedCrossfade
         }
     }
+
+    @Test
+    fun abnormalSettingOffOpensSurvivorOnly() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        val plan = TransitionPlan(
+            transitionStyle = TransitionStyle.BEATLESS_BRIDGE,
+            exitBeats = 4,
+            vocalOverlap = 0.85,
+            filterSweep = 0.25,
+            beatSeconds = 0.5,
+            fadeSeconds = 4.0,
+        )
+        field(c, "render").set(c, renderFor(c, plan))
+        field(c, "handedOff").set(c, true)
+        // Progress ~0.05 (both parked) with the classic setting switched
+        // off: the blend must end before progress 1 and the survivor must
+        // not strand parked.
+        val outState = PlayerState(volume = 0f, position = 8_100L, durationMs = 60_000L)
+        val inState = PlayerState(volume = 0f, position = 200L, durationMs = 200_000L)
+        val out = fakePlayer(outState)
+        val inn = fakePlayer(inState)
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        field(c, "fadeMs").setLong(c, 4000L)
+        field(c, "fadeEndMs").setLong(c, 60_000L)
+        field(c, "incomingCueTimeMs").setLong(c, 0L)
+        field(c, "fadeOutOriginMs").setLong(c, 8_000L)
+        field(c, "fadeOutBudgetMs").setLong(c, 2_000L)
+        field(c, "smartFadeActive").set(c, false)
+        field(c, "tailTarget").set(c, null)
+        setPhase(c, "FADING")
+        val driveFade = CrossfadeController::class.java.getDeclaredMethod("driveFade")
+        driveFade.isAccessible = true
+        val savedCrossfade = AppSettings.crossfadeSeconds.value
+        AppSettings.crossfadeSeconds.value = 0
+        try {
+            driveFade.invoke(c)
+            assertEquals("TAIL", field(c, "phase").get(c).toString())
+            assertTrue(
+                "survivor parked before tail completes, got ${fake.lastIncoming?.first}",
+                (fake.lastIncoming?.first ?: 99999f) < 5000f,
+            )
+            val parkedOutgoing = fake.lastOutgoing?.first ?: -1f
+            val parkedOutgoingHigh = fake.lastOutgoing?.second ?: -1f
+            assertTrue("spare parked before tail completes, got $parkedOutgoing", parkedOutgoing < 5000f)
+            // Tail dissolve completes: retiree silent, survivor alone at 1.
+            outState.volume = 0f
+            inState.volume = 1f
+            field(c, "outgoing").set(c, out)
+            field(c, "incoming").set(c, inn)
+            setPhase(c, "TAIL")
+            fake.resetOpen()
+            val finish = CrossfadeController::class.java.getDeclaredMethod("finish")
+            finish.isAccessible = true
+            finish.invoke(c)
+            assertEquals(
+                "survivor must return to full-band",
+                TransitionFilterProcessor.OPEN_HZ, fake.lastIncoming?.first ?: -1f, 1e-3f,
+            )
+            assertEquals(
+                "survivor HP must return to OFF_HZ",
+                TransitionFilterProcessor.OFF_HZ, fake.lastIncoming?.second ?: -1f, 1e-3f,
+            )
+            assertEquals(
+                "spare must stay untouched",
+                parkedOutgoing, fake.lastOutgoing?.first ?: -1f, 1e-3f,
+            )
+            assertEquals(
+                "spare HP must stay untouched",
+                parkedOutgoingHigh, fake.lastOutgoing?.second ?: -1f, 1e-3f,
+            )
+            assertEquals("no both-open while survivor audible", 0, fake.openCalls)
+        } finally {
+            AppSettings.crossfadeSeconds.value = savedCrossfade
+        }
+    }
+
+    @Test
+    fun forcedBailOpensSurvivorOnlyAfterRetireeSilent() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        val outState = PlayerState(volume = 0.9f)
+        val inState = PlayerState(volume = 0.4f)
+        val out = fakePlayer(outState)
+        val inn = fakePlayer(inState)
+        // Survivor (filters.incoming) parked mid-ride, spare (filters.outgoing)
+        // parked at the SWEEP/DECLINE floor.
+        fake.incoming(700f, 20f)
+        fake.outgoing(2800f, 20f)
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        field(c, "handedOff").set(c, true)
+        field(c, "tailTarget").set(c, null)
+        setPhase(c, "FADING")
+        fake.resetOpen()
+        val bail = CrossfadeController::class.java.getDeclaredMethod("bail", Boolean::class.javaPrimitiveType)
+        bail.isAccessible = true
+        bail.invoke(c, true)
+        assertEquals("BAILING", field(c, "phase").get(c).toString())
+        assertEquals(700f to 20f, fake.lastIncoming)
+        assertEquals(2800f to 20f, fake.lastOutgoing)
+        // BAILING dissolve completes: retiree silent, survivor alone at 1.
+        outState.volume = 0f
+        inState.volume = 1f
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        setPhase(c, "BAILING")
+        val finish = CrossfadeController::class.java.getDeclaredMethod("finish")
+        finish.isAccessible = true
+        finish.invoke(c)
+        assertEquals(
+            "survivor must return to full-band",
+            TransitionFilterProcessor.OPEN_HZ, fake.lastIncoming?.first ?: -1f, 1e-3f,
+        )
+        assertEquals(
+            "spare must stay untouched",
+            2800f to 20f, fake.lastOutgoing,
+        )
+        assertEquals("no both-open while survivor audible", 0, fake.openCalls)
+    }
+
+    @Test
+    fun staleTailDoesNotBlockNextNeutralization() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        // First transition: post-handoff tail completion. The spare
+        // (outgoing) has dissolved to silence, the survivor (incoming) is
+        // at 1, and tailTarget is the dissolving spare.
+        val outState = PlayerState(volume = 0f)
+        val inState = PlayerState(volume = 1f)
+        val out = fakePlayer(outState)
+        val inn = fakePlayer(inState)
+        fake.outgoing(2800f, 20f)
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        field(c, "handedOff").set(c, true)
+        field(c, "tailTarget").set(c, out)
+        setPhase(c, "TAIL")
+        val finish = CrossfadeController::class.java.getDeclaredMethod("finish")
+        finish.isAccessible = true
+        finish.invoke(c)
+        // finish must clear the tail reference after retirement. Without the
+        // clear, retire()'s volume=1 reset leaves a stale audible reference.
+        assertTrue("finish must clear tailTarget", field(c, "tailTarget").get(c) == null)
+        assertEquals(1f, outState.volume, 1e-6f)
+        // Next transition: the ex-tail player is now the audible survivor
+        // at 1 and the new spare is silent. Retiree gating must see only
+        // the silent spare, not the stale tail at 1, so the spare
+        // neutralisation begin() runs still opens.
+        val spareState = PlayerState(volume = 0f)
+        val spare = fakePlayer(spareState)
+        fake.outgoing(2800f, 20f)
+        field(c, "outgoing").set(c, spare)
+        field(c, "incoming").set(c, out)
+        field(c, "handedOff").set(c, true)
+        setPhase(c, "IDLE")
+        finish.invoke(c)
+        assertEquals(
+            "stale tail must not block next spare neutralisation",
+            TransitionFilterProcessor.OPEN_HZ, fake.lastOutgoing?.first ?: -1f, 1e-3f,
+        )
+        assertTrue("tailTarget must stay cleared", field(c, "tailTarget").get(c) == null)
+    }
 }

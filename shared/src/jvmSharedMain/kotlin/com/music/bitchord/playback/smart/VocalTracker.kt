@@ -30,7 +30,6 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.floor
-import kotlin.math.roundToInt
 
 /** The linear-frequency STFT front end open-unmix was trained on. */
 object VocalSpectrogram {
@@ -106,7 +105,7 @@ object VocalSpectrogram {
  * subtracting at [rate] would fold resampler error into the stem.
  *
  * Returns `(vocals, instrumental)` at [rate], each planar left/right sized
- * to `dry.size * rate / modelRate`, or null on size mismatch / resample
+ * to `floor(dry.size * rate / modelRate)`, or null on size mismatch / resample
  * failure. Extracted so JVM unit tests can exercise the 44.1k<->48k
  * subtraction without the native ONNX library.
  */
@@ -128,13 +127,84 @@ internal fun complementAtModelRate(
     if (rate == modelRate) {
         return (vocLeft to vocRight) to (instLeft44 to instRight44)
     }
-    val targetSize = (dryLeft.size * rate / modelRate).roundToInt().coerceAtLeast(1)
-    fun fixed(a: FloatArray): FloatArray = if (a.size == targetSize) a else a.copyOf(targetSize)
+    // Native resampler sizes output as floor(size * ratio)
+    // (native/analyzer/resampler.cpp), not round: e.g. floor(100 * 48000 /
+    // 44100) = 108, where round would give 109 and reject valid output.
+    val targetSize = floor(dryLeft.size * rate / modelRate).toInt().coerceAtLeast(1)
     val vocBackLeft = resample(vocLeft, modelRate, rate) ?: return null
     val vocBackRight = resample(vocRight, modelRate, rate) ?: return null
     val instBackLeft = resample(instLeft44, modelRate, rate) ?: return null
     val instBackRight = resample(instRight44, modelRate, rate) ?: return null
-    return (fixed(vocBackLeft) to fixed(vocBackRight)) to (fixed(instBackLeft) to fixed(instBackRight))
+    // Exact-size pair contract: a short/long resample answer is malformed,
+    // not a rounding to be zero-padded/truncated to targetSize. Return null
+    // so callers fall back instead of trusting a padded/truncated stem.
+    if (vocBackLeft.size != targetSize || vocBackRight.size != targetSize ||
+        instBackLeft.size != targetSize || instBackRight.size != targetSize
+    ) return null
+    return (vocBackLeft to vocBackRight) to (instBackLeft to instBackRight)
+}
+
+/**
+ * Bounded endpoint completion for the dual-stem round trip.
+ *
+ * The native resampler sizes output as `floor(size * ratio)`, so the
+ * 48k -> 44.1k -> 48k round trip deterministically loses a bounded number
+ * of endpoint samples: with `r = modelRate / rate`, `M = floor(N*r)` and
+ * `T = floor(M/r) <= N`, and `N - T < 1 + rate/modelRate`, i.e. at most
+ * `ceil(rate/modelRate)` samples (2 at 48k/44.1k). This helper accepts
+ * only that predicted loss (`0..ceil(rate/modelRate)`), not arbitrary
+ * padding: any longer, grossly shorter, empty, or channel-mismatched
+ * stem is malformed and returns null so callers fall back.
+ *
+ * For the accepted missing tail, vocal is extended with its last sample
+ * (deterministic hold) and instrumental tail is set to `dry - extended
+ * vocal`, so `inst + g*voc` at duck gain `g = 1` reconstructs `dry`
+ * exactly on the completed samples (and the head keeps the resampled
+ * complement, where `voc + inst` is the resampled dry). This is endpoint
+ * completion for double-floor resampling, not arbitrary zero-padding.
+ * Returns exact dry-size arrays, or null on any other size.
+ */
+internal fun completeDualStemEndpoint(
+    vocals: Pair<FloatArray, FloatArray>,
+    instrumental: Pair<FloatArray, FloatArray>,
+    dryLeft: FloatArray,
+    dryRight: FloatArray,
+    rate: Double,
+    modelRate: Double,
+): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
+    if (rate <= 0 || modelRate <= 0) return null
+    if (dryLeft.isEmpty() || dryLeft.size != dryRight.size) return null
+    val vocLeft = vocals.first
+    val vocRight = vocals.second
+    val instLeft = instrumental.first
+    val instRight = instrumental.second
+    if (vocLeft.isEmpty() || vocRight.isEmpty() ||
+        instLeft.isEmpty() || instRight.isEmpty()
+    ) return null
+    val stemSize = vocLeft.size
+    if (vocRight.size != stemSize || instLeft.size != stemSize || instRight.size != stemSize) {
+        return null
+    }
+    val targetSize = dryLeft.size
+    val loss = targetSize - stemSize
+    val maxLoss = ceil(rate / modelRate).toInt()
+    if (loss < 0 || loss > maxLoss) return null
+    if (loss == 0) {
+        return (vocLeft to vocRight) to (instLeft to instRight)
+    }
+    fun completeChannel(voc: FloatArray, inst: FloatArray, dry: FloatArray): Pair<FloatArray, FloatArray> {
+        val vocExt = voc.copyOf(targetSize)
+        val instExt = inst.copyOf(targetSize)
+        val lastVoc = voc[stemSize - 1]
+        for (i in stemSize until targetSize) {
+            vocExt[i] = lastVoc
+            instExt[i] = dry[i] - vocExt[i]
+        }
+        return vocExt to instExt
+    }
+    val (vocLeftExt, instLeftExt) = completeChannel(vocLeft, instLeft, dryLeft)
+    val (vocRightExt, instRightExt) = completeChannel(vocRight, instRight, dryRight)
+    return (vocLeftExt to vocRightExt) to (instLeftExt to instRightExt)
 }
 
 /**
@@ -379,7 +449,8 @@ class VocalTracker(
      * ONNX pass. Resampled at the model rate, one VocalSpectrogram.separate
      * call (keepVocals true) on the compact target, the instrumental
      * complement computed in the 44.1 kHz model domain, then both stems
-     * resampled back and padded/trimmed to left.size.
+     * resampled back to left.size (bounded endpoint completion for the
+     * double-floor round trip), or null on size mismatch.
      */
     fun separateBothWindows(
         left: FloatArray,
@@ -422,9 +493,8 @@ class VocalTracker(
                     val (vocals, instrumental) = complementAtModelRate(
                         resLeft, resRight, outLeft44, outRight44, rate, sr, MelSpectrogram::resample,
                     ) ?: return@runCatching null
-                    fun fixed(a: FloatArray): FloatArray = if (a.size == left.size) a else a.copyOf(left.size)
-                    (fixed(vocals.first) to fixed(vocals.second)) to
-                        (fixed(instrumental.first) to fixed(instrumental.second))
+                    completeDualStemEndpoint(vocals, instrumental, left, right, rate, sr)
+                        ?: return@runCatching null
                 }
             }
         }.getOrNull()
