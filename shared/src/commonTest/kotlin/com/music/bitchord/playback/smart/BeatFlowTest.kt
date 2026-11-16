@@ -74,8 +74,10 @@ class BeatFlowTest {
         // 0.82/0.18 exactly.
         val full = BeatFlow.FlowResult(score = 0.9, coverage = 1.0)
         assertEquals(0.55 * 0.72 + 0.45 * 0.9, BeatFlow.rankScore(0.72, full), 1e-9)
+        // Zero coverage falls back to neutral flow 0.5, never the recorded
+        // score: an unmeasured flow must not borrow an optimistic value.
         val none = BeatFlow.FlowResult(score = 0.9, coverage = 0.0)
-        assertEquals(0.82 * 0.72 + 0.18 * 0.9, BeatFlow.rankScore(0.72, none), 1e-9)
+        assertEquals(0.82 * 0.72 + 0.18 * 0.5, BeatFlow.rankScore(0.72, none), 1e-9)
         // No cliff: candidates differing by one sample of coverage must not
         // flip on formula alone. 17 samples is the denominator, so 1/17 apart
         // must move the rank by less than 0.02.
