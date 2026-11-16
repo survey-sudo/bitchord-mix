@@ -88,6 +88,66 @@ class StemClashTest {
         assertEquals(0.0, WienerGain.energyAt(Double.POSITIVE_INFINITY), 1e-9)
     }
 
+    /**
+     * The gain curve and the detector threshold are different scales, and
+     * moving the threshold to the curve's midpoint breaks the exact case this
+     * work exists to fix.
+     *
+     * The tempting move is: "VOCAL_ACTIVE_THRESHOLD of 0.25 keeps only 10% of
+     * the energy, so raise it to the half-energy point 0.50." That reasoning
+     * reads a gain as a detector. The mask that feeds the separator is a gain;
+     * the mask the analyzer stores is a measurement on its own calibrated
+     * scale, measured 2026-10-23 on Hymn for the Weekend: a clear chorus reads
+     * 0.57-0.71, a soft verse over the music 0.2-0.4, an instrumental break
+     * 0.02-0.15. A threshold of 0.25 sits in the gap. A threshold of 0.50 sits
+     * *inside the chorus band*.
+     *
+     * So raising it would make a soft verse read as instrumental — and the
+     * quiet-verse row below is exactly the pair the weighted measure was built
+     * to catch. At 0.50 the very case that motivated the change scores zero
+     * clash and the planner would happily schedule two singers on top of each
+     * other. This test is the guard against re-deriving that mistake.
+     */
+    @Test
+    fun detectorThresholdMustStayOnTheDetectorScale() {
+        val quietVerse = 0.30
+        val instrumentalBreak = 0.12
+        val chorus = 0.65
+
+        assertTrue(
+            quietVerse >= VOCAL_ACTIVE_THRESHOLD,
+            "a soft verse at $quietVerse must read as singing; the measured band is 0.2-0.4",
+        )
+        assertTrue(
+            instrumentalBreak < VOCAL_ACTIVE_THRESHOLD,
+            "an instrumental break at $instrumentalBreak must not read as singing",
+        )
+        assertTrue(
+            VOCAL_ACTIVE_THRESHOLD < 0.50,
+            "the detector threshold must stay below the chorus band and below the " +
+                "Wiener half-energy point; those are a gain's scale, not a detector's",
+        )
+
+        // At the half-energy point the soft verse — the motivating case — is
+        // invisible, and the whole fix collapses back to the old behaviour.
+        val raised = 0.50
+        assertTrue(quietVerse < raised, "guard: 0.50 would blind the detector to a soft verse")
+        assertTrue(chorus >= raised, "guard: 0.50 would keep only the loudest part of a chorus")
+
+        // Which is why the threshold lives where it does and the *weighting*
+        // carries the discrimination instead.
+        val quiet = List(12) { ClashFrame(quietVerse, quietVerse, 0.05) }
+        val loud = List(12) { ClashFrame(0.90, 0.90, 0.95) }
+        assertTrue(
+            weightedClash(quiet)!! > 0.05,
+            "the weighted measure still sees the soft verse at the real threshold",
+        )
+        assertTrue(
+            weightedClash(loud)!! > weightedClash(quiet)!! * 5.0,
+            "and separates it from the chorus by a wide margin",
+        )
+    }
+
     // ---- the weighted clash ------------------------------------------------
 
     /**

@@ -18,15 +18,7 @@ object SongMaps {
         }
         val n = bars
         val sung = BooleanArray(n)
-        for (window in analysis.vocalWindows) mark(sung, window, bar, n, 0.22f)
-        if (analysis.vocalWindows.isEmpty() && analysis.vocalActivityMask.isNotEmpty()) {
-            val mask = analysis.vocalActivityMask
-            for (b in 0 until n) {
-                val t = b * bar
-                val i = ((t / analysis.duration) * mask.size).toInt().coerceIn(0, mask.lastIndex)
-                sung[b] = mask[i] > 0.22
-            }
-        }
+        val vocalEnergy = buildVocalBars(analysis, bar, n, sung)
         val first = sung.indexOfFirst { it }.let { if (it < 0) null else it }
         val last = sung.indexOfLast { it }.let { if (it < 0) null else it }
         val introEnd = barIndex(analysis.introEndTime, bar, n)
@@ -288,6 +280,7 @@ object SongMaps {
             phraseLen = 8,
             sections = cleaned,
             sungBars = sung,
+            vocalEnergy = vocalEnergy,
             firstVocalBar = first,
             lastVocalBar = last,
             pickupBeats = if (first == 1) 1f else 0f,
@@ -339,6 +332,128 @@ object SongMaps {
             }
         }
     }
+
+    /**
+     * Fill [sung] and [vocalEnergy] from whatever vocal evidence the analysis
+     * carries.
+     *
+     * The two answer different questions and are deliberately built in one pass
+     * so they cannot disagree about which bars were measured:
+     *
+     *  * [sung] is the presence question — is anyone singing in this bar. It
+     *    keeps the gate and the transient rejection exactly as they were,
+     *    because [CuePoints] cuts gaps with it and a false positive there
+     *    produces a chop through a held note.
+     *
+     *  * [vocalEnergy] is the magnitude question — how much vocal is heard. No
+     *    gate, no rejection: a bar averaging 0.30 is quiet singing and a bar
+     *    averaging 0.90 is loud singing, and the planner needs to tell those
+     *    apart. Kept on the analyzer's own calibrated scale (chorus 0.57-0.71,
+     *    soft verse 0.2-0.4, instrumental 0.02-0.15) and deliberately NOT
+     *    re-normalised to the track peak: a track whose loudest bar is a quiet
+     *    verse would otherwise rescale its whispers to chorus level.
+     *
+     * With no measurement at all, [vocalEnergy] stays empty and
+     * [SongMap.vocalEnergyAt] falls back to the boolean, which is exactly the
+     * old behaviour.
+     */
+    private fun buildVocalBars(
+        analysis: TrackAnalysis,
+        bar: Double,
+        n: Int,
+        sung: BooleanArray,
+    ): FloatArray {
+        val raw = DoubleArray(n)
+        var measured = false
+
+        for (window in analysis.vocalWindows) {
+            mark(sung, window, bar, n, VOCAL_BAR_GATE)
+            accumulateCurve(window, bar, n, raw)
+            measured = true
+        }
+
+        if (analysis.vocalWindows.isEmpty() && analysis.vocalActivityMask.isNotEmpty()) {
+            val mask = analysis.vocalActivityMask
+            val times = analysis.energyCurve
+            if (times.size == mask.size && times.isNotEmpty()) {
+                // Resample the mask onto bar centres through its own timestamps
+                // rather than assuming they are evenly spaced.
+                for (b in 0 until n) {
+                    val t = (b + 0.5) * bar
+                    val i = nearestSample(times, t)
+                    val v = mask[i].coerceIn(0.0, 1.0)
+                    if (v > VOCAL_BAR_GATE) sung[b] = true
+                    raw[b] = v
+                }
+            } else {
+                val span = analysis.duration
+                if (span > 0.0) {
+                    for (b in 0 until n) {
+                        val t = (b + 0.5) * bar
+                        val i = ((t / span) * mask.size).toInt().coerceIn(0, mask.lastIndex)
+                        val v = mask[i].coerceIn(0.0, 1.0)
+                        if (v > VOCAL_BAR_GATE) sung[b] = true
+                        raw[b] = v
+                    }
+                }
+            }
+            measured = true
+        }
+
+        if (!measured) return FloatArray(0)
+        val out = FloatArray(n)
+        for (b in 0 until n) {
+            out[b] = raw[b].coerceIn(0.0, 1.0).toFloat()
+        }
+        return out
+    }
+
+    /** Bar-mean of one vocal window, ignoring frames that fall outside the track. */
+    private fun accumulateCurve(window: CurveWindow, bar: Double, n: Int, into: DoubleArray) {
+        if (window.values.isEmpty() || bar <= 0.0 || window.frameRate <= 0.0) return
+        val sum = DoubleArray(n)
+        val count = IntArray(n)
+        for (i in window.values.indices) {
+            val t = window.startTime + i / window.frameRate
+            val b = (t / bar).toInt()
+            if (b !in 0 until n) continue
+            sum[b] += window.values[i].toDouble().coerceIn(0.0, 1.0)
+            count[b]++
+        }
+        for (b in 0 until n) {
+            if (count[b] == 0) continue
+            val mean = sum[b] / count[b]
+            // Overlapping windows are averaged rather than summed, so two passes
+            // over the same bar cannot invent energy the audio does not have.
+            into[b] = if (into[b] > 0.0) (into[b] + mean) / 2.0 else mean
+        }
+    }
+
+    /** Index of the sample nearest [time] in an ascending time series. */
+    private fun nearestSample(times: List<EnergySample>, time: Double): Int {
+        var lo = 0
+        var hi = times.size - 1
+        if (time <= times[lo].time) return lo
+        if (time >= times[hi].time) return hi
+        while (lo + 1 < hi) {
+            val mid = (lo + hi) / 2
+            if (times[mid].time <= time) lo = mid else hi = mid
+        }
+        return if (kotlin.math.abs(times[lo].time - time) <= kotlin.math.abs(times[hi].time - time)) lo else hi
+    }
+
+    /**
+     * Presence gate for [SongMap.sungBars] only.
+     *
+     * Sits just under [VOCAL_ACTIVE_THRESHOLD] on purpose. The analysis mask and
+     * the vocal windows are already stored on the model's scale, where a soft
+     * verse reads 0.2-0.4 and an instrumental break 0.02-0.15 (see the
+     * [VOCAL_ACTIVE_THRESHOLD] doc). Moving this number up to the Wiener
+     * separator's half-energy point would be a category error: the separator's
+     * mask is a gain, this one is a detector, and they are different scales.
+     * This gate is a detector and belongs where the detector's scale puts it.
+     */
+    private const val VOCAL_BAR_GATE = 0.22f
 
     private fun phrase(
         start: Int, end: Int, fn: SectionFn, role: SectionRole, energy: Int, vocal: Float, loopable: Boolean = false,

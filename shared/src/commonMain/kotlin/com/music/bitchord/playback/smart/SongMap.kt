@@ -57,6 +57,21 @@ data class SongMap(
     val anchors: IntArray = IntArray(0),
     val sections: List<PhraseSection>,
     val sungBars: BooleanArray,
+    /**
+     * Per-bar vocal energy, 0..1: how much vocal a listener actually hears in
+     * that bar, not whether the mask crossed a line.
+     *
+     * [sungBars] answers "is anyone singing here", which is the right question
+     * for finding a gap to cut in and the wrong one for deciding whether an
+     * overlap will collide. A bar mean of 0.30 and a bar mean of 0.90 both read
+     * `sungBars[b] = true`; weighted by bar energy, the same pair of tracks
+     * scores 0.090 of clash against 0.810 — a factor of nine that the boolean
+     * throws away.
+     *
+     * Empty means "not measured", and [vocalEnergyAt] then falls back to the
+     * boolean, so a map built by hand behaves exactly as it did before.
+     */
+    val vocalEnergy: FloatArray = FloatArray(0),
     val firstVocalBar: Int?,
     val lastVocalBar: Int?,
     val pickupBeats: Float,
@@ -80,6 +95,30 @@ data class SongMap(
         val step = barSec
         val origin = downbeats.lastOrNull() ?: 0.0
         return origin + (bar - (downbeats.size - 1).coerceAtLeast(0)) * step
+    }
+
+    /**
+     * Vocal energy heard in [bar], 0..1.
+     *
+     * Falls back to the boolean when the map was built without a measurement,
+     * so a hand-constructed map is unchanged. An out-of-range bar is silence.
+     */
+    fun vocalEnergyAt(bar: Int): Double {
+        if (bar < 0) return 0.0
+        if (vocalEnergy.isNotEmpty()) {
+            return if (bar < vocalEnergy.size) vocalEnergy[bar].toDouble().coerceIn(0.0, 1.0) else 0.0
+        }
+        return if (sungBars.getOrElse(bar) { false }) 1.0 else 0.0
+    }
+
+    /** Mean vocal energy across [from] until [until], 0..1. Empty range is 0. */
+    fun vocalEnergyMean(from: Int, until: Int): Double {
+        val start = from.coerceAtLeast(0)
+        val stop = minOf(until, sungBars.size, if (vocalEnergy.isNotEmpty()) vocalEnergy.size else sungBars.size)
+        if (stop <= start) return 0.0
+        var sum = 0.0
+        for (b in start until stop) sum += vocalEnergyAt(b)
+        return sum / (stop - start)
     }
 
     fun sectionAt(bar: Int): PhraseSection? = sections.firstOrNull { bar >= it.startBar && bar < it.endBar }

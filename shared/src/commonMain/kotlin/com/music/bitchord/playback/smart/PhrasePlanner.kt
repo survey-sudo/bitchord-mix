@@ -457,8 +457,26 @@ object PhrasePlanner {
         val verse = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))
         if (verse?.fn == SectionFn.VERSE && exit.releaseBar in (verse.startBar + 1) until verse.endBar) return "mid verse"
         if (!carve(template)) {
+            // Two different questions, and they get two different answers.
+            //
+            // The beat count is a veto on the *structure*: more than one beat of
+            // straddled threshold means the shapes genuinely overlap, and on a
+            // pair we cannot weigh that is reason enough to look elsewhere.
+            //
+            // The weighted energy is a veto on the *sound*. Where it was
+            // measured, it overrides the count, because a count of four beats at
+            // 0.09 weighted is a soft verse sharing a bar with a bed and it
+            // sounds fine, while a count of one beat at 0.80 is two choruses
+            // colliding and it does not. That inversion is the whole reason the
+            // weighted measure exists, so the veto has to honour it.
             val clash = vocalClashBeats(out, inn, exit, entry)
-            if (clash > 1.0) return "vocal clash"
+            val clashEnergy = vocalClashEnergy(out, inn, exit, entry)
+            val blocked = if (clashEnergy != null) {
+                clashEnergy > CLASH_VETO_ENERGY
+            } else {
+                clash > 1.0
+            }
+            if (blocked) return "vocal clash"
         }
         val vocal = inn.firstVocalBar
         if (!PhraseConfig.ALLOW_RADIO_EDIT && vocal != null && entry.startBar > vocal) return "cuts the verse"
@@ -528,6 +546,42 @@ object PhrasePlanner {
         MixTemplate.M7, MixTemplate.RELAXED, MixTemplate.M9,
     )
 
+    /**
+     * Energy-weighted vocal collision across a proposed overlap, 0..1, or null
+     * when the pair carries no measurement to weigh.
+     *
+     * Bars are the only clock the planner has here — the two songs are on
+     * different timelines and the overlap maps one onto the other — so each bar
+     * contributes the *product* of the two vocal energies. Product, not
+     * fraction, is what makes a solo vocal free: one track singing over an
+     * instrumental bed is the normal, desirable overlap, and it scores zero
+     * because the other side has no vocal energy to collide with.
+     *
+     * Replaces [vocalClashBeats] for scoring. The boolean count is kept for
+     * [veto], where the question genuinely is "did the mask cross a line".
+     */
+    private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double? {
+        val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
+        if (bars <= 0) return null
+        if (out.vocalEnergy.isEmpty() && inn.vocalEnergy.isEmpty()) return null
+        var numerator = 0.0
+        var denominator = 0.0
+        for (i in 0 until bars) {
+            val a = exit.releaseBar - bars + i
+            val b = entry.startBar + i
+            // Weight by the outgoing section's own cross-track-comparable energy:
+            // a collision on a loud bar is audible, the same presence over a
+            // quiet bar is not. A map without section energy weighs every bar
+            // the same, which degrades to an unweighted mean rather than to a
+            // wrong answer.
+            val w = (out.sectionAt(a)?.energy ?: 0.5f).toDouble().coerceIn(0.0, 1.0)
+            numerator += w * out.vocalEnergyAt(a) * inn.vocalEnergyAt(b)
+            denominator += w
+        }
+        if (denominator <= 0.0) return null
+        return (numerator / denominator).coerceIn(0.0, 1.0)
+    }
+
     private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double {
         val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
         var beats = 0
@@ -556,8 +610,15 @@ object PhrasePlanner {
     ): PhraseChoice {
         val overlap = overlapOf(template, exit, entry, outBpm)
         val struct = structScore(template, exit, entry, out)
-        val clash = vocalClashBeats(out, inn, exit, entry)
-        val vocalScore = if (carve(template)) 0.8 else 1.0 - (clash / 4.0).coerceIn(0.0, 1.0)
+        val clashBeats = vocalClashBeats(out, inn, exit, entry)
+        // Energy-weighted collision where it was measured, and the old beat
+        // count normalised onto the same 0..1 axis where it was not. The two are
+        // not the same measurement, so each keeps its own meaning: the weighted
+        // one is what the listener hears, the fallback is a conservative proxy
+        // that reads a straddled threshold as a real collision.
+        val clashEnergy = vocalClashEnergy(out, inn, exit, entry)
+        val clash = clashEnergy ?: (clashBeats / 4.0).coerceIn(0.0, 1.0)
+        val vocalScore = if (carve(template)) 0.8 else 1.0 - clash
         val phrase = phraseScore(out, inn, exit.releaseBar, entry.landingBar)
         val delta = entry.energyAtLanding - exit.energyAtRelease
         val energy = if (template == MixTemplate.M10) 0.8 else energyScore(delta)
@@ -620,12 +681,33 @@ object PhrasePlanner {
             exit.kind == ExitKind.BRIDGE_END && template in setOf(MixTemplate.M6, MixTemplate.CUT_ON_ONE, MixTemplate.M10) && !bridgeVerseChop -> 0.06
             else -> 0.0
         }
-        val cost = 0.12 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats +
-            vocalSectionPenalty + chorusReleasePenalty + gapCost +
+        // Discarded vocal energy, integrated over the bars being thrown away
+        // rather than counted. The old term charged 0.12 per sung bar cut, so
+        // four sung bars cost 0.48 — more than the entire weighted signal and
+        // enough to wipe out any advantage the vocal term had just scored.
+        // Multiplying the section's own vocal level by the bar count keeps the
+        // charge proportional to what the listener actually loses.
+        val discardedVocalEnergy = discardedSections
+            .filter { it.vocal > 0.0f }
+            .sumOf { (it.vocal.coerceIn(0.0f, 1.0f).toDouble()) * (it.endBar - it.startBar).coerceAtLeast(0) }
+        // Where the collision was measured it is charged here too, so a loud
+        // clash cannot be laundered into a good score by a long overlap. The
+        // coefficient is small because veto() already refuses anything above
+        // CLASH_VETO_ENERGY; this is the tail below that line.
+        val clashCost = if (clashEnergy != null) 0.30 * clashEnergy else 0.0
+        val cost = 0.20 * discardedVocalEnergy + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats +
+            vocalSectionPenalty + chorusReleasePenalty + gapCost + clashCost +
             (if (insideBuildup && !atBuildupStart) 0.15 else 0.0) +
             (if (quietLanding) 0.15 else 0.0) - interpDiscount
-        val total = 0.25 * struct + 0.20 * MixWeightTuner.vocalWeight * vocalScore + 0.15 * phrase + 0.15 * MixWeightTuner.energyWeight * energy +
-            0.10 * length + 0.10 * MixWeightTuner.keyWeight * key + 0.05 * MixWeightTuner.tempoWeight * tempo - cost + seamBonus + buildupBonus + alignBonus + kindBonus
+        // Stacked format bonuses used to reach 0.37 while the largest possible
+        // vocal penalty was 0.20: a dual-chorus collision could be outvoted by
+        // seam + buildup + alignment + kind preferences, all of which simply
+        // restate that the planner likes the shape of this exit. Capped at
+        // 0.08 — bonuses may break ties, they may not overturn a measured
+        // musical defect.
+        val bonuses = (seamBonus + buildupBonus + alignBonus + kindBonus).coerceAtMost(0.08)
+        val total = 0.18 * struct + 0.30 * MixWeightTuner.vocalWeight * vocalScore + 0.12 * phrase + 0.14 * MixWeightTuner.energyWeight * energy +
+            0.08 * length + 0.08 * MixWeightTuner.keyWeight * key + 0.10 * MixWeightTuner.tempoWeight * tempo - cost + bonuses
         val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, ramp) = PhraseConfig.swapRampMs(template.name)
         val swap = when (template) {
@@ -670,7 +752,7 @@ object PhrasePlanner {
             swapRampMs = ramp,
             swapRampName = rampName,
             tempoPolicy = if (PhraseConfig.TEMPO_POLICY == "b") "TEMPO_POLICY=b" else "TEMPO_POLICY=a",
-            vocalOverlapBeats = clash,
+            vocalOverlapBeats = clashBeats,
             energyDelta = delta,
             struct = struct,
             vocalScore = vocalScore,
@@ -797,4 +879,23 @@ object PhrasePlanner {
         MixTemplate.M11 -> "Crossfade"
         MixTemplate.ROLLING -> "Rolling blend"
     }
+
+    /**
+     * Weighted vocal collision above which an overlap is refused outright.
+     *
+     * Deliberately not [VOCAL_CLASH_TOLERANCE], which is 0.05 and answers a
+     * different question. That constant is "how much simultaneous vocal can a
+     * transition carry and still count as clean" — a rendering target, and a
+     * strict one. This is "how bad does a measured collision have to be before
+     * searching for a different exit is worth more than reshaping this one".
+     *
+     * 0.20 is the point where the two measured cases separate cleanly: the soft
+     * verse scores 0.090 and survives, the chorus collision scores 0.810 and is
+     * refused. Anything between 0.10 and 0.79 gives the same verdict on those
+     * two, so the value is set near the middle of that band rather than at an
+     * edge — leaving room for a moderately loud pair to be reshaped rather than
+     * rejected, because a reachable exit with a ducked vocal usually beats
+     * jumping to a four-bar phrase boundary.
+     */
+    const val CLASH_VETO_ENERGY = 0.20
 }

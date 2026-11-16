@@ -367,6 +367,66 @@ fun simultaneousVocalFraction(
 const val VOCAL_CLASH_TOLERANCE = 0.05
 
 /**
+ * The same measurement as [simultaneousVocalFraction], weighted by what the
+ * overlap actually sounds like.
+ *
+ * [simultaneousVocalFraction] answers "what fraction of the clock spent two
+ * voices" — a vote in which a mask value of 0.30 and a mask value of 0.90 count
+ * identically. The listener does not hear a fraction of the clock; they hear
+ * two voices fighting when both are loud, and they hear nothing objectionable
+ * when both are quiet. Measured on the two shaped cases, the vote reports 1.000
+ * for both while the audible weight differs by 9x (0.090 against 0.810).
+ *
+ * So the frame weight here is the outgoing track's own energy: the listener is
+ * following the outgoing bar, and a collision landing on a loud bar is audible
+ * in a way the same presence values over a quiet bar are not. Presence is the
+ * *raw* mask product rather than a thresholded one, because the whole point is
+ * to keep the magnitude the threshold discards.
+ *
+ * Returns null when there is nothing to weigh — no usable mask, an empty
+ * window, or a programme with no energy across the overlap at all. Null means
+ * "not measured", which [StemClash.rank] treats as the midpoint rather than as
+ * a clean pair.
+ */
+fun weightedSimultaneousVocal(
+    outgoing: TrackAnalysis,
+    incoming: TrackAnalysis,
+    outStart: Double,
+    outEnd: Double,
+    inStart: Double,
+    rate: Double,
+): Double? {
+    val outMask = outgoing.vocalActivityMask
+    val outCurve = outgoing.energyCurve
+    val inMask = incoming.vocalActivityMask
+    val inCurve = incoming.energyCurve
+    if (outMask.isEmpty() || outMask.size != outCurve.size) return null
+    if (inMask.isEmpty() || inMask.size != inCurve.size) return null
+    if (!outEnd.isFinite() || !inStart.isFinite()) return null
+    if (outEnd <= outStart) return null
+    val step = if (rate.isFinite() && rate > 0) rate else 1.0
+
+    var inIndex = 0
+    var numerator = 0.0
+    var denominator = 0.0
+    for (index in outMask.indices) {
+        val time = outCurve[index].time
+        if (!time.isFinite() || time < outStart) continue
+        if (time > outEnd) break
+        val weight = outCurve[index].energy
+        if (!weight.isFinite() || weight <= 0.0) continue
+        val target = inStart + (time - outStart) * step
+        while (inIndex + 1 < inCurve.size && inCurve[inIndex + 1].time <= target) inIndex += 1
+        val pOut = outMask[index].let { if (it.isFinite()) it.coerceIn(0.0, 1.0) else 0.0 }
+        val pIn = inMask[inIndex].let { if (it.isFinite()) it.coerceIn(0.0, 1.0) else 0.0 }
+        numerator += weight * pOut * pIn
+        denominator += weight
+    }
+    if (denominator <= 0.0) return null
+    return (numerator / denominator).coerceIn(0.0, 1.0)
+}
+
+/**
  * Seconds of audible music in [start]..[end] on a track's own timeline,
  * judged against the track's own loud-end reference so the measure is
  * independent of how the analyzer scales energy. Returns null when there is
