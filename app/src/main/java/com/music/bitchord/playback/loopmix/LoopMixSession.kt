@@ -2,6 +2,7 @@ package com.music.bitchord.playback.loopmix
 
 import android.util.Log
 import com.music.bitchord.playback.smart.LoopMix
+import com.music.bitchord.playback.smart.LoopMixDuck
 import com.music.bitchord.playback.smart.MixGain
 import com.music.bitchord.playback.smart.TransitionAlternatives
 import com.music.bitchord.playback.smart.MixTemplate
@@ -152,7 +153,7 @@ class LoopMixSession private constructor(
          * target for "reads as clean", a stricter question than "worth
          * ducking".
          */
-        const val STEM_DUCK_TRIGGER = 0.12
+        const val STEM_DUCK_TRIGGER = LoopMixDuck.TRIGGER
 
         /**
          * Residual outgoing vocal gain after the duck. 0.15, not silence: a
@@ -161,7 +162,7 @@ class LoopMixSession private constructor(
          * floor keeps about 2% energy, but as a gain on the stem it keeps the
          * phrase present and audible.
          */
-        const val STEM_DUCK_FLOOR = 0.15f
+        const val STEM_DUCK_FLOOR = LoopMixDuck.MIN_FLOOR
 
         /** Two-thread daemon pool for parallel OUT+IN region decode (vc73). */
         private val DECODE_EXECUTOR: java.util.concurrent.ExecutorService =
@@ -332,13 +333,14 @@ class LoopMixSession private constructor(
                 // decision taken from the boolean would re-litigate the veto
                 // the planner already made with better data.
                 val clashE = script?.choice?.vocalClashEnergy?.takeIf { it.isFinite() }
-                val wantDuck = if (clashE != null) {
-                    clashE > STEM_DUCK_TRIGGER
-                } else {
-                    (outHasVocal && inHasEarlyVocal) || effectivePlan.carve || effectivePlan.clash || effectivePlan.muffle
-                }
-                if (wantDuck) {
-                    Log.i(TAG, "stem-duck out=${effectivePlan.out.loopStart} in=${plan.inn.loopStart} clashE=$clashE")
+                val duck = LoopMixDuck.decide(
+                    clashE = clashE,
+                    outHasVocal = outHasVocal,
+                    inHasEarlyVocal = inHasEarlyVocal,
+                    fallbackTrigger = effectivePlan.carve || effectivePlan.clash || effectivePlan.muffle,
+                )
+                if (duck.wantDuck) {
+                    Log.i(TAG, "stem-duck out=${effectivePlan.out.loopStart} in=${plan.inn.loopStart} clashE=$clashE outFloor=${duck.outFloor} inFloor=${duck.inFloor} duckIn=${duck.duckIncoming}")
                     val beatSec73 = effectivePlan.out.beatSec.takeIf { it > 0 } ?: 0.5
                     if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                         // vc74 (djmix32): single-pass contract - only the vocal stem is
@@ -363,11 +365,11 @@ class LoopMixSession private constructor(
                             for (i in outRegion.left.indices) {
                                 val g: Float = when {
                                     i < fadeStartSample -> 1.0f
-                                    i >= fadeEndSample -> STEM_DUCK_FLOOR
+                                    i >= fadeEndSample -> duck.outFloor
                                     else -> {
                                         val u = (i - fadeStartSample).toDouble() / fadeLen.toDouble()
                                         val c = 0.5 * (1.0 + cos(PI * u))
-                                        (STEM_DUCK_FLOOR + (1.0f - STEM_DUCK_FLOOR) * c).toFloat()
+                                        (duck.outFloor + (1.0f - duck.outFloor) * c).toFloat()
                                     }
                                 }
                                 newLeft[i] = instL[i] + g * voc.first[i]
@@ -386,12 +388,7 @@ class LoopMixSession private constructor(
                     // 0.20, so the E > 0.6 branch only fires on carve templates
                     // that skip the veto — in practice the incoming duck rests
                     // on inHasEarlyVocal.
-                    val duckIncoming = if (clashE != null) {
-                        clashE > 0.60 || inHasEarlyVocal
-                    } else {
-                        inHasEarlyVocal && outHasVocal
-                    }
-                    if (duckIncoming && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
+                    if (duck.duckIncoming && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
                         val vocIn = runCatching { separateVocalStem(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
                         val instInL = if (vocIn != null) dryMinusVocal(inRegion.left, vocIn.first) else null
                         val instInR = if (vocIn != null) dryMinusVocal(inRegion.right, vocIn.second) else null
@@ -405,12 +402,12 @@ class LoopMixSession private constructor(
                             val newRight = FloatArray(inRegion.right.size)
                             for (i in inRegion.left.indices) {
                                 val g: Float = when {
-                                    i < duckStartSample -> STEM_DUCK_FLOOR
+                                    i < duckStartSample -> duck.inFloor
                                     i >= duckEndSample -> 1.0f
                                     else -> {
                                         val u = (i - duckStartSample).toDouble() / duckLen.toDouble()
                                         val c = 0.5 * (1.0 - cos(PI * u))
-                                        (STEM_DUCK_FLOOR + (1.0f - STEM_DUCK_FLOOR) * c).toFloat()
+                                        (duck.inFloor + (1.0f - duck.inFloor) * c).toFloat()
                                     }
                                 }
                                 newLeft[i] = instInL[i] + g * vocIn.first[i]

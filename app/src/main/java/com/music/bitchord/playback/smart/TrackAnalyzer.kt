@@ -1229,6 +1229,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private class Structural(
         val features: TrackFeatures.Features?,
         val decodedShort: Boolean = false,
+        val map: SongMap? = null,
     )
 
     /**
@@ -1319,6 +1320,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
 
         val features = TrackFeatures.analyze(samples, effectiveDuration)
+        var structureMap: SongMap? = null
         if (features != null && !skipPhraseStructure()) {
             val started = SystemClock.elapsedRealtime()
             // djmix18 (Bug 3): the full-track mono PCM is already in memory (decoded for
@@ -1349,6 +1351,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             } else map
             if (correctedMap != null) {
                 PhraseMaps.put(trackId, correctedMap)
+                structureMap = correctedMap
                 Log.i(
                     "BitChordPhrase",
                     "structMs=${correctedMap.structMs} structWallMs=${SystemClock.elapsedRealtime() - started} " +
@@ -1357,7 +1360,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 )
             }
         }
-        return Structural(features)
+        return Structural(features, map = structureMap)
     }
 
     /** Severe heat or battery saver: keep the scalar map and skip the PCM structure pass. */
@@ -1466,8 +1469,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 "windows=${regions.size} vocalWindows=${regions.count { it.vocalWindow != null }}",
         )
 
-        return WholeTrack(
-                TrackAnalysis(
+        val analysis = TrackAnalysis(
                     status = TrackAnalysis.STATUS_READY,
                     trackId = trackId,
                     duration = effectiveDuration,
@@ -1512,8 +1514,18 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 // djmix25: instrumental share windows (empty unless the
                 // >=8GB + opt-in gate passed; see canUseWindowedStems).
                 instrumentalWindows = regions.mapNotNull { it.instrumentalWindow },
-            ),
-        )
+            )
+        if (structural.map != null) {
+            val enriched = SongMapEnrichment.enrich(structural.map, analysis)
+            if (enriched !== structural.map) {
+                PhraseMaps.put(trackId, enriched)
+            } else if (analysis.vocalWindows.isNotEmpty() && analysis.bpm > 0.0 && structural.map.bpm > 0.0 &&
+                abs(structural.map.bpm - analysis.bpm) / analysis.bpm > 0.02
+            ) {
+                Log.d(TAG, "SongMap enrichment skipped for $trackId: bpm mismatch base=${structural.map.bpm} analysis=${analysis.bpm}")
+            }
+        }
+        return WholeTrack(analysis)
     }
 
     /**

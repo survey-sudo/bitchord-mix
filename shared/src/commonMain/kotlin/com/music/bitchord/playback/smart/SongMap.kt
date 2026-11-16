@@ -143,8 +143,11 @@ data class SongMap(
         return trackKey == other.trackKey && schema == other.schema &&
             durationSec == other.durationSec && partial == other.partial &&
             sections == other.sections && startKind == other.startKind &&
-            endingKind == other.endingKind
+            endingKind == other.endingKind &&
+            sungBars.contentEquals(other.sungBars) && vocalEnergy.contentEquals(other.vocalEnergy)
     }
 
-    override fun hashCode(): Int = trackKey.hashCode() * 31 + sections.hashCode()
+    override fun hashCode(): Int =
+        ((trackKey.hashCode() * 31 + sections.hashCode()) * 31 + sungBars.contentHashCode()) * 31 +
+            vocalEnergy.contentHashCode()
 }

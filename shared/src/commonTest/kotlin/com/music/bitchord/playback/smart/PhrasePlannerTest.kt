@@ -333,6 +333,48 @@ class PhrasePlannerTest {
         assertTrue(lock.slides >= 1)
     }
 
+    @Test
+    fun oneSidedEmptyVocalEnergyIsUnmeasured() {
+        val outro = listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5))
+        val intro = listOf(
+            section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5),
+            section(16, 32, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 5, vocal = 0.8f),
+        )
+        val outMeasured = song("a", 120.0, 16, outro).copy(vocalEnergy = FloatArray(16) { 0.1f })
+        val inEmpty = song(
+            "b", 120.0, 32, intro,
+            firstVocal = 16,
+            sungFrom = 16,
+            start = StartKind.INTRO_INSTRUMENTAL,
+        )
+        val outEmpty = song("a", 120.0, 16, outro)
+        val inMeasured = inEmpty.copy(vocalEnergy = FloatArray(32) { 0.1f })
+
+        val first = assertNotNull(PhrasePlanner.select(outMeasured, inEmpty, 0, 120.0, 120.0))
+        assertNull(first.vocalClashEnergy, "out-measured/in-empty must be unmeasured")
+
+        val second = assertNotNull(PhrasePlanner.select(outEmpty, inMeasured, 0, 120.0, 120.0))
+        assertNull(second.vocalClashEnergy, "out-empty/in-measured must be unmeasured")
+    }
+
+    @Test
+    fun bothMeasuredVocalEnergyPopulatesClashEnergy() {
+        val outro = listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5))
+        val intro = listOf(
+            section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5),
+            section(16, 32, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 5, vocal = 0.8f),
+        )
+        val outMeasured = song("a", 120.0, 16, outro).copy(vocalEnergy = FloatArray(16) { 0.1f })
+        val inMeasured = song(
+            "b", 120.0, 32, intro,
+            firstVocal = 16,
+            sungFrom = 16,
+            start = StartKind.INTRO_INSTRUMENTAL,
+        ).copy(vocalEnergy = FloatArray(32) { 0.1f })
+        val choice = assertNotNull(PhrasePlanner.select(outMeasured, inMeasured, 0, 120.0, 120.0))
+        assertNotNull(choice.vocalClashEnergy, "both-measured must populate vocalClashEnergy")
+    }
+
     private fun blend(): PhraseChoice {
         val a = song("a", 120.0, 16, listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5)))
         val b = song("b", 120.0, 16, listOf(section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5)))

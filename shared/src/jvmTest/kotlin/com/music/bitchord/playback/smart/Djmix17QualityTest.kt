@@ -116,4 +116,44 @@ class Djmix17QualityTest {
         assertNull(store.load("bubble-tea"), "old provenance entry must be discarded")
         assertTrue(!file.exists(), "stale provenance file must be deleted")
     }
+
+    @Test fun fullVocalWindowsSurviveStoreReloadAndHeadStaysUnenriched() {
+        val (store, _) = tmpStore()
+        val withVocal = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            trackId = "with-vocal",
+            duration = 32.0,
+            bpm = 120.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.8,
+            downbeats = emptyList(),
+            vocalWindows = listOf(CurveWindow(0.0, 10.0, FloatArray(40) { 0.8f })),
+            quality = TrackAnalysis.QUALITY_FULL,
+        )
+        store.save("with-vocal", withVocal)
+        val loaded = store.load("with-vocal")
+        assertNotNull(loaded, "saved full analysis must load")
+        assertEquals(TrackAnalysis.QUALITY_FULL, loaded.quality)
+        assertTrue(loaded.vocalWindows.isNotEmpty(), "vocalWindows must survive the round-trip")
+        val map = SongMaps.fromAnalysis("with-vocal", loaded)
+        assertNotNull(map, "loaded analysis must yield a map")
+        assertTrue(map.vocalEnergy.isNotEmpty(), "reloaded vocalWindows must preserve non-empty vocalEnergy")
+        assertNotNull(map.firstVocalBar, "reloaded map must preserve firstVocalBar")
+
+        val head = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            trackId = "head-only",
+            duration = 32.0,
+            bpm = 120.0,
+            beatInterval = 0.5,
+            beatConfidence = 0.8,
+            downbeats = emptyList(),
+            vocalWindows = emptyList(),
+            quality = TrackAnalysis.QUALITY_HEAD,
+        )
+        val headBase = SongMaps.fromAnalysis("head-only", head)
+        assertNotNull(headBase, "head analysis must yield a base map")
+        val enriched = SongMapEnrichment.enrich(headBase, head)
+        assertTrue(enriched === headBase, "QUALITY_HEAD with empty vocalWindows must stay unenriched")
+    }
 }

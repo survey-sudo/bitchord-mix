@@ -28,7 +28,7 @@ env:
   ANDROID_BUILD_TOOLS: "36.0.0"
   ANDROID_NDK: "27.2.12479018"
   ANDROID_CMAKE: "3.22.1"
-  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.daemon=false"
 
 jobs:
   test:
@@ -63,6 +63,16 @@ jobs:
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test_asan
           /tmp/vocal_spectrogram_test_asan
+          echo "--- loopmix renderer A/B selftest ---"
+          if [ -f native/loopmix/loop_mix_renderer_ab_main.cpp ]; then
+            g++ -std=c++17 -O2 -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_ab_main.cpp \
+                -o /tmp/loop_mix_renderer_ab_main
+            /tmp/loop_mix_renderer_ab_main --selftest
+          else
+            echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
+          fi
 
       # The runner image is ~14 GB free and the NDK alone is ~2 GB.
       - name: Free disk space
@@ -90,10 +100,10 @@ jobs:
             "cmake;$ANDROID_CMAKE"
 
       - name: shared jvmTest
-        run: ./gradlew :shared:jvmTest --stacktrace
+        run: ./gradlew :shared:jvmTest --max-workers=2 --no-daemon --stacktrace
 
       - name: app unit tests
-        run: ./gradlew :app:testProdDebugUnitTest --stacktrace
+        run: ./gradlew :app:testProdDebugUnitTest --max-workers=2 --no-daemon --stacktrace
 
       - name: Upload test reports
         if: always()
@@ -110,6 +120,11 @@ jobs:
     name: Release APK (arm64)
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Non-blocking until two consecutive green runs confirm stability: run
+    # 43847603785 lost runner communication at 51m1s during assembleProdRelease
+    # (Unit tests passed in 8m24s). Reduced heap (-Xmx3g) and
+    # --max-workers=2 --no-daemon leave headroom on 7 GiB runners.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +139,16 @@ jobs:
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test
           /tmp/vocal_spectrogram_test
+          echo "--- loopmix renderer A/B selftest ---"
+          if [ -f native/loopmix/loop_mix_renderer_ab_main.cpp ]; then
+            g++ -std=c++17 -O2 -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_ab_main.cpp \
+                -o /tmp/loop_mix_renderer_ab_main
+            /tmp/loop_mix_renderer_ab_main --selftest
+          else
+            echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
+          fi
 
       - name: Free disk space
         run: |
@@ -177,8 +202,11 @@ jobs:
           } > keystore.properties
           chmod 600 bitchord-loopfix.jks keystore.properties
 
+      - name: Pre-build disk check
+        run: df -h
+
       - name: assembleProdRelease
-        run: ./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false --stacktrace
+        run: ./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false --max-workers=2 --no-daemon --stacktrace
 
       - name: Audit APK
         run: |
@@ -213,3 +241,15 @@ jobs:
           path: app/build/outputs/apk/prod/release/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload build diagnostics (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            app/build/outputs/logs/
+            build/reports/
+            app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14

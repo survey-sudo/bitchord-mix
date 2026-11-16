@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc75. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build gate for vc76 (2.2.3-djmix34). File kept as vc75-gate.sh for history; it now gates vc76. Needs only g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
@@ -32,7 +32,7 @@ say()  { printf '%s\n' "$*"; }
 # false failure this gate produced once and should never produce again.
 WORK="${VC75_GATE_TMP:-${HOME}/.cache/vc75-gate}"
 mkdir -p "$WORK" 2>/dev/null || WORK="${TMPDIR:-/tmp}"
-trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log"' EXIT
+trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log"' EXIT
 
 say "=== tree: $(pwd) ==="
 say "HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
@@ -70,10 +70,10 @@ fi
 # --- HARD: version stamp -----------------------------------------------------
 # versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
 # no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 75' build.gradle.kts \
-  && ok "versionCode is 75" || bad "versionCode is not 75"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix33"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix33" || bad "versionName is not 2.2.3-djmix33"
+grep -q 'extra\["bitchordVersionCode"\] = 76' build.gradle.kts \
+  && ok "versionCode is 76" || bad "versionCode is not 76"
+grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix34"' build.gradle.kts \
+  && ok "versionName is 2.2.3-djmix34" || bad "versionName is not 2.2.3-djmix34"
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""
@@ -117,12 +117,6 @@ else
   fi
 fi
 
-say ""
-if [ "$fail" -ne 0 ]; then
-  say "GATE FAILED — do not build, do not push, do not install."
-  exit 1
-fi
-
 # --- HARD: window-path calibration -----------------------------------------
 # The stem path is new working code as of vc75, so the invariants the automix
 # heuristics stand on are checked rather than assumed: the gain curve the
@@ -145,6 +139,11 @@ else
     bad "window calibration did not compile — see $WORK/wc.build.log"
     sed -n '1,12p' "$WORK/wc.build.log"
   fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  say "GATE FAILED — do not build, do not push, do not install."
+  exit 1
 fi
 
 say "GATE PASSED — tree is safe to build."

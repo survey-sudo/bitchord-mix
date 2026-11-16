@@ -453,7 +453,7 @@ object SongMaps {
      * mask is a gain, this one is a detector, and they are different scales.
      * This gate is a detector and belongs where the detector's scale puts it.
      */
-    private const val VOCAL_BAR_GATE = 0.22f
+    internal const val VOCAL_BAR_GATE = 0.22f
 
     private fun phrase(
         start: Int, end: Int, fn: SectionFn, role: SectionRole, energy: Int, vocal: Float, loopable: Boolean = false,

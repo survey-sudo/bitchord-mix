@@ -139,6 +139,7 @@ object StemClash {
      * that were measured and found clean, which is the wrong direction: the
      * unmeasured pair is a risk, not a bargain.
      */
+    // Unused in prod; kept pinned for candidate-scoring reference.
     fun rank(confidence: Double, flow: Double, meanClash: Double?): Double {
         val safeConfidence = if (confidence.isFinite()) confidence.coerceIn(0.0, 1.0) else 0.0
         val safeFlow = if (flow.isFinite()) flow.coerceIn(0.0, 1.0) else 0.5

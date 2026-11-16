@@ -3,15 +3,23 @@
 Status snapshot, 2026-11-16. Everything below is either **blocked**, **measured**, or
 **not started** — no item is claimed done without evidence.
 
-Current build: `vc75` / `2.2.3-djmix33`, APK `67,544,373 B`,
-SHA-256 `78d006d72e351c5fd58f2df5dd6f350014131b84dcb0ce202ea5f1f1f9400812`,
-signed locally, tag `vc75-2.2.3-djmix33` (`b7375e8`). CI run `43817363643`
-produced it: 443 shared + 1,359 app tests, 0 failures, plus the native
-analyzer test in both jobs.
+Current build: `vc76` / `2.2.3-djmix34`, signed APK `67,433,006 B`,
+SHA-256 `02920d8278003c5fe9b492a3f0a0dc052ddb4b48a93d8e8ff2e2b84cb1e0ca79`,
+signed with cert SHA-256
+`20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c` on
+`bk-android` (`app-prod-arm64-v8a-release.apk`), pulled to
+`~/Bitchord/work/vc76-release/`. Prior `vc75` (`78d006d7...`, `b7375e8`)
+remains superseded before device verification.
 
-**Not yet installed on `1439ebea`.** The phone left adb before the install, so
-the mid-playback verification below is still open and vc75 is unproven on
-device.
+**`vc76` is not yet installed on `1439ebea`** (no device on `adb`), so the
+mid-playback verification below is still open and `vc76` is unproven on device.
+
+Test & gate record on `bk-android` at `vc76`: `:shared:jvmTest` **479/479**
+pass; `:app:testProdDebugUnitTest` **1358/1359** pass (1 skipped), with only
+unrelated env-dependent `QueueShuffleTierTest` `< 50ms` timing benchmark
+failing under contention and passing **27/27** (`shuffle: 2.42ms`,
+`restore: 3.55ms`) isolated; `./tools/vc75-gate.sh` fixed (`fail` check moved
+after calibration) and passing (16 native + 11 calibration invariants).
 
 ---
 
@@ -19,17 +27,18 @@ device.
 
 Two council rounds (3 of 4 seats, then 4 of 4). Verdict: stems are the unfair
 advantage and were unused by default; the clash measurement now decides
-ranking, veto, and the render duck.
+ranking, veto, and the render duck. (`StemClash.rank` remains pinned-only /
+unused in production.)
 
 | # | Deliverable | Status |
 |---|---|---|
-| D1 | Energy-weighted clash core (`f59044a`): `SongMap.vocalEnergy`, `PhrasePlanner.vocalClashEnergy`, veto on measured `E > 0.20`, weights `0.18/0.30/0.12/0.14/0.08/0.08/0.10`, cut as `0.20×discardedVocalEnergy + 0.30×clashE`, bonuses capped `0.08` | **Landed** |
-| D2 | Stem-duck default-on (`d87faae`): trigger `E > 0.12`, asymmetric, floors `0.15`, boolean fallback when unmeasured, `PhraseChoice.vocalClashEnergy` plumbed | **Landed, unverified** — needs `:shared:jvmTest` + on-device listen |
-| D4 | `BeatFlow.rankScore` coverage-lerped `w = 0.18 + 0.27×coverage` (`b6d1d95`), penalty `0.7/0.3/0.2` | **Landed, unverified** |
+| D1 | Energy-weighted clash core (`f59044a` + Pass-2 `SongMapEnrichment.enrich` + `SongMap` equals/hashCode + `CrossfadeController.memoKey` + `PhrasePlanner.vocalClashEnergy` `\|\|` unmeasured guard): fixed Pass-1 `PhraseMaps` bypass where `StructureAnalyzer.fromPcm(..., mask=null)` left `vocalEnergy` empty and `sungBars` all-false in production; `SongMap.vocalEnergy`, `PhrasePlanner.vocalClashEnergy`, veto on measured `E > 0.20`, weights `0.18/0.30/0.12/0.14/0.08/0.08/0.10`, cut as `0.20×discardedVocalEnergy + 0.30×clashE`, bonuses capped `0.08` | **Landed, unit-tested (479/479 `:shared:jvmTest`), awaits on-device logs.** |
+| D2 | Stem-duck default-on (`d87faae` + `LoopMixDuck.decide` + `StemClash.duckGainFor` floor wiring): trigger `E > 0.12`, asymmetric, floor `0.15f`, boolean fallback when unmeasured, `PhraseChoice.vocalClashEnergy` plumbed; extracted pure `LoopMixDuck.decide()` and wired `duckGainFor` (floor `0.15f`) into outgoing and incoming stem duck; pinned with `LoopMixDuckTest` and off-device `native/loopmix/loop_mix_renderer_ab_main.cpp --selftest` (`duck-off -10.434 dB`, `duck-gain(0.18) -12.555 dB`, `fixed-0.15 / duck-gain(0.60) -12.749 dB`, `exitGateViolations=0`) | **Landed & verified off-device, awaits on-device listen.** |
+| D4 | `BeatFlow.rankScore` coverage-lerped `w = 0.18 + 0.27×coverage` (`b6d1d95`), penalty `0.7/0.3/0.2` | **Landed, unit-tested (479/479), awaits on-device listen.** |
 | D5 | `MixWeightTuner` deleted (`d87faae`) + its 3 `Djmix25` tests | **Landed** |
 | D3 | Seam-local tempo/key/energy; `1.09→1.06` cap | **Deferred**: needs per-bar key/BPM fields `SongMap` doesn't carry; cap ships only bundled with it (council, 3/3) |
 | D5b | `MixTemplate` 16→4 | **Deferred** until D6 shows which rungs win (council, 3/3) |
-| D6 | Blind A/B gate: 20 pairs, stem-on vs stem-off vs Apple, need ≥60% on clash pairs | **Blocked**: no phone on adb |
+| D6 | Blind A/B gate: 20 pairs, stem-on vs stem-off vs Apple, need ≥60% on clash pairs | **Blocked** on phone (`adb` disconnected) + Apple Automix WAV captures; off-device WAV A/B harness (`native/loopmix/loop_mix_renderer_ab_main.cpp`) is ready for stem-on vs stem-off renders |
 
 Not raised, on purpose: the detector threshold stays at `0.25`. It is a
 detector on the analyzer's calibrated scale (chorus `0.57–0.71`, soft verse
@@ -37,9 +46,9 @@ detector on the analyzer's calibrated scale (chorus `0.57–0.71`, soft verse
 and blind the planner to the soft verse the whole overhaul exists to catch.
 Pinned in `StemClashTest.detectorThresholdMustStayOnTheDetectorScale`.
 
-Build rule: APKs are built on instabox `bk-android`
-(`/data/workspace/vc75-build`), not on this PC. Local network was unreachable
-while this landed, so D2/D4 await their first run there.
+Build rule: APKs are built on instabox `bk-android`, not on this PC. `vc76`
+(`2.2.3-djmix34`) is built and pulled to `~/Bitchord/work/vc76-release/`, and
+awaits device install and listening verification.
 
 ---
 
@@ -138,10 +147,9 @@ signed, installable APK, add four repository secrets:
 
 **Decision pending:** whether the keystore goes into GitHub secrets at all.
 
-The CI release job is now **proven green** on run `43767187882` (commit `5fbe776`,
-2026-11-15): `Unit tests` finished in `8m 48s` (`528 s`), `Release APK (arm64)`
-finished in `17m 41s` (`1,061 s`), and the parallel run concluded in `17m 45s`
-(`1,065 s`). `assembleProdRelease` alone took `14m 21s` (`861 s`).
+Latest CI record: run `43847603785` at `0157ee5` (`Unit tests` passed in `8m 24s`; `Release APK (arm64)` failed at `51m 1s` when the hosted runner lost communication). `.github/workflows/android-ci.yml` has since been hardened (`-Xmx3g`, `--max-workers=2 --no-daemon`, pre-build `df -h`, failure diagnostics upload, and `continue-on-error: true` on `release` until two consecutive green runs).
+
+Historical `vc74` CI baseline (`5fbe776`, run `43767187882`, 2026-11-15): `Unit tests` finished in `8m 48s` (`528 s`), `Release APK (arm64)` finished in `17m 41s` (`1,061 s`), and the parallel run concluded in `17m 45s` (`1,065 s`). `assembleProdRelease` alone took `14m 21s` (`861 s`).
 
 - **Payload parity (`docs/ci-parity-vc74.md`):** **1,584 of 1,592 entries** are
   SHA-256 identical to the verified build-box `vc74` APK, including all three

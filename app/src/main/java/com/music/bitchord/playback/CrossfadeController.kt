@@ -4209,7 +4209,7 @@ class CrossfadeController(
         // djmix14 memo: PhrasePlanner.select is combinatorial; tick must
         // never recompute it every 250 ms for the same pair/qualities/BPMs.
         val earliestBar = if (out.bpm > 0) ((player.currentPosition / 1000.0) / (240.0 / out.bpm)).toInt() else 0
-        val memoKey = "$pair|${out.quality}|${inn.quality}|${out.bpm}|${inn.bpm}|$earliestBar|${outMap?.hashCode()}|${inMap?.hashCode()}"
+        val memoKey = "$pair|${out.quality}|${inn.quality}|${out.bpm}|${inn.bpm}|$earliestBar|${outMap?.hashCode()}|${inMap?.hashCode()}|${outMap?.vocalEnergy?.contentHashCode()}|${outMap?.sungBars?.contentHashCode()}|${inMap?.vocalEnergy?.contentHashCode()}|${inMap?.sungBars?.contentHashCode()}"
         val fresh = if (memoKey == phraseMemoKey) {
             phraseMemoFresh
         } else {

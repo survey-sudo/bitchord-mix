@@ -573,7 +573,7 @@ object PhrasePlanner {
     private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double? {
         val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
         if (bars <= 0) return null
-        if (out.vocalEnergy.isEmpty() && inn.vocalEnergy.isEmpty()) return null
+        if (out.vocalEnergy.isEmpty() || inn.vocalEnergy.isEmpty()) return null
         var numerator = 0.0
         var denominator = 0.0
         for (i in 0 until bars) {
