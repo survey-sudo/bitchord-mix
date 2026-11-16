@@ -1,5 +1,6 @@
 package com.music.bitchord.playback.audio
 
+import android.os.Process
 import android.util.Log
 import androidx.media3.common.C
 import androidx.media3.common.Format
@@ -95,6 +96,16 @@ class PrecisionAudioSink(
         private set
 
     private var processCounter: Long = 0L
+
+    /**
+     * Media3 creates and owns the thread that calls handleBuffer(), so its
+     * priority cannot be set from outside. Raise it from inside the first
+     * buffer instead: one boolean test in steady state. Every operation on
+     * this thread is audio (decode, DSP, PCM encode, loop render, delegate
+     * write), so URGENT_AUDIO is the correct class. Some OEMs refuse the
+     * call; a denial must not kill playback.
+     */
+    private var audioPrioritySet = false
 
     /** Sample rate of the configured format, for timestamping split sub-blocks. */
     private var configuredSampleRate: Int = 0
@@ -301,6 +312,13 @@ class PrecisionAudioSink(
         presentationTimeUs: Long,
         encodedAccessUnitCount: Int,
     ): Boolean {
+        // vc75: raise the render thread once, on the thread that does the
+        // work. Above the precision check on purpose - the delegate
+        // passthrough is audio work too.
+        if (!audioPrioritySet) {
+            audioPrioritySet = true
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
+        }
         if (!isPrecisionActive) {
             return delegate.handleBuffer(inputBuffer, presentationTimeUs, encodedAccessUnitCount)
         }
