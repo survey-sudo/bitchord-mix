@@ -15,6 +15,34 @@ device.
 
 ---
 
+## Automix overhaul (council-built, 2026-11-16)
+
+Two council rounds (3 of 4 seats, then 4 of 4). Verdict: stems are the unfair
+advantage and were unused by default; the clash measurement now decides
+ranking, veto, and the render duck.
+
+| # | Deliverable | Status |
+|---|---|---|
+| D1 | Energy-weighted clash core (`f59044a`): `SongMap.vocalEnergy`, `PhrasePlanner.vocalClashEnergy`, veto on measured `E > 0.20`, weights `0.18/0.30/0.12/0.14/0.08/0.08/0.10`, cut as `0.20×discardedVocalEnergy + 0.30×clashE`, bonuses capped `0.08` | **Landed** |
+| D2 | Stem-duck default-on (`d87faae`): trigger `E > 0.12`, asymmetric, floors `0.15`, boolean fallback when unmeasured, `PhraseChoice.vocalClashEnergy` plumbed | **Landed, unverified** — needs `:shared:jvmTest` + on-device listen |
+| D4 | `BeatFlow.rankScore` coverage-lerped `w = 0.18 + 0.27×coverage` (`b6d1d95`), penalty `0.7/0.3/0.2` | **Landed, unverified** |
+| D5 | `MixWeightTuner` deleted (`d87faae`) + its 3 `Djmix25` tests | **Landed** |
+| D3 | Seam-local tempo/key/energy; `1.09→1.06` cap | **Deferred**: needs per-bar key/BPM fields `SongMap` doesn't carry; cap ships only bundled with it (council, 3/3) |
+| D5b | `MixTemplate` 16→4 | **Deferred** until D6 shows which rungs win (council, 3/3) |
+| D6 | Blind A/B gate: 20 pairs, stem-on vs stem-off vs Apple, need ≥60% on clash pairs | **Blocked**: no phone on adb |
+
+Not raised, on purpose: the detector threshold stays at `0.25`. It is a
+detector on the analyzer's calibrated scale (chorus `0.57–0.71`, soft verse
+`0.2–0.4`), not the separator's gain; `0.50` would sit inside the chorus band
+and blind the planner to the soft verse the whole overhaul exists to catch.
+Pinned in `StemClashTest.detectorThresholdMustStayOnTheDetectorScale`.
+
+Build rule: APKs are built on instabox `bk-android`
+(`/data/workspace/vc75-build`), not on this PC. Local network was unreachable
+while this landed, so D2/D4 await their first run there.
+
+---
+
 ## Measured: the stem gain curve (calibration harness, 2026-11-16)
 
 `native/analyzer/window_calibration.cpp` reads the Wiener transfer function out
