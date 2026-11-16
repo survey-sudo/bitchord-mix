@@ -186,7 +186,11 @@ object BeatFlow {
         val start = firstBeat(incoming) ?: 0.0
         val anchor = anchorTime ?: inEnd
         val skip = ((anchor - start).coerceIn(0.0, MAX_SKIP_SECONDS) / MAX_SKIP_SECONDS)
-        val penalty = meanDeficit * 0.5 + worst * 0.5 + lateDrop * 0.3 +
+        // meanDeficit and worst are two readings of the same deficit, so
+        // weighting them 0.5/0.5 charged it twice. The worst sample is what the
+        // ear notices; the mean is corroboration. 0.7/0.3 keeps the mean
+        // primary without letting a single sample decide the candidate.
+        val penalty = meanDeficit * 0.7 + worst * 0.3 + lateDrop * 0.2 +
             minOf(waitSeconds / MAX_WAIT_SECONDS, 1.0) * 0.6 + minOf(skip, 1.0) * 0.4
         return FlowResult(
             score = (1.0 - penalty).coerceIn(0.0, 1.0),
@@ -201,13 +205,31 @@ object BeatFlow {
     }
 
     /**
-     * Ranking score for as many candidate overlaps as fit: Orchard weights
-     * beat flow 0.18 against the coarse frame measures, so the rank blends
-     * the candidate own confidence with its flow score the same way.
+     * Ranking score for as many candidate overlaps as fit.
+     *
+     * Orchard weights beat flow 0.18 against the coarse frame measures, and
+     * that is the split at zero coverage (0.82 confidence, 0.18 flow). As
+     * coverage rises the flow becomes a real measurement rather than a
+     * quarter-filled guess, and it is the more audible of the two signals —
+     * beat-tracker confidence saturates and is wrong on hand-played drums,
+     * while flow is how the beat the listener is already hearing survives the
+     * overlap. So the flow weight grows linearly with coverage,
+     * 0.18 + 0.27 * coverage, reaching 0.45 at full coverage while confidence
+     * demotes to 0.55.
+     *
+     * Linear rather than a step at half coverage: a step inverts near-identical
+     * candidates on formula alone, and candidates arrive with hard-coded
+     * confidences (0.72, 0.66) where one sample of coverage difference should
+     * never flip the winner.
      */
     fun rankScore(confidence: Double, flow: FlowResult): Double {
         val safeFlow = if (flow.coverage > 0.0) flow.score else 0.5
-        return confidence * 0.82 + safeFlow * 0.18
+        val safeConfidence = if (confidence.isFinite()) confidence.coerceIn(0.0, 1.0) else 0.0
+        val safeFlowClamped = safeFlow.coerceIn(0.0, 1.0)
+        val cov = if (flow.coverage.isFinite()) flow.coverage.coerceIn(0.0, 1.0) else 0.0
+        val flowWeight = 0.18 + 0.27 * cov
+        val confidenceWeight = 1.0 - flowWeight
+        return confidenceWeight * safeConfidence + flowWeight * safeFlowClamped
     }
 
     /** Whole-beat duration for a beatless run: floor to whole beats, capped. */

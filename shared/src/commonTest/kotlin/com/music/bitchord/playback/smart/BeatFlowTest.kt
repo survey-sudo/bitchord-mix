@@ -65,6 +65,30 @@ class BeatFlowTest {
     }
 
     @Test
+    fun rankScorePromotesFlowWithCoverageLerp() {
+        // w_flow = 0.18 + 0.27 * coverage, confidence takes the rest.
+        val half = BeatFlow.FlowResult(score = 0.9, coverage = 0.5)
+        val wHalf = 0.18 + 0.27 * 0.5
+        assertEquals((1.0 - wHalf) * 0.72 + wHalf * 0.9, BeatFlow.rankScore(0.72, half), 1e-9)
+        // Endpoints: full coverage is 0.55/0.45, zero coverage is Orchard's
+        // 0.82/0.18 exactly.
+        val full = BeatFlow.FlowResult(score = 0.9, coverage = 1.0)
+        assertEquals(0.55 * 0.72 + 0.45 * 0.9, BeatFlow.rankScore(0.72, full), 1e-9)
+        val none = BeatFlow.FlowResult(score = 0.9, coverage = 0.0)
+        assertEquals(0.82 * 0.72 + 0.18 * 0.9, BeatFlow.rankScore(0.72, none), 1e-9)
+        // No cliff: candidates differing by one sample of coverage must not
+        // flip on formula alone. 17 samples is the denominator, so 1/17 apart
+        // must move the rank by less than 0.02.
+        val a = BeatFlow.rankScore(0.72, BeatFlow.FlowResult(score = 0.9, coverage = 8.0 / 17.0))
+        val b = BeatFlow.rankScore(0.72, BeatFlow.FlowResult(score = 0.9, coverage = 9.0 / 17.0))
+        assertTrue(kotlin.math.abs(a - b) < 0.02, "one sample of coverage must not flip rank: $a vs $b")
+        // At full coverage a full flow swing is worth 0.45.
+        val hi = BeatFlow.rankScore(0.72, BeatFlow.FlowResult(score = 1.0, coverage = 1.0))
+        val lo = BeatFlow.rankScore(0.72, BeatFlow.FlowResult(score = 0.0, coverage = 1.0))
+        assertEquals(0.45, hi - lo, 1e-9, "measured flow spans exactly 0.45")
+    }
+
+    @Test
     fun presenceIsNullWithoutCurveAndFullAtReference() {
         assertEquals(null, BeatFlow.beatPresenceAt(steady(1.0).copy(lowEnergyCurve = emptyList()), 40.0))
         val presence = BeatFlow.beatPresenceAt(steady(1.0), 40.0)
