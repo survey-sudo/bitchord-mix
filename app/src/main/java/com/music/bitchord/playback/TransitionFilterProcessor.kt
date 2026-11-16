@@ -236,6 +236,15 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     fun parkColour() = colour.park()
 
     /**
+     * Releases colour without hard-zeroing it: [DjColour.set] lets the plate
+     * smoother ramp its wet gain to zero over ~150 ms. [parkColour] stays
+     * for silent/flush teardown ([onReset]) where no tail is audible.
+     */
+    fun releaseColour() {
+        colour.set(DjEffect.NONE, 0f, 0f, 0f)
+    }
+
+    /**
      * Processes interleaved Float32 audio samples in [block] in-place.
      * Preserves dynamic headroom without clamping to [-1.0f, +1.0f].
      */
@@ -327,15 +336,20 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         lowState.fill(0f)
         highState.fill(0f)
         midState.fill(0f)
+        // Re-arm the next ride at its intended target: onFlush runs before a
+        // new ride/idle (including from configure/reset in the DSP chain),
+        // so current must start from the target cutoff, not a stale glide.
         currentLowPassHz = targetLowPassHz
         currentHighPassHz = targetHighPassHz
         currentMidGainDb = targetMidGainDb
+        filterStateDirty = false
         // Whatever the ring holds is from before the seek; start it clean.
         echoSeenGeneration = echoGeneration - 1
     }
 
     override fun onReset() {
         parkEcho()
+        parkColour()
         echoSeenGeneration = echoGeneration - 1
         targetLowPassHz = OPEN_HZ
         targetHighPassHz = OFF_HZ
@@ -703,6 +717,14 @@ interface TransitionFilters {
 
     /** Drops any echo on either sink. Called whenever a transition ends, however it ended. */
     fun parkEchoes() = Unit
+
+    /**
+     * Releases colour smoothly on both sinks (see
+     * [TransitionFilterProcessor.releaseColour]). Called before [parkEchoes]
+     * at a teardown so an audible reverb tail decays instead of hard-cutting;
+     * [parkEcho] stays hard-parked in [parkEchoes].
+     */
+    fun releaseColour() = Unit
 
     /**
      * Beatmatch tempo about to be applied as a playback rate on this side.

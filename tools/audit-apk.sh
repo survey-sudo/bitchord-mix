@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# APK audit for vc76 (2.2.3-djmix34). Runs anywhere with unzip + python3; uses aapt2/apksigner
+# APK audit for vc77 (2.2.3-djmix35). Runs anywhere with unzip + python3; uses aapt2/apksigner
 # when an SDK is present, and degrades to structural checks when it is not.
 #
 #   ./audit-apk.sh path/to/app.apk
@@ -29,8 +29,8 @@ if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
   echo "versionCode: ${2:-?}"
   echo "versionName: ${3:-?}"
   [ "${1:-}" = "com.music.bitchord.loopfix" ] && ok "package is loopfix" || bad "package is not com.music.bitchord.loopfix"
-  [ "${2:-}" = "76" ] && ok "versionCode 76" || bad "versionCode is not 76 (got ${2:-?})"
-  [ "${3:-}" = "2.2.3-djmix34" ] && ok "versionName 2.2.3-djmix34" || bad "versionName is not 2.2.3-djmix34 (got ${3:-?})"
+  [ "${2:-}" = "77" ] && ok "versionCode 77" || bad "versionCode is not 77 (got ${2:-?})"
+  [ "${3:-}" = "2.2.3-djmix35" ] && ok "versionName 2.2.3-djmix35" || bad "versionName is not 2.2.3-djmix35 (got ${3:-?})"
 else
   echo "aapt2 not found — skipping badging; set ANDROID_HOME to enable"
 fi

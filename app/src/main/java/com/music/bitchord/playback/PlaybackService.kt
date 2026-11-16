@@ -2022,10 +2022,17 @@ class PlaybackService : MediaLibraryService() {
                 ) = spareFilter.setColour(effect, amount, beatSeconds, scoop)
 
                 override fun parkEchoes() {
+                    // vc77: parkEcho stays hard (the tail is cut, not faded);
+                    // colour is released smoothly via releaseColour() before
+                    // this, so parkColour is not called here. parkColour only
+                    // runs from the processor's onReset (silent teardown).
                     transitionFilterA.parkEcho()
                     transitionFilterB.parkEcho()
-                    transitionFilterA.parkColour()
-                    transitionFilterB.parkColour()
+                }
+
+                override fun releaseColour() {
+                    transitionFilterA.releaseColour()
+                    transitionFilterB.releaseColour()
                 }
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
@@ -2086,6 +2093,9 @@ class PlaybackService : MediaLibraryService() {
             },
             wholeTrackBusy = { trackAnalyzer.wholeTrackBusy() },
             separateTransitionBothWindows = { left, right, rate ->
+                trackAnalyzer.separateTransitionBothWindows(left, right, rate)
+            },
+            separateTransitionPair = { left, right, rate ->
                 trackAnalyzer.separateTransitionBothWindows(left, right, rate)
             },
             syncedLines = ::loopMixLyrics,

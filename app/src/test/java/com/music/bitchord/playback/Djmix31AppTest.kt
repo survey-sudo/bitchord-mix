@@ -244,4 +244,76 @@ class Djmix31AppTest {
     fun windowedStemsOnByDefault() {
         assertTrue(AppSettings.automixWindowedStemsEnabled.value)
     }
+
+    @Test
+    fun onFlushResetsStateWithoutSnappingCurrentToTarget() {
+        val proc = TransitionFilterProcessor()
+        proc.configure(44100, 2)
+        proc.setCutoffs(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        proc.setMidGainDb(0f)
+        // Start a mid-sweep ride: target parks, current is still gliding.
+        proc.setCutoffs(700f, TransitionFilterProcessor.OFF_HZ)
+        val frames = 1024
+        val block = AudioBlock(channelCount = 2, capacityFrames = frames)
+        for (f in 0 until frames) {
+            val s = (0.5 * sin(2.0 * PI * 1000.0 * f / 44100)).toFloat()
+            block.samples[f * 2] = s
+            block.samples[f * 2 + 1] = s
+        }
+        block.reset(frames)
+        proc.process(block)
+        val targetF = TransitionFilterProcessor::class.java.getDeclaredField("targetLowPassHz")
+        targetF.isAccessible = true
+        val currentF = TransitionFilterProcessor::class.java.getDeclaredField("currentLowPassHz")
+        currentF.isAccessible = true
+        val target = targetF.getFloat(proc)
+        val before = currentF.getFloat(proc)
+        assertEquals(700f, target, 1e-3f)
+        assertTrue("current must still be gliding (not yet at target), before=$before", before > target + 500f)
+        assertTrue("current must have moved from open, before=$before", before < TransitionFilterProcessor.OPEN_HZ)
+        // Flush mid-transition (seek): state must clear and the filter must
+        // fully re-initialize at its intended target, re-arming the next
+        // ride (configure/reset flush the same way, so no stale glide may
+        // survive into it).
+        val onFlush = TransitionFilterProcessor::class.java.getDeclaredMethod("onFlush")
+        onFlush.isAccessible = true
+        onFlush.invoke(proc)
+        val after = currentF.getFloat(proc)
+        assertEquals("flush must re-initialize current at target", target, after, 1e-3f)
+        val dirtyF = TransitionFilterProcessor::class.java.getDeclaredField("filterStateDirty")
+        dirtyF.isAccessible = true
+        assertTrue("flush must clear filterStateDirty", !dirtyF.getBoolean(proc))
+        val lowF = TransitionFilterProcessor::class.java.getDeclaredField("lowState")
+        lowF.isAccessible = true
+        val low = lowF.get(proc) as FloatArray
+        assertTrue("lowState must be zeroed on flush", low.all { it == 0f })
+        val highF = TransitionFilterProcessor::class.java.getDeclaredField("highState")
+        highF.isAccessible = true
+        val high = highF.get(proc) as FloatArray
+        assertTrue("highState must be zeroed on flush", high.all { it == 0f })
+        val midF = TransitionFilterProcessor::class.java.getDeclaredField("midState")
+        midF.isAccessible = true
+        val mid = midF.get(proc) as FloatArray
+        assertTrue("midState must be zeroed on flush", mid.all { it == 0f })
+        // onReset parks the filter back to neutral (silent teardown).
+        val onReset = TransitionFilterProcessor::class.java.getDeclaredMethod("onReset")
+        onReset.isAccessible = true
+        onReset.invoke(proc)
+        val targetHighF = TransitionFilterProcessor::class.java.getDeclaredField("targetHighPassHz")
+        targetHighF.isAccessible = true
+        assertEquals(
+            "onReset must park low-pass at OPEN_HZ",
+            TransitionFilterProcessor.OPEN_HZ, targetF.getFloat(proc), 1e-3f,
+        )
+        assertEquals(
+            "onReset must park high-pass at OFF_HZ",
+            TransitionFilterProcessor.OFF_HZ, targetHighF.getFloat(proc), 1e-3f,
+        )
+        val targetMidF = TransitionFilterProcessor::class.java.getDeclaredField("targetMidGainDb")
+        targetMidF.isAccessible = true
+        assertEquals("onReset must clear mid target", 0f, targetMidF.getFloat(proc), 1e-6f)
+        val currentMidF = TransitionFilterProcessor::class.java.getDeclaredField("currentMidGainDb")
+        currentMidF.isAccessible = true
+        assertEquals("onReset must clear mid current", 0f, currentMidF.getFloat(proc), 1e-6f)
+    }
 }

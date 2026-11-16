@@ -1,6 +1,9 @@
 package com.music.bitchord.playback.smart
 
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -373,6 +376,117 @@ class PhrasePlannerTest {
         ).copy(vocalEnergy = FloatArray(32) { 0.1f })
         val choice = assertNotNull(PhrasePlanner.select(outMeasured, inMeasured, 0, 120.0, 120.0))
         assertNotNull(choice.vocalClashEnergy, "both-measured must populate vocalClashEnergy")
+    }
+
+    @Test
+    fun musicalRescuePopulatesVocalClashEnergyAndOverlapBeats() {
+        // Force every strict template to veto on a measured vocal clash so
+        // musicalRescue runs: A is an all-sung chorus with no phrase-aligned
+        // unsung exit, so CuePoints falls through to the synthesized tail
+        // exit with roomBars = 8. B is a cold vocal, all sung, landing at
+        // bar 16 with a 16-bar lead-in. vocalEnergy is measured on both
+        // sides (0.9), so the weighted clash (0.81) vetoes every non-carve
+        // candidate (M1/M6/M10/M11/CUT_ON_ONE) and the rescue must report
+        // the clash it would otherwise have hidden as vocalOverlapBeats = 0.
+        val a = song(
+            "a", 120.0, 18,
+            listOf(section(0, 18, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.9f)),
+            ending = EndingKind.HARD_END,
+            sungFrom = 0,
+            sungUntil = 18,
+        ).copy(vocalEnergy = FloatArray(18) { 0.9f })
+        val b = song(
+            "b", 120.0, 32,
+            listOf(
+                section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5),
+                section(16, 32, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.9f),
+            ),
+            firstVocal = 16,
+            sungFrom = 0,
+            sungUntil = 32,
+            start = StartKind.COLD_VOCAL,
+        ).copy(vocalEnergy = FloatArray(32) { 0.9f })
+        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "rescue must produce a plan")
+        assertEquals(PhraseConfig.S_MIN, choice.score, 1e-9, "rescue carries S_MIN, got ${choice.score} via ${choice.template}")
+        assertNotNull(choice.vocalClashEnergy, "rescue must populate vocalClashEnergy")
+        assertTrue(choice.vocalOverlapBeats > 0.0, "rescue must populate vocalOverlapBeats, got ${choice.vocalOverlapBeats}")
+    }
+
+    @Test
+    fun headEntryWithZeroLeadInBarsMeasuresClashOverPlannedOverlap() {
+        // HEAD @ bar 9: B's first non-silence section starts at 9 and its
+        // first vocal bar (hence landing) is also 9, so leadInBars == 0.
+        // Before the fix vocalClashEnergy used leadInBars alone and returned
+        // null for every such entry even though the planner still plans a
+        // 4-bar overlap. Energy jump (A level 2 -> B level 9) vetoes every
+        // strict candidate, so the rescue measures the clash over its
+        // planned 4-bar overlap instead.
+        val a = song(
+            "a", 120.0, 18,
+            listOf(section(0, 18, SectionFn.CHORUS, SectionRole.RELEASE, energy = 2, vocal = 0.9f)),
+            ending = EndingKind.HARD_END,
+            sungFrom = 0,
+            sungUntil = 18,
+        ).copy(vocalEnergy = FloatArray(18) { 0.9f })
+        val b = song(
+            "b", 120.0, 25,
+            listOf(section(9, 25, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 9, vocal = 0.9f)),
+            firstVocal = 9,
+            sungFrom = 25,
+            sungUntil = 25,
+        ).copy(vocalEnergy = FloatArray(25) { 0.9f })
+        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "zero-lead-in HEAD must still produce a plan")
+        assertEquals(EntryKind.HEAD, choice.entry.kind)
+        assertEquals(9, choice.entry.startBar)
+        assertEquals(9, choice.entry.landingBar)
+        assertEquals(0, choice.entry.leadInBars)
+        assertNotNull(choice.vocalClashEnergy, "zero-lead-in HEAD must measure clash over the planned overlap")
+    }
+
+    @Test
+    fun reverbDecaysSmoothlyWhenAmountDropsToZero() {
+        val rate = 48000
+        val colour = DjColour()
+        colour.configure(rate, 1)
+        colour.set(DjEffect.REVERB, 1f, 0.5f, 0f)
+        val loud = FloatArray(rate) { i ->
+            (0.8 * sin(2.0 * PI * 440.0 * i / rate)).toFloat()
+        }
+        colour.process(loud, loud.size, 1)
+        assertTrue(loud.all { it.isFinite() })
+
+        // Drop to NONE / zero amount and feed silence: the tail must keep
+        // ringing and decay over ~150 ms, not cut to zero in one sample.
+        colour.set(DjEffect.NONE, 0f, 0.5f, 0f)
+        val tail = FloatArray(4800)
+        colour.process(tail, tail.size, 1)
+        assertTrue(tail.all { it.isFinite() })
+        var energy = 0.0
+        for (v in tail) energy += v * v
+        val rms = sqrt(energy / tail.size)
+        assertTrue(rms > 0.001f, "reverb tail must not cut instantly, rms=$rms")
+        var maxStep = 0f
+        for (i in 1 until tail.size) {
+            val step = abs(tail[i] - tail[i - 1])
+            if (step > maxStep) maxStep = step
+        }
+        assertTrue(maxStep < 0.05f, "no discontinuity step in decaying tail, maxStep=$maxStep")
+
+        // Same decay path via REVERB with amount back to 0.
+        val colour2 = DjColour()
+        colour2.configure(rate, 1)
+        colour2.set(DjEffect.REVERB, 1f, 0.5f, 0f)
+        val loud2 = FloatArray(rate) { i ->
+            (0.8 * sin(2.0 * PI * 440.0 * i / rate)).toFloat()
+        }
+        colour2.process(loud2, loud2.size, 1)
+        colour2.set(DjEffect.REVERB, 0f, 0.5f, 0f)
+        val tail2 = FloatArray(4800)
+        colour2.process(tail2, tail2.size, 1)
+        var energy2 = 0.0
+        for (v in tail2) energy2 += v * v
+        val rms2 = sqrt(energy2 / tail2.size)
+        assertTrue(rms2 > 0.001f, "reverb tail must decay smoothly at amount=0, rms=$rms2")
     }
 
     private fun blend(): PhraseChoice {

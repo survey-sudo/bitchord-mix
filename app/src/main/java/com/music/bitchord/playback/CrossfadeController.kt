@@ -486,6 +486,8 @@ class CrossfadeController(
     private val separateTransitionWindow: ((left: FloatArray, right: FloatArray, sampleRate: Int, keepVocals: Boolean) -> Pair<FloatArray, FloatArray>?)? = null,
     /** True on-device dual-stem (vocals+instrumental) separation for loop mixes (vc73). */
     private val separateTransitionBothWindows: ((left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
+    /** Exact dual-stem (voc, inst) pair for loop vocal-duck (vc77); same service as above. */
+    private val separateTransitionPair: ((left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
     /** True while a whole-track analysis pass is in flight (vc74 gate). */
     private val wholeTrackBusy: () -> Boolean = { false },
     /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
@@ -2665,6 +2667,11 @@ class CrossfadeController(
         // time factor of about a thousand, which is the 999x runaway.
         tracks.incomingTempo(1f)
         into.volume = 0f
+        // vc77: the incoming track rides on the spare sink; start its filter
+        // neutral so no parked cutoff from the last blend muffles its first
+        // decoded frames. Gated on the retiree (here the incoming deck
+        // itself, just silenced) so Seam A is never violated.
+        openSpareFiltersWhenSilent()
         val setNanos0 = SystemClock.elapsedRealtimeNanos()
         into.setMediaItems(items, nextIndex, incomingCueTimeMs)
         val setDurationUs = (SystemClock.elapsedRealtimeNanos() - setNanos0) / 1000L
@@ -3179,8 +3186,20 @@ class CrossfadeController(
         // player's own silenced audio, so that player is kept until its tail
         // has been heard out.
         val tailDone = !render.echo || elapsed / wallSpan >= render.echoAt + render.echoTailMs / wallSpan
-        val done = (progress >= 1f && tailDone) || settingSwitchedOff
+        // vc77: progress is the max of the two sides, so it can reach 1 while
+        // the incoming sink is still mid-blend and would strand its filter.
+        // Unless the outgoing file is about to EOF (where waiting would cut
+        // it off), completion needs the incoming side caught up too; when it
+        // is about to EOF the clamp below puts both sides at 1.0 full-band.
+        val outAboutToEof = outRemaining != null && outRemaining <= HANDOFF_GUARD_MS
+        val incomingReady = incomingAt >= 0.999f
+        val done = settingSwitchedOff ||
+            (progress >= 1f && tailDone && (incomingReady || outAboutToEof))
         if (done) {
+            // Clamp both sides to progress 1 before teardown: a stranded
+            // incoming filter otherwise survives into the next blend at a
+            // parked cutoff.
+            if (progress >= 1f) rideFilters(1f, 1f)
             // A blend cut short before its midpoint still ends on the incoming
             // track — it is the one playing on, and what [finish] keeps.
             handOff(out, player)
@@ -4521,7 +4540,20 @@ class CrossfadeController(
                             }
                         }
                     }
-                    LoopMixSession.build(plan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, outAnalysis = loopOutAnalysis, inAnalysis = loopInAnalysis, sungOut = loopSungOut, sungIn = loopSungIn, decode = { side, from, to ->
+                    // vc77: exact (voc, inst) pair from VocalTracker (no 48k
+                    // round-trip) for the duck; falls back to sepVocal above
+                    // inside LoopMixSession when this is null.
+                    val pairFn = if (skipStemAtLaunch) null else separateTransitionPair
+                    val sepVocalPair: ((LoopMix.Side, FloatArray, FloatArray, Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = pairFn?.let { sep ->
+                        { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int ->
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                                null
+                            } else {
+                                sep(left, right, sr)
+                            }
+                        }
+                    }
+                    LoopMixSession.build(plan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = loopOutAnalysis, inAnalysis = loopInAnalysis, sungOut = loopSungOut, sungIn = loopSungIn, decode = { side, from, to ->
                         // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
                         val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
                         deckSide = sideName
@@ -4686,6 +4718,43 @@ class CrossfadeController(
             }
             candidate = further
         }
+        // vc77 single retry: shiftToNextBar already walked forward from
+        // missed.out.loopStart + epsilon; for straight phrase blends (M1/M6,
+        // !outLoops && !inLoops, not an instrumental crown-loop) one relaxed
+        // PhrasePlanner.select at the live playhead can still rescue a later
+        // bar. Exactly one attempt, updating loopScript via compilePhrase;
+        // still null falls through to loopFallBack immediately (no loop).
+        if (candidate == null && !plan.outLoops && !plan.inLoops) {
+            val retryOutDurMs = out.duration.takeIf { it != C.TIME_UNSET && it > 1_000L }
+                ?: loopOutDurationMs.takeIf { it > 0L } ?: 0L
+            val outMapRetry = PhraseMaps.get(outItem.mediaId)
+                ?: runCatching { SongMaps.fromAnalysis(outItem.mediaId, outAnalysis) }.getOrNull()
+            val inMapRetry = PhraseMaps.get(inItem.mediaId)
+                ?: runCatching { SongMaps.fromAnalysis(inItem.mediaId, inAnalysis) }.getOrNull()
+            val choiceRetry = runCatching {
+                PhrasePlanner.select(
+                    outMapRetry, inMapRetry, regionalCamelotSteps(outAnalysis, inAnalysis),
+                    outAnalysis.bpm, inAnalysis.bpm,
+                    earliestExitSec = positionSec + 0.30,
+                    playableOutDurationSec = retryOutDurMs / 1000.0,
+                    outAnalysis = outAnalysis,
+                    inAnalysis = inAnalysis,
+                )
+            }.getOrNull()
+            val retryPlan = if (choiceRetry != null) {
+                runCatching { compilePhrase(choiceRetry, outAnalysis, inAnalysis, outItem.mediaId, inItem.mediaId) }.getOrNull()
+            } else null
+            if (retryPlan != null) {
+                val outDurSec = loopOutDurationMs / 1000.0
+                if (retryPlan.out.loopStart >= positionSec + 0.15 &&
+                    (outDurSec <= 0.0 || retryPlan.out.loopStart <= outDurSec)
+                ) {
+                    candidate = retryPlan
+                } else {
+                    loopScript = null
+                }
+            }
+        }
         val nowMs = SystemClock.elapsedRealtime()
         val deadline = deckTiming.deadlineMs
         val notLate = deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && nowMs <= deadline
@@ -4760,14 +4829,18 @@ class CrossfadeController(
         into.repeatMode = out.repeatMode
         into.shuffleModeEnabled = out.shuffleModeEnabled
         into.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, 1.0))
+        // vc77: the spare filter must already be neutral before either gain
+        // is raised. The incoming player is still the unspliced standby
+        // before prepare(), and loop audio bypasses the classic filters, so
+        // opening the spare here is inaudible on the loop path; the gated
+        // open keeps Seam A while both decks are still at their old gains.
+        filters.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        filters.outgoingMidDb(0f)
+        openFiltersWhenSilent()
         // Silent through its own sink until the handover, so the player's
         // volume stays where the listener's ear expects it.
         into.volume = 1f
         out.volume = 1f
-        // Loop audio bypasses the classic filters (spliced sink), so this
-        // reset is inaudible on the loop path; still gated by the Seam A
-        // invariant so a parked classic cutoff never glides open under gain.
-        openFiltersWhenSilent()
         onBlendHeadroom(1f)
         into.setMediaItems(items, nextIndex, (session.inStartTrack * 1000).roundToLong())
         items.getOrNull(nextIndex)?.let { item ->
@@ -5629,6 +5702,28 @@ class CrossfadeController(
         tracks.outgoingMidDb(0f)
     }
 
+    /**
+     * vc77 retiree gate (Seam A companion): the retiring (spare) filter is
+     * [filters.outgoing] — the physical spare sink — regardless of which
+     * track [tracks] currently routes. Post-handoff the survivor plays at 1,
+     * so [openFiltersWhenSilent] can never open the spare; gating on the
+     * retiree alone lets the spare return to neutral while the survivor
+     * stays untouched. Tested volume is the retiree plus [tailTarget].
+     */
+    private fun retireeAudible(): Boolean {
+        val retiring = if (handedOff) outgoing else incoming
+        val retiringVol = retiring?.volume ?: 0f
+        val tailVol = tailTarget?.volume ?: 0f
+        return RetireGuard.audible(retiringVol) || RetireGuard.audible(tailVol)
+    }
+
+    /** Opens only the spare filter, once its retiree is silent. */
+    private fun openSpareFiltersWhenSilent() {
+        if (retireeAudible()) return
+        filters.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        filters.outgoingMidDb(0f)
+    }
+
     private fun bail(force: Boolean = false) {
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
         // djmix10 freeze-once-armed: once the blend is audible (FADING,
@@ -5774,8 +5869,16 @@ class CrossfadeController(
         // at progress 1 (two-phase exit legs) or will be driven from the
         // parked state by the next arm while silent. Opening while audible
         // is the ~30 ms step.
-        if (handedOff && render.echo) outgoing?.volume = 0f
+        // vc77: past the guard above the retiring spare has dissolved to
+        // <= 0.001f (or was silenced pre-takeover), so silence it
+        // unconditionally when handed off; then also open the spare filter
+        // (see openSpareFiltersWhenSilent) so a handed-off survivor at 1
+        // never strands it at DECLINE/SWEEP park. Colour is released
+        // smoothly before echoes are parked.
+        if (handedOff) outgoing?.volume = 0f
         openFiltersWhenSilent()
+        openSpareFiltersWhenSilent()
+        filters.releaseColour()
         filters.parkEchoes()
         onBlendHeadroom(1f)
         // A loop mix already plays the incoming player at 1× (the renderer did
@@ -6073,7 +6176,7 @@ class CrossfadeController(
                 else -> 0f
             }
             // Only the tail. A wash from the first sample is what was muffling mixes.
-            com.music.bitchord.playback.smart.DjEffect.REVERB -> if (progress > 0.75f) settings.wet else 0f
+            com.music.bitchord.playback.smart.DjEffect.REVERB -> settings.wet * ((progress - 0.75f) / 0.25f).coerceIn(0f, 1f)
             com.music.bitchord.playback.smart.DjEffect.LOOP_ROLL -> if (progress > 0.35f) 1f else 0f
             // A throw on the last bars. The tempo-gap echo is [rideEchoOut], which
             // owns the dry kill; this one leaves the song intact.

@@ -30,6 +30,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.roundToInt
 
 /** The linear-frequency STFT front end open-unmix was trained on. */
 object VocalSpectrogram {
@@ -92,6 +93,48 @@ object VocalSpectrogram {
     @JvmStatic private external fun nativeSampleRate(): Double
     @JvmStatic private external fun nativeHop(): Int
     @JvmStatic private external fun nativeFftSize(): Int
+}
+
+/**
+ * Pure complement helper at the model rate.
+ *
+ * [dryLeft]/[dryRight] and [vocLeft]/[vocRight] are all at [modelRate]
+ * (typically 44.1 kHz). The instrumental complement is computed *there*,
+ * `dry - voc`, and only then are vocals and instrumental both resampled
+ * to [rate] via [resample]. Computing the complement in the model domain
+ * keeps `voc + inst == dry` exact before resampling; resampling first and
+ * subtracting at [rate] would fold resampler error into the stem.
+ *
+ * Returns `(vocals, instrumental)` at [rate], each planar left/right sized
+ * to `dry.size * rate / modelRate`, or null on size mismatch / resample
+ * failure. Extracted so JVM unit tests can exercise the 44.1k<->48k
+ * subtraction without the native ONNX library.
+ */
+internal fun complementAtModelRate(
+    dryLeft: FloatArray,
+    dryRight: FloatArray,
+    vocLeft: FloatArray,
+    vocRight: FloatArray,
+    rate: Double,
+    modelRate: Double = VocalSpectrogram.sampleRate,
+    resample: (FloatArray, Double, Double) -> FloatArray?,
+): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
+    if (dryLeft.isEmpty() || dryLeft.size != dryRight.size ||
+        dryLeft.size != vocLeft.size || dryLeft.size != vocRight.size
+    ) return null
+    if (rate <= 0 || modelRate <= 0) return null
+    val instLeft44 = FloatArray(dryLeft.size) { dryLeft[it] - vocLeft[it] }
+    val instRight44 = FloatArray(dryRight.size) { dryRight[it] - vocRight[it] }
+    if (rate == modelRate) {
+        return (vocLeft to vocRight) to (instLeft44 to instRight44)
+    }
+    val targetSize = (dryLeft.size * rate / modelRate).roundToInt().coerceAtLeast(1)
+    fun fixed(a: FloatArray): FloatArray = if (a.size == targetSize) a else a.copyOf(targetSize)
+    val vocBackLeft = resample(vocLeft, modelRate, rate) ?: return null
+    val vocBackRight = resample(vocRight, modelRate, rate) ?: return null
+    val instBackLeft = resample(instLeft44, modelRate, rate) ?: return null
+    val instBackRight = resample(instRight44, modelRate, rate) ?: return null
+    return (fixed(vocBackLeft) to fixed(vocBackRight)) to (fixed(instBackLeft) to fixed(instBackRight))
 }
 
 /**
@@ -333,9 +376,10 @@ class VocalTracker(
  
     /**
      * Sample-exact dual-stem separation: vocals + instrumental from one
-     * ONNX pass. Resampled at the model rate, two VocalSpectrogram.separate
-     * calls (keepVocals true/false) on the same compact target, resampled
-     * back and padded/trimmed to left.size.
+     * ONNX pass. Resampled at the model rate, one VocalSpectrogram.separate
+     * call (keepVocals true) on the compact target, the instrumental
+     * complement computed in the 44.1 kHz model domain, then both stems
+     * resampled back and padded/trimmed to left.size.
      */
     fun separateBothWindows(
         left: FloatArray,
@@ -371,20 +415,16 @@ class VocalTracker(
                             }
                         }
                     }
-                    fun stem(keepVocals: Boolean): Pair<FloatArray, FloatArray>? {
-                        val out = VocalSpectrogram.separate(resLeft, resRight, sr, compact, frames, keepVocals)
-                        if (out.isEmpty()) return null
-                        val outLeft44 = out.copyOfRange(0, resLeft.size)
-                        val outRight44 = out.copyOfRange(resLeft.size, out.size)
-                        if (rate == sr) return outLeft44 to outRight44
-                        val backLeft = MelSpectrogram.resample(outLeft44, sr, rate) ?: return null
-                        val backRight = MelSpectrogram.resample(outRight44, sr, rate) ?: return null
-                        fun fixed(a: FloatArray): FloatArray = if (a.size == left.size) a else a.copyOf(left.size)
-                        return fixed(backLeft) to fixed(backRight)
-                    }
-                    val vocals = stem(true) ?: return@runCatching null
-                    val instrumental = stem(false) ?: return@runCatching null
-                    vocals to instrumental
+                    val out = VocalSpectrogram.separate(resLeft, resRight, sr, compact, frames, true)
+                    if (out.isEmpty()) return@runCatching null
+                    val outLeft44 = out.copyOfRange(0, resLeft.size)
+                    val outRight44 = out.copyOfRange(resLeft.size, out.size)
+                    val (vocals, instrumental) = complementAtModelRate(
+                        resLeft, resRight, outLeft44, outRight44, rate, sr, MelSpectrogram::resample,
+                    ) ?: return@runCatching null
+                    fun fixed(a: FloatArray): FloatArray = if (a.size == left.size) a else a.copyOf(left.size)
+                    (fixed(vocals.first) to fixed(vocals.second)) to
+                        (fixed(instrumental.first) to fixed(instrumental.second))
                 }
             }
         }.getOrNull()

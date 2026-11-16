@@ -1,7 +1,10 @@
 package com.music.bitchord.playback
 
+import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.playback.smart.DjEffect
 import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
+import com.music.bitchord.playback.smart.effectSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +28,10 @@ class Vc70ExitLegAppTest {
         var outgoingLow = arrayListOf<Float>()
         var lastIncoming: Pair<Float, Float>? = null
         var lastOutgoing: Pair<Float, Float>? = null
+        var lastIncomingMid: Float? = null
+        var lastOutgoingMid: Float? = null
+        var lastOutgoingColourEffect: DjEffect? = null
+        var lastOutgoingColourAmount: Float? = null
         override fun incoming(lowPassHz: Float, highPassHz: Float) {
             incomingLow.add(lowPassHz)
             lastIncoming = lowPassHz to highPassHz
@@ -32,6 +39,12 @@ class Vc70ExitLegAppTest {
         override fun outgoing(lowPassHz: Float, highPassHz: Float) {
             outgoingLow.add(lowPassHz)
             lastOutgoing = lowPassHz to highPassHz
+        }
+        override fun incomingMidDb(gainDb: Float) { lastIncomingMid = gainDb }
+        override fun outgoingMidDb(gainDb: Float) { lastOutgoingMid = gainDb }
+        override fun outgoingColour(effect: DjEffect, amount: Float, beatSeconds: Float, scoop: Float) {
+            lastOutgoingColourEffect = effect
+            lastOutgoingColourAmount = amount
         }
         override fun open() {
             openCalls++
@@ -42,7 +55,12 @@ class Vc70ExitLegAppTest {
         fun resetOpen() { openCalls = 0 }
     }
 
-    private class PlayerState(var volume: Float = 1f, var playWhenReady: Boolean = false)
+    private class PlayerState(
+        var volume: Float = 1f,
+        var playWhenReady: Boolean = false,
+        var position: Long = 0L,
+        var durationMs: Long = 200_000L,
+    )
 
     private fun fakePlayer(state: PlayerState): ExoPlayer {
         val handler = java.lang.reflect.InvocationHandler { _, method, args ->
@@ -53,8 +71,8 @@ class Vc70ExitLegAppTest {
                 "setPlayWhenReady" -> { state.playWhenReady = (args?.get(0) as? Boolean) ?: false; null }
                 "getPlaybackState" -> 4 // STATE_READY
                 "isPlaying" -> false
-                "getCurrentPosition" -> 0L
-                "getDuration" -> 200_000L
+                "getCurrentPosition" -> state.position
+                "getDuration" -> state.durationMs
                 "getCurrentMediaItem" -> null
                 "getPlaybackParameters" -> null
                 else -> {
@@ -263,5 +281,138 @@ class Vc70ExitLegAppTest {
         finish.invoke(c)
         assertEquals(0, fake.openCalls)
         assertEquals("parked cutoff must survive audible teardown", parked, fake.lastIncoming?.first ?: -1f, 1e-3f)
+    }
+
+    @Test
+    fun postHandoffFinishOpensSpareFilterWhileSurvivorStaysUntouched() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        val outState = PlayerState(volume = 0f)
+        val inState = PlayerState(volume = 1f)
+        val out = fakePlayer(outState)
+        val inn = fakePlayer(inState)
+        // Survivor sentinel (must survive finish) and parked spare at the
+        // SWEEP/DECLINE floor (must be opened even though the survivor at 1
+        // blocks the gated open).
+        fake.incoming(700f, 20f)
+        fake.outgoing(2800f, 20f)
+        fake.outgoingMidDb(-6f)
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        field(c, "handedOff").set(c, true)
+        field(c, "tailTarget").set(c, null)
+        setPhase(c, "IDLE")
+        fake.resetOpen()
+        val finish = CrossfadeController::class.java.getDeclaredMethod("finish")
+        finish.isAccessible = true
+        finish.invoke(c)
+        assertEquals(
+            "spare must open to OPEN_HZ",
+            TransitionFilterProcessor.OPEN_HZ, fake.lastOutgoing?.first ?: -1f, 1e-3f,
+        )
+        assertEquals(
+            "spare HP must open to OFF_HZ",
+            TransitionFilterProcessor.OFF_HZ, fake.lastOutgoing?.second ?: -1f, 1e-3f,
+        )
+        assertEquals("spare mid must open to 0 dB", 0f, fake.lastOutgoingMid ?: -1f, 1e-6f)
+        assertEquals("survivor must stay untouched", 700f to 20f, fake.lastIncoming)
+        assertEquals("no gated open while survivor audible", 0, fake.openCalls)
+    }
+
+    @Test
+    fun reverbRideRampsSmoothlyFromPoint75ToOne() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        val plan = TransitionPlan(
+            transitionStyle = TransitionStyle.EQUAL_POWER,
+            djEffect = DjEffect.REVERB,
+            beatSeconds = 0.5,
+            fadeSeconds = 4.0,
+        )
+        field(c, "render").set(c, renderFor(c, plan))
+        field(c, "handedOff").set(c, true)
+        val wet = effectSettings(DjEffect.REVERB).wet
+        val amounts = mutableListOf<Float>()
+        for (p in listOf(0.75f, 0.80f, 0.90f, 1.0f)) {
+            invokeRide(c, "rideColour", p)
+            assertEquals(DjEffect.REVERB, fake.lastOutgoingColourEffect)
+            amounts.add(fake.lastOutgoingColourAmount ?: -1f)
+        }
+        assertEquals("reverb must start silent at 0.75", 0f, amounts[0], 1e-6f)
+        assertTrue(
+            "reverb must ramp monotonically, got $amounts",
+            amounts[0] < amounts[1] && amounts[1] < amounts[2] && amounts[2] < amounts[3],
+        )
+        assertTrue(
+            "0.80 must still be well below wet (no single-tick jump), 0.80=${amounts[1]} wet=$wet",
+            amounts[1] < wet * 0.5f,
+        )
+        assertTrue("0.90 must still be below wet, 0.90=${amounts[2]} wet=$wet", amounts[2] < wet)
+        assertEquals("reverb must reach wet at 1.0", wet, amounts[3], 1e-4f)
+        for (i in 1 until amounts.size) {
+            val step = amounts[i] - amounts[i - 1]
+            assertTrue("step $i ($step) must not be a jump towards $wet", step < wet * 0.6f)
+        }
+    }
+
+    @Test
+    fun driveFadeClampsStrandedIncomingFilterWhenProgressReachesOne() {
+        val fake = FakeFilters()
+        val c = newController(fake)
+        val plan = TransitionPlan(
+            transitionStyle = TransitionStyle.BEATLESS_BRIDGE,
+            exitBeats = 4,
+            vocalOverlap = 0.85,
+            filterSweep = 0.25,
+            beatSeconds = 0.5,
+            fadeSeconds = 4.0,
+        )
+        field(c, "render").set(c, renderFor(c, plan))
+        field(c, "handedOff").set(c, true)
+        // Outgoing budget exhausts (progress 1) while the incoming sink is
+        // still at ~0.375: incoming would strand parked if completion fired
+        // without the clamp.
+        val outState = PlayerState(volume = 0f, position = 10_000L, durationMs = 60_000L)
+        val inState = PlayerState(volume = 0f, position = 1_500L, durationMs = 200_000L)
+        val out = fakePlayer(outState)
+        val inn = fakePlayer(inState)
+        field(c, "outgoing").set(c, out)
+        field(c, "incoming").set(c, inn)
+        field(c, "fadeMs").setLong(c, 4000L)
+        field(c, "fadeEndMs").setLong(c, 60_000L)
+        field(c, "incomingCueTimeMs").setLong(c, 0L)
+        field(c, "fadeOutOriginMs").setLong(c, 8000L)
+        field(c, "fadeOutBudgetMs").setLong(c, 2000L)
+        field(c, "smartFadeActive").set(c, false)
+        setPhase(c, "FADING")
+        val driveFade = CrossfadeController::class.java.getDeclaredMethod("driveFade")
+        driveFade.isAccessible = true
+        val savedCrossfade = AppSettings.crossfadeSeconds.value
+        AppSettings.crossfadeSeconds.value = 8
+        try {
+            // First tick: outgoing at progress 1, incoming at ~0.375, file
+            // not about to EOF => must NOT complete; incoming stays parked.
+            driveFade.invoke(c)
+            val phaseAfterFirst = field(c, "phase").get(c).toString()
+            assertTrue("must wait for incoming when file is far from EOF, phase=$phaseAfterFirst", phaseAfterFirst == "FADING")
+            assertTrue(
+                "incoming must still be parked before EOF, got ${fake.lastIncoming?.first}",
+                (fake.lastIncoming?.first ?: 99999f) < 5000f,
+            )
+            // Second tick: outgoing now within the guard window => complete,
+            // and the clamped ride must leave the incoming full-band.
+            outState.durationMs = 10_200L
+            driveFade.invoke(c)
+            assertEquals(
+                "incoming must clamp to full-band at completion",
+                TransitionFilterProcessor.OPEN_HZ, fake.lastIncoming?.first ?: -1f, 1e-3f,
+            )
+            assertEquals(
+                "outgoing must clamp to full-band at completion",
+                TransitionFilterProcessor.OPEN_HZ, fake.lastOutgoing?.first ?: -1f, 1e-3f,
+            )
+        } finally {
+            AppSettings.crossfadeSeconds.value = savedCrossfade
+        }
     }
 }

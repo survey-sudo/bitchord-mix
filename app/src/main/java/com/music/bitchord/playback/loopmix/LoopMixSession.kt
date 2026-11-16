@@ -230,6 +230,7 @@ class LoopMixSession private constructor(
             script: PhraseScript? = null,
             separateStem: ((side: LoopMix.Side, left: FloatArray, right: FloatArray, sampleRate: Int, keepVocals: Boolean) -> Pair<FloatArray, FloatArray>?)? = null,
             separateVocalStem: ((side: LoopMix.Side, left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<FloatArray, FloatArray>?)? = null,
+            separateVocalPair: ((side: LoopMix.Side, left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
             outAnalysis: TrackAnalysis? = null,
             inAnalysis: TrackAnalysis? = null,
             sungOut: List<LoopMix.Span>? = null,
@@ -313,7 +314,7 @@ class LoopMixSession private constructor(
             // ran when the count-based test fired, which is exactly the noisy
             // case. Feasibility is the 21.5 s window and a separator that
             // actually answers; both are checked where they arise below.
-            if (!effectivePlan.acapella && separateVocalStem != null) {
+            if (!effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
                 val inWinFrom = plan.inn.loopStart
                 val inWinTo = maxOf(inWinFrom + 1.0, clock.elementTrackTime)
                 val inMask = if (!inAnalysis?.vocalWindows.isNullOrEmpty()) {
@@ -333,6 +334,23 @@ class LoopMixSession private constructor(
                 // decision taken from the boolean would re-litigate the veto
                 // the planner already made with better data.
                 val clashE = script?.choice?.vocalClashEnergy?.takeIf { it.isFinite() }
+                    ?: if (outAnalysis != null && inAnalysis != null &&
+                        outAnalysis.vocalWindows.isNotEmpty() && inAnalysis.vocalWindows.isNotEmpty()
+                    ) {
+                        val outBeatSec = effectivePlan.out.beatSec
+                        val inBeatSec = effectivePlan.inn.beatSec
+                        val fold = effectivePlan.fold
+                        val rate = if (outBeatSec.isFinite() && outBeatSec > 0.0 &&
+                            inBeatSec.isFinite() && inBeatSec > 0.0 &&
+                            fold.isFinite() && fold > 0.0
+                        ) {
+                            (inBeatSec * fold) / outBeatSec
+                        } else 1.0
+                        com.music.bitchord.playback.smart.weightedSimultaneousVocal(
+                            outAnalysis, inAnalysis, effectivePlan.out.loopStart, outVocalEndSec,
+                            effectivePlan.inn.loopStart, rate,
+                        )?.takeIf { it.isFinite() }
+                    } else null
                 val duck = LoopMixDuck.decide(
                     clashE = clashE,
                     outHasVocal = outHasVocal,
@@ -347,14 +365,30 @@ class LoopMixSession private constructor(
                         // inferred; the instrumental is dry minus vocal locally (the
                         // native OLA is sample-aligned: same framing, pad-centred,
                         // renormalised by win_sq), so no second Wiener pass per deck.
-                        val voc = runCatching { separateVocalStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate) }.getOrNull()
-                        val instL = if (voc != null) dryMinusVocal(outRegion.left, voc.first) else null
-                        val instR = if (voc != null) dryMinusVocal(outRegion.right, voc.second) else null
+                        // vc77: prefer the exact (voc, inst) pair from VocalTracker
+                        // (no rate round-trip residual); fall back to stem + local
+                        // subtraction when the pair is absent or mis-sized.
+                        val (voc, instL, instR) = run {
+                            val pair = if (separateVocalPair != null) {
+                                runCatching { separateVocalPair(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate) }.getOrNull()
+                            } else null
+                            if (pair != null &&
+                                pair.first.first.size == outRegion.left.size && pair.first.second.size == outRegion.right.size &&
+                                pair.second.first.size == outRegion.left.size && pair.second.second.size == outRegion.right.size
+                            ) {
+                                Triple(pair.first, pair.second.first, pair.second.second)
+                            } else {
+                                val stemVoc = if (separateVocalStem != null) runCatching { separateVocalStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate) }.getOrNull() else null
+                                val stemInstL = if (stemVoc != null) dryMinusVocal(outRegion.left, stemVoc.first) else null
+                                val stemInstR = if (stemVoc != null) dryMinusVocal(outRegion.right, stemVoc.second) else null
+                                Triple(stemVoc, stemInstL, stemInstR)
+                            }
+                        }
                         if (voc != null && instL != null && instR != null) {
                             var fadeStartSec = maxOf(0.0, clock.handoffAt - 2 * beatSec73)
                             var fadeEndSec = minOf(clock.releaseAt, clock.handoffAt)
                             if (fadeEndSec <= fadeStartSec) {
-                                fadeStartSec = plan.out.loopStart
+                                fadeStartSec = 0.0
                                 fadeEndSec = clock.handoffAt
                             }
                             val fadeStartSample = ((fadeStartSec + plan.out.loopStart - outRegion.start) * sampleRate.toDouble()).roundToLong().coerceIn(0, outRegion.left.size.toLong())
@@ -389,9 +423,23 @@ class LoopMixSession private constructor(
                     // that skip the veto — in practice the incoming duck rests
                     // on inHasEarlyVocal.
                     if (duck.duckIncoming && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
-                        val vocIn = runCatching { separateVocalStem(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
-                        val instInL = if (vocIn != null) dryMinusVocal(inRegion.left, vocIn.first) else null
-                        val instInR = if (vocIn != null) dryMinusVocal(inRegion.right, vocIn.second) else null
+                        // vc77: exact pair first (see OUT above), stem fallback.
+                        val (vocIn, instInL, instInR) = run {
+                            val pair = if (separateVocalPair != null) {
+                                runCatching { separateVocalPair(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
+                            } else null
+                            if (pair != null &&
+                                pair.first.first.size == inRegion.left.size && pair.first.second.size == inRegion.right.size &&
+                                pair.second.first.size == inRegion.left.size && pair.second.second.size == inRegion.right.size
+                            ) {
+                                Triple(pair.first, pair.second.first, pair.second.second)
+                            } else {
+                                val stemVoc = if (separateVocalStem != null) runCatching { separateVocalStem(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull() else null
+                                val stemInstL = if (stemVoc != null) dryMinusVocal(inRegion.left, stemVoc.first) else null
+                                val stemInstR = if (stemVoc != null) dryMinusVocal(inRegion.right, stemVoc.second) else null
+                                Triple(stemVoc, stemInstL, stemInstR)
+                            }
+                        }
                         if (vocIn != null && instInL != null && instInR != null) {
                             val duckStartTrack = clock.inTrackTimeAt((clock.handoffAt - beatSec73).coerceAtLeast(0.0))
                             val duckEndTrack = clock.inTrackTimeAt(clock.handoffAt + 1.5 * beatSec73)
@@ -634,10 +682,12 @@ class LoopMixSession private constructor(
                         roomSize = 2.2f, damping = reverbDamping, wet = reverbWet,
                     )
                     val open = (clock.releaseAt - effectivePlan.out.beatSec).coerceAtLeast(0.0)
+                    // vc77: taper the send back to zero by outStopMixSec so
+                    // the wash never hard-cuts at stopAt.
                     renderer.setEnvelope(
                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_REVERB_SEND,
-                        doubleArrayOf(open, clock.releaseAt),
-                        floatArrayOf(0f, 0.65f),
+                        doubleArrayOf(open, clock.releaseAt, outStopMixSec),
+                        floatArrayOf(0f, 0.65f, 0f),
                     )
                 }
 

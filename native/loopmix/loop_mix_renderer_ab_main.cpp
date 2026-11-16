@@ -685,8 +685,115 @@ int runSelfTest() {
     fail("duckGainFor(0.60) unexpected");
   }
 
+  // -------------------------------------------------------------------------
+  // vc77 reverb-tail verification (Renderer::setReverb + KIND_REVERB_SEND).
+  // Deck 0 carries a sustained 440 Hz tone. The KIND_REVERB_SEND envelope
+  // (native Deck::reverbSend) ramps 0 -> 0.65 -> 0 before stopAt, and the
+  // KIND_GAIN envelope (native Deck::gain) fades smoothly to 0 before
+  // stopAt. Rendering past stopAt must stay exit-gate clean, and the RMS
+  // in the final 200 ms before stopAt must sit strictly below -40 dB
+  // relative to the active wet tail, proving the reverb is inaudible by
+  // stopAt and no hard-cut pop can occur there.
+  // -------------------------------------------------------------------------
+  {
+    Renderer renderer(48000);
+    renderer.setHighQuality(false);
+    renderer.setReverb(0, 2.2f, 0.55f, 0.35f);
+
+    std::vector<float> toneL(regionFrames), toneR(regionFrames);
+    for (size_t i = 0; i < regionFrames; ++i) {
+      const double t = static_cast<double>(i) / static_cast<double>(kSampleRate);
+      const float v = static_cast<float>(0.30 * std::sin(2.0 * kPi * 440.0 * t));
+      toneL[i] = v;
+      toneR[i] = v * 0.9f;
+    }
+
+    const double stopAtSec = 5.0;
+    auto& d0 = renderer.deck(0);
+    d0.left = toneL;
+    d0.right = toneR;
+    d0.regionStart = 0.0;
+    d0.loopStart = 0;
+    d0.loopEnd = 0;
+    d0.releaseAt = 1e18;
+    const int64_t lastKnotFrame = static_cast<int64_t>(6.0 * kSampleRate);
+    d0.knotTimes = {0.0, static_cast<double>(lastKnotFrame)};
+    d0.knotPositions = {0.0, static_cast<double>(lastKnotFrame)};
+    d0.runOn = false;
+    d0.stopAt = stopAtSec;
+    d0.preroll = 0.4;
+    d0.level = 1.0f;
+    // KIND_REVERB_SEND envelope (Deck::reverbSend): 0 -> 0.65 -> 0.
+    d0.reverbSend.times = {0.0, 2.0, 3.0};
+    d0.reverbSend.values = {0.0f, 0.65f, 0.0f};
+    // KIND_GAIN envelope (Deck::gain): hold 1, fade smoothly to 0.
+    d0.gain.times = {0.0, 3.0, 4.0};
+    d0.gain.values = {1.0f, 1.0f, 0.0f};
+
+    renderer.prepare();
+
+    // Render past stopAt (firstFrame .. stopAt + 1.5 s).
+    const int64_t tailFirst = renderer.firstFrame();
+    const int64_t tailEnd =
+        static_cast<int64_t>((stopAtSec + 1.5) * static_cast<double>(kSampleRate));
+    const int64_t tailTotal = tailEnd - tailFirst;
+    std::vector<float> tailOut(static_cast<size_t>(tailTotal) * 2, 0.0f);
+    const int64_t kTailBlock = 4096;
+    int64_t tailDone = 0;
+    while (tailDone < tailTotal) {
+      const int64_t tailChunk = std::min<int64_t>(kTailBlock, tailTotal - tailDone);
+      renderer.render(tailFirst + tailDone,
+                      tailOut.data() + static_cast<size_t>(tailDone) * 2,
+                      static_cast<int>(tailChunk));
+      tailDone += tailChunk;
+    }
+
+    if (renderer.exitGateViolations() != 0) {
+      fail("reverb-tail exitGateViolations() != 0");
+      std::fprintf(stderr, "  violations=%d\n", renderer.exitGateViolations());
+    } else {
+      std::printf("ok reverb-tail exit-gate violations=0\n");
+    }
+
+    auto rmsDbTail = [&](double s, double e) -> double {
+      int64_t fs = static_cast<int64_t>(std::llround(s * static_cast<double>(kSampleRate)));
+      int64_t fe = static_cast<int64_t>(std::llround(e * static_cast<double>(kSampleRate)));
+      fs = std::clamp<int64_t>(fs, tailFirst, tailEnd);
+      fe = std::clamp<int64_t>(fe, fs, tailEnd);
+      double sumSq = 0.0;
+      int64_t count = 0;
+      for (int64_t frame = fs; frame < fe; ++frame) {
+        const size_t idx = static_cast<size_t>(frame - tailFirst) * 2;
+        const double l = tailOut[idx];
+        const double r = tailOut[idx + 1];
+        sumSq += l * l + r * r;
+        ++count;
+      }
+      const double rms =
+          count > 0 ? std::sqrt(sumSq / (static_cast<double>(count) * 2.0))
+                    : std::numeric_limits<double>::quiet_NaN();
+      return (rms > 0.0 && std::isfinite(rms)) ? 20.0 * std::log10(rms) : -240.0;
+    };
+
+    // Active wet tail: send peak window with gain 1.
+    const double activeDb = rmsDbTail(1.5, 2.5);
+    // Final 200 ms before stopAt.
+    const double finalDb = rmsDbTail(stopAtSec - 0.2, stopAtSec);
+    // Strictly below -40 dB relative to the active wet tail. This is the
+    // code-level contract: activeDb - finalDb > 40 dB. No hard-cut pop.
+    if (finalDb < activeDb - 40.0) {
+      std::printf("ok reverb-tail final 200ms RMS %.3f dB is %.3f dB below "
+                  "active wet tail %.3f dB (below -40 dB relative)\n",
+                  finalDb, activeDb - finalDb, activeDb);
+    } else {
+      fail("reverb-tail final 200ms RMS not below -40 dB relative to active wet tail");
+      std::fprintf(stderr, "  active=%.4f final=%.4f drop=%.4f (need >40 dB)\n",
+                   activeDb, finalDb, activeDb - finalDb);
+    }
+  }
+
   if (ok) {
-    std::printf("ok selftest passed (5 renders, firstFrame=%lld)\n",
+    std::printf("ok selftest passed (6 renders, firstFrame=%lld)\n",
                 static_cast<long long>(firstFrames[0]));
     return 0;
   }

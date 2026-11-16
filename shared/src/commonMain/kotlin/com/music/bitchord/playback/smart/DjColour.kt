@@ -28,6 +28,7 @@ class DjColour {
     private var allpass = Array(2) { FloatArray(0) }
     private var allpassPos = IntArray(2)
     private var revLow = 0f
+    private var reverbWet = 0f
 
     private var echo = FloatArray(0)
     private var echoPos = 0
@@ -108,6 +109,7 @@ class DjColour {
         echo.fill(0f)
         echoPos = 0
         revLow = 0f
+        reverbWet = 0f
         scoopX1.fill(0f)
         scoopX2.fill(0f)
         scoopY1.fill(0f)
@@ -131,8 +133,9 @@ class DjColour {
 
     fun process(samples: FloatArray, frames: Int, channels: Int) {
         if (frames <= 0 || this.channels != channels || sampleRate <= 0) return
-        if (effect == DjEffect.NONE && scoop <= 0.001f) return
+        if (effect == DjEffect.NONE && scoop <= 0.001f && reverbWet <= 1e-4f) return
         val settings = effectSettings(effect)
+        val reverbDecaySettings = effectSettings(DjEffect.REVERB).copy(wet = 0f)
         for (frame in 0 until frames) {
             val base = frame * channels
             if (scoop > 0.001f) {
@@ -140,10 +143,10 @@ class DjColour {
             }
             when (effect) {
                 DjEffect.FLANGER -> if (amount > 0.001f) flange(samples, base, channels, settings)
-                DjEffect.REVERB -> if (amount > 0.001f) reverb(samples, base, channels, settings)
+                DjEffect.REVERB -> if (amount > 0.001f || reverbWet > 1e-4f) reverb(samples, base, channels, settings)
                 DjEffect.LOOP_ROLL -> roll(samples, base, channels)
                 DjEffect.ECHO -> if (amount > 0.001f) echo(samples, base, channels, settings)
-                else -> Unit
+                else -> if (reverbWet > 1e-4f) reverb(samples, base, channels, reverbDecaySettings)
             }
         }
     }
@@ -235,7 +238,10 @@ class DjColour {
             allpassPos[i] = if (at + 1 == buf.size) 0 else at + 1
             wet = out
         }
-        val mix = settings.wet * amount
+        val ramp = (sampleRate * 0.15f).toInt().coerceAtLeast(1)
+        val wetTarget = settings.wet * amount
+        reverbWet += (wetTarget - reverbWet) / ramp
+        val mix = reverbWet
         for (c in 0 until channels) samples[base + c] = samples[base + c] * (1f - mix) + wet * mix
     }
 

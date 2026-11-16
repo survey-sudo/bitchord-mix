@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc76 (2.2.3-djmix34). File kept as vc75-gate.sh for history; it now gates vc76. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build gate for vc77 (2.2.3-djmix35). File kept as vc75-gate.sh for history; it now gates vc77. Needs only g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
@@ -32,7 +32,7 @@ say()  { printf '%s\n' "$*"; }
 # false failure this gate produced once and should never produce again.
 WORK="${VC75_GATE_TMP:-${HOME}/.cache/vc75-gate}"
 mkdir -p "$WORK" 2>/dev/null || WORK="${TMPDIR:-/tmp}"
-trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log"' EXIT
+trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log" "$WORK/lm_bin" "$WORK/lm.out" "$WORK/lm.build.log"' EXIT
 
 say "=== tree: $(pwd) ==="
 say "HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
@@ -70,10 +70,10 @@ fi
 # --- HARD: version stamp -----------------------------------------------------
 # versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
 # no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 76' build.gradle.kts \
-  && ok "versionCode is 76" || bad "versionCode is not 76"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix34"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix34" || bad "versionName is not 2.2.3-djmix34"
+grep -q 'extra\["bitchordVersionCode"\] = 77' build.gradle.kts \
+  && ok "versionCode is 77" || bad "versionCode is not 77"
+grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix35"' build.gradle.kts \
+  && ok "versionName is 2.2.3-djmix35" || bad "versionName is not 2.2.3-djmix35"
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""
@@ -138,6 +138,28 @@ else
   else
     bad "window calibration did not compile — see $WORK/wc.build.log"
     sed -n '1,12p' "$WORK/wc.build.log"
+  fi
+fi
+
+# --- HARD: loopmix A/B selftest (vc77 reverb-tail) ---------------------------
+say ""
+LM_IMPL="native/loopmix/loop_mix_renderer.cpp"
+LM_MAIN="native/loopmix/loop_mix_renderer_ab_main.cpp"
+if [ ! -f "$LM_MAIN" ] || [ ! -f "$LM_IMPL" ]; then
+  bad "loopmix A/B selftest missing — $LM_MAIN / $LM_IMPL not present"
+else
+  if g++ -std=c++17 -O2 -I native -I native/third_party "$LM_IMPL" "$LM_MAIN" \
+        -o "$WORK/lm_bin" 2>"$WORK/lm.build.log"; then
+    if "$WORK/lm_bin" --selftest >"$WORK/lm.out" 2>&1; then
+      ok "loopmix A/B selftest passed: $(grep -c '^ok' "$WORK/lm.out") assertions passed"
+    else
+      rc=$?
+      bad "loopmix A/B selftest FAILED (exit $rc)"
+      sed -n '1,25p' "$WORK/lm.out"
+    fi
+  else
+    bad "loopmix A/B selftest did not compile — see $WORK/lm.build.log"
+    sed -n '1,12p' "$WORK/lm.build.log"
   fi
 fi
 

@@ -319,6 +319,8 @@ object PhrasePlanner {
         }
         val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
+        val clashBeats = vocalClashBeats(out, inn, exit, entry, rescueOverlap)
+        val clashEnergy = vocalClashEnergy(out, inn, exit, entry, rescueOverlap)
         return PhraseChoice(
             template = template,
             rung = rungOf(template),
@@ -338,7 +340,8 @@ object PhrasePlanner {
             swapRampMs = rampMs,
             swapRampName = rampName,
             tempoPolicy = if (PhraseConfig.TEMPO_POLICY == "b") "TEMPO_POLICY=b" else "TEMPO_POLICY=a",
-            vocalOverlapBeats = 0.0,
+            vocalOverlapBeats = clashBeats,
+            vocalClashEnergy = clashEnergy,
             energyDelta = 0f,
             struct = 0.6,
             vocalScore = 0.6,
@@ -479,8 +482,9 @@ object PhrasePlanner {
             // sounds fine, while a count of one beat at 0.80 is two choruses
             // colliding and it does not. That inversion is the whole reason the
             // weighted measure exists, so the veto has to honour it.
-            val clash = vocalClashBeats(out, inn, exit, entry)
-            val clashEnergy = vocalClashEnergy(out, inn, exit, entry)
+            val overlap = overlapOf(template, exit, entry, outBpm, steps)
+            val clash = vocalClashBeats(out, inn, exit, entry, overlap)
+            val clashEnergy = vocalClashEnergy(out, inn, exit, entry, overlap)
             val blocked = if (clashEnergy != null) {
                 clashEnergy > CLASH_VETO_ENERGY
             } else {
@@ -570,8 +574,8 @@ object PhrasePlanner {
      * Replaces [vocalClashBeats] for scoring. The boolean count is kept for
      * [veto], where the question genuinely is "did the mask cross a line".
      */
-    private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double? {
-        val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
+    private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double? {
+        val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
         if (bars <= 0) return null
         if (out.vocalEnergy.isEmpty() || inn.vocalEnergy.isEmpty()) return null
         var numerator = 0.0
@@ -592,8 +596,8 @@ object PhrasePlanner {
         return (numerator / denominator).coerceIn(0.0, 1.0)
     }
 
-    private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double {
-        val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
+    private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double {
+        val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
         var beats = 0
         for (i in 0 until bars) {
             val a = exit.releaseBar - bars + i
@@ -620,13 +624,13 @@ object PhrasePlanner {
     ): PhraseChoice {
         val overlap = overlapOf(template, exit, entry, outBpm)
         val struct = structScore(template, exit, entry, out)
-        val clashBeats = vocalClashBeats(out, inn, exit, entry)
+        val clashBeats = vocalClashBeats(out, inn, exit, entry, overlap)
         // Energy-weighted collision where it was measured, and the old beat
         // count normalised onto the same 0..1 axis where it was not. The two are
         // not the same measurement, so each keeps its own meaning: the weighted
         // one is what the listener hears, the fallback is a conservative proxy
         // that reads a straddled threshold as a real collision.
-        val clashEnergy = vocalClashEnergy(out, inn, exit, entry)
+        val clashEnergy = vocalClashEnergy(out, inn, exit, entry, overlap)
         val clash = clashEnergy ?: (clashBeats / 4.0).coerceIn(0.0, 1.0)
         val vocalScore = if (carve(template)) 0.8 else 1.0 - clash
         val phrase = phraseScore(out, inn, exit.releaseBar, entry.landingBar)
