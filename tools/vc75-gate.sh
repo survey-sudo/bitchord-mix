@@ -122,4 +122,29 @@ if [ "$fail" -ne 0 ]; then
   say "GATE FAILED — do not build, do not push, do not install."
   exit 1
 fi
+
+# --- HARD: window-path calibration -----------------------------------------
+# The stem path is new working code as of vc75, so the invariants the automix
+# heuristics stand on are checked rather than assumed: the gain curve the
+# shipped code realises, the complement identity that legitimises
+# "instrumental = dry - vocals", and sample alignment.
+say ""
+CAL="native/analyzer/window_calibration.cpp"
+if [ ! -f "$CAL" ]; then
+  bad "$CAL missing — the stem invariants are unverified"
+else
+  if g++ -std=c++17 -O2 -I native/analyzer "$CAL" "$NATIVE" \
+        -o "$WORK/wc_bin" 2>"$WORK/wc.build.log"; then
+    if "$WORK/wc_bin" >"$WORK/wc.out" 2>&1; then
+      ok "window calibration: $(grep -c '^ok' "$WORK/wc.out") invariants held"
+    else
+      bad "window calibration FAILED (exit $?) — stem invariants do not hold"
+      sed -n '1,25p' "$WORK/wc.out"
+    fi
+  else
+    bad "window calibration did not compile — see $WORK/wc.build.log"
+    sed -n '1,12p' "$WORK/wc.build.log"
+  fi
+fi
+
 say "GATE PASSED — tree is safe to build."

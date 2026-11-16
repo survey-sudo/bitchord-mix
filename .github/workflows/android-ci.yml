@@ -51,6 +51,12 @@ jobs:
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test
           /tmp/vocal_spectrogram_test
+          echo "--- window path calibration ---"
+          g++ -std=c++17 -O2 -I native/analyzer \
+              native/analyzer/window_calibration.cpp \
+              native/analyzer/vocal_spectrogram.cpp \
+              -o /tmp/window_calibration
+          /tmp/window_calibration
           echo "--- same test under ASan/UBSan ---"
           g++ -std=c++17 -O1 -g -fsanitize=address,undefined -I native/analyzer \
               native/analyzer/vocal_spectrogram_test.cpp \

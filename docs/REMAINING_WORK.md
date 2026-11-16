@@ -3,9 +3,42 @@
 Status snapshot, 2026-11-16. Everything below is either **blocked**, **measured**, or
 **not started** — no item is claimed done without evidence.
 
-Current build: `vc74` / `2.2.3-djmix32`, APK `67,431,730 B`,
-SHA-256 `c3215537daa1ea7a01322db27b3fac735dfc75f356a2b2094ec1f16ec9deae14`,
-installed on `1439ebea`.
+Current build: `vc75` / `2.2.3-djmix33`, APK `67,544,373 B`,
+SHA-256 `78d006d72e351c5fd58f2df5dd6f350014131b84dcb0ce202ea5f1f1f9400812`,
+signed locally, tag `vc75-2.2.3-djmix33` (`b7375e8`). CI run `43817363643`
+produced it: 443 shared + 1,359 app tests, 0 failures, plus the native
+analyzer test in both jobs.
+
+**Not yet installed on `1439ebea`.** The phone left adb before the install, so
+the mid-playback verification below is still open and vc75 is unproven on
+device.
+
+---
+
+## Measured: the stem gain curve (calibration harness, 2026-11-16)
+
+`native/analyzer/window_calibration.cpp` reads the Wiener transfer function out
+of the shipped code rather than out of the comment, and pins it:
+
+| mask value `r` | 0.10 | 0.25 | 0.35 | 0.50 | 0.62 | 0.80 | 1.00 |
+|---|---|---|---|---|---|---|---|
+| energy kept | 1.2% | 10.0% | 22.5% | 50.0% | 72.7% | 94.1% | 100% |
+
+The curve is `r²/(r²+(1−r)²)`, so **every decision threshold in the tree sits
+below 50%**: `VOCAL_ACTIVE_THRESHOLD = 0.25` keeps 10% of energy,
+`VocalDepthFilter.VOICE_FLOOR = 0.35` keeps 22.5%, `vocalProbability ≥ 0.62`
+keeps 72.7%. A threshold is not a gain, and none of the three has been checked
+against a listening test.
+
+Also pinned, and previously only asserted in a comment:
+
+- `vocals + instrumental` reconstructs dry to `2.5e-09` RMS at dry RMS `0.255`
+  — the complement identity the single-pass `dry − vocals` design rests on.
+- `(dry − vocals)` matches the complement-mask stem to `2.9e-09`.
+- Best alignment lag is **0 samples** across a ±64 search, so the local
+  subtraction cannot comb-filter.
+- Boolean frame-count clash reports 1.000 for both a quiet verse and a loud
+  chorus; the energy-weighted mean reports 0.090 and 0.810.
 
 ---
 
