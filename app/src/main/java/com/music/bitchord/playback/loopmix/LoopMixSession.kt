@@ -138,6 +138,31 @@ class LoopMixSession private constructor(
     companion object {
         private const val TAG = "BitChordLoopMix"
 
+        /**
+         * Measured energy-weighted clash above which the outgoing vocal is
+         * stem-ducked.
+         *
+         * 0.12, not 0.05: E is a weighted product, so a soft verse over a soft
+         * verse lands at 0.04-0.16 (0.09 canonical) — exactly the band the
+         * planner deliberately lets through the veto. Ducking that to a 0.15
+         * floor carves a -16.5 dB hole into a clean handover. Above ~0.12 the
+         * pair is two real voices, and there a solvable gain curve beats two
+         * intelligible leads. Deliberately distinct from
+         * VOCAL_CLASH_TOLERANCE (0.05), which is the planner's rendering
+         * target for "reads as clean", a stricter question than "worth
+         * ducking".
+         */
+        const val STEM_DUCK_TRIGGER = 0.12
+
+        /**
+         * Residual outgoing vocal gain after the duck. 0.15, not silence: a
+         * fully removed vocal under an instrument bed reads as karaoke, which
+         * is a worse artefact than a quiet collision. At the Wiener curve this
+         * floor keeps about 2% energy, but as a gain on the stem it keeps the
+         * phrase present and audible.
+         */
+        const val STEM_DUCK_FLOOR = 0.15f
+
         /** Two-thread daemon pool for parallel OUT+IN region decode (vc73). */
         private val DECODE_EXECUTOR: java.util.concurrent.ExecutorService =
             java.util.concurrent.Executors.newFixedThreadPool(
@@ -281,8 +306,13 @@ class LoopMixSession private constructor(
             }
             var outStemSeparated = false
             var inStemSeparated = false
-            val stemsOn73 = runCatching { com.music.bitchord.data.settings.AppSettings.automixWindowedStemsEnabled.value }.getOrDefault(false)
-            if (!effectivePlan.acapella && stemsOn73 && separateVocalStem != null) {
+            // Stem-duck is default-on, gated only by feasibility. The old
+            // settings check (automixWindowedStemsEnabled) has always defaulted
+            // true, so the real gate was the boolean below it: separation only
+            // ran when the count-based test fired, which is exactly the noisy
+            // case. Feasibility is the 21.5 s window and a separator that
+            // actually answers; both are checked where they arise below.
+            if (!effectivePlan.acapella && separateVocalStem != null) {
                 val inWinFrom = plan.inn.loopStart
                 val inWinTo = maxOf(inWinFrom + 1.0, clock.elementTrackTime)
                 val inMask = if (!inAnalysis?.vocalWindows.isNullOrEmpty()) {
@@ -297,7 +327,18 @@ class LoopMixSession private constructor(
                 } else null
                 val outSung = !sungOut.isNullOrEmpty()
                 val outHasVocal = (outMask != null && outMask.mean >= 0.20) || outSung || effectivePlan.carve || effectivePlan.clash || effectivePlan.muffle || ((outAnalysis?.vocalProbability ?: 0.0) >= 0.35)
-                if ((outHasVocal && inHasEarlyVocal) || effectivePlan.carve || effectivePlan.clash || effectivePlan.muffle) {
+                // The measured collision decides where it was measured; the
+                // legacy boolean gate is the fallback where it was not. A duck
+                // decision taken from the boolean would re-litigate the veto
+                // the planner already made with better data.
+                val clashE = script?.choice?.vocalClashEnergy?.takeIf { it.isFinite() }
+                val wantDuck = if (clashE != null) {
+                    clashE > STEM_DUCK_TRIGGER
+                } else {
+                    (outHasVocal && inHasEarlyVocal) || effectivePlan.carve || effectivePlan.clash || effectivePlan.muffle
+                }
+                if (wantDuck) {
+                    Log.i(TAG, "stem-duck out=${effectivePlan.out.loopStart} in=${plan.inn.loopStart} clashE=$clashE")
                     val beatSec73 = effectivePlan.out.beatSec.takeIf { it > 0 } ?: 0.5
                     if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                         // vc74 (djmix32): single-pass contract - only the vocal stem is
@@ -322,11 +363,11 @@ class LoopMixSession private constructor(
                             for (i in outRegion.left.indices) {
                                 val g: Float = when {
                                     i < fadeStartSample -> 1.0f
-                                    i >= fadeEndSample -> 0.08f
+                                    i >= fadeEndSample -> STEM_DUCK_FLOOR
                                     else -> {
                                         val u = (i - fadeStartSample).toDouble() / fadeLen.toDouble()
                                         val c = 0.5 * (1.0 + cos(PI * u))
-                                        (0.08 + 0.92 * c).toFloat()
+                                        (STEM_DUCK_FLOOR + (1.0f - STEM_DUCK_FLOOR) * c).toFloat()
                                     }
                                 }
                                 newLeft[i] = instL[i] + g * voc.first[i]
@@ -336,7 +377,21 @@ class LoopMixSession private constructor(
                             outStemSeparated = true
                         }
                     }
-                    if (inHasEarlyVocal && outHasVocal && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
+                    // Asymmetric: the incoming vocal is ducked only when the
+                    // collision is severe (measured E > 0.6) or its line lands
+                    // in the opening beats, because a gratuitously ducked entry
+                    // reads as a karaoke intro. The outgoing side is always
+                    // ducked: the listener is following it.
+                    // Note: for measured plans the veto already refuses E >
+                    // 0.20, so the E > 0.6 branch only fires on carve templates
+                    // that skip the veto — in practice the incoming duck rests
+                    // on inHasEarlyVocal.
+                    val duckIncoming = if (clashE != null) {
+                        clashE > 0.60 || inHasEarlyVocal
+                    } else {
+                        inHasEarlyVocal && outHasVocal
+                    }
+                    if (duckIncoming && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
                         val vocIn = runCatching { separateVocalStem(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
                         val instInL = if (vocIn != null) dryMinusVocal(inRegion.left, vocIn.first) else null
                         val instInR = if (vocIn != null) dryMinusVocal(inRegion.right, vocIn.second) else null
@@ -350,12 +405,12 @@ class LoopMixSession private constructor(
                             val newRight = FloatArray(inRegion.right.size)
                             for (i in inRegion.left.indices) {
                                 val g: Float = when {
-                                    i < duckStartSample -> 0.10f
+                                    i < duckStartSample -> STEM_DUCK_FLOOR
                                     i >= duckEndSample -> 1.0f
                                     else -> {
                                         val u = (i - duckStartSample).toDouble() / duckLen.toDouble()
                                         val c = 0.5 * (1.0 - cos(PI * u))
-                                        (0.10 + 0.90 * c).toFloat()
+                                        (STEM_DUCK_FLOOR + (1.0f - STEM_DUCK_FLOOR) * c).toFloat()
                                     }
                                 }
                                 newLeft[i] = instInL[i] + g * vocIn.first[i]

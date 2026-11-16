@@ -46,6 +46,16 @@ data class PhraseChoice(
     val legacyLoop: LoopMix.Plan? = null,
     val detail: String = "",
     val keyClash: Boolean = false,
+    /**
+     * Energy-weighted vocal collision over the overlap, 0..1, or null when the
+     * pair carried no measurement to weigh.
+     *
+     * The renderer's stem-duck decision reads this: it is the number the whole
+     * scoring rewrite was built to produce, and a duck decision taken from any
+     * other signal would be a second, disagreeing copy of it. Null means
+     * "not measured" and the renderer falls back to the legacy boolean gate.
+     */
+    val vocalClashEnergy: Double? = null,
 ) {
     /** Incoming deck rate at [beat] on the master clock, landing at 0. */
     fun incomingRate(beat: Double): Double = if (beat >= -PhraseConfig.B_UNITY_BARS_BEFORE_LANDING * 1.0) 1.0 else incomingRateBefore(beat)
@@ -706,8 +716,8 @@ object PhrasePlanner {
         // 0.08 — bonuses may break ties, they may not overturn a measured
         // musical defect.
         val bonuses = (seamBonus + buildupBonus + alignBonus + kindBonus).coerceAtMost(0.08)
-        val total = 0.18 * struct + 0.30 * MixWeightTuner.vocalWeight * vocalScore + 0.12 * phrase + 0.14 * MixWeightTuner.energyWeight * energy +
-            0.08 * length + 0.08 * MixWeightTuner.keyWeight * key + 0.10 * MixWeightTuner.tempoWeight * tempo - cost + bonuses
+        val total = 0.18 * struct + 0.30 * vocalScore + 0.12 * phrase + 0.14 * energy +
+            0.08 * length + 0.08 * key + 0.10 * tempo - cost + bonuses
         val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, ramp) = PhraseConfig.swapRampMs(template.name)
         val swap = when (template) {
@@ -764,6 +774,7 @@ object PhrasePlanner {
             cost = cost,
             detail = "${template.name} ${exit.kind}→${entry.kind} O=$overlap",
             keyClash = (steps ?: 0) > 2,
+            vocalClashEnergy = clashEnergy,
         )
     }
 

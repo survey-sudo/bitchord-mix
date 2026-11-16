@@ -277,40 +277,11 @@ class Djmix25SharedTest {
         assertEquals("Echo", plan!!.rung)
         assertTrue(plan.echoTail)
     }
-    // ---- vc67 P2 MixWeightTuner ----
-    @Test
-    fun tunerClampsToBounds() {
-        MixWeightTuner.reset()
-        assertEquals(1.0, MixWeightTuner.vocalWeight, 1e-9)
-        repeat(30) { MixWeightTuner.recordFeedback("a->b", true, true, false, false, false) }
-        assertEquals(1.5, MixWeightTuner.vocalWeight, 1e-9)
-        repeat(40) { MixWeightTuner.recordFeedback("a->b", false, true, false, false, false) }
-        assertEquals(0.6, MixWeightTuner.vocalWeight, 1e-9)
-        MixWeightTuner.recordFeedback("", true, true, true, true, true)
-        MixWeightTuner.reset()
-        assertEquals(1.0, MixWeightTuner.vocalWeight, 1e-9)
-        assertEquals(1.0, MixWeightTuner.keyWeight, 1e-9)
-    }
-    @Test
-    fun tunerDefaultsPreservePhraseScores() {
-        MixWeightTuner.reset()
-        val snap = MixWeightTuner.snapshot()
-        assertEquals(1.0, snap.keyWeight, 1e-9)
-        assertEquals(1.0, snap.energyWeight, 1e-9)
-        assertEquals(1.0, snap.tempoWeight, 1e-9)
-        MixWeightTuner.recordFeedback("a->b", true, false, true, true, true)
-        assertTrue(MixWeightTuner.keyWeight > 1.0)
-        assertTrue(MixWeightTuner.energyWeight > 1.0)
-        assertTrue(MixWeightTuner.tempoWeight > 1.0)
-        MixWeightTuner.reset()
-    }
-    @Test
-    fun tunerUnflaggedDeltasAreNoops() {
-        MixWeightTuner.reset()
-        MixWeightTuner.recordFeedback("a->b", true, false, false, false, false)
-        assertEquals(1.0, MixWeightTuner.vocalWeight, 1e-9)
-        assertEquals(1.0, MixWeightTuner.keyWeight, 1e-9)
-    }
+    // ---- vc67 P2 MixWeightTuner (deleted in the automix overhaul) ----
+    // The tuner was global +/-0.05 scalars with no production caller and no
+    // per-pair memory: it learned nothing audible and still multiplied every
+    // score by a phantom 0.6-1.5 factor. Weights are now fixed at the council-
+    // settled values. The clamp behaviour it demonstrated is gone with it.
     // ---- vc67 P2 MixVerify ----
     @Test
     fun verifyPassesWhenAllGatesClear() {
