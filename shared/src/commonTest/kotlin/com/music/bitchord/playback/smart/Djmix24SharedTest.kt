@@ -126,6 +126,7 @@ class Djmix24SharedTest {
             tempoScore = 0.9,
             cost = 0.0,
             legacyLoop = legacy,
+            vocalClashEnergy = 0.0,
         )
     }
 
@@ -258,15 +259,14 @@ class Djmix24SharedTest {
     // ---- Pillar A: EDM deterministic trigger + Bug A1/A2 ----
 
     @Test
-    fun calvinPairTriggersBuildupFlangerAndRoll() {
+    fun unmeasuredCalvinPairKeepsCleanEffectPolicy() {
         // This Is What You Came For (124.34) -> One Kiss (124.25), clean loops.
         val out = analysis(124.34, 200.0, trackId = "out")
         val inn = analysis(124.25, 180.0, trackId = "in")
         val plan = LoopMix.plan(out, out.duration, inn, inn.duration, 0.0, clear, clear)
         assertNotNull(plan, "Calvin pair must loop")
-        assertTrue(plan.flanger, "EDM pair must enable flanger (Bug A4 deterministic)")
-        assertTrue(plan.buildupRoll, "EDM pair with loops must enable buildupRoll")
-        assertTrue(plan.hpSweepEndHz in 420f..600f, "buildup HPF sweep 420..600Hz, got ${plan.hpSweepEndHz}")
+        assertFalse(plan.flanger, "BPM range alone is not measured buildup evidence")
+        assertFalse(plan.buildupRoll, "unmeasured loop grids must not receive a roll")
         // 8-beat LFO math: 1/(8*beatSec) ~0.258 Hz, NEVER 15.5 Hz.
         val beatSec = 60.0 / 124.34
         val lfo = LoopMix.lfoHzForBeatSec(beatSec)
@@ -285,9 +285,9 @@ class Djmix24SharedTest {
             outgoingId = "calvin-out",
             incomingId = "calvin-in",
         )
-        assertTrue(script.plan.flanger, "TransitionMoves.compile EDM must set plan.flanger")
-        assertTrue(script.plan.buildupRoll, "TransitionMoves.compile EDM must set plan.buildupRoll")
-        assertTrue(script.flanger, "script flanger must follow EDM")
+        assertFalse(script.plan.flanger, "ordinary outro-to-intro blend is not a buildup")
+        assertFalse(script.plan.buildupRoll, "ordinary outro-to-intro blend is not a buildup")
+        assertFalse(script.flanger, "ordinary blend must stay dry")
         // Crisp incoming vocal lanes: inMid/inHigh stay at 0 dB when singing.
         val singing = TransitionMoves.compile(
             choice(MixTemplate.M1, overlapBars = 8, vocalOverlap = 0.0, leadInVocal = 1f),
@@ -301,17 +301,15 @@ class Djmix24SharedTest {
     }
 
     @Test
-    fun loopMixBridgeEnablesBuildupOnCleanEdmBlend() {
+    fun loopMixBridgeStaysCleanWithoutMeasuredBuildup() {
         val out = analysis(124.34, 200.0, trackId = "out")
         val inn = analysis(124.25, 180.0, trackId = "in")
         // Force bridge (plan would loop; bridge covers blend/drop paths).
         val plan = LoopMix.bridge(out, out.duration, inn, inn.duration, 0.0, clear, clear)
         assertNotNull(plan, "bridge must produce a plan for clean EDM pair")
-        // Beat blend on EDM clean pair gets flanger; at minimum FX carrier must be set (Bug A1).
-        // If bridge returns Echo (tempo-gap path), no flanger — but Calvin delta is tiny,
-        // so it must be a blend, not echo.
         assertTrue(plan.rung == "Beat blend" || plan.rung == "Drop", "Calvin bridge must be blend/drop, got ${plan.rung}")
-        assertTrue(plan.flanger, "bridge EDM blend must carry flanger in Plan scalars (Bug A1)")
+        assertFalse(plan.flanger, "unmeasured bridge blend must stay clean")
+        assertFalse(plan.buildupRoll, "unmeasured bridge blend must not trigger roll")
     }
 
     @Test
