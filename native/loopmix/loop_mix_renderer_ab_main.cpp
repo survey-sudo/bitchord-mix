@@ -1217,6 +1217,7 @@ void printUsage(std::ostream& os, const char* argv0) {
   os << "Usage:\n"
      << "  " << argv0 << " [--selftest]\n"
      << "  " << argv0 << " --reverb-stop-probe\n"
+     << "  " << argv0 << " --loop-domain-probe\n"
      << "  " << argv0
      << " --out-bed <wav> --out-voc <wav> --in-bed <wav> --in-voc <wav>"
         " --out-prefix <path> [--clashE <val>] [--csv <gain.csv>]\n"
@@ -1356,12 +1357,178 @@ int runFileMode(const FileOpts& opt) {
   return 0;
 }
 
+// Finite-loop source-domain regression. Full physical PCM must service an
+// arbitrarily longer monotonic loop stream; decode padding is not a repair.
+int runLoopDomainProbe() {
+  bool ok = true;
+  auto check = [&](bool condition, const char* message) {
+    if (!condition) { std::printf("FAIL loop-domain %s\n", message); ok = false; }
+  };
+  // Same track-second table as LoopSourceDomainTest in shared tests.
+  struct Mapping { double value, expected; };
+  for (const auto c : {Mapping{3,3}, {5,5}, {6,4}, {10,4}, {12,6}, {15,9}}) {
+    Renderer r(kSampleRate); auto& d = r.deck(1);
+    d.regionStart = 2; d.loopStart = 2*kSampleRate; d.loopEnd = 4*kSampleRate;
+    d.releaseAt = 10*kSampleRate;
+    const double position = (c.value - d.regionStart)*kSampleRate;
+    check(std::abs(d.trackSecondsAt(position,kSampleRate)-c.expected)<1e-9, "cross-language mapping");
+    if(c.value>=12) check(std::abs(d.releasedPositionOf(c.expected,kSampleRate)-position)<1e-6,"release inverse");
+  }
+  // Held straight/looped input retains monotonic knots. Genuine EOF pads
+  // positive input through stretch, so buffered processing latency can drain.
+  for(bool loop : {false,true}) for(double hold : {0.0,0.75}) {
+    Renderer r(kSampleRate);auto& d=r.deck(1);
+    d.left.assign(3*kSampleRate,.1f);d.right.assign(3*kSampleRate,-.1f);
+    d.loopStart=kSampleRate/2;d.loopEnd=loop?kSampleRate:d.loopStart;
+    d.releaseAt=loop?4*kSampleRate:1e18;
+    d.knotTimes={0,hold*kSampleRate,(hold+3.5)*kSampleRate,(hold+4.5)*kSampleRate};
+    d.knotPositions={.5*kSampleRate,.5*kSampleRate,4*kSampleRate,5*kSampleRate};
+    if(hold==0){d.knotTimes.erase(d.knotTimes.begin());d.knotPositions.erase(d.knotPositions.begin());}
+    d.runOn=true;r.prepare();std::vector<float> pcm(2*509);
+    double lastPeak=0,beforeEOF=0;
+    for(int64_t frame=r.firstFrame();frame<int64_t((hold+7)*kSampleRate);frame+=509) {
+      r.render(frame,pcm.data(),509);double peak=0;
+      for(float v:pcm){check(std::isfinite(v),"finite EOF drain");peak=std::max(peak,double(std::abs(v)));}
+      if(frame>int64_t((hold+1)*kSampleRate)&&frame<int64_t((hold+1.5)*kSampleRate))beforeEOF=std::max(beforeEOF,peak);
+      lastPeak=peak;
+    }
+    check(beforeEOF>.05,"straight/held material survives startup");
+    check(lastPeak<1e-5,"true EOF drains to silence");
+    check(d.readPos>d.inputEnd(),"EOF advances in source domain while padding");
+  }
+  for(bool roll : {false,true}) {
+    Renderer r(kSampleRate);auto& d=r.deck(0);
+    d.left.assign(2*kSampleRate,.1f);d.right.assign(2*kSampleRate,-.1f);
+    d.loopStart=kSampleRate/2;d.loopEnd=kSampleRate;d.releaseAt=1e18;
+    d.knotTimes={0,8*kSampleRate};d.knotPositions={.5*kSampleRate,8.5*kSampleRate};
+    d.runOn=true;
+    if(roll) r.setLoopRoll(0,true,1,.125,7,48);
+    r.prepare();std::vector<float> pcm(2*1021);double minimum=1;
+    for(int64_t frame=r.firstFrame();frame<8*kSampleRate;frame+=1021) {
+      r.render(frame,pcm.data(),1021);double sum=0;
+      for(float v:pcm)sum+=double(v)*v;
+      if(frame>kSampleRate) minimum=std::min(minimum,std::sqrt(sum/pcm.size()));
+    }
+    check(minimum>.04,"outgoing infinite/roll remains audible past physical EOF");
+  }
+  int cases=0, rampCases=0, unityCases=0;
+  double lowestRms=1,lowestUnityCorrelation=1,largestPostPeak=0,largestReferenceDifference=0;
+  for(bool ramp : {false,true})
+  for(int bars : {1,2,4}) for(double fold : {0.5,1.0,2.0})
+  for(bool high : {false,true}) for(int block : {127,1024,4096}) {
+    if(!ramp && (high || block!=1024)) continue;
+    const double beat=.4775, start=3.875, region=start-1;
+    const int beats=32, settle=int(8/fold);
+    // Exact synthetic 2/4/2-bar ramp used by the saved vc79 reproduction.
+    // Its fold=1, bars=1 case has unwrapped anchor22.975/physical9.605.
+    std::vector<double> times(1,0.0);
+    for(int k=0;k<beats+settle;++k) {
+      const double a=126.24934245134071/fold,b=(60/beat)/fold;
+      const double bpm=!ramp?b:(k<8?a:(k>=24?b:a+(b-a)*(k-8+.5)/16));
+      times.push_back(times.back()+60/bpm);
+    }
+    const double releaseMix=times[beats], element=times.back();
+    const double loopEnd=start+bars*4*beat, release=start+beats*fold*beat;
+    // Valid looping geometry: whole numbers of the incoming loop, fold=.5..2.
+    const double physical=loopEnd+(element-releaseMix);
+    Renderer r(kSampleRate);r.setHighQuality(high);auto& d=r.deck(1);
+    d.regionStart=region;d.loopStart=std::llround((start-region)*kSampleRate);
+    d.loopEnd=std::llround((loopEnd-region)*kSampleRate);d.releaseAt=(release-region)*kSampleRate;
+    const int count=int(std::ceil((physical+3-region)*kSampleRate));
+    const int generousCount=int(std::ceil((release+element-releaseMix+8-region)*kSampleRate));
+    Renderer reference(kSampleRate);reference.setHighQuality(high);auto& ref=reference.deck(1);
+    ref.left.resize(generousCount);ref.right.resize(generousCount);
+    uint32_t seed=12345;
+    for(int i=0;i<generousCount;++i) {
+      seed=seed*1664525u+1013904223u;
+      // Nonzero bounded broadband/DC input separates availability from
+      // phase-vocoder coloration. Slow-watermark ramp dips are characterized
+      // separately; raw music PCM is not a strict nonunity-stretch oracle.
+      ref.left[i]=.1f+float(double(seed)/2147483648.0-1)*.035f;
+      seed=seed*1664525u+1013904223u;
+      ref.right[i]=-.1f+float(double(seed)/2147483648.0-1)*.035f;
+    }
+    d.left.assign(ref.left.begin(),ref.left.begin()+count);
+    d.right.assign(ref.right.begin(),ref.right.begin()+count);
+    for(int k=0;k<=beats+settle;++k) {
+      const double time=times[k];
+      const double position=k<=beats?start+k*fold*beat:release+time-releaseMix;
+      d.knotTimes.push_back(time*kSampleRate);d.knotPositions.push_back((position-region)*kSampleRate);
+    }
+    const double actualPhysical=d.trackSecondsAt(d.knotPositions.back(),kSampleRate);
+    check(std::abs(actualPhysical-physical)<1.0/kSampleRate,"physical handover");
+    check(std::abs(d.releasedPositionOf(actualPhysical,kSampleRate)-d.knotPositions.back())<1e-5,"fade inverse at final knot");
+    ref.regionStart=d.regionStart;ref.loopStart=d.loopStart;ref.loopEnd=d.loopEnd;ref.releaseAt=d.releaseAt;
+    ref.knotTimes=d.knotTimes;ref.knotPositions=d.knotPositions;d.runOn=true;ref.runOn=true;
+    r.prepare();reference.prepare();
+    d.fadeOutAt.store(d.releasedPositionOf(actualPhysical,kSampleRate));
+    ref.fadeOutAt.store(ref.releasedPositionOf(actualPhysical,kSampleRate));
+    std::vector<float> pcm(block*2), referencePcm(block*2);
+    const int64_t end=int64_t(std::ceil((element+.2)*kSampleRate));
+    double minimumRms=1, postPeak=0, xy=0,xx=0,yy=0, previousRead=-1, referenceDifference=0;
+    bool wasFinished=false;
+    for(int64_t frame=r.firstFrame();frame<end;) {
+      int n=int(std::min<int64_t>(block,end-frame));
+      // Offset boundaries as well as regular block sizes exercise wrap/release crossing.
+      r.render(frame,pcm.data(),n);
+      reference.render(frame,referencePcm.data(),n);
+      check(d.readPos>=previousRead,"monotonic input pointer");previousRead=d.readPos;
+      for(int i=0;i<2*n;++i) referenceDifference=std::max(referenceDifference,
+          std::abs(double(pcm[i])-referencePcm[i]));
+      double sum=0;
+      for(int i=0;i<n;++i) {
+        const double t=double(frame+i)/kSampleRate;
+        sum+=double(pcm[2*i])*pcm[2*i]+double(pcm[2*i+1])*pcm[2*i+1];
+        if(t>element+.12)postPeak=std::max(postPeak,double(std::max(std::abs(pcm[2*i]),std::abs(pcm[2*i+1]))));
+        if(t>releaseMix+.7&&t<element-.2) {
+          const int64_t index=int64_t(std::llround((loopEnd+t-releaseMix-region)*kSampleRate));
+          if(index>=0&&index<count)for(int ch=0;ch<2;++ch){double a=pcm[2*i+ch],b=ch?d.right[index]:d.left[index];xy+=a*b;xx+=a*a;yy+=b*b;}
+        }
+      }
+      const double begin=double(frame)/kSampleRate,finish=double(frame+n)/kSampleRate;
+      if(begin>.5&&finish<element-.05) {
+        minimumRms=std::min(minimumRms,std::sqrt(sum/(2*n)));
+        check(d.sampleAt(int64_t(std::floor(d.readPos)))>=0,"mapped source stays available");
+      }
+      wasFinished=d.finished;frame+=n;
+    }
+    const double corr=xy/std::sqrt(std::max(1e-30,xx*yy));
+    check(minimumRms>.015,"no premature silence through release/settle");
+    // Exact same knots/stretcher/content, different unused region extent:
+    // strict transport oracle even when a ramp changes PCM phase.
+    check(referenceDifference<1e-7,"full physical PCM equals generous reference through handover");
+    if(!ramp) {
+      check(corr>.999,"unity raw physical decoder passage after release");
+      lowestUnityCorrelation=std::min(lowestUnityCorrelation,corr);++unityCases;
+    } else ++rampCases;
+    check(wasFinished&&postPeak<1e-7,"physical fade completes at handover");
+    lowestRms=std::min(lowestRms,minimumRms);
+    largestReferenceDifference=std::max(largestReferenceDifference,referenceDifference);
+    largestPostPeak=std::max(largestPostPeak,postPeak);
+    ++cases;
+  }
+  // Genuine truncated PCM and malformed stereo must not acquire virtual loop coverage.
+  Renderer controls(kSampleRate);auto& c=controls.deck(1);
+  c.left.assign(100,.1f);c.right.assign(100,.1f);c.loopStart=10;c.loopEnd=200;c.releaseAt=1000;
+  check(c.inputEnd()==100,"truncated loop has real EOF");
+  c.right.resize(50);check(c.sampleAt(75)==-1,"short right channel cannot be read");
+  c.knotTimes={0,48000};c.knotPositions={10,48010};controls.prepare();
+  check(c.finished,"unequal channels rejected");
+  c.right.resize(100);c.loopEnd=80;c.releaseAt=1e18;
+  check(c.inputEnd()>1e15,"outgoing infinite loop remains unbounded");
+  c.loopRoll=true;check(c.inputEnd()>1e15,"outgoing loop roll remains unbounded");
+  c.loopEnd=c.loopStart;check(c.inputEnd()==100,"straight EOF remains physical");
+  std::printf("%s loop-domain-probe: %d finite-loop pairs (%d exact-ramp, %d unity), mapping/EOF/drain/infinite-roll controls; minRMS=%.8f maxReferenceDifference=%.9f minUnityCorrelation=%.8f postFadePeak=%.9f\n",ok?"ok":"FAIL",cases,rampCases,unityCases,lowestRms,largestReferenceDifference,lowestUnityCorrelation,largestPostPeak);
+  return ok?0:1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc == 1) return runSelfTest();
   bool wantSelftest = false;
   bool wantProbe = false;
+  bool wantLoopDomain = false;
   FileOpts opt;
   bool haveFileArgs = false;
   for (int i = 1; i < argc; ++i) {
@@ -1377,6 +1544,8 @@ int main(int argc, char** argv) {
       wantSelftest = true;
     } else if (arg == "--reverb-stop-probe") {
       wantProbe = true;
+    } else if (arg == "--loop-domain-probe") {
+      wantLoopDomain = true;
     } else if (arg == "--out-bed") {
       opt.outBed = needValue("--out-bed");
       haveFileArgs = true;
@@ -1426,6 +1595,7 @@ int main(int argc, char** argv) {
     }
     return runFileMode(opt);
   }
+  if (wantLoopDomain) return runLoopDomainProbe();
   if (wantProbe) return runReverbStopProbe();
   if (wantSelftest || argc == 1) return runSelfTest();
   printUsage(std::cerr, argv[0]);

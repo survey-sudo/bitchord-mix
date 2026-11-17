@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc79 (2.2.3-djmix37). File kept as vc75-gate.sh for history; it now gates vc79. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build gate for vc80 (2.2.3-djmix38). File kept as vc75-gate.sh for history; it now gates vc80. Needs only g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
@@ -70,10 +70,10 @@ fi
 # --- HARD: version stamp -----------------------------------------------------
 # versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
 # no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 79' build.gradle.kts \
-  && ok "versionCode is 79" || bad "versionCode is not 79"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix37"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix37" || bad "versionName is not 2.2.3-djmix37"
+grep -q 'extra\["bitchordVersionCode"\] = 80' build.gradle.kts \
+  && ok "versionCode is 80" || bad "versionCode is not 80"
+grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix38"' build.gradle.kts \
+  && ok "versionName is 2.2.3-djmix38" || bad "versionName is not 2.2.3-djmix38"
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""
@@ -165,6 +165,13 @@ else
     else
       rc=$?
       bad "loopmix reverb-stop probe FAILED (exit $rc)"
+      sed -n '1,40p' "$WORK/lm.probe.out"
+    fi
+    if "$WORK/lm_bin" --loop-domain-probe >"$WORK/lm.probe.out" 2>&1; then
+      ok "loopmix source-domain probe passed"
+    else
+      rc=$?
+      bad "loopmix source-domain probe FAILED (exit $rc)"
       sed -n '1,40p' "$WORK/lm.probe.out"
     fi
   else

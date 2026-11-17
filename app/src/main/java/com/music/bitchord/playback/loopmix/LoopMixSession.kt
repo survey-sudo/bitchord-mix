@@ -251,10 +251,8 @@ class LoopMixSession private constructor(
                 plan.copy(incomingHoldSec = effectiveHoldSec)
             } else plan
             val clock = LoopMix.Clock(effectivePlan)
-            // Single source of truth for decode bounds (matches isLoopFastReady).
-            // djmix19: regionBounds already covers the straight-deck tail to stopAt
-            // (settle + echoHold + exitTail on the steady tail rate); build decodes
-            // exactly [outFrom, outTo] so isLoopFastReady / cache / build agree.
+            // Nominal bounds shared with fast-ready checks. Actual tracked
+            // knots below may extend the physical decode request before build.
             val bounds = LoopMix.regionBounds(effectivePlan)
             val echoHoldEarly = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
             val outStopMixSec = clock.releaseAt + 0.05 + echoHoldEarly + effectivePlan.exitTailSeconds
@@ -265,18 +263,31 @@ class LoopMixSession private constructor(
             } else 1.0
             val outTo = bounds.outTo
             val inTail = bounds.inTo - clock.elementTrackTime
+            // Resolve actual tracked knots before decoding. A local grid can
+            // extend beyond nominal Clock bounds; decode that physical passage
+            // once, then reject an incomplete decoder result below.
+            val outHasTailKnot = !effectivePlan.outLoops && outStopMixSec > clock.releaseAt + 1e-6
+            val knots = buildDeckKnots(effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
+                outHasTailKnot, outStopMixSec, tailRateEarly)
+            val incomingGeometry = incomingGeometry(effectivePlan, clock, knots)
+            val actualInTo = maxOf(bounds.inTo, incomingGeometry.handoverTrack + inTail,
+                incomingGeometry.requiredEnd)
+            // Preserve straight OUT's existing real-EOF/effect-drain contract.
+            // Only repeated OUT audio needs a complete loop body and seam.
+            val requiredOutEnd = if (effectivePlan.outLoops) effectivePlan.out.loopEnd + 0.008 else null
+            val actualOutTo = outTo
             val (outDecoded, inDecoded) = try {
                 val outFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.OUT, bounds.outFrom, outTo) },
+                    { decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) },
                     DECODE_EXECUTOR,
                 )
                 val inFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.IN, bounds.inFrom, bounds.inTo) },
+                    { decode(LoopMix.Side.IN, bounds.inFrom, actualInTo) },
                     DECODE_EXECUTOR,
                 )
                 outFuture.get() to inFuture.get()
             } catch (e: Exception) {
-                decode(LoopMix.Side.OUT, bounds.outFrom, outTo) to decode(LoopMix.Side.IN, bounds.inFrom, bounds.inTo)
+                decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) to decode(LoopMix.Side.IN, bounds.inFrom, actualInTo)
             }
             var outRegion = outDecoded ?: return null
             var inRegion = inDecoded ?: return null
@@ -284,6 +295,13 @@ class LoopMixSession private constructor(
                 Log.w(TAG, "a region starts after its loop: out ${outRegion.start}, in ${inRegion.start}")
                 return null
             }
+            if (!coversOutgoingStartAndLoop(outRegion, sampleRate, effectivePlan) ||
+                !coversPhysical(inRegion, sampleRate, effectivePlan.inn.loopStart, incomingGeometry.requiredEnd)
+            ) {
+                Log.i(TAG, "loop-domain rejected: incomplete physical PCM out=${outRegion.left.size}/${outRegion.right.size} in=${inRegion.left.size}/${inRegion.right.size} requiredOut=$requiredOutEnd requiredIn=${incomingGeometry.requiredEnd}")
+                return null
+            }
+            Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
             // instrumental when windowed stems are enabled. Worker thread only; null
@@ -473,8 +491,6 @@ class LoopMixSession private constructor(
             val renderer = LoopMixRenderer(sampleRate)
             if (!renderer.isValid) return null
             val sr = sampleRate.toDouble()
-            val beats = clock.beats
-
             fun samplesOf(region: LoopRegion, trackSeconds: Double) = (trackSeconds - region.start) * sr
 
             // K-weighted loudness of the outgoing exit window against the incoming
@@ -511,17 +527,6 @@ class LoopMixSession private constructor(
 
             val echoHold = echoHoldEarly
             val outStopAtSec = outStopMixSec
-            val outHasTailKnot = !effectivePlan.outLoops && outStopAtSec > clock.releaseAt + 1e-6
-            val knots = buildDeckKnots(
-                plan = effectivePlan,
-                clock = clock,
-                sampleRate = sampleRate,
-                outAnalysis = outAnalysis,
-                inAnalysis = inAnalysis,
-                outHasTailKnot = outHasTailKnot,
-                outStopAtSec = outStopAtSec,
-                tailRateEarly = tailRateEarly,
-            )
             val outKnotFrames = knots.outFrames
             val outKnotPositions = DoubleArray(knots.outPositionsSec.size) {
                 samplesOf(outRegion, knots.outPositionsSec[it])
@@ -548,13 +553,9 @@ class LoopMixSession private constructor(
             val inKnotPositions = DoubleArray(knots.inPositionsSec.size) {
                 samplesOf(inRegion, knots.inPositionsSec[it])
             }
-            val inLoopEnd = if (effectivePlan.inLoops) effectivePlan.inn.loopEnd else effectivePlan.inn.loopStart
-            val inReleaseTrackSec = if (effectivePlan.inLoops) {
-                clock.inReleasePosition
-            } else {
-                knots.inPositionsSec[beats.coerceAtMost(knots.inPositionsSec.lastIndex)]
-            }
-            val handoverTrackSec = knots.inPositionsSec.last()
+            val inLoopEnd = if (incomingGeometry.loops) effectivePlan.inn.loopEnd else effectivePlan.inn.loopStart
+            val inReleaseTrackSec = incomingGeometry.releaseTrack
+            val handoverTrackSec = incomingGeometry.handoverTrack
             renderer.setDeck(
                 LoopMixRenderer.IN,
                 LoopMixRenderer.DeckSetup(
@@ -987,6 +988,39 @@ class LoopMixSession private constructor(
             return out
         }
 
+        internal data class IncomingGeometry(
+            val loops: Boolean,
+            val releaseTrack: Double,
+            val handoverTrack: Double,
+            val requiredEnd: Double,
+        )
+
+        /** Coordinates here remain track seconds; native subtracts region.start. */
+        internal fun incomingGeometry(plan: LoopMix.Plan, clock: LoopMix.Clock, knots: DeckKnots): IncomingGeometry {
+            val release = knots.inPositionsSec[clock.beats]
+            val loops = plan.inLoops && !plan.nativeIncoming && release >= plan.inn.loopEnd
+            fun physical(position: Double) = if (loops) LoopMix.physicalTrackTime(
+                position, plan.inn.loopStart, plan.inn.loopEnd, release,
+            ) else position
+            val handover = physical(knots.inPositionsSec.last())
+            // Entire repeated body plus the 8 ms seam continuation must exist;
+            // post-release music extends through the 25 ms renderer fade.
+            val required = maxOf(knots.inPositionsSec.maxOf(::physical), handover + 0.025,
+                if (loops) plan.inn.loopEnd + 0.008 else plan.inn.loopStart)
+            return IncomingGeometry(loops, release, handover, required)
+        }
+
+        internal fun coversPhysical(region: LoopRegion, sampleRate: Int, requiredStart: Double, requiredEnd: Double): Boolean =
+            sampleRate > 0 && region.start.isFinite() && requiredStart.isFinite() && requiredEnd.isFinite() &&
+                region.left.isNotEmpty() && region.left.size == region.right.size && region.start <= requiredStart &&
+                region.start + region.left.size.toDouble() / sampleRate + 1.0 / sampleRate >= requiredEnd
+
+        /** OUT loop completeness only; straight OUT may reach real EOF during FX drain. */
+        internal fun coversOutgoingStartAndLoop(region: LoopRegion, sampleRate: Int, plan: LoopMix.Plan): Boolean =
+            coversPhysical(region, sampleRate, plan.out.loopStart,
+                if (plan.outLoops) plan.out.loopEnd + 0.008 else plan.out.loopStart) &&
+                region.start + region.left.size.toDouble() / sampleRate > plan.out.loopStart
+
         internal fun buildDeckKnots(
             plan: LoopMix.Plan,
             clock: LoopMix.Clock,
@@ -1035,7 +1069,7 @@ class LoopMixSession private constructor(
             val inPositionsSec = DoubleArray(totalInBeats + 1) { k ->
                 val mixSec = clock.beatTimes[k]
                 when {
-                    clock.incomingHoldSec > 1e-9 -> clock.inTrackTimeAt(mixSec)
+                    clock.incomingHoldSec > 1e-9 -> clock.inUnwrappedTimeAt(mixSec)
                     plan.nativeIncoming -> plan.inn.loopStart + mixSec
                     k <= beats -> clock.inPositionAt(k)
                     else -> clock.inPositionAt(beats) + (mixSec - clock.releaseAt)

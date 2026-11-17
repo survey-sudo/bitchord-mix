@@ -1046,42 +1046,28 @@ object LoopMix {
         /** The incoming player takes over here, at this track position. */
         val elementAt: Double get() = beatTimes[beats + settleBeats]
 
-        /** Track position (seconds) of the incoming deck at [mixSec] after t0. */
-        fun inTrackTimeAt(mixSec: Double): Double {
+        /** Monotonic source coordinate for native knots, including a held loop. */
+        fun inUnwrappedTimeAt(mixSec: Double): Double {
             val hold = incomingHoldSec.coerceAtLeast(0.0)
             if (mixSec <= hold) return plan.inn.loopStart
-            if (plan.nativeIncoming) return plan.inn.loopStart + (mixSec - hold)
-            if (hold <= 1e-9) {
-                if (mixSec >= releaseAt) {
-                    return if (plan.inLoops) {
-                        plan.inn.loopEnd + (mixSec - releaseAt)
-                    } else {
-                        plan.inn.loopStart + beats * plan.fold * plan.inn.beatSec + (mixSec - releaseAt)
-                    }
-                }
-                val (k, frac) = beatAt(mixSec)
-                if (k < 0) return plan.inn.loopStart
-                return if (plan.inLoops) {
-                    plan.inn.loopStart + (((k * plan.fold) % plan.inn.beats) + frac * plan.fold) * plan.inn.beatSec
-                } else {
-                    plan.inn.loopStart + (k + frac) * plan.fold * plan.inn.beatSec
-                }
-            }
-            fun beatProgress(t: Double): Double {
+            if (plan.nativeIncoming) return plan.inn.loopStart + mixSec - hold
+            fun progress(t: Double): Double {
                 if (t <= 0.0) return 0.0
                 if (t >= releaseAt) return beats.toDouble()
-                val (k, frac) = beatAt(t)
-                return if (k < 0) 0.0 else k + frac
+                val (k, fraction) = beatAt(t)
+                return k + fraction
             }
-            val deltaBeats = (beatProgress(mixSec.coerceAtMost(releaseAt)) - beatProgress(hold)).coerceAtLeast(0.0)
-            val postRelease = (mixSec - releaseAt).coerceAtLeast(0.0)
-            return if (plan.inLoops) {
-                val loopBeats = plan.inn.beats.toDouble().coerceAtLeast(1.0)
-                val totalInBeats = deltaBeats * plan.fold
-                plan.inn.loopStart + (totalInBeats % loopBeats) * plan.inn.beatSec + postRelease
-            } else {
-                plan.inn.loopStart + deltaBeats * plan.fold * plan.inn.beatSec + postRelease
-            }
+            return plan.inn.loopStart + (progress(mixSec) - progress(hold)).coerceAtLeast(0.0) *
+                plan.fold * plan.inn.beatSec + (mixSec - maxOf(releaseAt, hold)).coerceAtLeast(0.0)
+        }
+
+        /** Track position (seconds) of the incoming deck at [mixSec] after t0. */
+        fun inTrackTimeAt(mixSec: Double): Double {
+            val unwrapped = inUnwrappedTimeAt(mixSec)
+            // A hold that ends before even one loop was consumed has nothing
+            // to wrap. Native-incoming decks are always identity coordinates.
+            if (!plan.inLoops || plan.nativeIncoming || inReleasePosition < plan.inn.loopEnd) return unwrapped
+            return physicalTrackTime(unwrapped, plan.inn.loopStart, plan.inn.loopEnd, inReleasePosition)
         }
 
         val handoverTrackSec: Double get() = inTrackTimeAt(elementAt)
@@ -1092,7 +1078,7 @@ object LoopMix {
         fun inPositionAt(k: Int): Double = plan.inn.loopStart + k * plan.fold * plan.inn.beatSec
 
         /** Unwrapped positions past which each deck no longer loops (the incoming one runs on). */
-        val inReleasePosition: Double get() = inPositionAt(beats)
+        val inReleasePosition: Double get() = inUnwrappedTimeAt(releaseAt)
 
         /** The beat [t] falls in, and how far through it (0..1); k = -1 before t0. */
         fun beatAt(t: Double): Pair<Int, Double> {
@@ -1107,6 +1093,13 @@ object LoopMix {
             if (k + 1 >= beatTimes.size) return k to 0.0
             return k to min(1.0, (t - beatTimes[k]) / (beatTimes[k + 1] - beatTimes[k]))
         }
+    }
+
+    /** Same coordinate transform as native Deck::trackSecondsAt (track-second units). */
+    fun physicalTrackTime(unwrapped: Double, loopStart: Double, loopEnd: Double, release: Double): Double {
+        if (loopEnd <= loopStart || unwrapped < loopEnd) return unwrapped
+        return if (unwrapped < release) loopStart + (unwrapped - loopStart) % (loopEnd - loopStart)
+        else loopEnd + (unwrapped - release)
     }
 
     /**

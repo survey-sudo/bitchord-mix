@@ -71,6 +71,7 @@ jobs:
                 -o /tmp/loop_mix_renderer_ab_main
             /tmp/loop_mix_renderer_ab_main --selftest
             /tmp/loop_mix_renderer_ab_main --reverb-stop-probe
+            /tmp/loop_mix_renderer_ab_main --loop-domain-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi
@@ -148,6 +149,7 @@ jobs:
                 -o /tmp/loop_mix_renderer_ab_main
             /tmp/loop_mix_renderer_ab_main --selftest
             /tmp/loop_mix_renderer_ab_main --reverb-stop-probe
+            /tmp/loop_mix_renderer_ab_main --loop-domain-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi

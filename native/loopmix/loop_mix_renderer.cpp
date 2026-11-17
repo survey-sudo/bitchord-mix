@@ -399,7 +399,7 @@ int64_t Deck::sampleAtEffective(int64_t unwrapped) const {
       index = effEnd + (unwrapped - int64_t(releaseAt));
     }
   }
-  return (index >= 0 && index < int64_t(left.size())) ? index : -1;
+  return (index >= 0 && index < int64_t(std::min(left.size(), right.size()))) ? index : -1;
 }
 
 void Deck::readEffective(int64_t unwrapped, int seamSamples, double mixSec, float& leftOut, float& rightOut) const {
@@ -465,7 +465,18 @@ int64_t Deck::sampleAt(int64_t unwrapped) const {
       index = loopEnd + (unwrapped - int64_t(releaseAt));
     }
   }
-  return (index >= 0 && index < int64_t(left.size())) ? index : -1;
+  return (index >= 0 && index < int64_t(std::min(left.size(), right.size()))) ? index : -1;
+}
+
+double Deck::inputEnd() const {
+  const double size = double(std::min(left.size(), right.size()));
+  // Only a fully decoded loop body can repeat. Truncated/malformed loops
+  // retain their real physical EOF instead of manufacturing available music.
+  if (loopStart >= 0 && loopEnd > loopStart && loopEnd <= size && releaseAt >= loopEnd) {
+    if (releaseAt > 1e15) return 1e18;
+    return releaseAt + (size - loopEnd);
+  }
+  return size;
 }
 
 void Deck::read(int64_t unwrapped, int seamSamples, float& leftOut, float& rightOut) const {
@@ -625,7 +636,7 @@ void Renderer::prepare() {
     if (highQuality_) deck.stretch.presetDefault(2, float(sampleRate_), true);
     else deck.stretch.presetCheaper(2, float(sampleRate_), true);
     deck.started = false;
-    deck.finished = deck.left.empty() || deck.knotTimes.size() < 2;
+    deck.finished = deck.left.empty() || deck.left.size() != deck.right.size() || deck.knotTimes.size() < 2;
     deck.activeStartFrame = 0.0;
     if (!deck.knotTimes.empty() && deck.knotPositions.size() == deck.knotTimes.size()) {
       const double p0 = deck.knotPositions.front();
@@ -818,50 +829,27 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       if (deck.effectiveLoopEnd <= deck.loopStart) deck.effectiveLoopEnd = -1;
     }
   }
-  const bool loopsForever = (deck.loopEnd > deck.loopStart && deck.releaseAt > 1e15);
-  const int64_t deckSize = int64_t(deck.left.size());
+  const double inputEnd = deck.inputEnd();
+  const bool loopsForever = inputEnd > 1e15;
   const int64_t readFrom = int64_t(std::floor(deck.readPos));
   const int minInput = std::max(1, int(std::floor(double(activeFrames) * 0.75)));
   const int maxInput = std::max(minInput, int(std::ceil(double(activeFrames) * 1.35)));
-  const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, deckSize - readFrom);
+  const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, int64_t(std::ceil(inputEnd)) - readFrom);
 
-  if (!loopsForever && remaining <= 0) {
-    // Past decoded PCM EOF: silence dry audio without calling stretch.process(0, frames),
-    // letting only wet echo/flanger tails ring out until stopAt.
-    std::fill(outLeft_.begin() + silentFrames, outLeft_.begin() + frames, 0.f);
-    std::fill(outRight_.begin() + silentFrames, outRight_.begin() + frames, 0.f);
-    deck.readPos = double(deckSize);
-  } else if (!loopsForever && remaining < minInput) {
-    const int avail = std::min(activeFrames, int(remaining));
-    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
-    for (int i = 0; i < avail; ++i) {
-      const double mixSec = double(frame + silentFrames + i) / sr;
-      if (deck.loopRoll) deck.readEffective(readFrom + i, seam, mixSec, outLeft_[silentFrames + i], outRight_[silentFrames + i]);
-      else deck.read(readFrom + i, seam, outLeft_[silentFrames + i], outRight_[silentFrames + i]);
-    }
-    const int fadeLen = std::min(avail, 64);
-    const int fadeStart = avail - fadeLen;
-    for (int i = 0; i < fadeLen; ++i) {
-      const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
-      outLeft_[silentFrames + fadeStart + i] *= f;
-      outRight_[silentFrames + fadeStart + i] *= f;
-    }
-    for (int i = avail; i < activeFrames; ++i) {
-      outLeft_[silentFrames + i] = 0.f;
-      outRight_[silentFrames + i] = 0.f;
-    }
-    deck.readPos = double(deckSize);
-  } else {
+  {
     const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
     int inputSamples = int(std::floor(readEnd - deck.readPos));
     inputSamples = std::clamp(inputSamples, minInput, maxInput);
-    if (!loopsForever) {
-      inputSamples = std::min<int>(inputSamples, int(remaining));
-    }
+    // Always feed a positive bounded block. At true EOF pad input with zero
+    // through the stretcher so its buffered latency drains on the same path;
+    // never replace stretched output with raw input or park an unwrapped
+    // pointer at a physical array size.
+    const int available = int(std::min<int64_t>(inputSamples, remaining));
     // No resize on the audio thread (pre-allocated in prepare()).
     if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
     const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
     for (int i = 0; i < inputSamples; ++i) {
+      if (i >= available) { inLeft_[i] = 0.f; inRight_[i] = 0.f; continue; }
       const double mixSec = double(frame + silentFrames + i) / sr;
       if (deck.loopRoll) deck.readEffective(readFrom + i, seam, mixSec, inLeft_[i], inRight_[i]);
       else deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
@@ -871,15 +859,6 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     float* input[2] = {inLeft_.data(), inRight_.data()};
     float* output[2] = {outLeft_.data() + silentFrames, outRight_.data() + silentFrames};
     deck.stretch.process(input, inputSamples, output, activeFrames);
-    if (!loopsForever && readFrom + inputSamples >= deckSize) {
-      const int fadeLen = std::min(activeFrames, 64);
-      const int fadeStart = frames - fadeLen;
-      for (int i = 0; i < fadeLen; ++i) {
-        const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
-        outLeft_[fadeStart + i] *= f;
-        outRight_[fadeStart + i] *= f;
-      }
-    }
   }
 
   const double heardStart = deck.heardPos;

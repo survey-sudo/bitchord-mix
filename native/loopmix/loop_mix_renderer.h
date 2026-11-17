@@ -244,6 +244,8 @@ struct Deck {
   double releasedPositionOf(double seconds, double sampleRate) const;
   /** The region sample an unwrapped position reads, or -1 outside the region. */
   int64_t sampleAt(int64_t unwrapped) const;
+  /** End of available input in the monotonic, unwrapped source coordinate. */
+  double inputEnd() const;
   /**
    * Reads [unwrapped], crossfading the first 8 ms of a loop with the audio
    * just past the loop end so the seam isn't a click.
