@@ -629,9 +629,9 @@ class PrecisionAudioSink(
             val blockUs = loopNextUs
             loopNextUs += Util.sampleCountToDurationUs(frames.toLong(), configuredSampleRate)
             processedEndUs = loopNextUs
-            pendingPresentationTimeUs = blockUs
+            pendingPresentationTimeUs = if (blockUs != C.TIME_UNSET) blockUs + delegateOffsetUs else blockUs
             pendingAccessUnitCount = 0
-            val consumed = delegate.handleBuffer(outputByteBuffer, blockUs, 0)
+            val consumed = delegate.handleBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
             if (!consumed || outputByteBuffer.hasRemaining()) return false
         }
         return false

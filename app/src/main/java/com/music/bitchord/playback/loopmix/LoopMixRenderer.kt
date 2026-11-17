@@ -13,11 +13,14 @@ import android.util.Log
 class LoopMixRenderer internal constructor(val sampleRate: Int, private val readout: Readout?) : AutoCloseable {
     constructor(sampleRate: Int) : this(sampleRate, null)
 
-    /** Only native measurements are substituted by controller JVM tests. */
+    /** Native measurements and optional rendering substituted by JVM tests. */
     internal interface Readout {
         fun firstFrame(): Long
         fun heard(index: Int): Double
         fun exitGateViolations(): Int
+        fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) {
+            error("This readout does not substitute rendering")
+        }
     }
 
 
@@ -83,8 +86,10 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
     fun firstFrame(): Long = readout?.firstFrame() ?: nativeFirstFrame(handle)
 
     /** Renders [frames] stereo frames from mix frame [frame] into [interleaved] at frame [offset]. */
-    fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) =
-        nativeRender(handle, frame, interleaved, offset, frames)
+    fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) {
+        if (readout != null) readout.render(frame, interleaved, offset, frames)
+        else nativeRender(handle, frame, interleaved, offset, frames)
+    }
 
     /** Fade [index] out over 25 ms once it plays track second [trackSeconds] after its release. */
     fun setFadeOut(index: Int, trackSeconds: Double) = nativeSetFadeOut(handle, index, trackSeconds)
