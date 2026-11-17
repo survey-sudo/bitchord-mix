@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc81 (2.2.3-djmix39). File kept as vc75-gate.sh for history; it now gates vc81. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build gate for vc82 (2.2.3-djmix40). File kept as vc75-gate.sh for history; it now gates vc82. Needs only g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
@@ -70,10 +70,10 @@ fi
 # --- HARD: version stamp -----------------------------------------------------
 # versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
 # no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 81' build.gradle.kts \
-  && ok "versionCode is 81" || bad "versionCode is not 81"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix39"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix39" || bad "versionName is not 2.2.3-djmix39"
+grep -q 'extra\["bitchordVersionCode"\] = 82' build.gradle.kts \
+  && ok "versionCode is 82" || bad "versionCode is not 82"
+grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix40"' build.gradle.kts \
+  && ok "versionName is 2.2.3-djmix40" || bad "versionName is not 2.2.3-djmix40"
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""

@@ -664,7 +664,7 @@ object TransitionAlternatives {
 
     // -- bounded-decline carve envelope (pure, shared so it is testable) --
     //
-    // Offline gain-policy candidate for the bounded 4 s DJ_FILTER decline.
+    // Complementary faders for the bounded 4 s DJ_FILTER decline.
     // Both faders use the same linear progress through complementary sin/cos
     // curves: squared gains sum to 1, with both gains >= 0.5 over the middle
     // third. This positive overlap is an engineering contract, not a claim

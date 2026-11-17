@@ -6920,8 +6920,8 @@ class CrossfadeController(
      * [headroomFor] keeps two faders at full from summing past full scale.
      */
     private fun mixRise(progress: Float): Float {
-        // The decline carve owns its faders: its loud regions never coincide,
-        // which is what hides the raw-tempo flam. Same numbers as the tests.
+        // The decline owns complementary faders over common progress; its
+        // existing filters and bass handoff still shape the overlap.
         if (render.filterVariant == FilterTransitionVariant.DECLINE) {
             return TransitionAlternatives.declineInGainAt(progress.toDouble()).toFloat()
         }
@@ -6946,7 +6946,7 @@ class CrossfadeController(
      * low-pass is already taking it away.
      */
     private fun mixFall(progress: Float): Float {
-        // See mixRise: the carve's early fall keeps the loud regions disjoint.
+        // See mixRise: the decline's faders share the same progress.
         if (render.filterVariant == FilterTransitionVariant.DECLINE) {
             return TransitionAlternatives.declineOutGainAt(progress.toDouble()).toFloat()
         }
