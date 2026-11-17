@@ -18,6 +18,42 @@ import kotlin.math.sqrt
  * the djmix6 plan.
  */
 object StructureAnalyzer {
+    private data class ReconciledGrid(val times: DoubleArray, val coverage: BooleanArray, val stable: Boolean)
+
+    private fun reconcileBarGrid(measured: DoubleArray, barSec: Double, duration: Double): ReconciledGrid {
+        val source = measured.filter { it.isFinite() && it >= 0.0 }.distinct().sorted()
+        if (source.isEmpty()) {
+            val count = max(1, kotlin.math.ceil(duration / barSec.coerceAtLeast(0.01)).toInt())
+            return ReconciledGrid(DoubleArray(count) { it * barSec }, BooleanArray(count), false)
+        }
+        val step = if (source.size >= 2) (source[1] - source[0]).coerceAtLeast(0.01) else barSec
+        val out = ArrayList<Double>()
+        val covered = ArrayList<Boolean>()
+        var first = source.first()
+        while (first - step >= 0.0) {
+            first -= step
+        }
+        var t = first
+        while (t < source.first() - step * 0.2) {
+            out += t
+            covered += false
+            t += step
+        }
+        for (value in source) {
+            out += value
+            covered += true
+        }
+        t = source.last() + step
+        while (t < duration) {
+            out += t
+            covered += false
+            t += step
+        }
+        // Keep a phase-preserving local interpolation for measured non-uniform grids.
+        val stable = source.zipWithNext().all { (a, b) -> abs((b - a) - step) <= step * 0.08 }
+        return ReconciledGrid(out.toDoubleArray(), covered.toBooleanArray(), stable)
+    }
+
     class Timeout(message: String) : RuntimeException(message)
 
     class Bar(
@@ -45,6 +81,8 @@ object StructureAnalyzer {
         partial: Boolean,
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
+        gridMeasured: Boolean = false,
+        gridCoverage: BooleanArray = BooleanArray(0),
     ): SongMap {
         checkTime(startedMs, now)
         val n = bars.size
@@ -94,6 +132,10 @@ object StructureAnalyzer {
             activation = activation,
             speechLike = speechLike,
             chorusCount = sections.count { it.fn == SectionFn.CHORUS },
+            vocalCoverage = BooleanArray(n) { mask != null && mask.isNotEmpty() },
+            gridMeasured = gridMeasured,
+            gridCoverage = gridCoverage,
+            provenance = if (gridMeasured) "pcm:model-grid" else "pcm:unverified-grid",
         )
     }
 
@@ -113,6 +155,11 @@ object StructureAnalyzer {
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
         fullTrackDurationSec: Double = 0.0,
+        downbeats: DoubleArray? = null,
+        beatsPerBar: Int = 4,
+        gridConfidence: Float? = null,
+        tempoStable: Boolean? = null,
+        gridMeasured: Boolean = false,
     ): SongMap {
         val mono = if (sampleRate == RATE) pcm else resample(pcm, sampleRate, RATE)
         val frames = frames(mono)
@@ -121,17 +168,21 @@ object StructureAnalyzer {
         val effectiveDuration = if (fullTrackDurationSec > 0.0) maxOf(pcmDurationSec, fullTrackDurationSec) else pcmDurationSec
         val effectivePartial = partial || (fullTrackDurationSec > pcmDurationSec + 1.0)
         val beatSec = 60.0 / bpm.coerceAtLeast(1.0)
-        val barSec = beatSec * 4.0
-        val barsN = max(1, (pcmDurationSec / barSec).toInt())
-        val downbeats = DoubleArray(barsN) { it * barSec }
-        val bars = beatSync(frames, downbeats, beatSec)
+        val meter = beatsPerBar.coerceAtLeast(1)
+        val barSec = beatSec * meter
+        val grid = reconcileBarGrid(downbeats ?: DoubleArray(0), barSec, pcmDurationSec)
+        val starts = grid.times.filter { it < pcmDurationSec }.toDoubleArray().ifEmpty { doubleArrayOf(0.0) }
+        val bars = beatSync(frames, starts, barSec)
+        val measured = !downbeats.isNullOrEmpty()
         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
         val activation = if (fluxPeak <= 1e-6f) 0f else (frames.map { it.flux }.average() / fluxPeak).toFloat()
         val map = analyseBars(
-            trackKey, effectiveDuration, bpm, 4, downbeats, bars,
-            mask, lyricPrior, gridConfidence = if (activation < PhraseConfig.ACTIVATION_FLOOR) 0.3f else 0.8f,
-            tempoStable = true, activation = activation, speechLike = false, partial = effectivePartial,
+            trackKey, effectiveDuration, bpm, meter, starts, bars,
+            mask, lyricPrior, gridConfidence = (gridConfidence ?: if (measured) 0.5f else 0.3f)
+                .coerceIn(0f, if (measured) 1f else 0.35f),
+            tempoStable = tempoStable ?: (measured && grid.stable), activation = activation, speechLike = false, partial = effectivePartial,
             startedMs = startedMs, now = now,
+            gridMeasured = measured, gridCoverage = BooleanArray(starts.size) { measured && grid.coverage.getOrElse(it) { false } },
         )
         return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
             map.copy(contentEndSec = effectiveDuration)
@@ -170,8 +221,8 @@ object StructureAnalyzer {
             var sum = 0.0
             var peak = 0f
             var count = 0
-            val a = (t0 / duration * mask.size).toInt().coerceIn(0, mask.size)
-            val z = (t1 / duration * mask.size).toInt().coerceIn(a, mask.size)
+            val a = (t0 / duration.coerceAtLeast(0.001) * mask.size).toInt().coerceIn(0, mask.size)
+            val z = (t1 / duration.coerceAtLeast(0.001) * mask.size).toInt().coerceIn(a, mask.size)
             for (i in a until z) {
                 sum += mask[i]
                 if (mask[i] > peak) peak = mask[i]
@@ -759,13 +810,14 @@ object StructureAnalyzer {
         return out
     }
 
-    private fun beatSync(frames: List<Frame>, downbeats: DoubleArray, beatSec: Double): List<Bar> {
+    private fun beatSync(frames: List<Frame>, downbeats: DoubleArray, barSec: Double): List<Bar> {
         val bars = ArrayList<Bar>(downbeats.size)
         for (b in downbeats.indices) {
             val t0 = downbeats[b]
-            val t1 = if (b + 1 < downbeats.size) downbeats[b + 1] else t0 + beatSec * 4
+            val t1 = if (b + 1 < downbeats.size) downbeats[b + 1] else t0 +
+                if (b > 0) t0 - downbeats[b - 1] else barSec
             val from = (t0 * RATE / HOP).toInt().coerceIn(0, frames.size)
-            val to = (t1 * RATE / HOP).toInt().coerceIn(from + 1, frames.size)
+            val to = (t1 * RATE / HOP).toInt().coerceIn(minOf(from + 1, frames.size), frames.size)
             val slice = frames.subList(from, to.coerceAtMost(frames.size))
             if (slice.isEmpty()) {
                 bars.add(Bar(FloatArray(13), FloatArray(12), -80f, 0f, 0f, 0f))

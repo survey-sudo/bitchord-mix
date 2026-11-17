@@ -86,13 +86,27 @@ data class SongMap(
     val activation: Float = 1f,
     val speechLike: Boolean = false,
     val chorusCount: Int = sections.count { it.fn == SectionFn.CHORUS },
+    /** Empty retains legacy hand-built maps; producers explicitly mark unknown bars false. */
+    val vocalCoverage: BooleanArray = BooleanArray(0),
+    val gridMeasured: Boolean = false,
+    val provenance: String = "",
+    /** True only for observed downbeats, never interpolated/extrapolated ones. */
+    val gridCoverage: BooleanArray = BooleanArray(0),
 ) {
-    val barSec: Double get() = if (bpm > 1.0) beatsPerBar * 60.0 / bpm else 0.0
+    val barSec: Double get() = if (bpm > 1.0) beatsPerBar.coerceAtLeast(1) * 60.0 / bpm else 0.0
+
+    fun isVocalMeasured(bar: Int): Boolean = if (vocalCoverage.isEmpty()) {
+        bar in sungBars.indices && (vocalEnergy.isEmpty() || bar < vocalEnergy.size)
+    } else vocalCoverage.getOrElse(bar) { false }
+
+    fun isGridMeasured(bar: Int): Boolean = gridMeasured &&
+        if (gridCoverage.isEmpty()) bar in downbeats.indices else gridCoverage.getOrElse(bar) { false }
 
     fun barTime(bar: Int): Double {
         if (bar < 0) return 0.0
         if (bar < downbeats.size) return downbeats[bar]
-        val step = barSec
+        val step = if (downbeats.size >= 2) (downbeats.last() - downbeats[downbeats.lastIndex - 1])
+            .takeIf { it.isFinite() && it > 0.0 } ?: barSec else barSec
         val origin = downbeats.lastOrNull() ?: 0.0
         return origin + (bar - (downbeats.size - 1).coerceAtLeast(0)) * step
     }

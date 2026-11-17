@@ -5,11 +5,70 @@ package com.music.bitchord.playback.smart
  * upgrades this when it finishes; the planner can run on this alone.
  */
 object SongMaps {
-    fun fromAnalysis(trackKey: String, analysis: TrackAnalysis, partial: Boolean = false): SongMap? {
+    /** Merges time-stamped model windows without turning uncovered gaps into zero. */
+    fun mergeVocalMasks(size: Int, windows: List<Pair<DoubleArray, DoubleArray?>>): DoubleArray? {
+        if (size <= 0 || windows.isEmpty()) return null
+        val out = DoubleArray(size) { Double.NaN }
+        val weight = DoubleArray(size)
+        for ((times, values) in windows) {
+            if (values == null || values.isEmpty() || times.isEmpty()) continue
+            val frames = minOf(times.size, values.size)
+            for (i in 0 until frames) {
+                val index = times[i].toInt()
+                if (index !in 0 until size) continue
+                val value = values[i]
+                if (!value.isFinite()) continue
+                val w = 1.0
+                out[index] = if (out[index].isNaN()) value else (out[index] * weight[index] + value * w) / (weight[index] + w)
+                weight[index] += w
+            }
+        }
+        return if (weight.any { it > 0.0 }) out else null
+    }
+
+    /** Crossfades overlapping full-length masks while preserving [neutralSentinel] gaps. */
+    fun mergeMeasuredMasks(size: Int, masks: List<DoubleArray>, neutralSentinel: Double): DoubleArray? {
+        if (size <= 0 || masks.isEmpty()) return null
+        val out = DoubleArray(size) { neutralSentinel }
+        for (index in 0 until size) {
+            val active = masks.mapIndexedNotNull { source, mask ->
+                val value = mask.getOrNull(index)
+                if (value == null || !value.isFinite() || value == neutralSentinel) return@mapIndexedNotNull null
+                val start = mask.indexOfFirst { it.isFinite() && it != neutralSentinel }.takeIf { it >= 0 } ?: return@mapIndexedNotNull null
+                val end = mask.indexOfLast { it.isFinite() && it != neutralSentinel }
+                Triple(source, value, start to end)
+            }
+            if (active.isEmpty()) continue
+            if (active.size == 1) {
+                out[index] = active[0].second
+            } else {
+                val overlapStart = active.maxOf { it.third.first }
+                val overlapEnd = active.minOf { it.third.second }
+                val phase = if (overlapEnd > overlapStart) {
+                    ((index - overlapStart).toDouble() / (overlapEnd - overlapStart)).coerceIn(0.0, 1.0)
+                } else 0.5
+                var value = 0.0
+                for ((position, item) in active.withIndex()) {
+                    val weight = when (position) {
+                        0 -> 1.0 - phase
+                        active.lastIndex -> phase
+                        else -> 1.0
+                    }
+                    value += item.second * weight
+                }
+                val norm = if (active.size == 2) 1.0 else active.size - 2.0 + 1.0
+                out[index] = value / norm
+            }
+        }
+        return out
+    }
+
+    fun fromAnalysis(trackKey: String, analysis: TrackAnalysis, partial: Boolean = false, beatsPerBar: Int = 4): SongMap? {
         if (!analysis.isUsable || analysis.duration <= 1.0) return null
         val bpm = analysis.bpm.coerceIn(40.0, 220.0)
         val beat = if (analysis.beatInterval > 0.05) analysis.beatInterval else 60.0 / bpm
-        val bar = beat * 4.0
+        val meter = beatsPerBar.coerceAtLeast(1)
+        val bar = beat * meter
         val bars = (analysis.duration / bar).toInt().coerceIn(4, 512)
         val downbeats = if (analysis.downbeats.size >= 4) {
             analysis.downbeats.filter { it.isFinite() && it >= 0.0 }.toDoubleArray()
@@ -18,11 +77,12 @@ object SongMaps {
         }
         val n = bars
         val sung = BooleanArray(n)
-        val vocalEnergy = buildVocalBars(analysis, bar, n, sung)
+        val coverage = BooleanArray(n)
+        val vocalEnergy = buildVocalBars(analysis, downbeats, bar, n, sung, coverage)
         val first = sung.indexOfFirst { it }.let { if (it < 0) null else it }
         val last = sung.indexOfLast { it }.let { if (it < 0) null else it }
-        val introEnd = barIndex(analysis.introEndTime, bar, n)
-        val rawOutroStart = barIndex(analysis.outroStartTime, bar, n).coerceAtLeast(introEnd)
+        val introEnd = barIndex(analysis.introEndTime, downbeats, bar, n)
+        val rawOutroStart = barIndex(analysis.outroStartTime, downbeats, bar, n).coerceAtLeast(introEnd)
         val outroStart = if (analysis.outroStartTime > 0.0 && rawOutroStart < n) {
             (((rawOutroStart + 2) / 4) * 4).coerceIn(introEnd, n)
         } else {
@@ -36,7 +96,7 @@ object SongMaps {
             // Proxy from sung flag inversion is weak; use section heuristic
             // only when no curve. When curve exists, sample it directly.
             if (analysis.energyCurve.isNotEmpty()) {
-                val t = b * bar
+                val t = if (b < downbeats.size) downbeats[b] else b * bar
                 val sample = analysis.energyCurve.minByOrNull { kotlin.math.abs(it.time - t) }
                 sample?.energy ?: 1.0
             } else {
@@ -239,13 +299,14 @@ object SongMaps {
                     SectionFn.DROP -> SectionRole.RELEASE; SectionFn.VERSE -> SectionRole.NARRATIVE
                     SectionFn.BRIDGE -> SectionRole.NARRATIVE; else -> SectionRole.GROOVE
                 }
-                val vocal = if (fn == SectionFn.CHORUS || fn == SectionFn.VERSE || fn == SectionFn.PRE_CHORUS || fn == SectionFn.BRIDGE) 0.7f else 0f
+                val vocal = measuredVocal(b, e, sung, coverage)
                 sections.add(phrase(b, e, fn, role, lvl, vocal))
                 b = e
             }
         } else if (first != null && first < bodyEnd) {
             sections.add(phrase(introEnd, first.coerceAtLeast(introEnd + 1), SectionFn.INTRO, SectionRole.GROOVE, 4, 0f))
-            sections.add(phrase(first, (last ?: first) + 1, SectionFn.VERSE, SectionRole.NARRATIVE, 6, 0.7f))
+            sections.add(phrase(first, (last ?: first) + 1, SectionFn.VERSE, SectionRole.NARRATIVE, 6,
+                measuredVocal(first, (last ?: first) + 1, sung, coverage)))
         } else if (bodyEnd > introEnd) {
             // Split body by BUILD/DROP when present, else single INSTRUMENTAL.
             if (buildDropBars.isEmpty()) {
@@ -272,7 +333,7 @@ object SongMaps {
             trackKey = trackKey,
             durationSec = analysis.duration,
             bpm = bpm,
-            beatsPerBar = 4,
+            beatsPerBar = meter,
             downbeats = downbeats,
             gridConfidence = analysis.beatConfidence.toFloat().coerceIn(0f, 1f),
             tempoStable = analysis.beatConfidence >= 0.45,
@@ -299,15 +360,20 @@ object SongMaps {
             coarse = analysis.beatConfidence < PhraseConfig.GRID_COARSE,
             activation = if (analysis.beatConfidence < 0.2 && analysis.bpm <= 0) PhraseConfig.ACTIVATION_FLOOR else 1f,
             speechLike = speech,
+            vocalCoverage = coverage,
+            gridMeasured = analysis.downbeats.size >= 4 || analysis.headBeats != null || analysis.tailBeats != null,
+            gridCoverage = BooleanArray(downbeats.size) { it < analysis.downbeats.size },
+            provenance = if (analysis.vocalWindows.isNotEmpty() || analysis.vocalActivityMask.isNotEmpty())
+                "analysis:vocal-model" else "analysis:scalar",
         )
     }
 
-    private fun barIndex(time: Double, bar: Double, n: Int): Int {
+    private fun barIndex(time: Double, downbeats: DoubleArray, bar: Double, n: Int): Int {
         if (!time.isFinite() || time <= 0.0 || bar <= 0.0) return 0
-        return (time / bar).toInt().coerceIn(0, n)
+        return barIndexAt(time, downbeats, bar).coerceIn(0, n)
     }
 
-    private fun mark(sung: BooleanArray, window: CurveWindow, bar: Double, n: Int, gate: Float) {
+    private fun mark(sung: BooleanArray, window: CurveWindow, downbeats: DoubleArray, bar: Double, n: Int, gate: Float, coverage: BooleanArray) {
         if (window.values.isEmpty() || bar <= 0.0 || window.frameRate <= 0.0) return
         val sum = DoubleArray(n)
         val count = IntArray(n)
@@ -316,8 +382,9 @@ object SongMaps {
         for (i in window.values.indices) {
             val v = window.values[i]
             val t = window.startTime + i / window.frameRate
-            val b = (t / bar).toInt()
+            val b = barIndexAt(t, downbeats, bar)
             if (b !in 0 until n) continue
+            coverage[b] = true
             sum[b] += v.toDouble()
             count[b]++
             if (v > gate) above[b]++
@@ -331,6 +398,17 @@ object SongMaps {
                 sung[b] = true
             }
         }
+    }
+
+    private fun measuredVocal(from: Int, until: Int, sung: BooleanArray, coverage: BooleanArray): Float {
+        var measured = 0
+        var vocal = 0
+        for (b in from until until.coerceAtMost(sung.size)) {
+            if (!coverage.getOrElse(b) { false }) continue
+            measured++
+            if (sung[b]) vocal++
+        }
+        return if (measured == 0) 0f else vocal.toFloat() / measured
     }
 
     /**
@@ -359,17 +437,19 @@ object SongMaps {
      */
     private fun buildVocalBars(
         analysis: TrackAnalysis,
+        downbeats: DoubleArray,
         bar: Double,
         n: Int,
         sung: BooleanArray,
+        coverage: BooleanArray,
     ): FloatArray {
         val raw = DoubleArray(n)
         var measured = false
 
         for (window in analysis.vocalWindows) {
-            mark(sung, window, bar, n, VOCAL_BAR_GATE)
-            accumulateCurve(window, bar, n, raw)
-            measured = true
+            mark(sung, window, downbeats, bar, n, VOCAL_BAR_GATE, coverage)
+            accumulateCurve(window, downbeats, bar, n, raw, coverage)
+            measured = measured || window.values.isNotEmpty()
         }
 
         if (analysis.vocalWindows.isEmpty() && analysis.vocalActivityMask.isNotEmpty()) {
@@ -379,9 +459,10 @@ object SongMaps {
                 // Resample the mask onto bar centres through its own timestamps
                 // rather than assuming they are evenly spaced.
                 for (b in 0 until n) {
-                    val t = (b + 0.5) * bar
+                    val t = if (b < downbeats.size) downbeats[b] + bar / 2.0 else (b + 0.5) * bar
                     val i = nearestSample(times, t)
                     val v = mask[i].coerceIn(0.0, 1.0)
+                    coverage[b] = true
                     if (v > VOCAL_BAR_GATE) sung[b] = true
                     raw[b] = v
                 }
@@ -389,9 +470,10 @@ object SongMaps {
                 val span = analysis.duration
                 if (span > 0.0) {
                     for (b in 0 until n) {
-                        val t = (b + 0.5) * bar
+                        val t = if (b < downbeats.size) downbeats[b] + bar / 2.0 else (b + 0.5) * bar
                         val i = ((t / span) * mask.size).toInt().coerceIn(0, mask.lastIndex)
                         val v = mask[i].coerceIn(0.0, 1.0)
+                        coverage[b] = true
                         if (v > VOCAL_BAR_GATE) sung[b] = true
                         raw[b] = v
                     }
@@ -409,14 +491,15 @@ object SongMaps {
     }
 
     /** Bar-mean of one vocal window, ignoring frames that fall outside the track. */
-    private fun accumulateCurve(window: CurveWindow, bar: Double, n: Int, into: DoubleArray) {
+    private fun accumulateCurve(window: CurveWindow, downbeats: DoubleArray, bar: Double, n: Int, into: DoubleArray, coverage: BooleanArray) {
         if (window.values.isEmpty() || bar <= 0.0 || window.frameRate <= 0.0) return
         val sum = DoubleArray(n)
         val count = IntArray(n)
         for (i in window.values.indices) {
             val t = window.startTime + i / window.frameRate
-            val b = (t / bar).toInt()
+            val b = barIndexAt(t, downbeats, bar)
             if (b !in 0 until n) continue
+            coverage[b] = true
             sum[b] += window.values[i].toDouble().coerceIn(0.0, 1.0)
             count[b]++
         }
@@ -427,6 +510,18 @@ object SongMaps {
             // over the same bar cannot invent energy the audio does not have.
             into[b] = if (into[b] > 0.0) (into[b] + mean) / 2.0 else mean
         }
+    }
+
+    private fun barIndexAt(time: Double, downbeats: DoubleArray, bar: Double): Int {
+        if (downbeats.isEmpty()) return (time / bar).toInt()
+        if (time < downbeats.first()) return -1
+        var lo = 0
+        var hi = downbeats.size
+        while (lo + 1 < hi) {
+            val mid = (lo + hi) / 2
+            if (downbeats[mid] <= time) lo = mid else hi = mid
+        }
+        return lo
     }
 
     /** Index of the sample nearest [time] in an ascending time series. */
@@ -463,3 +558,10 @@ object SongMaps {
         energySlope = 0f, vocal = vocal, bass = 0.4f, loopable = loopable,
     )
 }
+
+/** Runtime-facing adapters; the implementation remains in [SongMaps]. */
+fun mergeVocalMasks(size: Int, windows: List<Pair<DoubleArray, DoubleArray?>>): DoubleArray? =
+    SongMaps.mergeVocalMasks(size, windows)
+
+fun mergeMeasuredMasks(size: Int, masks: List<DoubleArray>, neutralSentinel: Double): DoubleArray? =
+    SongMaps.mergeMeasuredMasks(size, masks, neutralSentinel)
