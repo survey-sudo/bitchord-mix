@@ -44,8 +44,12 @@ fun labelSections(analysis: TrackAnalysis, lyrics: List<LyricCue> = emptyList())
     val end = analysis.contentEndTime.takeIf { it in 1.0..duration + 0.01 } ?: duration
     val cues = lyrics.mapNotNull { cue ->
         val text = normalizeLyric(cue.text)
-        if (text.isEmpty() || cue.startSec >= end) null
-        else LyricCue(cue.startSec.coerceAtLeast(0.0), cue.endSec.coerceIn(cue.startSec + 0.3, end), text)
+        val start = cue.startSec.coerceAtLeast(0.0)
+        val minimumEnd = start + 0.3
+        // A clipped tail cannot supply the minimum cue span; do not clamp
+        // against an inverted range when less than 300 ms of content remains.
+        if (text.isEmpty() || !(minimumEnd <= end)) null
+        else LyricCue(start, cue.endSec.coerceIn(minimumEnd, end), text)
     }.sortedBy { it.startSec }
 
     val chorus = ArrayList<Pair<Double, Double>>()
