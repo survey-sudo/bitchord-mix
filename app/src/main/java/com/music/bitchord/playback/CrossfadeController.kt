@@ -454,6 +454,7 @@ private data class TransitionSnapshot(
     val rendererQuality: Boolean? = null,
     val scriptAttached: Boolean = false,
     val fxSelection: String? = null,
+    val fallbackFromPlanId: String? = null,
 )
 
 internal fun isConsecutiveAlbumTrack(
@@ -631,6 +632,7 @@ class CrossfadeController(
 
     private var phase = Phase.IDLE
     private val sessionId = "session-${SESSION_COUNTER.incrementAndGet()}"
+    private var pendingFallbackPlan: Pair<String, String>? = null
     private var transitionSnapshot: TransitionSnapshot? = null
 
     /**
@@ -783,7 +785,7 @@ class CrossfadeController(
             "beatConfidenceA" to it.beatConfidenceA, "beatConfidenceB" to it.beatConfidenceB,
             "loudnessGainDb" to it.loudnessGainDb, "duckGain" to it.duckGain,
             "rendererQuality" to it.rendererQuality, "scriptAttached" to it.scriptAttached,
-            "fxSelection" to it.fxSelection,
+            "fxSelection" to it.fxSelection, "fallbackFromPlanId" to it.fallbackFromPlanId,
         )
     } ?: emptyMap()
 
@@ -795,13 +797,15 @@ class CrossfadeController(
         inAnalysis: TrackAnalysis,
     ): TransitionSnapshot {
         val hash = planHash(plan ?: "classic|${out.mediaId}|${into.mediaId}")
+        val fallback = pendingFallbackPlan
+        val planId = fallback?.second ?: hash
         return TransitionSnapshot(
-            transitionId = "$sessionId-$hash",
+            transitionId = "$sessionId-t${TRANSITION_COUNTER.incrementAndGet()}-$hash",
             sessionId = sessionId,
             outId = out.mediaId,
             inId = into.mediaId,
-            planId = hash,
-            planHash = hash,
+            planId = planId,
+            planHash = if (fallback != null) planId else hash,
             path = "classic_dual_player",
             rung = plan?.transitionStyle?.name ?: "classic",
             style = plan?.transitionStyle?.name ?: "EQUAL_POWER",
@@ -819,6 +823,7 @@ class CrossfadeController(
             beatConfidenceA = outAnalysis.beatConfidence,
             beatConfidenceB = inAnalysis.beatConfidence,
             fxSelection = plan?.djEffect?.name,
+            fallbackFromPlanId = fallback?.first,
         )
     }
 
@@ -1485,6 +1490,7 @@ class CrossfadeController(
         lastRejectedLogKey = null
         lastEmittedPlanVerdict = null
         lastFallbackLogKey = null
+        pendingFallbackPlan = null
         lastArmDeathKey = null
         loopSuppressedPair = null
         loopSuppressedUntil = 0L
@@ -2893,6 +2899,7 @@ class CrossfadeController(
                     "scores" to evidence?.scores,
                 ),
             )
+            pendingFallbackPlan = null
         }
 
         val t0 = SystemClock.elapsedRealtimeNanos()
@@ -4822,8 +4829,8 @@ class CrossfadeController(
         val outAnalysis = loopOutAnalysis ?: TrackAnalysis(trackId = outItem.mediaId)
         val inAnalysis = loopInAnalysis ?: TrackAnalysis(trackId = inItem.mediaId)
         val snapshotHash = planHash(plan)
-            transitionSnapshot = TransitionSnapshot(
-            transitionId = "$sessionId-$snapshotHash",
+        transitionSnapshot = TransitionSnapshot(
+            transitionId = "$sessionId-t${TRANSITION_COUNTER.incrementAndGet()}-$snapshotHash",
             sessionId = sessionId,
             outId = outItem.mediaId,
             inId = inItem.mediaId,
@@ -4929,7 +4936,10 @@ class CrossfadeController(
                             if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
-                                sep(left, right, sr, keep)
+                                com.music.bitchord.playback.smart.TransitionBudgetContext.withBudget(
+                                    context.deadlineMs,
+                                    { generation != buildGeneration },
+                                ) { sep(left, right, sr, keep) }
                             }
                         }
                     }
@@ -4941,7 +4951,10 @@ class CrossfadeController(
                             if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
-                                sep(left, right, sr, true)
+                                com.music.bitchord.playback.smart.TransitionBudgetContext.withBudget(
+                                    context.deadlineMs,
+                                    { generation != buildGeneration },
+                                ) { sep(left, right, sr, true) }
                             }
                         }
                     }
@@ -4954,7 +4967,10 @@ class CrossfadeController(
                             if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
-                                sep(left, right, sr)
+                                com.music.bitchord.playback.smart.TransitionBudgetContext.withBudget(
+                                    context.deadlineMs,
+                                    { generation != buildGeneration },
+                                ) { sep(left, right, sr) }
                             }
                         }
                     }
@@ -4978,16 +4994,22 @@ class CrossfadeController(
             }
             if (generation != buildGeneration) {
                 session?.close()
+                buildContexts.remove(generation)
                 return@launch
             }
-            if (armWhenReady && SystemClock.elapsedRealtime() > context.deadlineMs + LOOP_COMMIT_MS) {
+            val commitWindowStarted = context.deadlineMs != DeckBudget.NO_DEADLINE_MS &&
+                context.deadlineMs > 0L &&
+                SystemClock.elapsedRealtime() > context.deadlineMs - LOOP_COMMIT_MS
+            if (armWhenReady && commitWindowStarted) {
                 session?.close()
                 if (phase == Phase.LOOP_ARMING && outgoing === out) loopFallBack("build-crossed-commit-guard")
+                buildContexts.remove(generation)
                 return@launch
             }
             context.timing.endOpen()
             if (primedKey != key) {
                 session?.close()
+                buildContexts.remove(generation)
                 return@launch
             }
             val steps = context.timing.snapshot(SystemClock.elapsedRealtime(), context.deadlineMs)
@@ -5016,6 +5038,7 @@ class CrossfadeController(
                 }
                 return@launch
             }
+            buildContexts.keys.removeIf { it < generation - 2 }
             val builtMs = SystemClock.elapsedRealtime() - began
             blendArmLeadMs = com.music.bitchord.playback.smart.PrepLead.next(blendArmLeadMs, builtMs)
             Log.d(TAG, "loop decks built in ${builtMs}ms ($steps), next arm ${blendArmLeadMs}ms")
@@ -5850,9 +5873,9 @@ class CrossfadeController(
             mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)) + snapshotFields(transitionSnapshot),
         )
         val fbKey = "$reason|${phase.name}"
+        val fallbackPlanId = "fallback-${SESSION_COUNTER.incrementAndGet()}"
         if (fbKey != lastFallbackLogKey) {
             lastFallbackLogKey = fbKey
-            val fallbackPlanId = "fallback-${SESSION_COUNTER.incrementAndGet()}"
             AutomixTelemetry.event(
                 "mix.loop.fallback",
                 mapOf(
@@ -5873,6 +5896,8 @@ class CrossfadeController(
             loopSuppressedPair = pairKey
             loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
         }
+        val supersededPlanId = transitionSnapshot?.planId
+        if (supersededPlanId != null) pendingFallbackPlan = supersededPlanId to fallbackPlanId
         loopPlanned = null
         loopScript = null
         loopPlanKey = null
@@ -6496,6 +6521,7 @@ class CrossfadeController(
         outgoing = null
         incoming = null
         transitionSnapshot = null
+        if (pendingFallbackPlan?.first != completedSnapshot?.planId) pendingFallbackPlan = null
         // Clear the dissolved-tail reference only after retire and after the
         // Seam A gates above have run. An active tail is preserved until
         // driveTail has silenced it, and finish's early returns (emergency
@@ -7546,6 +7572,7 @@ class CrossfadeController(
 
     private companion object {
         private val SESSION_COUNTER = AtomicLong(0)
+        private val TRANSITION_COUNTER = AtomicLong(0)
         /** How much of each track either side of the overlap the mix popup shows, as a fraction of the overlap. */
         const val MIX_VIEW_CONTEXT = 0.24
 

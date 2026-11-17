@@ -1,6 +1,7 @@
 package com.music.bitchord.playback.loopmix
 
 import android.util.Log
+import android.os.SystemClock
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.LoopMixDuck
 import com.music.bitchord.playback.smart.MixGain
@@ -50,6 +51,52 @@ class LoopMixSession private constructor(
     /** Track second the incoming player becomes audible at (knot-exact). */
     val handoverTrack: Double = clock.elementTrackTime,
 ) {
+    /** Immutable identity and deadline for one deck build generation. */
+    data class BuildContext(
+        val generation: Int,
+        val deadlineMs: Long,
+        val timing: BuildTiming,
+    )
+
+    /** Thread-safe build spans; each context owns one instance. */
+    class BuildTiming {
+        private val lock = Any()
+        private val spans = ArrayList<LoopMix.PrepSpan>()
+        private val openSteps = HashMap<String, Triple<String, Long, Long>>()
+
+        fun begin(step: String, deadlineMs: Long = Long.MAX_VALUE / 4, side: String = "build") = synchronized(lock) {
+            closeOpen(side, SystemClock.elapsedRealtime())
+            openSteps[side] = Triple(step, SystemClock.elapsedRealtime(), deadlineMs)
+        }
+
+        fun endOpen(side: String = "build") = synchronized(lock) { closeOpen(side, SystemClock.elapsedRealtime()) }
+
+        fun endOpenIf(step: String, side: String = "build") = synchronized(lock) {
+            if (openSteps[side]?.first == step) closeOpen(side, SystemClock.elapsedRealtime())
+        }
+
+        fun addClosed(step: String, startedMs: Long, endedMs: Long, deadlineMs: Long) = synchronized(lock) {
+            spans += LoopMix.PrepSpan(step, startedMs, endedMs, deadlineMs)
+        }
+
+        fun clear() = synchronized(lock) {
+            spans.clear()
+            openSteps.clear()
+        }
+
+        fun snapshot(nowMs: Long, deadlineMs: Long): List<LoopMix.PrepSpan> = synchronized(lock) {
+            val closed = spans.toList()
+            if (openSteps.isEmpty()) return closed
+            closed + openSteps.values.map { (step, started, deadline) ->
+                LoopMix.PrepSpan(step, started, nowMs, deadline)
+            }
+        }
+
+        private fun closeOpen(side: String, nowMs: Long) {
+            val open = openSteps.remove(side) ?: return
+            spans += LoopMix.PrepSpan(open.first, open.second, nowMs, open.third)
+        }
+    }
     /** Track microseconds of the outgoing loop start: where the sink splices. */
     val takeoverUs: Long = (plan.out.loopStart * 1_000_000).roundToLong()
 
@@ -237,8 +284,9 @@ class LoopMixSession private constructor(
             outAnalysis: TrackAnalysis? = null,
             inAnalysis: TrackAnalysis? = null,
             sungOut: List<LoopMix.Span>? = null,
-            sungIn: List<LoopMix.Span>? = null,
-            decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
+        sungIn: List<LoopMix.Span>? = null,
+        buildContext: BuildContext? = null,
+        decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
             if (!LoopMixRenderer.available || sampleRate <= 0) return null
@@ -278,11 +326,19 @@ class LoopMixSession private constructor(
             val actualOutTo = outTo
             val (outDecoded, inDecoded) = try {
                 val outFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) },
+                    {
+                        buildContext?.let { it.timing.begin("outgoing decode", it.deadlineMs, "out") }
+                        try { decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) }
+                        finally { buildContext?.timing?.endOpen("out") }
+                    },
                     DECODE_EXECUTOR,
                 )
                 val inFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.IN, bounds.inFrom, actualInTo) },
+                    {
+                        buildContext?.let { it.timing.begin("incoming decode", it.deadlineMs, "in") }
+                        try { decode(LoopMix.Side.IN, bounds.inFrom, actualInTo) }
+                        finally { buildContext?.timing?.endOpen("in") }
+                    },
                     DECODE_EXECUTOR,
                 )
                 outFuture.get() to inFuture.get()

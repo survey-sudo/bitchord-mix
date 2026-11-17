@@ -47,6 +47,49 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+
+/** Deadline-aware serialization gate for model inference and deterministic JVM tests. */
+internal class TransitionModelGate(private val now: () -> Long = { SystemClock.elapsedRealtime() }) {
+    private val lock = ReentrantLock()
+
+    fun <T> withBudget(deadlineMs: Long, shouldAbort: () -> Boolean, block: () -> T): T? {
+        if (shouldAbort() || budgetExpired(deadlineMs)) return null
+        if (!lock.tryLock(remainingBudgetMs(deadlineMs).coerceAtLeast(1L), TimeUnit.MILLISECONDS)) return null
+        try {
+            if (shouldAbort() || budgetExpired(deadlineMs)) return null
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    fun <T> hold(block: () -> T): T {
+        lock.lock()
+        return try { block() } finally { lock.unlock() }
+    }
+
+    private fun budgetExpired(deadlineMs: Long): Boolean =
+        deadlineMs != DeckBudget.NO_DEADLINE_MS && deadlineMs - now() <= 2_000L
+
+    private fun remainingBudgetMs(deadlineMs: Long): Long =
+        if (deadlineMs == DeckBudget.NO_DEADLINE_MS || deadlineMs <= 0L) 30_000L
+        else (deadlineMs - now() - 2_000L).coerceAtLeast(1L)
+}
+
+internal object TransitionBudgetContext {
+    private data class Budget(val deadlineMs: Long, val shouldAbort: () -> Boolean)
+    private val local = ThreadLocal<Budget?>()
+
+    fun <T> withBudget(deadlineMs: Long, shouldAbort: () -> Boolean, block: () -> T): T {
+        val previous = local.get()
+        local.set(Budget(deadlineMs, shouldAbort))
+        return try { block() } finally { local.set(previous) }
+    }
+
+    fun current(): Pair<Long, () -> Boolean>? = local.get()?.let { it.deadlineMs to it.shouldAbort }
+}
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
@@ -440,7 +483,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     /** The cache itself (tests + budget gate). */
     fun loopRegionCache(): LoopRegionCache = loopCache
 
-    private val modelLock = Any()
+    private val modelLock = TransitionModelGate()
+    /** Runs a transition stem callback with a build-scoped deadline and cancellation gate. */
+    fun <T> withTransitionBudget(
+        deadlineMs: Long,
+        shouldAbort: () -> Boolean,
+        block: () -> T,
+    ): T {
+        return TransitionBudgetContext.withBudget(deadlineMs, shouldAbort, block)
+    }
 
     /**
      * What is known about [trackId] right now: never a computation, never a
@@ -522,9 +573,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * call, then waits here before the next window. Extends an open window
      * rather than shortening it.
      */
-    fun yieldToPlayback(forMs: Long = PLAYBACK_FIRST_MS) {
+    fun yieldToPlayback(forMs: Long = PLAYBACK_FIRST_MS, deadlineMs: Long = DeckBudget.NO_DEADLINE_MS) {
         val until = android.os.SystemClock.elapsedRealtime() + forMs
-        if (until > yieldUntilElapsed) yieldUntilElapsed = until
+        val bounded = if (deadlineMs != DeckBudget.NO_DEADLINE_MS && deadlineMs > 0L) {
+            minOf(until, deadlineMs)
+        } else until
+        if (bounded > yieldUntilElapsed) yieldUntilElapsed = bounded
     }
 
     /**
@@ -542,14 +596,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         return stopped
     }
 
-    private fun playbackFirst() {
-        if (android.os.SystemClock.elapsedRealtime() >= yieldUntilElapsed) return
+    private fun playbackFirst(deadlineMs: Long = DeckBudget.NO_DEADLINE_MS): Boolean {
+        if (deadlineMs != DeckBudget.NO_DEADLINE_MS && deadlineMs > 0L &&
+            deadlineMs - android.os.SystemClock.elapsedRealtime() <= STEM_BUDGET_GUARD_MS
+        ) return false
+        if (android.os.SystemClock.elapsedRealtime() >= yieldUntilElapsed) return true
         // No restore after the wait: with the whole pass pinned to background
         // there is nothing to put back, and the second call that used to undo
         // the drop is now the same value. Kept as one call, at the point where
         // the work actually starts waiting.
         Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
-        while (!stopped && android.os.SystemClock.elapsedRealtime() < yieldUntilElapsed) {
+        while (!stopped && android.os.SystemClock.elapsedRealtime() < yieldUntilElapsed &&
+            (deadlineMs == DeckBudget.NO_DEADLINE_MS || android.os.SystemClock.elapsedRealtime() < deadlineMs)
+        ) {
             val left = yieldUntilElapsed - android.os.SystemClock.elapsedRealtime()
             if (left <= 0L) break
             try {
@@ -558,6 +617,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 break
             }
         }
+        return !stopped && (deadlineMs == DeckBudget.NO_DEADLINE_MS || deadlineMs - android.os.SystemClock.elapsedRealtime() > STEM_BUDGET_GUARD_MS)
     }
 
     fun request(trackId: String, uri: Uri, durationSeconds: Double) {
@@ -1687,11 +1747,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val inputs = regionInputs(stereo, seconds, deriveFeatures)
 
         playbackFirst()
-        val (rawGrid, vocalValues) = synchronized(modelLock) {
+        val modelResult = modelLock.withBudget(DeckBudget.NO_DEADLINE_MS, { stopped }) {
             val grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) }
             val vocals = if (features != null) vocalValues(stereo) else null
             grid to vocals
-        }
+        } ?: return null
+        val (rawGrid, vocalValues) = modelResult
         return Region(
             grid = rawGrid?.let { snapGrid(it, stereo, actualStart) },
             vocalMask = if (features != null && vocalValues != null) vocalMask(vocalValues, features, actualStart) else null,
@@ -1881,27 +1942,44 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * below the policy's own VOCAL_ACTIVE_THRESHOLD, so unmeasured material can never trip vocal
      * logic in either direction.
      */
-        fun separateTransitionWindow(
+    fun separateTransitionWindow(
         left: FloatArray,
         right: FloatArray,
         sampleRate: Int,
         keepVocals: Boolean,
+        deadlineMs: Long = DeckBudget.NO_DEADLINE_MS,
+        shouldAbort: () -> Boolean = { false },
     ): Pair<FloatArray, FloatArray>? {
-        if (yieldOrStopped()) return null
-        return synchronized(modelLock) {
-            if (yieldOrStopped()) null else vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
+        val budget = TransitionBudgetContext.current()
+        val effectiveDeadline = if (deadlineMs == DeckBudget.NO_DEADLINE_MS) budget?.first ?: deadlineMs else deadlineMs
+        val effectiveAbort = { yieldOrStopped() || shouldAbort() || budget?.second?.invoke() == true }
+        return modelLock.withBudget(effectiveDeadline, effectiveAbort) {
+            vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
         }
     }
 
-        fun separateTransitionBothWindows(
+    fun separateTransitionBothWindows(
         left: FloatArray,
         right: FloatArray,
         sampleRate: Int,
+        deadlineMs: Long = DeckBudget.NO_DEADLINE_MS,
+        shouldAbort: () -> Boolean = { false },
     ): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
-        return synchronized(modelLock) {
-            if (yieldOrStopped()) null else vocals.separateBothWindows(left, right, sampleRate.toDouble())
+        val budget = TransitionBudgetContext.current()
+        val effectiveDeadline = if (deadlineMs == DeckBudget.NO_DEADLINE_MS) budget?.first ?: deadlineMs else deadlineMs
+        val effectiveAbort = { yieldOrStopped() || shouldAbort() || budget?.second?.invoke() == true }
+        return modelLock.withBudget(effectiveDeadline, effectiveAbort) {
+            vocals.separateBothWindows(left, right, sampleRate.toDouble())
         }
     }
+
+    private fun budgetExpired(deadlineMs: Long): Boolean =
+        deadlineMs != DeckBudget.NO_DEADLINE_MS &&
+            deadlineMs - android.os.SystemClock.elapsedRealtime() <= STEM_BUDGET_GUARD_MS
+
+    private fun remainingBudgetMs(deadlineMs: Long): Long =
+        if (deadlineMs == DeckBudget.NO_DEADLINE_MS || deadlineMs <= 0L) 30_000L
+        else (deadlineMs - android.os.SystemClock.elapsedRealtime() - STEM_BUDGET_GUARD_MS).coerceAtLeast(1L)
  
 private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         if (!VocalSpectrogram.available) return null
@@ -2079,6 +2157,7 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
 
         /** How long a handover keeps analysis off the cores, from the moment it is asked. */
         const val PLAYBACK_FIRST_MS = 10_000L
+        const val STEM_BUDGET_GUARD_MS = 2_000L
 
         /**
          * What an unmeasured instant reads as. Below the policy's VOCAL_ACTIVE_THRESHOLD by
