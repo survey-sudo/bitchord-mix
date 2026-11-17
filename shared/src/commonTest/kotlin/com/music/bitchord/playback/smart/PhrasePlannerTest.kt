@@ -108,8 +108,7 @@ class PhrasePlannerTest {
         )
         val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0))
         assertEquals(MixTemplate.M2, choice.template)
-        assertTrue(choice.loopK >= 3, "k=${choice.loopK}")
-        assertTrue(4 + choice.loopK * 4 >= 16)
+        assertEquals(0, choice.loopK, "loopK is metadata only until a renderer consumer exists")
         assertEquals("Loop mix", choice.rung)
     }
 
@@ -386,8 +385,7 @@ class PhrasePlannerTest {
         // exit with roomBars = 8. B is a cold vocal, all sung, landing at
         // bar 16 with a 16-bar lead-in. vocalEnergy is measured on both
         // sides (0.9), so the weighted clash (0.81) vetoes every non-carve
-        // candidate (M1/M6/M10/M11/CUT_ON_ONE) and the rescue must report
-        // the clash it would otherwise have hidden as vocalOverlapBeats = 0.
+         // candidate; M6 rescue reports measured energy while its dry overlap is zero.
         val a = song(
             "a", 120.0, 18,
             listOf(section(0, 18, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.9f)),
@@ -409,7 +407,7 @@ class PhrasePlannerTest {
         val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "rescue must produce a plan")
         assertEquals(PhraseConfig.S_MIN, choice.score, 1e-9, "rescue carries S_MIN, got ${choice.score} via ${choice.template}")
         assertNotNull(choice.vocalClashEnergy, "rescue must populate vocalClashEnergy")
-        assertTrue(choice.vocalOverlapBeats > 0.0, "rescue must populate vocalOverlapBeats, got ${choice.vocalOverlapBeats}")
+         assertEquals(0.0, choice.vocalOverlapBeats, "echo/cut rescue has no simultaneous dry vocal overlap")
     }
 
     @Test
