@@ -664,40 +664,25 @@ object TransitionAlternatives {
 
     // -- bounded-decline carve envelope (pure, shared so it is testable) --
     //
-    // The generic bounded decline (4 s DJ_FILTER) used to render through
-    // rideFilterSweep, whose 1500 Hz floor and equal-power faders left both
-    // decks wide-band and high-gain at the midpoint: 4500 Hz out / 174 Hz in
-    // at gains 0.57/0.53, over two raw tempi. The carve below is a different
-    // gesture with one purpose: never let both decks be audible in the same
-    // band at the same time. Verified by a sweep test: no progress point
-    // exists where both gains exceed 0.5 while outLp exceeds inHp.
-    // Numbers (verified against the measured 164/90 behaviour):
-    // - engage at 7000 Hz immediately: same hand-on-the-filter entry the
-    //   sweep uses, so the gesture reads from the first instant.
-    // - floor 400 Hz, not 1500: below the vocal body, so the leaving track
-    //   is muffled (kick bed only) while the incoming is still held high.
-    //   A 4 s exit is dismissed, not kept recognisable; the sweep's
-    //   keep-it-recognisable floor is wrong for a carve.
-    // - sweep shape 0.4 (front-loaded): a back-loaded shape spends the
-    //   travel past the midpoint, where both tracks are loudest together.
-    //   0.4 puts the body below 1000 Hz by the midpoint (800 Hz at p=0.5).
-    // - incoming HP 2800 Hz held to 0.82: presence only until the leaving
-    //   track is muffled; opens only as it is gone. Higher and later than
-    //   the vocal-safe sweep, because a decline is for pairs with no
-    //   matchable relationship at all.
-    // - gains: out falls with exponent 0.5 (below 0.5 by p=0.44), in rises
-    //   with 1.9 (above 0.5 only past p=0.81). The loud regions never
-    //   coincide, so the raw-tempo flam rides at whisper level on one deck.
-    //   No stretch is applied on the decline (rate 1.0 by construction);
-    //   the separation, not the stretcher, is what hides the flam.
+    // Offline gain-policy candidate for the bounded 4 s DJ_FILTER decline.
+    // Both faders use the same linear progress through complementary sin/cos
+    // curves: squared gains sum to 1, with both gains >= 0.5 over the middle
+    // third. This positive overlap is an engineering contract, not a claim
+    // about perceived loudness or listening quality for unmatched tempi.
+    // The old independent exponents gave midpoint out/in gains ~0.444/0.409
+    // (power sum ~0.364); the candidate gives ~0.707/0.707 (power sum 1).
+    // Filters still ride their existing curves: outgoing LP 7000 -> 400 Hz
+    // with shape 0.4; incoming HP 2800 -> 20 Hz, open by progress 0.82 with
+    // shape 0.5. At midpoint the corners are ~800 Hz out / ~440 Hz in, so
+    // these bands overlap. The existing low-end handoff remains in place.
+    // Duration, content-end placement, anchors and native playback rates
+    // remain unchanged; offline comparison and listening must assess merit.
     const val DECLINE_ENTRY_HZ = 7000.0
     const val DECLINE_FLOOR_HZ = 400.0
     const val DECLINE_SWEEP_SHAPE = 0.4
     const val DECLINE_IN_HP_HZ = 2800.0
     const val DECLINE_IN_OPEN_BY = 0.82
     const val DECLINE_IN_SHAPE = 0.5
-    const val DECLINE_OUT_FALL_SHAPE = 0.5
-    const val DECLINE_IN_RISE_SHAPE = 1.9
     /** High-pass floor of the carve's entry glide; mirrors the renderer's OFF_HZ. */
     const val DECLINE_OFF_HZ = 20.0
 
@@ -715,13 +700,13 @@ object TransitionAlternatives {
         return glideHz(DECLINE_OFF_HZ, DECLINE_IN_HP_HZ, sweep.coerceIn(0.0, 1.0) * remaining.pow(DECLINE_IN_SHAPE))
     }
 
-    /** Incoming fader of the bounded-decline carve: the late rise keeps loud regions disjoint. */
+    /** Incoming fader of the bounded-decline carve, sharing linear progress with the outgoing fader. */
     fun declineInGainAt(progress: Double): Double =
-        MixGain.rise(progress.coerceIn(0.0, 1.0).pow(DECLINE_IN_RISE_SHAPE).toFloat()).toDouble()
+        MixGain.rise(progress.coerceIn(0.0, 1.0).toFloat()).toDouble()
 
-    /** Outgoing fader of the bounded-decline carve: the early fall keeps loud regions disjoint. */
+    /** Outgoing fader of the bounded-decline carve, complementary to the incoming fader. */
     fun declineOutGainAt(progress: Double): Double =
-        MixGain.fall(progress.coerceIn(0.0, 1.0).pow(DECLINE_OUT_FALL_SHAPE).toFloat()).toDouble()
+        MixGain.fall(progress.coerceIn(0.0, 1.0).toFloat()).toDouble()
 
     /**
      * Octave-relationship gate string for evidence, or null when the pair's
