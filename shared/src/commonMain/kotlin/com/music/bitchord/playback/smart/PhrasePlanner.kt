@@ -293,8 +293,18 @@ object PhrasePlanner {
     ): PhraseChoice? {
         if (outBpm <= 0 || inBpm <= 0) return null
         if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
-        val exit = exits.lastOrNull() ?: return null
+        val exit = exits.maxByOrNull { it.releaseSec } ?: return null
         val entry = entries.firstOrNull() ?: return null
+        val quiet = out.speechLike || inn.speechLike || out.startKind == StartKind.SPOKEN || inn.startKind == StartKind.SPOKEN ||
+            out.activation < PhraseConfig.ACTIVATION_FLOOR || inn.activation < PhraseConfig.ACTIVATION_FLOOR
+        if (quiet) return null
+        if (entry.startSec < 0.0 || entry.landingBar > inn.sungBars.size ||
+            (inn.durationSec > 0.0 && entry.startSec > inn.durationSec * MAX_INCOMING_SKIP_FRACTION) ||
+            (inn.durationSec > 0.0 && entry.startSec >= inn.durationSec - MIN_INCOMING_CLEARANCE_SECONDS)
+        ) return null
+        if (exit.releaseBar !in 0..out.sungBars.size || entry.startBar !in 0..inn.sungBars.size ||
+            exit.roomBars <= 0 || entry.leadInBars < 0
+        ) return null
         // Respect the musical tension veto: tension only resolves to a
         // release. A rescue must not route tension into ambient.
         val aRole = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))?.role ?: exit.role
@@ -308,19 +318,14 @@ object PhrasePlanner {
         val dualVocal = (out.sungBars.any { it } && inn.sungBars.any { it }) &&
             entry.leadInVocal >= 0.2f
         val harmonicClash = (steps ?: 0) > 2
-        val useEcho = delta > 0.08 || dualVocal
+        val useEcho = delta > 0.08 || dualVocal || harmonicClash
         val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
-        val steadyGrids = out.downbeats.size >= 8 && inn.downbeats.size >= 8
-        val rescueOverlap = when {
-            template != MixTemplate.M1 -> 4
-            harmonicClash -> if (steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8) 8 else 4
-            steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8 -> 8
-            else -> 4
-        }
+        val rescueOverlap = overlapOf(template, exit, entry, outBpm, steps)
         val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
         val clashBeats = vocalClashBeats(out, inn, exit, entry, rescueOverlap)
         val clashEnergy = vocalClashEnergy(out, inn, exit, entry, rescueOverlap)
+        if (template != MixTemplate.M6 && clashEnergy != null && clashEnergy > CLASH_VETO_ENERGY) return null
         return PhraseChoice(
             template = template,
             rung = rungOf(template),
@@ -575,7 +580,8 @@ object PhrasePlanner {
      * [veto], where the question genuinely is "did the mask cross a line".
      */
     private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double? {
-        val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
+        if (overlapBars == 0) return if (out.vocalEnergy.isNotEmpty() && inn.vocalEnergy.isNotEmpty()) 0.0 else null
+        val bars = minOf(exit.roomBars, overlapBars, PhraseConfig.O_MAX_BARS)
         if (bars <= 0) return null
         if (out.vocalEnergy.isEmpty() || inn.vocalEnergy.isEmpty()) return null
         var numerator = 0.0
@@ -597,7 +603,8 @@ object PhrasePlanner {
     }
 
     private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double {
-        val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
+        if (overlapBars == 0) return 0.0
+        val bars = minOf(exit.roomBars, overlapBars, PhraseConfig.O_MAX_BARS)
         var beats = 0
         for (i in 0 until bars) {
             val a = exit.releaseBar - bars + i
@@ -622,7 +629,7 @@ object PhrasePlanner {
         outBpm: Double,
         inBpm: Double,
     ): PhraseChoice {
-        val overlap = overlapOf(template, exit, entry, outBpm)
+        val overlap = overlapOf(template, exit, entry, outBpm, steps)
         val struct = structScore(template, exit, entry, out)
         val clashBeats = vocalClashBeats(out, inn, exit, entry, overlap)
         // Energy-weighted collision where it was measured, and the old beat
@@ -735,19 +742,18 @@ object PhrasePlanner {
             MixTemplate.M1, MixTemplate.M3 -> 1.0
             else -> 0.0
         }
-        val loopK = if (template == MixTemplate.M2) {
-            val need = entry.leadInBars.coerceAtLeast(16)
-            val loopLen = 4
-            ((need - exit.roomBars).coerceAtLeast(0) + loopLen - 1) / loopLen
-        } else 0
+        val loopK = 0
         val prep = tempoPrepBars(outBpm, inBpm, entry.leadInVocal > 0.2f || exit.vocalRoomBars > 0)
-        var product = 0f
-        val bars = minOf(exit.roomBars, entry.leadInBars, overlap)
+        var productSum = 0.0
+        var productCount = 0
+        val bars = minOf(exit.roomBars, overlap, PhraseConfig.O_MAX_BARS)
         for (i in 0 until bars) {
-            val a = if (out.sungBars.getOrElse(exit.releaseBar - bars + i) { false }) 1f else 0f
-            val b = if (inn.sungBars.getOrElse(entry.startBar + i) { false }) 1f else 0f
-            if (a * b > product) product = a * b
+            val a = out.vocalEnergyAt(exit.releaseBar - bars + i)
+            val b = inn.vocalEnergyAt(entry.startBar + i)
+            productSum += a * b
+            productCount++
         }
+        val product = if (productCount > 0) productSum / productCount else 0.0
         return PhraseChoice(
             template = template,
             rung = rungOf(template),
@@ -759,7 +765,7 @@ object PhrasePlanner {
             tailBeats = tail,
             loopK = loopK,
             echoGated = template == MixTemplate.M6 || template == MixTemplate.ROLLING || template == MixTemplate.M5,
-            vocalProduct = product,
+            vocalProduct = product.toFloat(),
             tempoPrepBars = prep,
             echoDelayBeats = delay,
             echoDelayName = delayName,

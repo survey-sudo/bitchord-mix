@@ -96,7 +96,7 @@ private const val MIN_SMART_DURATION_SECONDS = 20.0
 private const val UNMIXABLE_VETO_ENABLED = true
 
 /** Leave enough incoming material after a calibrated handoff to avoid landing in its outro. */
-private const val MIN_INCOMING_CLEARANCE_SECONDS = 5.0
+internal const val MIN_INCOMING_CLEARANCE_SECONDS = 5.0
 
 private val KEY_INDEX = mapOf(
     "C" to 0, "C♯" to 1, "D♭" to 1, "D" to 2, "D♯" to 3, "E♭" to 3,
@@ -2138,8 +2138,13 @@ private fun mixPlan(
     val sameBeatBlend = (
         currentBpm > 0 && nextBpm > 0 &&
             withinCap &&
-            (analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE || nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE)
-        ) || (traits?.phaseLockable == true && foldedRateDelta <= PhraseConfig.TEMPO_HARD_DELTA)
+            (analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE && nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE)
+        ) || (
+            traits?.phaseLockable == true &&
+                analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE &&
+                nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE &&
+                foldedRateDelta <= PhraseConfig.TEMPO_HARD_DELTA
+        )
     val outgoingArrangementOverlap = 0.0
     val arrangementEnd = max(0.0, mixAnchor - outgoingArrangementOverlap)
     // Advanced: the exit pulled back onto a downbeat, so whatever the incoming
