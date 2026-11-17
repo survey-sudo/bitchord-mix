@@ -59,6 +59,7 @@ import com.music.bitchord.playback.smart.planTransition
 import com.music.bitchord.playback.smart.camelotCode
 import com.music.bitchord.playback.smart.camelotSteps
 import com.music.bitchord.playback.smart.regionalCamelotSteps
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -646,6 +647,8 @@ class CrossfadeController(
     /** Which player this class's own listener is currently attached to. */
     private var listeningTo: ExoPlayer? = null
     private var tickerJob: Job? = null
+    private var lastTickState: Map<String, Any?>? = null
+    private var lastTickStateAtMs = 0L
 
     /** Length of the transition in flight, in ms. Fixed when it begins. */
     private var fadeMs = 0L
@@ -1468,28 +1471,75 @@ class CrossfadeController(
         listenTo(active())
         tickerJob?.cancel()
         tickerJob = scope.launch {
+            var failedTicks = 0L
             while (isActive) {
-                tick()
-                val base = when (phase) {
-                    Phase.IDLE -> IDLE_STEP_MS
-                    Phase.ARMING -> ARM_STEP_MS
-                    Phase.FADING -> FADE_STEP_MS
-                    Phase.TAIL -> FADE_STEP_MS
-                    Phase.SLEEP_FADE -> FADE_STEP_MS
-                    Phase.BAILING -> BAIL_STEP_MS
-                    Phase.LOOP_ARMING -> ARM_STEP_MS
-                    Phase.LOOP_RUNNING -> LOOP_STEP_MS
+                val nextDelayMs = try {
+                    tick()
+                    val base = when (phase) {
+                        Phase.IDLE -> IDLE_STEP_MS
+                        Phase.ARMING -> ARM_STEP_MS
+                        Phase.FADING -> FADE_STEP_MS
+                        Phase.TAIL -> FADE_STEP_MS
+                        Phase.SLEEP_FADE -> FADE_STEP_MS
+                        Phase.BAILING -> BAIL_STEP_MS
+                        Phase.LOOP_ARMING -> ARM_STEP_MS
+                        Phase.LOOP_RUNNING -> LOOP_STEP_MS
+                    }
+                    // djmix14: firing jitter — within 2 s of the target, tick
+                    // every 20 ms so startFade fires within +-25 ms.
+                    val nearTarget = when (phase) {
+                        Phase.ARMING -> lastSmartPlanStartMs > 0L && kotlin.math.abs((active().currentPosition - lastSmartPlanStartMs)) <= 2000L
+                        Phase.LOOP_ARMING -> loopTargetStartMs > 0L && kotlin.math.abs((active().currentPosition - loopTargetStartMs)) <= 2000L
+                        else -> false
+                    }
+                    if (failedTicks > 0L) {
+                        AutomixTelemetry.event("mix.tick.recovered", mapOf("phase" to phase.name, "failedTicks" to failedTicks))
+                        failedTicks = 0L
+                    }
+                    if (nearTarget) 20L else base
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    // A failed iteration must not kill Automix's SupervisorJob child.
+                    // Report once per uninterrupted failure burst; success re-arms it.
+                    if (failedTicks == 0L) reportTickError(error)
+                    failedTicks++
+                    IDLE_STEP_MS
                 }
-                // djmix14: firing jitter — within 2 s of the target, tick
-                // every 20 ms so startFade fires within +-25 ms.
-                val nearTarget = when (phase) {
-                    Phase.ARMING -> lastSmartPlanStartMs > 0L && kotlin.math.abs((active().currentPosition - lastSmartPlanStartMs)) <= 2000L
-                    Phase.LOOP_ARMING -> loopTargetStartMs > 0L && kotlin.math.abs((active().currentPosition - loopTargetStartMs)) <= 2000L
-                    else -> false
-                }
-                delay(if (nearTarget) 20L else base)
+                // Also yield on failure, including deterministic player getter failures.
+                delay(nextDelayMs)
             }
         }
+    }
+
+    private fun reportTickError(error: Exception) {
+        // Diagnostic getters can fail for the same reason as tick(). Never let
+        // them hide the original failure, and never swallow cancellation/errors.
+        fun <T> readSafely(read: () -> T): T? = try {
+            read()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        val player = readSafely { active() }
+        AutomixTelemetry.event(
+            "mix.tick.error",
+            mapOf(
+                "phase" to phase.name,
+                "currentId" to readSafely { player?.currentMediaItem?.mediaId },
+                "nextId" to readSafely {
+                    player?.let { deck ->
+                        deck.nextMediaItemIndex.takeIf { it != C.INDEX_UNSET }
+                            ?.let { deck.getMediaItemAt(it).mediaId }
+                    }
+                },
+                "positionMs" to readSafely { player?.currentPosition },
+                "exception" to error.javaClass.name,
+                // Frames identify the throw site without messages containing URLs/tokens.
+                "origin" to error.stackTrace.take(4).joinToString(" <- "),
+            ),
+        )
     }
 
     fun release() {
@@ -1540,6 +1590,35 @@ class CrossfadeController(
 
     // ---- Ticker -------------------------------------------------------------
 
+    private fun publishTickState() {
+        val player = active()
+        val current = player.currentMediaItem
+        val next = player.nextMediaItemIndex.takeIf { it != C.INDEX_UNSET }?.let { player.getMediaItemAt(it) }
+        val enabled = AppSettings.smartFadeEnabled.value
+        val state = mapOf<String, Any?>(
+            "phase" to phase.name,
+            "currentId" to current?.mediaId,
+            "nextId" to next?.mediaId,
+            "smartFadeEnabled" to enabled,
+            "isPlaying" to player.isPlaying,
+            "playWhenReady" to player.playWhenReady,
+            "playbackState" to player.playbackState,
+            "durationMs" to player.duration,
+            "repeatMode" to player.repeatMode,
+            "currentVideoOrigin" to current?.isVideoOrigin,
+            "nextVideoOrigin" to next?.isVideoOrigin,
+            "versionSwapActive" to versionSwapActive(),
+            "inParty" to ListenTogether.state.value.inParty,
+            "bitPerfect" to BitPerfectOutput.status.value.active,
+        )
+        val now = SystemClock.elapsedRealtime()
+        if (state != lastTickState || (enabled && now - lastTickStateAtMs >= 30_000L)) {
+            AutomixTelemetry.event("mix.state", state + ("positionMs" to player.currentPosition))
+            lastTickState = state
+            lastTickStateAtMs = now
+        }
+    }
+
     private fun tick() {
         // A pause has to take the other player with it, or one half of the blend
         // carries on alone over a stopped one. Mirrored every tick rather than
@@ -1579,6 +1658,13 @@ class CrossfadeController(
             Phase.BAILING -> driveBail()
             Phase.LOOP_ARMING -> driveLoopArming()
             Phase.LOOP_RUNNING -> driveLoopMix()
+        }
+        try {
+            publishTickState()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // Best-effort observation must not interrupt core work or its cadence.
         }
     }
 
