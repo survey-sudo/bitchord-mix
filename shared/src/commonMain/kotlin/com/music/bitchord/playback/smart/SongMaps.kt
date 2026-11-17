@@ -5,6 +5,9 @@ package com.music.bitchord.playback.smart
  * upgrades this when it finishes; the planner can run on this alone.
  */
 object SongMaps {
+    private data class MaskBounds(val source: Int, val values: DoubleArray, val start: Int, val end: Int)
+    private data class ActiveMask(val source: Int, val value: Double, val start: Int, val end: Int)
+
     /** Merges time-stamped model windows without turning uncovered gaps into zero. */
     fun mergeVocalMasks(size: Int, windows: List<Pair<DoubleArray, DoubleArray?>>): DoubleArray? {
         if (size <= 0 || windows.isEmpty()) return null
@@ -30,20 +33,22 @@ object SongMaps {
     fun mergeMeasuredMasks(size: Int, masks: List<DoubleArray>, neutralSentinel: Double): DoubleArray? {
         if (size <= 0 || masks.isEmpty()) return null
         val out = DoubleArray(size) { neutralSentinel }
+        val bounds = masks.mapIndexedNotNull { source, mask ->
+            val start = mask.indexOfFirst { it.isFinite() && it != neutralSentinel }
+            if (start < 0) null else MaskBounds(source, mask, start, mask.indexOfLast { it.isFinite() && it != neutralSentinel })
+        }
         for (index in 0 until size) {
-            val active = masks.mapIndexedNotNull { source, mask ->
-                val value = mask.getOrNull(index)
-                if (value == null || !value.isFinite() || value == neutralSentinel) return@mapIndexedNotNull null
-                val start = mask.indexOfFirst { it.isFinite() && it != neutralSentinel }.takeIf { it >= 0 } ?: return@mapIndexedNotNull null
-                val end = mask.indexOfLast { it.isFinite() && it != neutralSentinel }
-                Triple(source, value, start to end)
-            }
+            val active = bounds.mapNotNull { bound ->
+                val value = bound.values.getOrNull(index)
+                if (value == null || !value.isFinite() || value == neutralSentinel) null
+                else ActiveMask(bound.source, value, bound.start, bound.end)
+            }.sortedWith(compareBy<ActiveMask> { it.start }.thenBy { it.source })
             if (active.isEmpty()) continue
             if (active.size == 1) {
-                out[index] = active[0].second
+                out[index] = active[0].value
             } else {
-                val overlapStart = active.maxOf { it.third.first }
-                val overlapEnd = active.minOf { it.third.second }
+                val overlapStart = active.maxOf { it.start }
+                val overlapEnd = active.minOf { it.end }
                 val phase = if (overlapEnd > overlapStart) {
                     ((index - overlapStart).toDouble() / (overlapEnd - overlapStart)).coerceIn(0.0, 1.0)
                 } else 0.5
@@ -54,7 +59,7 @@ object SongMaps {
                         active.lastIndex -> phase
                         else -> 1.0
                     }
-                    value += item.second * weight
+                    value += item.value * weight
                 }
                 val norm = if (active.size == 2) 1.0 else active.size - 2.0 + 1.0
                 out[index] = value / norm
