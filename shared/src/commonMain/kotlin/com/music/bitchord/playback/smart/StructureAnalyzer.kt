@@ -170,20 +170,31 @@ object StructureAnalyzer {
         val beatSec = 60.0 / bpm.coerceAtLeast(1.0)
         val meter = beatsPerBar.coerceAtLeast(1)
         val barSec = beatSec * meter
+        val suppliedDownbeats = downbeats != null && downbeats.isNotEmpty()
         val grid = reconcileBarGrid(downbeats ?: DoubleArray(0), barSec, pcmDurationSec)
         val starts = grid.times.filter { it < pcmDurationSec }.toDoubleArray().ifEmpty { doubleArrayOf(0.0) }
         val bars = beatSync(frames, starts, barSec)
-        val measured = !downbeats.isNullOrEmpty()
+        val measured = suppliedDownbeats && gridMeasured
+        val confidenceCap = when {
+            measured -> 1f
+            suppliedDownbeats -> 0.60f
+            else -> 0.35f
+        }
+        val provenance = when {
+            measured -> "pcm:model-grid"
+            suppliedDownbeats -> "pcm:dsp-grid"
+            else -> "pcm:unverified-grid"
+        }
         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
         val activation = if (fluxPeak <= 1e-6f) 0f else (frames.map { it.flux }.average() / fluxPeak).toFloat()
         val map = analyseBars(
             trackKey, effectiveDuration, bpm, meter, starts, bars,
             mask, lyricPrior, gridConfidence = (gridConfidence ?: if (measured) 0.5f else 0.3f)
-                .coerceIn(0f, if (measured) 1f else 0.35f),
-            tempoStable = tempoStable ?: (measured && grid.stable), activation = activation, speechLike = false, partial = effectivePartial,
+                .coerceIn(0f, confidenceCap),
+            tempoStable = tempoStable ?: (suppliedDownbeats && grid.stable), activation = activation, speechLike = false, partial = effectivePartial,
             startedMs = startedMs, now = now,
-            gridMeasured = measured, gridCoverage = BooleanArray(starts.size) { measured && grid.coverage.getOrElse(it) { false } },
-        )
+            gridMeasured = measured, gridCoverage = BooleanArray(starts.size) { suppliedDownbeats && grid.coverage.getOrElse(it) { false } },
+        ).copy(provenance = provenance)
         return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
             map.copy(contentEndSec = effectiveDuration)
         } else {
