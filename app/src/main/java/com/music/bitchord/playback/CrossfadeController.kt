@@ -934,6 +934,8 @@ class CrossfadeController(
     private val countdownStabilizer = CountdownStabilizer()
     private var scrubSettledAtMs: Long = 0L
     private var tailLoopSession: LoopMixSession? = null
+    private var loopCleanupContendedSession: LoopMixSession? = null
+    private var loopCleanupContendedSinceNanos = 0L
     private var inFallbackReplan = false
     private var armGraceUsed = false
     private var armDeadline = 0L
@@ -5192,6 +5194,7 @@ class CrossfadeController(
             )
             return loopBail("paused", settle = true)
         }
+        if (loopCleanupContendedSession === session) return finishLoop()
         val now = System.nanoTime()
         val m = session.mixSeconds(now, out.isPlaying) ?: return
         if (!loopIncomingStarted && m >= session.inStartAt) {
@@ -5324,22 +5327,67 @@ class CrossfadeController(
 
     /** The mix played out: the incoming player is the song, the outgoing one is retired. */
     private fun finishLoop() {
+        val session = loopSession ?: return finish()
+        val out = outgoing
+        val into = incoming
+        val wasIncomingStarted = loopIncomingStarted
+        val nowNanos = System.nanoTime()
+        val outReading = session.outPort?.readPresentedPosition(nowNanos, out?.isPlaying == true)
+        val inReading = if (wasIncomingStarted) session.inPort?.readPresentedPosition(nowNanos, into?.isPlaying == true) else null
+        val contended = outReading?.contended == true || inReading?.contended == true
+        if (contended && (if (handedOff) into?.playWhenReady else out?.playWhenReady) == true &&
+            session.outPort?.interrupted != true && session.inPort?.interrupted != true
+        ) {
+            if (loopCleanupContendedSession !== session) {
+                loopCleanupContendedSession = session
+                loopCleanupContendedSinceNanos = nowNanos
+            }
+            // Five ordinary 20 ms LOOP ticks at most; keep ports and decoder
+            // untouched while a publication overlaps the read. Never seek on it.
+            if (nowNanos - loopCleanupContendedSinceNanos < 100_000_000L) return
+            loopBail("loop-cleanup-clock-contention-timeout", settle = false, preserveSeek = true, deferDisarm = true)
+            return
+        }
+        loopCleanupContendedSession = null
+        loopCleanupContendedSinceNanos = 0L
+        val m = outReading?.seconds?.let { it - session.plan.out.loopStart }
+        val incomingNow = inReading?.seconds
+        val violations = session.renderer.exitGateViolations()
+        // finish() can route here before the scheduled decoder splice. Such
+        // termination is abnormal, never evidence of a healthy handover.
+        val abnormal = when {
+            out == null || into == null -> "loop-cleanup-missing-player"
+            session.outPort?.interrupted == true || session.inPort?.interrupted == true -> "loop-cleanup-interrupted"
+            !(if (handedOff) into.playWhenReady else out.playWhenReady) -> "loop-cleanup-paused"
+            m == null -> "loop-cleanup-clock-unavailable"
+            m < session.clock.elementAt -> "loop-cleanup-before-splice"
+            violations != 0 -> "loop-cleanup-exit-gate"
+            wasIncomingStarted && (!out.isPlaying || !into.isPlaying ||
+                into.playbackState != Player.STATE_READY ||
+                incomingNow == null) -> "loop-cleanup-incoming-unavailable"
+            !wasIncomingStarted && (!out.playWhenReady || !out.isPlaying) -> "loop-cleanup-outgoing-unavailable"
+            else -> null
+        }
+        if (abnormal != null) {
+            // Nulls loopSession before finish() and uses its existing bounded
+            // retire tail, so there is no finish -> finishLoop recursion or
+            // speculative seek over a user target.
+            loopBail(abnormal, settle = false, preserveSeek = true, deferDisarm = true)
+            return
+        }
         lastCompleteReason = "loop-complete"
-        val session = loopSession
         // djmix15: loop BPMs live in session.plan, not in
         // outgoingAnalysis/incomingAnalysis (blank 0.0). Record them before
         // finish() so mix.complete reports real tempos even if the retire
         // guard diverts to a TAIL and finish() is re-entered after
         // loopSession is gone. Scalars only.
-        val plan = session?.plan
-        if (plan != null) {
-            if (outgoingAnalysis.bpm <= 0) outgoingAnalysis = outgoingAnalysis.copy(bpm = plan.out.bpm)
-            if (incomingAnalysis.bpm <= 0) incomingAnalysis = incomingAnalysis.copy(bpm = plan.inn.bpm)
-            tailDurationMs = RetireGuard.loopTailMs(plan.exitTailSeconds)
-        }
+        val plan = session.plan
+        if (outgoingAnalysis.bpm <= 0) outgoingAnalysis = outgoingAnalysis.copy(bpm = plan.out.bpm)
+        if (incomingAnalysis.bpm <= 0) incomingAnalysis = incomingAnalysis.copy(bpm = plan.inn.bpm)
+        tailDurationMs = RetireGuard.loopTailMs(plan.exitTailSeconds)
         Log.d(
             TAG,
-            "loop mix done: incoming ${"%+.2f".format(Locale.ROOT, session?.alignedErrorMs ?: Double.NaN)}ms " +
+            "loop mix cleanup: incoming ${"%+.2f".format(Locale.ROOT, session.alignedErrorMs)}ms " +
                 "against the deck at the handover",
         )
         loopScript?.let { script ->
@@ -5347,57 +5395,50 @@ class CrossfadeController(
             Log.i("AutomixScript", TransitionMoves.scriptJson(script, counts[0], counts[1], counts[2], slides = phraseLock.slides, lockedAt = phraseLock.lockedAtSec))
             Log.i("BitChordPhrase", TransitionMoves.phraseLine(script.choice))
         }
-        // djmix18 (Bug 2): exact handover target. heard(IN) is the deck truth; the clock
-        // is the fallback. With incomingHoldSec > 0 both must equal
-        // inn.loopStart + (elementAt - incomingHoldSec), never + elementAt.
-        // No AudioTrack output-latency API is exposed here, so no latency subtraction;
-        // the heard position is already compared as track seconds. Log all three in
-        // mix.complete (handoverExpectedMs/HeardMs/TargetMs) for verification.
-        val sess = session
-        val expectedHandoverMs = if (sess == null) 0L else (sess.clock.handoverTrackSec * 1000).roundToLong()
-        val heardInSecRaw = if (sess == null) null else runCatching { sess.renderer.heard(LoopMixRenderer.IN) }.getOrNull()
+        // heard(IN) is a generated block endpoint, frozen after its fade.
+        // Diagnostic only: position decisions use both presented clocks at now.
+        val expectedHandoverMs = (session.handoverTrack * 1000).roundToLong()
+        val heardInSecRaw = runCatching { session.renderer.heard(LoopMixRenderer.IN) }.getOrNull()
         val heardValidSec = heardInSecRaw?.takeIf { it.isFinite() && it != 0.0 &&
-            sess != null && it >= sess.plan.inn.loopStart - 0.05 }
-        val targetSec = if (sess == null) 0.0 else handoverTargetSec(heardValidSec, sess.clock.handoverTrackSec, sess.plan.inn.loopStart)
+            it >= session.plan.inn.loopStart - 0.05 }
+        val targetSec = session.handoverTrack + (m!! - session.clock.elementAt)
         val targetMs = (targetSec * 1000).roundToLong()
         handoverExpectedMs = expectedHandoverMs
         handoverHeardMs = heardValidSec?.let { (it * 1000).roundToLong() } ?: -1L
         handoverTargetMs = targetMs
-        // Corrective seek only when the silent ExoPlayer drifted beyond the sink alignment's
-        // reach. The player was pre-positioned by setMediaItems (no cold 0 -> 19s seek at the
-        // splice); a mid-loop pre-seek would trip the inPort interrupted bail, so it is never
-        // done here. A small drift (<150ms) is left alone — seeking it would stutter.
-        // djmix23: finishLoop can be reached with the incoming player never
-        // started (tick jumped to the end before the inStartAt branch ran).
-        // Start it here first, so the session never lands on a paused player.
-        // Only while the mix was actually playing: a player already paused is
-        // the listener's pause and is never second-guessed.
-        if (!loopIncomingStarted) {
-            val outPlayer = outgoing
-            val inPlayer = incoming
-            if (outPlayer != null && inPlayer != null && outPlayer.playWhenReady) {
-                loopIncomingStarted = true
-                inPlayer.playWhenReady = true
-                if (!handedOff) handOff(outPlayer, inPlayer)
-            }
-        }
-        val sessionPlayer = if (handedOff) incoming else outgoing
-        if (sessionPlayer != null && sessionPlayer.playbackState == Player.STATE_READY) {
-            val driftMs = targetMs - sessionPlayer.currentPosition
-            if (abs(driftMs) > 150L) {
-                AutomixTelemetry.event(
-                    "mix.seek",
-                    mapOf("phase" to phase.name, "reason" to "loop-handover-correct",
-                        "expectedHandoverMs" to expectedHandoverMs,
-                        "actualHeardMs" to handoverHeardMs, "targetMs" to targetMs,
-                        "driftMs" to driftMs),
-                )
-                internalHandoverSeek = true
-                suppressScrubUntilMs = SystemClock.elapsedRealtime() + 1_200L
-                sessionPlayer.seekTo(targetMs.coerceAtLeast(0L))
+        val driftMs = incomingNow?.let { ((targetSec - it) * 1000).roundToLong() }
+        if (!wasIncomingStarted || (driftMs != null && abs(driftMs) > 150L)) {
+            val reason = if (wasIncomingStarted) "loop-handover-drift-recovery" else "loop-handover-unstarted-recovery"
+            lastCompleteReason = reason
+            AutomixTelemetry.event(
+                "mix.seek",
+                mapOf("phase" to phase.name, "reason" to reason,
+                    "expectedHandoverMs" to expectedHandoverMs,
+                    "actualHeardMs" to handoverHeardMs, "targetMs" to targetMs,
+                    "driftMs" to driftMs),
+            )
+            internalHandoverSeek = true
+            suppressScrubUntilMs = SystemClock.elapsedRealtime() + 1_200L
+            try {
+                // Explicitly INCOMING, including a never-started buffering
+                // decoder. Seek before play/adopt; READY is not required.
+                into!!.seekTo(targetMs.coerceAtLeast(0L))
+            } finally {
                 internalHandoverSeek = false
             }
         }
+        if (!wasIncomingStarted) {
+            loopIncomingStarted = true
+            into!!.playWhenReady = true
+        }
+        if (!handedOff) handOff(out!!, into!!)
+        if (!handedOff) {
+            loopBail("loop-cleanup-adoption-refused", settle = false, preserveSeek = true, deferDisarm = true)
+            return
+        }
+        // Record phase while ports are still armed. Missing phase is unknown,
+        // never a zero-error success.
+        if (wasIncomingStarted && incomingNow != null) session.recordAligned(incomingNow - targetSec)
         loopAlignJob?.cancel()
         loopAlignJob = null
         // djmix15: the native renderer already brought the outgoing deck
@@ -5408,33 +5449,34 @@ class CrossfadeController(
         // port still holds silence, so zero dry sample can ever leak, then
         // disarm. Only when the renderer provably finished — genuine audible
         // audio still takes the guard below.
-        val violations = session?.renderer?.exitGateViolations() ?: -1
-        if (session != null && violations == 0) {
-            val retiring = if (handedOff) outgoing else incoming
-            retiring?.volume = 0f
-        }
-        session?.outPort?.disarm()
-        session?.inPort?.disarm()
+        outgoing?.volume = 0f
+        session.outPort?.disarm()
+        session.inPort?.disarm()
         loopSession = null
         // The player is now the only source. The first seconds of that song
         // are where a starved decoder underruns, so analysis waits again
         // from this instant, not from the earlier mid-mix handoff.
         AutomixTelemetry.event("mix.exit.gate", mapOf("violations" to violations))
-        // vc73: sample real phase before verify if job was active or never measured.
-        if (session != null && (loopAlignJob?.isActive == true || session.alignedErrorMs.isNaN())) {
-            runCatching { session.offsetNow(System.nanoTime())?.let { session.recordAligned(it) } }
-        }
         // vc67: post-plan dry-run verification (scalars only).
         runCatching {
-            val aligned = session?.alignedErrorMs
-            val phaseErr = if (aligned != null && aligned.isFinite()) aligned else 0.0
+            val aligned = session.alignedErrorMs
+            val phaseErr = if (wasIncomingStarted && aligned.isFinite()) aligned else Double.NaN
             val vr = com.music.bitchord.playback.smart.MixVerify.verify(0.0, 0.0f, phaseErr, violations)
-            AutomixTelemetry.event("mix.verify", mapOf("ok" to vr.ok, "reasons" to vr.reasons.joinToString(","), "phaseErrorMs" to phaseErr, "exitGateViolations" to violations))
+            AutomixTelemetry.event(
+                "mix.verify",
+                mapOf(
+                    "ok" to (vr.ok && phaseErr.isFinite()),
+                    "reasons" to if (phaseErr.isFinite()) vr.reasons.joinToString(",") else "phase-unmeasured",
+                    "phaseErrorMs" to phaseErr.takeIf { it.isFinite() },
+                    "exitGateViolations" to violations,
+                    "scope" to "phase-and-exit-gate-only",
+                ),
+            )
         }
 
         yieldAnalysis()
         finish()
-        session?.renderer?.let(::closeLater)
+        closeLater(session.renderer)
     }
 
     /**
@@ -5450,6 +5492,8 @@ class CrossfadeController(
         deferDisarm: Boolean = false,
     ) {
         lastCompleteReason = reason
+        loopCleanupContendedSession = null
+        loopCleanupContendedSinceNanos = 0L
         val session = loopSession
         // djmix15: loop BPMs live in the plan, not in the (blank) analyses.
         // Record them so finish() reports real tempos even after a

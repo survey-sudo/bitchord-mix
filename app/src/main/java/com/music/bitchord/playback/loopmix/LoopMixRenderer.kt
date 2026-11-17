@@ -10,10 +10,19 @@ import android.util.Log
  * Built and filled on a worker thread; after [prepare] only [render] (the
  * playback thread, inside the outgoing sink) and the small setters touch it.
  */
-class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
+class LoopMixRenderer internal constructor(val sampleRate: Int, private val readout: Readout?) : AutoCloseable {
+    constructor(sampleRate: Int) : this(sampleRate, null)
+
+    /** Only native measurements are substituted by controller JVM tests. */
+    internal interface Readout {
+        fun firstFrame(): Long
+        fun heard(index: Int): Double
+        fun exitGateViolations(): Int
+    }
+
 
     @Volatile
-    private var handle: Long = if (available) nativeCreate(sampleRate) else 0L
+    private var handle: Long = if (readout == null && available) nativeCreate(sampleRate) else 0L
 
     val isValid: Boolean get() = handle != 0L
 
@@ -63,7 +72,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
         nativeSetFlanger(handle, index, lfoHz, depthSeconds, feedback, wet)
 
     /** How many times a deck went silent while still audible at its stopAt (djmix11 exit gate). */
-    fun exitGateViolations(): Int = nativeExitGateViolations(handle)
+    fun exitGateViolations(): Int = readout?.exitGateViolations() ?: nativeExitGateViolations(handle)
 
     /** LR4 isolator on a phrase mix. Off for the djmix6 envelopes. */
     fun setIsolate(index: Int, on: Boolean) = nativeSetIsolate(handle, index, on)
@@ -71,7 +80,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
     fun prepare() = nativePrepare(handle)
 
     /** The earliest mix frame anything renders at; negative, before t0. */
-    fun firstFrame(): Long = nativeFirstFrame(handle)
+    fun firstFrame(): Long = readout?.firstFrame() ?: nativeFirstFrame(handle)
 
     /** Renders [frames] stereo frames from mix frame [frame] into [interleaved] at frame [offset]. */
     fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) =
@@ -81,7 +90,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
     fun setFadeOut(index: Int, trackSeconds: Double) = nativeSetFadeOut(handle, index, trackSeconds)
 
     /** Track seconds [index] played at the end of the last rendered block. */
-    fun heard(index: Int): Double = nativeHeard(handle, index)
+    fun heard(index: Int): Double = readout?.heard(index) ?: nativeHeard(handle, index)
 
     override fun close() {
         val h = handle

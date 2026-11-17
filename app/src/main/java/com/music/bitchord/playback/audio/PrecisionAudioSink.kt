@@ -517,6 +517,11 @@ class PrecisionAudioSink(
      * free.
      */
     override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
+        val port = loop
+        // Capture before querying the delegate: an arm/flush racing the query
+        // must not publish the old AudioTrack's reading into the new session.
+        val armGeneration = port.generation
+        val epoch = port.clockEpoch
         val delegatePosition = super.getCurrentPositionUs(sourceEnded)
         if (delegatePosition == AudioSink.CURRENT_POSITION_NOT_SET) return delegatePosition
         // The delegate counts any silence the loop mix inserted, and none of the
@@ -526,10 +531,8 @@ class PrecisionAudioSink(
         if (processed != C.TIME_UNSET) {
             dspChain.transition.leadUs = (processed - position).coerceAtLeast(0L)
         }
-        val port = loop
         if (port.outArm != null || port.inArm != null) {
-            port.positionUs = position - port.streamOffsetUs
-            port.positionNanos = System.nanoTime()
+            port.publishPosition(position - port.streamOffsetUs, System.nanoTime(), armGeneration, epoch)
         }
         return position
     }
@@ -763,6 +766,7 @@ class PrecisionAudioSink(
      */
     private fun loopInterrupted() {
         val port = loop
+        port.invalidatePosition()
         if ((port.outArm != null && loopRendering) || (port.inArm != null && loopInStarted)) {
             port.interrupted = true
         }

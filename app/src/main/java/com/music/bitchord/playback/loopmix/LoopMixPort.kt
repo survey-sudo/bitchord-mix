@@ -55,6 +55,7 @@ class LoopMixPort {
         inArm = null
         outArm = arm
         generation++
+        invalidatePosition()
     }
 
     fun armIncoming(arm: InArm) {
@@ -62,6 +63,7 @@ class LoopMixPort {
         inArm = arm
         pendingShift.set(0)
         generation++
+        invalidatePosition()
     }
 
     fun disarm() {
@@ -69,6 +71,7 @@ class LoopMixPort {
         inArm = null
         pendingShift.set(0)
         generation++
+        invalidatePosition()
     }
 
     // ---- What the sink publishes ---------------------------------------------------------
@@ -94,16 +97,62 @@ class LoopMixPort {
      * ([System.nanoTime]); the player's own clock, at sub-millisecond
      * resolution, read on every renderer tick.
      */
-    @Volatile var positionUs: Long = C.TIME_UNSET
-    @Volatile var positionNanos: Long = 0L
+    private val positionEpoch = AtomicLong()
+    val clockEpoch: Long get() = positionEpoch.get()
+    @Volatile private var positionSequence = 0L
+    @Volatile private var observedGeneration = -1
+    @Volatile private var observedEpoch = -1L
+    @Volatile private var observedUs = C.TIME_UNSET
+    @Volatile private var observedNanos = 0L
+
+    val positionUs: Long get() = if (observedGeneration == generation && observedEpoch == clockEpoch) observedUs else C.TIME_UNSET
+    val positionNanos: Long get() = if (observedGeneration == generation && observedEpoch == clockEpoch) observedNanos else 0L
+
+    /** Also called on flush, including startup flushes that leave the arm intact. */
+    fun invalidatePosition() {
+        positionEpoch.incrementAndGet()
+    }
+
+    /** Single playback-thread writer; no lock or allocation on the audio path. */
+    fun publishPosition(positionUs: Long, nowNanos: Long, armGeneration: Int, epoch: Long) {
+        if (armGeneration != generation || epoch != clockEpoch) return
+        positionSequence++
+        observedUs = positionUs
+        observedNanos = nowNanos
+        observedGeneration = armGeneration
+        observedEpoch = epoch
+        positionSequence++
+    }
+
+    /** Control-thread snapshot: contention is transient, invalid/stale clocks are unavailable. */
+    internal data class PositionReading(val seconds: Double?, val contended: Boolean = false)
+
+    internal fun readPresentedPosition(nowNanos: Long, playing: Boolean): PositionReading {
+        repeat(3) {
+            val armGeneration = generation
+            val epoch = clockEpoch
+            val sequence = positionSequence
+            if ((sequence and 1L) != 0L) return@repeat
+            val position = observedUs
+            val nanos = observedNanos
+            val observationGeneration = observedGeneration
+            val observationEpoch = observedEpoch
+            if (sequence != positionSequence) return@repeat
+            if (armGeneration != generation || epoch != clockEpoch ||
+                observationGeneration != armGeneration || observationEpoch != epoch || position == C.TIME_UNSET
+            ) return POSITION_UNAVAILABLE
+            val age = nowNanos - nanos
+            // Publication can follow the common reference instant: project it
+            // backwards, bounded just as strictly as an older observation.
+            if (age < -POSITION_FRESHNESS_NANOS || age > POSITION_FRESHNESS_NANOS) return POSITION_UNAVAILABLE
+            val elapsed = if (playing) age / 1e9 else 0.0
+            return PositionReading(position / 1e6 + elapsed)
+        }
+        return POSITION_CONTENDED
+    }
 
     /** Where the presented audio is now, in track seconds, extrapolated from the last reading. */
-    fun presentedSeconds(nowNanos: Long, playing: Boolean): Double? {
-        val position = positionUs
-        if (position == C.TIME_UNSET) return null
-        val elapsed = if (playing) (nowNanos - positionNanos) / 1e9 else 0.0
-        return position / 1e6 + elapsed
-    }
+    fun presentedSeconds(nowNanos: Long, playing: Boolean): Double? = readPresentedPosition(nowNanos, playing).seconds
 
     // ---- The incoming side's alignment ------------------------------------------------------
 
@@ -169,6 +218,11 @@ class LoopMixPort {
     }
 
     companion object {
+        // Media3's documented ~280 ms polling interval plus 120 ms scheduling
+        // margin. Still rejects stalled observations instead of advancing forever.
+        const val POSITION_FRESHNESS_NANOS = 400_000_000L
+        private val POSITION_UNAVAILABLE = PositionReading(null)
+        private val POSITION_CONTENDED = PositionReading(null, contended = true)
         const val SPLICE_CAPTURE = 8192
     }
 }

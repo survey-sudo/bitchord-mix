@@ -109,11 +109,14 @@ class LoopMixSession private constructor(
      * release too, as far as the player's timeline is concerned.
      */
     fun offsetNow(nowNanos: Long): Double? {
-        val m = mixSeconds(nowNanos, playing = true) ?: return null
+        val deck = incomingTrackNow(nowNanos, outgoingPlaying = true) ?: return null
         val player = inPort?.presentedSeconds(nowNanos, playing = true) ?: return null
-        val deck = handoverTrack - (clock.elementAt - m)
         return player - deck
     }
+
+    /** The decoder's rate-1 timeline, anchored to the actual renderer knot. */
+    fun incomingTrackNow(nowNanos: Long, outgoingPlaying: Boolean): Double? =
+        mixSeconds(nowNanos, outgoingPlaying)?.let { handoverTrack + (it - clock.elementAt) }
 
     /** Asks the incoming sink to cancel [offsetSeconds] (player ahead: silence inserted; behind: frames dropped). */
     fun correct(offsetSeconds: Double) {
