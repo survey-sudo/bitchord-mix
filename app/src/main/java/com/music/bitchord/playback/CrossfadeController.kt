@@ -78,6 +78,7 @@ import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 import kotlin.math.sin
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * A real crossfade: two tracks audible at once, the outgoing one falling as the
@@ -419,6 +420,42 @@ internal class PhraseCandidate(
     val inn: TrackAnalysis,
 )
 
+/** Immutable attribution for the plan that actually owns a transition. */
+private data class TransitionSnapshot(
+    val transitionId: String,
+    val sessionId: String,
+    val outId: String,
+    val inId: String,
+    val planId: String,
+    val planHash: String,
+    val path: String,
+    val rung: String,
+    val style: String,
+    val alternativeKind: String,
+    val reason: String,
+    val analysisRevision: String,
+    val sampleRate: Int? = null,
+    val plannedStartMs: Long? = null,
+    val armLeadMs: Long? = null,
+    val deadlineMs: Long? = null,
+    val cueTargetMs: Long? = null,
+    val spliceTargetMs: Long? = null,
+    val inStartAtMs: Long? = null,
+    val handoverAtMs: Long? = null,
+    val bpmA: Double? = null,
+    val bpmB: Double? = null,
+    val rateA: Double? = null,
+    val rateB: Double? = null,
+    val fold: Double? = null,
+    val beatConfidenceA: Double? = null,
+    val beatConfidenceB: Double? = null,
+    val loudnessGainDb: Double? = null,
+    val duckGain: Double? = null,
+    val rendererQuality: Boolean? = null,
+    val scriptAttached: Boolean = false,
+    val fxSelection: String? = null,
+)
+
 internal fun isConsecutiveAlbumTrack(
     albumA: String, albumIdA: String, trackNumA: Int,
     albumB: String, albumIdB: String, trackNumB: Int,
@@ -593,6 +630,8 @@ class CrossfadeController(
     }
 
     private var phase = Phase.IDLE
+    private val sessionId = "session-${SESSION_COUNTER.incrementAndGet()}"
+    private var transitionSnapshot: TransitionSnapshot? = null
 
     /**
      * The player the session was on when this transition began — the one whose
@@ -718,6 +757,70 @@ class CrossfadeController(
 
     /** The Automix plan the transition in flight was armed from, for the mix popup; null for a standard fade. */
     private var planInFlight: TransitionPlan? = null
+
+    private fun analysisRevision(analysis: TrackAnalysis): String =
+        listOf(
+            analysis.trackId, analysis.quality, analysis.status, analysis.bpm,
+            analysis.beatConfidence, analysis.key, analysis.downbeats.size,
+            analysis.energyCurve.size, analysis.vocalWindows.size,
+        ).joinToString("|")
+
+    private fun planHash(value: Any): String = value.toString().hashCode().toUInt().toString(16)
+
+    private fun snapshotFields(snapshot: TransitionSnapshot?): Map<String, Any?> = snapshot?.let {
+        mapOf(
+            "transitionId" to it.transitionId, "sessionId" to it.sessionId,
+            "outId" to it.outId, "inId" to it.inId, "planId" to it.planId,
+            "planHash" to it.planHash, "path" to it.path, "rung" to it.rung,
+            "style" to it.style, "alternativeKind" to it.alternativeKind,
+            "reason" to it.reason, "analysisRevision" to it.analysisRevision,
+            "sampleRate" to it.sampleRate, "plannedStartMs" to it.plannedStartMs,
+            "armLeadMs" to it.armLeadMs, "deadlineMs" to it.deadlineMs,
+            "cueTargetMs" to it.cueTargetMs, "spliceTargetMs" to it.spliceTargetMs,
+            "inStartAtMs" to it.inStartAtMs, "handoverAtMs" to it.handoverAtMs,
+            "bpmA" to it.bpmA, "bpmB" to it.bpmB, "rateA" to it.rateA,
+            "rateB" to it.rateB, "fold" to it.fold,
+            "beatConfidenceA" to it.beatConfidenceA, "beatConfidenceB" to it.beatConfidenceB,
+            "loudnessGainDb" to it.loudnessGainDb, "duckGain" to it.duckGain,
+            "rendererQuality" to it.rendererQuality, "scriptAttached" to it.scriptAttached,
+            "fxSelection" to it.fxSelection,
+        )
+    } ?: emptyMap()
+
+    private fun classicSnapshot(
+        out: MediaItem,
+        into: MediaItem,
+        plan: TransitionPlan?,
+        outAnalysis: TrackAnalysis,
+        inAnalysis: TrackAnalysis,
+    ): TransitionSnapshot {
+        val hash = planHash(plan ?: "classic|${out.mediaId}|${into.mediaId}")
+        return TransitionSnapshot(
+            transitionId = "$sessionId-$hash",
+            sessionId = sessionId,
+            outId = out.mediaId,
+            inId = into.mediaId,
+            planId = hash,
+            planHash = hash,
+            path = "classic_dual_player",
+            rung = plan?.transitionStyle?.name ?: "classic",
+            style = plan?.transitionStyle?.name ?: "EQUAL_POWER",
+            alternativeKind = plan?.alternativeKind.orEmpty(),
+            reason = plan?.reason ?: "standard",
+            analysisRevision = "${analysisRevision(outAnalysis)}>${analysisRevision(inAnalysis)}",
+            plannedStartMs = plan?.let { (it.transitionStart * 1000).roundToLong() },
+            armLeadMs = ARM_TIMEOUT_MS,
+            cueTargetMs = plan?.let { (it.incomingCueTime * 1000).roundToLong() },
+            handoverAtMs = plan?.let { ((it.transitionStart + it.fadeSeconds * it.handoffFraction) * 1000).roundToLong() },
+            bpmA = outAnalysis.bpm.takeIf { it > 0 },
+            bpmB = inAnalysis.bpm.takeIf { it > 0 },
+            rateA = plan?.outgoingPlaybackRate,
+            rateB = plan?.incomingPlaybackRate,
+            beatConfidenceA = outAnalysis.beatConfidence,
+            beatConfidenceB = inAnalysis.beatConfidence,
+            fxSelection = plan?.djEffect?.name,
+        )
+    }
 
     /** The last reason logged for the seek bar's Automix marker showing or not, so it logs on change. */
     private var lastMarkerVerdict = ""
@@ -2103,25 +2206,6 @@ class CrossfadeController(
                     "djEffect" to plan.djEffect.name,
                 ),
             )
-            // vc69 P2 evidence dump: one structured record per armed
-            // transition (Orchard ORCHARD_MIX_DUMP shape: what was chosen,
-            // why, and the gate scores), pulled without root from the same
-            // telemetry stream.
-            val dumpedEvidence = TransitionEvidenceCache.recent(1).firstOrNull()
-            if (dumpedEvidence != null) {
-                AutomixTelemetry.event(
-                    "mix.dump",
-                    mapOf(
-                        "outId" to dumpedEvidence.outId,
-                        "inId" to dumpedEvidence.inId,
-                        "style" to dumpedEvidence.style,
-                        "reason" to dumpedEvidence.reason,
-                        "confidence" to dumpedEvidence.confidence,
-                        "flowScore" to dumpedEvidence.flowScore,
-                        "gates" to dumpedEvidence.gates.toString(),
-                    ),
-                )
-            }
         }
         // The loop mix first: a pair it can do never reaches the blend below.
         // djmix13: a loop that just died for this shown pair stays suppressed
@@ -2786,6 +2870,30 @@ class CrossfadeController(
         outgoing = out
         incoming = into
         outgoingItemIndex = out.currentMediaItemIndex
+        if (transitionSnapshot == null) {
+            val incomingItem = out.getMediaItemAt(nextIndex)
+            transitionSnapshot = classicSnapshot(
+                out.currentMediaItem ?: return armDeath("missing-outgoing-item"),
+                incomingItem,
+                plan,
+                out.currentMediaItem?.let(analysisFor) ?: TrackAnalysis(),
+                incomingItem.let(analysisFor),
+            )
+            AutomixTelemetry.event("mix.plan", snapshotFields(transitionSnapshot) + mapOf("accepted" to true))
+            val evidence = TransitionEvidenceCache.recent(200).firstOrNull {
+                it.outId == transitionSnapshot?.outId && it.inId == transitionSnapshot?.inId &&
+                    it.style == transitionSnapshot?.style && it.reason == transitionSnapshot?.reason
+            }
+            AutomixTelemetry.event(
+                "mix.dump",
+                snapshotFields(transitionSnapshot) + mapOf(
+                    "confidence" to evidence?.confidence,
+                    "flowScore" to evidence?.flowScore,
+                    "gates" to evidence?.gates,
+                    "scores" to evidence?.scores,
+                ),
+            )
+        }
 
         val t0 = SystemClock.elapsedRealtimeNanos()
         val items = (0 until out.mediaItemCount).map { out.getMediaItemAt(it) }
@@ -2966,13 +3074,13 @@ class CrossfadeController(
      * this is only ever waiting on a buffer.
      */
     private fun driveArming() {
-        val out = outgoing ?: return bail()
-        val into = incoming ?: return bail()
-        if (!stillWorthFading()) return bail()
+        val out = outgoing ?: return cancelArming("missing-outgoing-player")
+        val into = incoming ?: return cancelArming("missing-incoming-player")
+        if (!stillWorthFading()) return cancelArming("mix-disabled-or-no-next")
         // Paused while armed: the transition is no longer imminent, and holding
         // a prepared decoder open against a stopped player is worse than arming
         // again when playback resumes.
-        if (!out.playWhenReady) return bail()
+        if (!out.playWhenReady) return cancelArming("paused-before-fade")
 
         val expired = SystemClock.elapsedRealtime() > armDeadline
         val ready = into.playbackState == Player.STATE_READY
@@ -2990,11 +3098,7 @@ class CrossfadeController(
                 return
             }
             AutomixTelemetry.event("mix.arm.expired", mapOf("phase" to phase.name))
-            AutomixTelemetry.event(
-                "mix.arm.death",
-                mapOf("reason" to "arm-expired", "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
-            )
-            return bail()
+            return cancelArming("arm-expired")
         }
 
         // Both sinks write seconds ahead of the speaker. The standby fills its
@@ -3029,8 +3133,8 @@ class CrossfadeController(
      * one that was still plainly playing.
      */
     private fun startFade() {
-        val out = outgoing ?: return bail()
-        val into = incoming ?: return bail()
+        val out = outgoing ?: return cancelArming("missing-outgoing-at-fade")
+        val into = incoming ?: return cancelArming("missing-incoming-at-fade")
 
         into.volume = 0f
         into.playWhenReady = true
@@ -3042,12 +3146,21 @@ class CrossfadeController(
             "mix.fire",
             mapOf(
                 "mode" to "classic",
-                "plannedStartMs" to lastSmartPlanStartMs,
+                "plannedStartMs" to (transitionSnapshot?.plannedStartMs ?: lastSmartPlanStartMs),
                 "actualStartMs" to out.currentPosition,
-                "deltaMs" to (out.currentPosition - lastSmartPlanStartMs),
+                "deltaMs" to (out.currentPosition - (transitionSnapshot?.plannedStartMs ?: lastSmartPlanStartMs)),
+                "cueActualMs" to into.currentPosition,
                 "cueErrorMs" to (into.currentPosition - targetCueMs),
+                "remainingAtFireMs" to (out.duration - out.currentPosition).takeIf { it >= 0L },
+                "cueTargetMs" to targetCueMs,
+                "spliceTargetMs" to null,
+                "tookOverAtFire" to null,
+                "incomingStartedAtFire" to null,
+                "rendererFirstFrame" to null,
+                "prerollSec" to null,
+                "rendererGen" to null,
                 "trackIndex" to outgoingItemIndex,
-            ),
+            ) + snapshotFields(transitionSnapshot),
         )
         fadeOutOriginMs = out.currentPosition
         val fileLeft = out.duration.takeIf { it != C.TIME_UNSET && it > 0L }?.minus(fadeOutOriginMs)
@@ -4012,8 +4125,9 @@ class CrossfadeController(
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
-    private val deckTiming = DeckTiming()
-    @Volatile private var deckSide: String = "outgoing"
+    private val buildContexts = java.util.concurrent.ConcurrentHashMap<Int, LoopMixSession.BuildContext>()
+    private val buildContextLocal = ThreadLocal<LoopMixSession.BuildContext?>()
+    private var activeBuildContext: LoopMixSession.BuildContext? = null
 
     /** The loop currently being armed, and the analyses the shift re-checks against. */
     private var loopTarget: LoopMix.Plan? = null
@@ -4638,7 +4752,7 @@ class CrossfadeController(
         if (primedKey == key && SystemClock.elapsedRealtime() < primeRetryAt) return
         discardPrime()
         val lead = (plan.out.loopStart * 1000).roundToLong() - player.currentPosition
-        deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
+        activeBuildContext = newBuildContext(player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
         Log.d(
             TAG,
             "loop prime ${outItem.mediaId}->${inItem.mediaId} at ${sampleRate}Hz, " +
@@ -4657,7 +4771,7 @@ class CrossfadeController(
             lastArmDeathKey = key
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)) + snapshotFields(transitionSnapshot),
             )
         }
         return false
@@ -4705,6 +4819,46 @@ class CrossfadeController(
         outgoingItemIndex = out.currentMediaItemIndex
         loopTarget = plan
         loopTargetStartMs = (plan.out.loopStart * 1000).roundToLong()
+        val outAnalysis = loopOutAnalysis ?: TrackAnalysis(trackId = outItem.mediaId)
+        val inAnalysis = loopInAnalysis ?: TrackAnalysis(trackId = inItem.mediaId)
+        val snapshotHash = planHash(plan)
+            transitionSnapshot = TransitionSnapshot(
+            transitionId = "$sessionId-$snapshotHash",
+            sessionId = sessionId,
+            outId = outItem.mediaId,
+            inId = inItem.mediaId,
+            planId = snapshotHash,
+            planHash = snapshotHash,
+            path = "native_loopmix",
+            rung = plan.rung,
+            style = plan.rung,
+            alternativeKind = plan.alternativeKind,
+            reason = loopRefusal ?: "planned",
+            analysisRevision = "${analysisRevision(outAnalysis)}>${analysisRevision(inAnalysis)}",
+            sampleRate = outPort.sampleRate,
+            plannedStartMs = loopTargetStartMs,
+            armLeadMs = blendArmLeadMs,
+            deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition),
+            spliceTargetMs = loopTargetStartMs,
+            inStartAtMs = LoopMixSession.incomingStartFor(LoopMix.Clock(plan)).first.let { (it * 1000).roundToLong() },
+            handoverAtMs = (plan.out.loopStart * 1000 + plan.totalBars * plan.out.beatSec * 1000).roundToLong(),
+            bpmA = plan.out.bpm,
+            bpmB = plan.inn.bpm,
+            rateA = plan.out.beatSec.takeIf { it > 0 }?.let { 1.0 },
+            rateB = plan.targetBpm.takeIf { it > 0 }?.div(plan.out.bpm.coerceAtLeast(0.01)),
+            fold = plan.fold,
+            beatConfidenceA = outAnalysis.beatConfidence,
+            beatConfidenceB = inAnalysis.beatConfidence,
+            rendererQuality = AppSettings.automixPerformanceMode.value != AutomixPerformanceMode.EFFICIENT,
+            scriptAttached = loopScript != null,
+            fxSelection = listOfNotNull(
+                plan.echoTail.takeIf { it }?.let { "echo" },
+                plan.flanger.takeIf { it }?.let { "flanger" },
+                plan.reverbWash.takeIf { it }?.let { "reverb" },
+            ).joinToString(",").ifBlank { null },
+        )
+        AutomixTelemetry.event("mix.plan", snapshotFields(transitionSnapshot) + mapOf("accepted" to true))
+        AutomixTelemetry.event("mix.dump", snapshotFields(transitionSnapshot))
         holdAtEnd(out)
         val sampleRate = outPort.sampleRate
         val key = primeKey(plan, outItem, inItem, sampleRate)
@@ -4722,16 +4876,15 @@ class CrossfadeController(
             // in-force wall deadline driveLoopArming's lateness math is
             // blind until the watchdog. Recompute if missing so a slow
             // hung primeJob is still judged against this loop's wall.
-            if (deckTiming.deadlineMs == DeckBudget.NO_DEADLINE_MS || deckTiming.deadlineMs <= 0L) {
-                deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+            if (activeBuildContext?.deadlineMs == DeckBudget.NO_DEADLINE_MS || (activeBuildContext?.deadlineMs ?: 0L) <= 0L) {
+                activeBuildContext = newBuildContext(out.isPlaying, loopTargetStartMs, out.currentPosition)
             }
             Log.d(TAG, "loop decks still building ${loopTargetStartMs - out.currentPosition}ms ahead")
             return true
         }
         // djmix15: fresh build — drop any stale spans/deadline from a prior
         // pair before installing this build's wall deadline.
-        deckTiming.clear()
-        deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+        activeBuildContext = newBuildContext(out.isPlaying, loopTargetStartMs, out.currentPosition)
         startLoopBuild(key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = true)
         return true
     }
@@ -4750,6 +4903,9 @@ class CrossfadeController(
     ) {
         primedKey = key
         val generation = ++buildGeneration
+        val context = buildContexts[generation] ?: newBuildContext(out.isPlaying, (plan.out.loopStart * 1000).roundToLong(), out.currentPosition, generation).also {
+            buildContexts[generation] = it
+        }
         val inLevel = (loudnessGain(inItem.mediaId) / loudnessGain(outItem.mediaId))
             .takeIf { it.isFinite() && it > 0f } ?: 1f
         val highQuality = AppSettings.automixPerformanceMode.value != AutomixPerformanceMode.EFFICIENT
@@ -4757,7 +4913,7 @@ class CrossfadeController(
         val spliceRemainingAtLaunch = (plan.out.loopStart * 1000).roundToLong() - out.currentPosition
         val skipStemAtLaunch = shouldSkipStemAtLaunch(
             spliceRemainingAtLaunch,
-            deckTiming.deadlineMs,
+            context.deadlineMs,
             SystemClock.elapsedRealtime(),
             wholeTrackBusy(),
             armWhenReady,
@@ -4770,7 +4926,7 @@ class CrossfadeController(
                     val stemFn = if (skipStemAtLaunch) null else separateTransitionWindow
                     val sepStem: ((LoopMix.Side, FloatArray, FloatArray, Int, Boolean) -> Pair<FloatArray, FloatArray>?)? = stemFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int, keep: Boolean ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
                                 sep(left, right, sr, keep)
@@ -4782,7 +4938,7 @@ class CrossfadeController(
                     val vocalFn = if (skipStemAtLaunch) null else separateTransitionWindow
                     val sepVocal: ((LoopMix.Side, FloatArray, FloatArray, Int) -> Pair<FloatArray, FloatArray>?)? = vocalFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
                                 sep(left, right, sr, true)
@@ -4795,38 +4951,46 @@ class CrossfadeController(
                     val pairFn = if (skipStemAtLaunch) null else separateTransitionPair
                     val sepVocalPair: ((LoopMix.Side, FloatArray, FloatArray, Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = pairFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, context.deadlineMs, SystemClock.elapsedRealtime())) {
                                 null
                             } else {
                                 sep(left, right, sr)
                             }
                         }
                     }
-                    LoopMixSession.build(plan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = loopOutAnalysis, inAnalysis = loopInAnalysis, sungOut = loopSungOut, sungIn = loopSungIn, decode = { side, from, to ->
-                        // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
+                    LoopMixSession.build(plan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = loopOutAnalysis, inAnalysis = loopInAnalysis, sungOut = loopSungOut, sungIn = loopSungIn, buildContext = context, decode = { side, from, to ->
                         val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
-                        deckSide = sideName
+                        buildContextLocal.set(context)
                         val item = if (side == LoopMix.Side.OUT) outItem else inItem
                         val length = if (side == LoopMix.Side.OUT) durationMs else nextDurationMs
-                        loopRegion(item, length, from, to, sampleRate).also { region ->
-                            if (region == null) buildFailure = "$sideName decode-null"
+                        try {
+                            loopRegion(item, length, from, to, sampleRate).also { region ->
+                                if (region == null) synchronized(context) { buildFailure = "$sideName decode-null" }
+                            }
+                        } finally {
+                            buildContextLocal.remove()
                         }
                     })
                 }.onFailure {
                     Log.w(TAG, "loop build failed", it)
-                    buildFailure = "${deckSide.ifEmpty { "deck" }} error:${it.javaClass.simpleName}"
+                    buildFailure = "build error:${it.javaClass.simpleName}"
                 }.getOrNull()
             }
             if (generation != buildGeneration) {
                 session?.close()
                 return@launch
             }
-            deckTiming.endOpen()
+            if (armWhenReady && SystemClock.elapsedRealtime() > context.deadlineMs + LOOP_COMMIT_MS) {
+                session?.close()
+                if (phase == Phase.LOOP_ARMING && outgoing === out) loopFallBack("build-crossed-commit-guard")
+                return@launch
+            }
+            context.timing.endOpen()
             if (primedKey != key) {
                 session?.close()
                 return@launch
             }
-            val steps = deckTiming.snapshot(SystemClock.elapsedRealtime())
+            val steps = context.timing.snapshot(SystemClock.elapsedRealtime(), context.deadlineMs)
                 .joinToString { "${it.step} ${it.endedMs - it.startedMs}ms" }
             if (session == null) {
                 Log.w(TAG, "loop build produced no decks ($steps)")
@@ -4842,9 +5006,9 @@ class CrossfadeController(
                 // file once the DirectSourceGate window opens).
                 if (phase == Phase.LOOP_ARMING && outgoing === out) {
                     val nowMs = SystemClock.elapsedRealtime()
-                    val deadline = deckTiming.deadlineMs
+                    val deadline = context.deadlineMs
                     val reason = if (deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && nowMs <= deadline) {
-                        buildFailure ?: "${deckSide.ifEmpty { "deck" }} build-null"
+                         buildFailure ?: "build-null"
                     } else {
                         lateDeckReason()
                     }
@@ -4916,11 +5080,32 @@ class CrossfadeController(
 
     private fun primeKey(plan: LoopMix.Plan, outItem: MediaItem, inItem: MediaItem, sampleRate: Int) =
         "${plan.rung}|${outItem.mediaId}->${inItem.mediaId}|${plan.out.loopStart}|${plan.out.loopEnd}|${plan.out.bars}|" +
-            "${plan.inn.loopStart}|${plan.inn.loopEnd}|${plan.inn.bars}|$sampleRate"
+            "${plan.inn.loopStart}|${plan.inn.loopEnd}|${plan.inn.bars}|$sampleRate|" +
+            "inLevel=${"%.5f".format(Locale.ROOT, loudnessGain(inItem.mediaId) / loudnessGain(outItem.mediaId).coerceAtLeast(0.0001f))}|" +
+            "hq=${AppSettings.automixPerformanceMode.value != AutomixPerformanceMode.EFFICIENT}|script=${loopScript != null}|" +
+            "template=${loopScript?.choice?.template}|fx=${plan.echoTail},${plan.flanger},${plan.reverbWash}|" +
+            "analysis=${analysisRevision(loopOutAnalysis ?: TrackAnalysis(trackId = outItem.mediaId))}>${analysisRevision(loopInAnalysis ?: TrackAnalysis(trackId = inItem.mediaId))}|" +
+            "sung=${loopSungOut?.size ?: 0}:${loopSungOut?.hashCode() ?: 0},${loopSungIn?.size ?: 0}:${loopSungIn?.hashCode() ?: 0}"
 
     /** Called from the decode thread at the start of each stream/decode/resample slice. */
     fun markDeckStep(step: String) {
-        deckTiming.begin("$deckSide $step")
+        val context = buildContextLocal.get() ?: activeBuildContext ?: return
+        context.timing.begin("deck $step", context.deadlineMs)
+    }
+
+    private fun newBuildContext(
+        playing: Boolean,
+        targetMs: Long,
+        positionMs: Long,
+        generation: Int = buildGeneration + 1,
+    ): LoopMixSession.BuildContext {
+        val context = LoopMixSession.BuildContext(
+            generation = generation,
+            deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), playing, targetMs, positionMs),
+            timing = LoopMixSession.BuildTiming(),
+        )
+        buildContexts[generation] = context
+        return context
     }
 
     private fun discardPrime() {
@@ -4934,7 +5119,7 @@ class CrossfadeController(
         // djmix15: a stale deckTiming from a prior track/build can never be
         // this build's deadlines — reset on every prime/scrub/discard so
         // lateStepReason cannot subtract a dead wall epoch.
-        deckTiming.clear()
+        activeBuildContext?.timing?.clear()
     }
 
     /**
@@ -5012,7 +5197,8 @@ class CrossfadeController(
             }
         }
         val nowMs = SystemClock.elapsedRealtime()
-        val deadline = deckTiming.deadlineMs
+        val context = activeBuildContext
+        val deadline = context?.deadlineMs ?: DeckBudget.NO_DEADLINE_MS
         val notLate = deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && nowMs <= deadline
         val reason = if (notLate) "shift-bar-null" else lateDeckReason()
         if (candidate == null) {
@@ -5052,8 +5238,7 @@ class CrossfadeController(
             loopFallBack(reason)
             return
         }
-        deckTiming.clear()
-          deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+        activeBuildContext = newBuildContext(out.isPlaying, loopTargetStartMs, out.currentPosition)
         // The reason stays on the refusal until the shifted mix actually arms,
         // so a later fallback still says what was late the first time if this
         // attempt records nothing of its own.
@@ -5067,7 +5252,8 @@ class CrossfadeController(
 
     private fun lateDeckReason(): String {
         val now = SystemClock.elapsedRealtime()
-        return LoopMix.lateStepReason(deckTiming.snapshot(now), now, deckTiming.deadlineMs)
+        val context = activeBuildContext ?: return "loop-build-deadline-unavailable"
+        return LoopMix.lateStepReason(context.timing.snapshot(now, context.deadlineMs), now, context.deadlineMs)
     }
 
     /** The decks are built: the incoming player loads its song, and both sinks are armed. */
@@ -5106,7 +5292,7 @@ class CrossfadeController(
         }
         into.playWhenReady = false
         inPort.armIncoming(LoopMixPort.InArm((session.handoverTrack * 1_000_000).roundToLong()))
-        deckTiming.begin("incoming prepare")
+        activeBuildContext?.timing?.begin("incoming prepare")
         into.prepare()
         session.attach(outPort, inPort)
         loopSession = session
@@ -5206,7 +5392,7 @@ class CrossfadeController(
             }
             return
         }
-        if (incoming?.playbackState == Player.STATE_READY) deckTiming.endOpenIf("incoming prepare")
+        if (incoming?.playbackState == Player.STATE_READY) activeBuildContext?.timing?.endOpenIf("incoming prepare")
         if (session.outPort?.interrupted == true) return loopBail("the outgoing sink was flushed", settle = false)
         if (session.outPort?.tookOver == true) {
             phase = Phase.LOOP_RUNNING
@@ -5219,10 +5405,18 @@ class CrossfadeController(
                     "plannedStartMs" to loopTargetStartMs,
                     "actualStartMs" to out.currentPosition,
                     "deltaMs" to (out.currentPosition - loopTargetStartMs),
+                    "cueActualMs" to (session.inStartTrack * 1000).roundToLong(),
+                    "cueErrorMs" to ((session.inStartTrack - session.plan.inn.loopStart) * 1000).roundToLong(),
+                    "remainingAtFireMs" to (out.duration - out.currentPosition).takeIf { it >= 0L },
                     "prerollSec" to 1.0,
                     "spliceTargetMs" to loopTargetStartMs,
+                    "tookOverAtFire" to true,
+                    "incomingStartedAtFire" to loopIncomingStarted,
+                    "rendererFirstFrame" to runCatching { session.renderer.firstFrame() }.getOrNull(),
+                    "rendererGen" to session.outPort?.generation,
+                    "cueTargetMs" to (session.inStartTrack * 1000).roundToLong(),
                     "trackIndex" to outgoingItemIndex,
-                ),
+                ) + snapshotFields(transitionSnapshot),
             )
             scope.launch(Dispatchers.Default) {
                 session.outPort?.spliceLag()?.let { (lag, score) ->
@@ -5244,7 +5438,7 @@ class CrossfadeController(
             // splice step in wall time only (now -> now against the
             // wall deadline); the shift decision stays a media decision.
             val now = SystemClock.elapsedRealtime()
-            deckTiming.addClosed("outgoing splice", now, now, deckTiming.deadlineMs)
+            activeBuildContext?.let { it.timing.addClosed("outgoing splice", now, now, it.deadlineMs) }
             shiftLoopOrFallback(out)
         }
     }
@@ -5556,7 +5750,10 @@ class CrossfadeController(
                     "phaseErrorMs" to phaseErr.takeIf { it.isFinite() },
                     "exitGateViolations" to violations,
                     "scope" to "phase-and-exit-gate-only",
-                ),
+                    "lufsStatus" to "unmeasured",
+                    "peakStatus" to "unmeasured",
+                    "phaseStatus" to if (phaseErr.isFinite()) "measured" else "unmeasured",
+                ) + snapshotFields(transitionSnapshot),
             )
         }
 
@@ -5650,12 +5847,21 @@ class CrossfadeController(
         // djmix13: count every arm death so regressions are visible.
         AutomixTelemetry.event(
             "mix.arm.death",
-            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)) + snapshotFields(transitionSnapshot),
         )
         val fbKey = "$reason|${phase.name}"
         if (fbKey != lastFallbackLogKey) {
             lastFallbackLogKey = fbKey
-            AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
+            val fallbackPlanId = "fallback-${SESSION_COUNTER.incrementAndGet()}"
+            AutomixTelemetry.event(
+                "mix.loop.fallback",
+                mapOf(
+                    "reason" to reason,
+                    "phase" to phase.name,
+                    "fallbackFromPlanId" to transitionSnapshot?.planId,
+                    "newPlanId" to fallbackPlanId,
+                ) + snapshotFields(transitionSnapshot),
+            )
         }
         Log.d(TAG, "loop mix falls back to a blend: $reason")
         val pairKey = loopOutItem?.let { o -> loopInItem?.let { i -> "${o.mediaId}->${i.mediaId}" } }
@@ -6045,6 +6251,31 @@ class CrossfadeController(
         }
     }
 
+    /** Cancels a pre-fade arm; unlike interruption, this phase has no audible mix to freeze. */
+    private fun cancelArming(reason: String) {
+        if (phase != Phase.ARMING) return
+        val snapshot = transitionSnapshot
+        lastCompleteReason = reason
+        AutomixTelemetry.event(
+            "mix.arm.death",
+            mapOf(
+                "reason" to reason,
+                "phase" to phase.name,
+                "terminal" to true,
+                "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs),
+            ) + snapshotFields(snapshot),
+        )
+        // driveArming may have parked the active curve, but startFade never
+        // ran. The incoming deck is still silent, so this terminal path can
+        // restore both filter banks without an audible transition.
+        filters.open()
+        tracks.incomingMidDb(0f)
+        tracks.outgoingMidDb(0f)
+        // The incoming player is silent and the outgoing player has never entered
+        // the fade, so finish() preserves the survivor's position and queue.
+        bail(force = true)
+    }
+
     private fun bail(force: Boolean = false) {
         if (phase == Phase.IDLE || phase == Phase.BAILING) return
         // djmix10 freeze-once-armed: once the blend is audible (FADING,
@@ -6114,6 +6345,7 @@ class CrossfadeController(
         // vc67: clear the tail account so the next mix never inherits it.
         tailDurationMs = 0L
         val completeReason = lastCompleteReason ?: "finish"
+        val completedSnapshot = transitionSnapshot
         // djmix12 retire guard: an audible spare may not be retired
         // here. Convert to an emergency TAIL (350 ms) first; driveTail
         // quiets it to silence and re-enters finish() with phase==TAIL.
@@ -6263,6 +6495,7 @@ class CrossfadeController(
 
         outgoing = null
         incoming = null
+        transitionSnapshot = null
         // Clear the dissolved-tail reference only after retire and after the
         // Seam A gates above have run. An active tail is preserved until
         // driveTail has silenced it, and finish's early returns (emergency
@@ -6286,7 +6519,8 @@ class CrossfadeController(
             AutomixTelemetry.event(
                 "mix.complete",
                 mapOf("phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm, "tailMs" to tailMs, "reason" to completeReason,
-                    "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs),
+                    "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs) +
+                    snapshotFields(completedSnapshot),
             )
             handoverExpectedMs = 0L
             handoverHeardMs = -1L
@@ -7311,6 +7545,7 @@ class CrossfadeController(
     // equal-power is right everywhere.
 
     private companion object {
+        private val SESSION_COUNTER = AtomicLong(0)
         /** How much of each track either side of the overlap the mix popup shows, as a fraction of the overlap. */
         const val MIX_VIEW_CONTEXT = 0.24
 
@@ -7826,55 +8061,4 @@ class CrossfadeController(
         const val LOOP_RENDERER_CLOSE_DELAY_MS = 1_500L
     }
 
-    /**
-     * Wall-clock slices of one deck build. Written on the decode thread and
-     * read on the playback thread; the lock is the whole protocol.
-     */
-    private class DeckTiming {
-        private val lock = Any()
-        private val spans = ArrayList<LoopMix.PrepSpan>()
-        private var openStep: String? = null
-        private var openStarted = 0L
-        // djmix15: NO_DEADLINE (paused/none), never 0L. 0L would subtract as
-        // the boot uptime (~374000 ms on device) in lateStepReason.
-        var deadlineMs: Long = DeckBudget.NO_DEADLINE_MS
-
-        fun begin(step: String) = synchronized(lock) {
-            val now = SystemClock.elapsedRealtime()
-            closeOpen(now)
-            openStep = step
-            openStarted = now
-        }
-
-        fun endOpen() = synchronized(lock) { closeOpen(SystemClock.elapsedRealtime()) }
-
-        fun endOpenIf(step: String) = synchronized(lock) {
-            if (openStep == step) closeOpen(SystemClock.elapsedRealtime())
-        }
-
-        fun addClosed(step: String, startedMs: Long, endedMs: Long, deadline: Long) = synchronized(lock) {
-            spans += LoopMix.PrepSpan(step, startedMs, endedMs, deadline)
-        }
-
-        fun clear() = synchronized(lock) {
-            spans.clear()
-            openStep = null
-            // djmix15: drop the prior build's wall deadline too, so a stale
-            // nowMs - deadlineMs can never read as this build's lateness
-            // (374320 ms over, growing 1:1 with wall time).
-            deadlineMs = DeckBudget.NO_DEADLINE_MS
-        }
-
-        fun snapshot(now: Long): List<LoopMix.PrepSpan> = synchronized(lock) {
-            val closed = spans.toList()
-            val step = openStep ?: return closed
-            closed + LoopMix.PrepSpan(step, openStarted, now, deadlineMs)
-        }
-
-        private fun closeOpen(now: Long) {
-            val step = openStep ?: return
-            spans += LoopMix.PrepSpan(step, openStarted, now, deadlineMs)
-            openStep = null
-        }
-    }
 }
