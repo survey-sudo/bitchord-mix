@@ -216,18 +216,14 @@ object CuePoints {
             val delta = rawBar - localAnchor
             val rem = ((delta % 4) + 4) % 4
             var alignedBar = if (rem <= 2) rawBar - rem else rawBar + (4 - rem)
-            var alignedSec = if (alignedBar < map.downbeats.size && map.downbeats[alignedBar] <= maxSec) {
-                map.downbeats[alignedBar]
-            } else {
-                alignedBar * barSec
-            }
+            var alignedSec = map.barTime(alignedBar).coerceAtMost(maxSec)
             if (alignedSec > maxSec) {
                 alignedBar = (alignedBar - 4).coerceAtLeast(localAnchor)
-                alignedSec = if (alignedBar < map.downbeats.size) map.downbeats[alignedBar] else alignedBar * barSec
+                alignedSec = map.barTime(alignedBar).coerceAtMost(maxSec)
             }
             if (alignedSec < minSec - 1e-6 && alignedBar + 4 >= 0) {
                 val nextBar = alignedBar + 4
-                val nextSec = if (nextBar < map.downbeats.size) map.downbeats[nextBar] else nextBar * barSec
+                val nextSec = map.barTime(nextBar)
                 if (nextSec <= maxSec) {
                     alignedBar = nextBar
                     alignedSec = nextSec
