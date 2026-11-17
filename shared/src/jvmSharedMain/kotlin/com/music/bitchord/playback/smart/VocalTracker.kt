@@ -385,6 +385,16 @@ class VocalTracker(
             }
             curve[frame] = if (count > 0) (sum / count).toFloat() else 0f
         }
+        // A one-frame separator glitch is not musically meaningful. Blend it
+        // lightly only when both neighbours agree, preserving calibrated edges.
+        for (frame in 1 until curve.lastIndex) {
+            val left = curve[frame - 1]
+            val right = curve[frame + 1]
+            val middle = curve[frame]
+            if (kotlin.math.abs(left - right) < 0.15f && kotlin.math.abs(middle - left) > 0.22f) {
+                curve[frame] = middle * 0.5f + (left + right) * 0.25f
+            }
+        }
         return curve
     }
 

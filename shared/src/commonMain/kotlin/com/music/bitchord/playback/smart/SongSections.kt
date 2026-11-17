@@ -318,7 +318,7 @@ fun vocalShare(analysis: TrackAnalysis, from: Double, until: Double): Double {
 
 fun normalizeLyric(text: String): String =
     text.lowercase()
-        .replace(Regex("[^a-z0-9\\s]"), " ")
+        .map { if (it.isLetterOrDigit() || it.isWhitespace()) it else ' ' }.joinToString("")
         .replace(Regex("\\s+"), " ")
         .trim()
 

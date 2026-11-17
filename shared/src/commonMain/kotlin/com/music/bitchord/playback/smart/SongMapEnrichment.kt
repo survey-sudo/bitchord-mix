@@ -36,7 +36,20 @@ object SongMapEnrichment {
         val n = base.sungBars.size
         if (n <= 0) return base
 
-        val barStarts = DoubleArray(n + 1) { base.barTime(it) }
+        val modelBeats = (analysis.headBeats?.downbeats.orEmpty() + analysis.tailBeats?.downbeats.orEmpty())
+            .filter { it.isFinite() && it >= 0.0 }.distinct().sorted()
+        val reconciledDownbeats = if (modelBeats.size >= 2) {
+            DoubleArray(base.downbeats.size) { b ->
+                val original = base.barTime(b)
+                modelBeats.minByOrNull { abs(it - original) }
+                    ?.takeIf { abs(it - original) <= base.barSec * 0.75 } ?: original
+            }
+        } else base.downbeats
+        val barStarts = DoubleArray(n + 1) { b ->
+            if (b < reconciledDownbeats.size) reconciledDownbeats[b]
+            else (reconciledDownbeats.lastOrNull() ?: 0.0) +
+                (b - reconciledDownbeats.size + 1) * base.barSec
+        }
         val seen = BooleanArray(n)
         val sungFromWin = BooleanArray(n)
         val energyAccum = DoubleArray(n)
@@ -83,13 +96,37 @@ object SongMapEnrichment {
             if (cEnd <= cStart) return@map sec
             var overlapsCovered = false
             var sungCount = 0
+            var measuredBars = 0
             for (b in cStart until cEnd) {
-                if (seen[b]) overlapsCovered = true
-                if (outSung[b]) sungCount++
+                if (seen[b]) { overlapsCovered = true; measuredBars++ }
+                if (seen[b] && outSung[b]) sungCount++
             }
             if (!overlapsCovered) return@map sec
-            val len = cEnd - cStart
-            sec.copy(vocal = sungCount.toFloat() / len)
+            val vocal = sungCount.toFloat() / measuredBars.coerceAtLeast(1)
+            val fn = when {
+                sec.fn == SectionFn.FADE_OUT || sec.fn == SectionFn.SILENCE -> sec.fn
+                vocal >= 0.3f && sec.fn == SectionFn.INSTRUMENTAL -> SectionFn.VERSE
+                else -> sec.fn
+            }
+            sec.copy(
+                fn = fn,
+                role = when (fn) {
+                    SectionFn.VERSE, SectionFn.BRIDGE -> SectionRole.NARRATIVE
+                    SectionFn.CHORUS, SectionFn.DROP -> SectionRole.RELEASE
+                    else -> sec.role
+                },
+                vocal = vocal,
+                loopable = sec.loopable && vocal < 0.2f,
+                conf = if (vocal >= 0.3f) maxOf(sec.conf, 0.45f) else sec.conf,
+            )
+        }
+
+        val vocalSections = newSections.filter { it.vocal >= 0.4f }
+        val repeatedGroups = vocalSections.groupingBy { it.group }.eachCount().filterValues { it >= 2 }.keys
+        val recomputedSections = newSections.map { sec ->
+            if (sec.vocal >= 0.4f && sec.group in repeatedGroups && sec.fn == SectionFn.VERSE) {
+                sec.copy(fn = SectionFn.CHORUS, role = SectionRole.RELEASE, loopable = false, conf = maxOf(sec.conf, 0.5f))
+            } else sec
         }
 
         val first = outSung.indexOfFirst { it }.let { if (it < 0) null else it }
@@ -102,14 +139,36 @@ object SongMapEnrichment {
             else -> base.startKind
         }
 
+        val tailVocal = recomputedSections.lastOrNull()?.vocal ?: 0f
+        val ending = when {
+            base.endingKind == EndingKind.FADE_OUT -> base.endingKind
+            tailVocal >= 0.3f -> EndingKind.OUTRO_VOCAL
+            else -> base.endingKind
+        }
+        val anchors = (base.anchors.toList() + recomputedSections.filter { it.vocal >= 0.3f }.map { it.startBar })
+            .distinct().sorted().toIntArray()
+        val confidence = if (recomputedSections.isEmpty()) base.labelConfidence else
+            recomputedSections.map { it.conf }.average().toFloat().coerceIn(0f, 1f)
         return base.copy(
             sungBars = outSung,
             vocalEnergy = outEnergy,
-            sections = newSections,
+            sections = recomputedSections,
             firstVocalBar = first,
             lastVocalBar = last,
             pickupBeats = pickup,
             startKind = startKind,
+            endingKind = ending,
+            chorusCount = recomputedSections.count { it.fn == SectionFn.CHORUS },
+            labelConfidence = confidence,
+            anchors = anchors,
+            downbeats = if (modelBeats.size >= 2) reconciledDownbeats else base.downbeats,
+            gridConfidence = if (modelBeats.size >= 2) maxOf(base.gridConfidence, analysis.beatConfidence.toFloat()) else base.gridConfidence,
+            tempoStable = if (modelBeats.size >= 2) base.tempoStable && analysis.beatConfidence >= 0.45 else base.tempoStable,
+            gridMeasured = base.gridMeasured || modelBeats.size >= 2,
+            vocalCoverage = if (base.vocalCoverage.isEmpty()) {
+                BooleanArray(n) { seen[it] }
+            } else base.vocalCoverage.copyOf().also { for (b in seen.indices) if (seen[b] && b < it.size) it[b] = true },
+            provenance = if (base.provenance.isBlank()) "enriched:vocal-model" else base.provenance + "+vocal-model",
         )
     }
 }
