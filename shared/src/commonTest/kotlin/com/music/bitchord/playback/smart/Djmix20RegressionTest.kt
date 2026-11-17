@@ -215,6 +215,7 @@ class Djmix20RegressionTest {
             swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
             vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
             energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
+            vocalClashEnergy = 0.0,
         )
         val script = TransitionMoves.compile(choice, 120.0, 120.0)
         assertTrue(script.plan.exitTailSeconds >= 0.8, "exitTail=${script.plan.exitTailSeconds}")
@@ -258,7 +259,7 @@ class Djmix20RegressionTest {
     fun flangerFiresOnEligibleLowVocalBeatmixForRightPairHash() {
         val (outId, inId) = findIds(0)
         assertTrue(pairHash(outId, inId) % 4 == 0)
-        assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId))
+        assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId, measured = true))
         val settings = effectSettings(DjEffect.FLANGER)
         assertTrue(settings.wet <= 0.42f, "wet=${settings.wet}")
         assertEquals(8f, settings.beats, 1e-6f)
@@ -291,7 +292,7 @@ class Djmix20RegressionTest {
     @Test
     fun flangerNeverOnDualVocalClash() {
         val (outId, inId) = findIds(0)
-        assertTrue(blendColour(0.85, outId, inId) != DjEffect.FLANGER, "dual vocal must not flange")
+        assertTrue(blendColour(0.85, outId, inId, measured = true) != DjEffect.FLANGER, "dual vocal must not flange")
         val raw = TransitionPlan(
             transitionStyle = TransitionStyle.DJ_BLEND,
             transitionStart = 140.0, transitionEnd = 176.0, fadeSeconds = 36.0,

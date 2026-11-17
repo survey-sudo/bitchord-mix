@@ -140,12 +140,9 @@ object LoopMix {
     }
 
     /**
-     * djmix24 deterministic pair-hash FX rotation for non-EDM pairs.
-     * Scalars only (hash of the two track ids). Never returns FLANGER when
-     * dual-vocal overlap is active.
-     * 0=FLANGER, 1=CLEAN_SWAP, 2=ECHO, 3=REVERB.
+     * Stable pair slot; effect eligibility belongs to [FxPolicy].
      */
-    fun fxSlotForPair(outId: String, inId: String): Int = ((pairHash(outId, inId) % 4) + 4) % 4
+    fun fxSlotForPair(outId: String, inId: String): Int = FxPolicy.fxSlot(outId, inId)
 
     /** Beat-quantized tightening schedule: loop length in beats for [beatsIntoRoll] (0..total). */
     fun rollLoopBeats(beatsIntoRoll: Double, totalRollBeats: Double): Double {
@@ -532,26 +529,20 @@ object LoopMix {
             checkedBy = clean.checkedBy,
             anchorBeats = anchors,
         )
-        // djmix24 Bug A4: deterministic EDM buildup. Both sides dance tempo,
-        // post-fold delta within TEMPO_HARD_DELTA, clean instrumental loops
-        // (firstClean already guarantees low vocal share), low dual-vocal
-        // clash. Then flanger + tightening roll + HPF sweep. Non-EDM pairs
-        // use deterministic pair-hash FX rotation (scalars only).
+        // FX are chosen only after both loop candidates passed their own clean checks.
         val dualVocal = (outPick.vocal + inPick.vocal) > 0.06
-        val edm = isEdmPair(outBpm, inBpm, fold) && !dualVocal
-        val (fxFlanger, fxRoll, fxReverb, fxEcho) = if (edm) {
-            // EDM: jet flanger + tightening roll + reverb release.
-            Quad(true, true, true, false)
-        } else {
-            // Non-EDM rotation: FLANGER / CLEAN_SWAP / ECHO / REVERB, never
-            // flanging over dual-vocal overlap.
-            if (dualVocal) Quad(false, false, false, false)
-            else when (fxSlotForPair(out.trackId, inn.trackId)) {
-                0 -> Quad(true, false, false, false)
-                1 -> Quad(false, false, false, false)
-                2 -> Quad(false, false, false, true)
-                else -> Quad(false, false, true, false)
-            }
+        val fx = FxPolicy.select(
+            out.trackId, inn.trackId, rhythmic = true,
+            measured = (outPick.checkedBy == Check.MASK || outPick.checkedBy == Check.LYRICS_AND_MASK) &&
+                (inPick.checkedBy == Check.MASK || inPick.checkedBy == Check.LYRICS_AND_MASK),
+            vocalClash = if (dualVocal) 1.0 else 0.0, speechLike = false,
+            drifting = false, buildup = false, cleanSpace = false,
+        )
+        val (fxFlanger, fxRoll, fxReverb, fxEcho) = when (fx) {
+            DjEffect.FLANGER -> Quad(true, false, false, false)
+            DjEffect.ECHO -> Quad(false, false, false, true)
+            DjEffect.REVERB -> Quad(false, false, true, false)
+            else -> Quad(false, false, false, false)
         }
         // 2B tracked-beat anchors: slice each side's own BeatSide.beats over
         // its chosen crown loop. Null (safe synthetic path) when the grid does not
@@ -1282,7 +1273,12 @@ object LoopMix {
         val bars = clean.bars.coerceIn(2, 4)
         val rampBars = (bars - 2).coerceAtLeast(1)
         val exitBars = (bars - 1 - rampBars).coerceAtLeast(0)
-        val dropEdm = isEdmPair(outBpm, inBpm, fold) && clean.vocal < 0.06
+        val dropFx = FxPolicy.select(
+            out.trackId, inn.trackId, rhythmic = true,
+            measured = clean.checkedBy == Check.MASK || clean.checkedBy == Check.LYRICS_AND_MASK,
+            vocalClash = if (clean.vocal >= 0.06) 1.0 else 0.0, speechLike = false,
+            drifting = false, buildup = false, cleanSpace = false,
+        )
         return Plan(
             out = Pick(clean.start, clean.end, clean.bars, outBeat, outBpm, clean.vocal, clean.checkedBy),
             inn = straightPick(cueOf(inn, sungIn), inBeat, inBpm),
@@ -1296,10 +1292,10 @@ object LoopMix {
             nativeIncoming = true,
             rung = "Drop",
             keys = keys,
-            flanger = dropEdm,
-            buildupRoll = dropEdm,
-            reverbWash = dropEdm,
-            hpSweepEndHz = if (dropEdm) BUILDUP_HP_END_HZ else 0f,
+            flanger = dropFx == DjEffect.FLANGER,
+            buildupRoll = dropFx == DjEffect.LOOP_ROLL,
+            reverbWash = dropFx == DjEffect.REVERB,
+            hpSweepEndHz = if (dropFx == DjEffect.LOOP_ROLL) BUILDUP_HP_END_HZ else 0f,
         )
     }
 
@@ -1352,14 +1348,15 @@ object LoopMix {
         if (outStart >= outDuration - 0.5 || outDuration - outStart < need * 0.75) return null
         // djmix24 Bug A4 (bridge path): deterministic EDM buildup on clean
         // instrumental blends; rotation otherwise. Never flange dual-vocal or key-clash.
-        val blendEdm = !bothSing && !keyClash && windowClean && isEdmPair(outBpm, inBpm, fold)
-        val blendFx = if (blendEdm) Quad(true, true, false, false)
-        else if (bothSing || keyClash) Quad(false, false, false, false)
-        else when (fxSlotForPair(keys, "$outBpm|$inBpm")) {
-            0 -> Quad(true, false, false, false)
-            1 -> Quad(false, false, false, false)
-            2 -> Quad(false, false, false, false)
-            else -> Quad(false, false, true, false)
+        val blendFx = if (bothSing || keyClash) Quad(false, false, false, false)
+        else when (FxPolicy.select(
+            out.trackId, inn.trackId, rhythmic = true, measured = windowClean,
+            vocalClash = if (bothSing || keyClash) 1.0 else 0.0, speechLike = false, drifting = false,
+            buildup = false, cleanSpace = false,
+        )) {
+            DjEffect.FLANGER -> Quad(true, false, false, false)
+            DjEffect.REVERB -> Quad(false, false, true, false)
+            else -> Quad(false, false, false, false)
         }
         return Plan(
             out = straightPick(outStart, outBeat, outBpm),

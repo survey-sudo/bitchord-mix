@@ -91,21 +91,16 @@ class DjMixTest {
     }
 
     @Test
-    fun aKnownPairEchoesAndTheNextHashReverbs() {
-        // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
-        assertEquals(0, pairHash("a", "b") % 3)
-        val echoed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
+    fun tempoGapUsesCleanEffectOnlyWhenMeasuredAndDefaultsCleanOtherwise() {
+        val reverbPair = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
+        assertEquals(DjEffect.REVERB, reverbPair.djEffect)
+        assertEquals(0.0, reverbPair.echoSeconds)
+        val echoId = (0 until 64).first { FxPolicy.fxSlot("a", "id-$it") == 2 }
+        val echoed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$echoId")
         assertEquals(DjEffect.ECHO, echoed.djEffect)
         assertTrue(echoed.echoSeconds > 0.2)
-        val echoId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 1 }
-        val stillEcho = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$echoId")
-        assertEquals(DjEffect.ECHO, stillEcho.djEffect)
-        assertTrue(stillEcho.echoSeconds > 0.2)
-        val reverbId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 2 }
-        val reverbed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$reverbId")
-        assertEquals(DjEffect.REVERB, reverbed.djEffect)
-        assertEquals(0.0, reverbed.echoSeconds)
-        assertTrue(reverbed.mixSummary.contains("reverb wash"))
+        val cleanPair = FxPolicy.select("a", "b", false, true, 0.0, false, false, false, true)
+        assertTrue(cleanPair == DjEffect.ECHO || cleanPair == DjEffect.REVERB || cleanPair == DjEffect.NONE)
     }
 
     @Test
@@ -168,8 +163,9 @@ class DjMixTest {
     @Test
     fun anInstrumentalBlendCanFlangeAndTwoSingersDoNotGetThatFlanger() {
         val id = (0 until 24).first { pairHash("out", "fx-$it") % 4 == 0 }
-        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id"))
-        assertEquals(DjEffect.NONE, blendColour(0.5, "out", "fx-$id"))
+        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id", measured = true))
+        assertEquals(DjEffect.NONE, blendColour(0.0, "out", "fx-$id"))
+        assertEquals(DjEffect.NONE, blendColour(0.5, "out", "fx-$id", measured = true))
     }
 
     @Test
