@@ -23,6 +23,7 @@ object AutomixTelemetry {
     private const val MAX_BYTES = 2_000_000L
 
     private val counter = AtomicLong(0)
+    private val writeLock = Any()
     @Volatile private var dir: File? = null
 
     /** Must be called once from a Context (PlaybackService). Safe to call repeatedly. */
@@ -49,29 +50,63 @@ object AutomixTelemetry {
      */
     fun event(name: String, fields: Map<String, Any?> = emptyMap()) {
         val d = dir ?: return
-        try {
-            val sb = StringBuilder()
-            sb.append('{')
-            sb.append("\"ts\":").append(System.currentTimeMillis())
-            sb.append(",\"seq\":").append(counter.incrementAndGet())
-            sb.append(",\"ev\":").append(quote(name))
-            for ((k, v) in fields) {
-                sb.append(',').append(quote(k)).append(':')
-                when (v) {
-                    null -> sb.append("null")
-                    is Number, is Boolean -> sb.append(v.toString())
-                    else -> sb.append(quote(v.toString()))
+        synchronized(writeLock) {
+            try {
+                val sb = StringBuilder()
+                sb.append('{')
+                sb.append("\"ts\":").append(System.currentTimeMillis())
+                sb.append(",\"seq\":").append(counter.incrementAndGet())
+                sb.append(",\"ev\":").append(quote(name))
+                for ((k, v) in fields) {
+                    sb.append(',').append(quote(k)).append(':')
+                    appendJson(sb, v)
                 }
+                sb.append("}\n")
+                val file = File(d, FILE_NAME)
+                if (file.exists() && file.length() > MAX_BYTES) {
+                    // Single-file ring: start over rather than grow forever.
+                    file.delete()
+                }
+                file.appendText(sb.toString())
+            } catch (_: Throwable) {
+                // Ignore: telemetry must never break playback.
             }
-            sb.append("}\n")
-            val file = File(d, FILE_NAME)
-            if (file.exists() && file.length() > MAX_BYTES) {
-                // Single-file ring: start over rather than grow forever.
-                file.delete()
+        }
+    }
+
+    private fun appendJson(sb: StringBuilder, value: Any?) {
+        when (value) {
+            null -> sb.append("null")
+            is Boolean -> sb.append(value)
+            is Double -> if (value.isFinite()) sb.append(value) else sb.append("null")
+            is Float -> if (value.isFinite()) sb.append(value) else sb.append("null")
+            is Number -> sb.append(value)
+            is Map<*, *> -> {
+                sb.append('{')
+                value.entries.forEachIndexed { index, entry ->
+                    if (index > 0) sb.append(',')
+                    sb.append(quote(entry.key?.toString().orEmpty())).append(':')
+                    appendJson(sb, entry.value)
+                }
+                sb.append('}')
             }
-            file.appendText(sb.toString())
-        } catch (_: Throwable) {
-            // Ignore: telemetry must never break playback.
+            is Iterable<*> -> {
+                sb.append('[')
+                value.forEachIndexed { index, item ->
+                    if (index > 0) sb.append(',')
+                    appendJson(sb, item)
+                }
+                sb.append(']')
+            }
+            is Array<*> -> {
+                sb.append('[')
+                value.forEachIndexed { index, item ->
+                    if (index > 0) sb.append(',')
+                    appendJson(sb, item)
+                }
+                sb.append(']')
+            }
+            else -> sb.append(quote(value.toString()))
         }
     }
 
