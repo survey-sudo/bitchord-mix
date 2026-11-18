@@ -1653,7 +1653,7 @@ class CrossfadeController(
                 "exception" to error.javaClass.name,
                 // Frames identify the throw site without messages containing URLs/tokens.
                 "origin" to error.stackTrace.take(4).joinToString(" <- "),
-            ),
+            )),
         )
     }
 
@@ -1812,7 +1812,7 @@ class CrossfadeController(
                 "msSinceHandoff" to sinceHandoff,
                 "positionMs" to sessionPlayer.currentPosition,
                 "loopIncomingStarted" to loopIncomingStarted,
-            ),
+            )),
         )
     }
 
@@ -2216,7 +2216,7 @@ class CrossfadeController(
                     "gapless" to (plan.transitionStyle.name == "GAPLESS"),
                     "filterVariant" to plan.filterVariant.name,
                     "djEffect" to plan.djEffect.name,
-                ),
+                )),
             )
         }
         // The loop mix first: a pair it can do never reaches the blend below.
@@ -3557,7 +3557,7 @@ class CrossfadeController(
                     "gainDb" to RetireGuard.gainDb(vol),
                     "reason" to reason,
                     "retireSite" to retireSite,
-                ),
+                )),
             )
             finish()
             return
@@ -3576,7 +3576,7 @@ class CrossfadeController(
                 "gainDb" to RetireGuard.gainDb(vol),
                 "reason" to reason,
                 "retireSite" to retireSite,
-            ),
+            )),
         )
         phase = Phase.TAIL
     }
@@ -5350,8 +5350,7 @@ class CrossfadeController(
                     "loopIncomingStarted" to loopIncomingStarted,
                     "inStartAtMs" to ((loopSession?.inStartAt?.times(1000))?.roundToLong() ?: -1L),
                     "handoffAtMs" to ((loopSession?.clock?.handoffAt?.times(1000))?.roundToLong() ?: -1L),
-                ),
-                ),
+                )),
             )
             return loopBail("paused before the loop")
         }
