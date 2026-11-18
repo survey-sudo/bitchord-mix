@@ -18,8 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * cannot be verified on a real Snapdragon: session open and the HTP graph
  * initialisation only happen then. This probe opens a minimal QNN session
  * against the bundled beat model shortly after app start, on its own
- * daemon thread, and logs the outcome under BitChordNPU with fixed line
- * shapes. The HTP ARCH line comes from the vendor QAIRT library.
+ * daemon thread with CPU fallback disabled and EPContext caching off. It
+ * logs the outcome under BitChordNPU; verbose ORT node assignment and the
+ * vendor HTP ARCH log are required too. Session creation alone proves nothing.
  *
  * At most one run per process; off UI and audio threads; never throws; a
  * failure cannot affect playback; aborted when backgrounded.
@@ -29,8 +30,6 @@ object NpuSelfTest {
     private const val START_DELAY_MS = 3000L
     /** Fixed small thread count; this proves dispatch, not throughput. */
     private const val THREADS = 2
-    /** Bound on dummy-input elements (4M floats = 16 MB worst case). */
-    private const val MAX_INPUT_ELEMENTS = 4_000_000L
     private val started = AtomicBoolean(false)
 
     /**
@@ -45,7 +44,7 @@ object NpuSelfTest {
         libDir: () -> String?,
     ) {
         // Dormant by default: no thread, no model unpack, no dlopen.
-        if (!NpuSupport.QNN_ENABLED) return
+        if (!NpuSupport.QNN_ENABLED || !NpuSupport.BEAT_QDQ_ENABLED) return
         if (!started.compareAndSet(false, true)) return
         Thread({
             try {
@@ -62,8 +61,8 @@ object NpuSelfTest {
         libDir: () -> String?,
     ) {
         val startMs = System.currentTimeMillis()
-        if (!NpuSupport.QNN_ENABLED) {
-            Log.i(TAG, "selftest skipped (qnn disabled)")
+        if (!NpuSupport.QNN_ENABLED || !NpuSupport.BEAT_QDQ_ENABLED) {
+            Log.i(TAG, "selftest skipped (qnn or QDQ beat candidate disabled)")
             Log.i(TAG, "selftest done in 0ms")
             return
         }
@@ -92,62 +91,73 @@ object NpuSelfTest {
             done()
             return
         }
-        val model = runCatching { unpackModel(appContext, BeatTracker.MODEL_ASSET) }.getOrNull()
+        val model = runCatching { unpackModel(appContext, BeatTracker.NPU_MODEL_ASSET) }.getOrNull()
         if (model == null) {
             Log.i(TAG, "selftest qnn open FAILED: bundled beat model unavailable")
             Log.i(TAG, "selftest provider=none inference=not-attempted (beat model unavailable)")
             done()
             return
         }
-        // Mirror production preflight (dlopen and ADSP path) before graph
-        // init. Never throws; a failure here means graph open fails
-        // honestly below.
-        if (dir != null) NpuNative.initBundledQnn(dir)
+        // The linker-visible libcdsprpc gate must pass BEFORE opening QAIRT.
+        val preflight = dir != null && NpuNative.initBundledQnn(dir)
+        if (!NpuSupport.htpPreflightReady(backend != null, preflight)) {
+            Log.i(TAG, "selftest provider=none inference=not-attempted (HTP/libcdsprpc preflight failed)")
+            done()
+            return
+        }
         val cacheDir = runCatching {
             File(appContext.noBackupFilesDir, "npu/selftest-cache").apply { mkdirs() }
         }.getOrNull()
         var session: OrtSession? = null
         var qnnOk = false
         try {
-            session = NpuSession.openQnn(model, THREADS, NpuSupport.NpuConfig(), backend, cacheDir)
+            session = NpuSession.openQnnProbe(
+                model, THREADS, NpuSupport.NpuConfig(deviceFingerprint = Build.FINGERPRINT),
+                backend, cacheDir, preflightPassed = preflight,
+            )
             qnnOk = true
-            Log.i(TAG, "selftest qnn open OK")
+            Log.i(TAG, "selftest qnn open OK fallback=disabled htp_arch=" + NpuSupport.HTP_ARCH + " (not dispatch proof)")
         } catch (t: Throwable) {
             Log.i(TAG, "selftest qnn open FAILED: " + (t.message ?: t.toString()) + " [" + t.javaClass.simpleName + "]")
         }
         var inference = "not-attempted"
         if (qnnOk && session != null) {
-            inference = if (runDummyInference(session)) "ok" else "skipped"
+            inference = if (runDummyInference(session)) "ok" else "failed"
         }
         runCatching { session?.close() }
-        Log.i(TAG, "selftest provider=" + (if (qnnOk) "QNN" else "QNN-FAILED") + " inference=" + inference)
+        Log.i(TAG, "selftest provider=" + (if (qnnOk) "QNN-PROBE" else "QNN-FAILED") + " inference=" + inference + " fallback=disabled evidence=requires-HTP-node-assignment")
         done()
     }
     /**
-     * Runs one tiny forward pass on a zeros input shaped from the
-     * session input metadata (forces the HTP graph to execute, not
-     * merely open). Dynamic dims are substituted with a small concrete
-     * size; anything unexpected yields false, reported as skipped.
+     * Runs the exact fixed [1,1500,128] beat contract. Fetch only named
+     * beat/downbeat heads and require finite [1,1500] outputs, so the
+     * probe proves a forward pass rather than merely creating a session.
      */
     private fun runDummyInference(session: OrtSession): Boolean {
         var tensor: OnnxTensor? = null
         var result: OrtSession.Result? = null
         return try {
-            val infos = session.getInputInfo()
-            val first = infos.entries.firstOrNull() ?: return false
-            val tensorInfo = first.value.info as? ai.onnxruntime.TensorInfo ?: return false
-            val shape = tensorInfo.getShape().map { d -> if (d > 0) d else 8L }.toLongArray()
-            val elements = shape.fold(1L) { acc, d -> acc * d }
-            if (elements <= 0 || elements > MAX_INPUT_ELEMENTS) return false
+            val inputName = "input_spectrogram"
+            val outputNames = setOf("beat", "downbeat")
+            require(inputName in session.inputNames && session.outputNames.containsAll(outputNames)) { "Wrong beat-model I/O" }
+            val shape = longArrayOf(1, BeatTracker.CHUNK_FRAMES.toLong(), 128)
             val inputTensor = OnnxTensor.createTensor(
                 OrtEnvironment.getEnvironment(),
-                FloatBuffer.wrap(FloatArray(elements.toInt())),
+                FloatBuffer.wrap(FloatArray(BeatTracker.CHUNK_FRAMES * 128)),
                 shape,
             )
             tensor = inputTensor
-            result = session.run(mapOf(first.key to inputTensor))
+            result = session.run(mapOf(inputName to inputTensor), outputNames)
+            for (name in outputNames) {
+                // Supplier overload is API-24 compatible (the no-arg Java-10 method is not).
+                val rows = result.get(name).orElseThrow { IllegalStateException("Missing output $name") }.value as? Array<*>
+                    ?: error("Non-array output $name")
+                val row = rows.singleOrNull() as? FloatArray ?: error("Wrong batch for $name")
+                require(row.size == BeatTracker.CHUNK_FRAMES && row.all { it.isFinite() }) { "Malformed output $name" }
+            }
             true
-        } catch (_: Throwable) {
+        } catch (failure: Throwable) {
+            Log.i(TAG, "selftest inference FAILED: " + (failure.message ?: failure.toString()))
             false
         } finally {
             runCatching { result?.close() }

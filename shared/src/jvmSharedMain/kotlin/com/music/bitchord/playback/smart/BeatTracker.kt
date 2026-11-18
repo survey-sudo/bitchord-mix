@@ -33,7 +33,8 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Beat and downbeat tracking with the Beat This! model (CPJKU, ISMIR 2024).
+ * Beat/downbeat tracking with Beat This! (CPJKU, ISMIR 2024) and a default-off
+ * fixed-shape Nirovi QDQ candidate. The existing CPU weights/path stay the default.
  *
  * Why a model at all: tempo and *meter* are different problems. Autocorrelation reads tempo well,
  * but nothing in an autocorrelation says which of four beats is beat one, and a mix that enters on
@@ -63,6 +64,10 @@ class BeatTracker(
     private val npuVendor: () -> NpuSupport.Vendor = { NpuSupport.Vendor.NONE },
     private val npuBackendPath: () -> String? = { null },
     private val npuCacheDir: () -> File? = { null },
+    /** Must match modelPath's asset; independent of QNN so CUE can probe the candidate on CPU. */
+    private val useQdqModel: Boolean = NpuSupport.BEAT_QDQ_ENABLED,
+    /** Android's libcdsprpc/backend preflight; false never attempts HTP. */
+    private val npuPreflightPassed: () -> Boolean = { false },
 ) {
 
     /** A tracked grid on the analysed audio's own timeline, in seconds. */
@@ -89,8 +94,9 @@ class BeatTracker(
             session = null
             return runCatching {
                 val file = File(modelPath())
-                // vc69 NPU: QNN when supported, CPU otherwise (automatic CPU fallback inside NpuSession).
-                NpuSession.open(file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir())
+                // QNN is beat/QDQ-only. The original dynamic-quant model stays on the original CPU path.
+                val config = npuConfig().let { if (useQdqModel) it else it.copy(enabled = false) }
+                NpuSession.open(file.absolutePath, threads, config, npuVendor(), npuBackendPath(), npuCacheDir(), npuPreflightPassed())
                     .also {
                         session = it
                         sessionThreads = threads
@@ -167,36 +173,26 @@ class BeatTracker(
     ): Boolean = runCatching {
         val environment = OrtEnvironment.getEnvironment()
         val mels = spectrogram.mels
-        val name = session.inputNames.first()
-        val stride = CHUNK_FRAMES - 2 * BORDER_FRAMES
-
-        var start = 0
-        while (start < spectrogram.frames) {
-            val length = min(CHUNK_FRAMES, spectrogram.frames - start)
-            // A chunk shorter than the border padding carries no usable centre.
-            if (length <= 2 * BORDER_FRAMES && start > 0) break
-
-            val chunk = spectrogram.values.copyOfRange(start * mels, (start + length) * mels)
-            val shape = longArrayOf(1, length.toLong(), mels.toLong())
-
+        val name = if (useQdqModel) BeatModelAdapter.INPUT_NAME.also {
+            require(it in session.inputNames) { "Missing QDQ input $it" }
+            require(session.outputNames.containsAll(BeatModelAdapter.OUTPUT_NAMES)) { "Missing QDQ beat outputs" }
+        } else session.inputNames.first()
+        BeatModelAdapter.inferChunks(spectrogram, beatLogits, downbeatLogits, useQdqModel) { chunk, inputFrames ->
+            val shape = longArrayOf(1, inputFrames.toLong(), mels.toLong())
             OnnxTensor.createTensor(environment, FloatBuffer.wrap(chunk), shape).use { tensor ->
-                session.run(mapOf(name to tensor)).use { outputs ->
-                    val beat = (outputs.get(0).value as Array<FloatArray>)[0]
-                    val downbeat = (outputs.get(1).value as Array<FloatArray>)[0]
-
-                    val keepFrom = if (start == 0) 0 else BORDER_FRAMES
-                    val keepTo = if (start + length >= spectrogram.frames) length else length - BORDER_FRAMES
-                    for (index in keepFrom until keepTo) {
-                        val target = start + index
-                        if (target >= beatLogits.size) break
-                        beatLogits[target] = beat[index]
-                        downbeatLogits[target] = downbeat[index]
-                    }
+                // Do not depend on graph output order or fetch auxiliary outputs from future QDQ exports.
+                val result = if (useQdqModel) session.run(mapOf(name to tensor), BeatModelAdapter.OUTPUT_NAMES)
+                    else session.run(mapOf(name to tensor))
+                result.use { outputs ->
+                    val beat = if (useQdqModel) outputs.get(BeatModelAdapter.BEAT_OUTPUT)
+                        .orElseThrow { IllegalStateException("Missing beat output") }.value
+                        else outputs.get(0).value
+                    val downbeat = if (useQdqModel) outputs.get(BeatModelAdapter.DOWNBEAT_OUTPUT)
+                        .orElseThrow { IllegalStateException("Missing downbeat output") }.value
+                        else outputs.get(1).value
+                    (beat as Array<FloatArray>)[0] to (downbeat as Array<FloatArray>)[0]
                 }
             }
-
-            if (start + length >= spectrogram.frames) break
-            start += stride
         }
         true
     }.onFailure { AnalysisLog.warn("Beat inference failed", it) }.getOrDefault(false)
@@ -219,7 +215,9 @@ class BeatTracker(
          * too and found no beats at all. A new name rather than the old one because the app
          * unpacks assets once by name and would keep serving the stale copy.
          */
-        const val MODEL_ASSET = "beat_this_final0_q8.onnx"
+        const val CPU_MODEL_ASSET = "beat_this_final0_q8.onnx"
+        const val NPU_MODEL_ASSET = "nirovi_qnn.onnx"
+        val MODEL_ASSET: String get() = BeatModelAdapter.modelAsset(NpuSupport.BEAT_QDQ_ENABLED)
 
         /** The broken earlier export, whose unpacked copy is deleted on first use of the new one. */
         const val RETIRED_MODEL_ASSET = "beat_this_int8.onnx"

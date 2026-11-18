@@ -46,22 +46,39 @@ JNIEXPORT jboolean JNICALL Java_com_music_bitchord_playback_smart_NpuNative_nati
         LogWarn("bundled QNN init: empty libraryDir");
         return JNI_FALSE;
     }
+    // API 31+ requires the optional uses-native-library manifest declaration.
+    // Probe by soname in the app namespace, NOT by /vendor path existence:
+    // an inaccessible FastRPC transport must skip HTP before QAIRT opens.
+    void* rpcLib = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
+    if (!rpcLib) {
+        const char* error = dlerror();
+        LogWarn(std::string("bundled QNN init: libcdsprpc unavailable; HTP skipped: ") +
+                (error ? error : "unknown"));
+        return JNI_FALSE;
+    }
+    LogInfo("bundled QNN init: libcdsprpc linker gate OK");
     // Bundled libraries first so the DSP finds them; Orchard qnn_runner
     // sets the same value before opening its add-on runtime.
     const std::string adsp =
         libraryDir + ";/vendor/lib/rfsa/adsp;/vendor/dsp/cdsp;/vendor/dsp";
     if (setenv("ADSP_LIBRARY_PATH", adsp.c_str(), 1) != 0) {
         LogWarn("bundled QNN init: setenv ADSP_LIBRARY_PATH failed");
+        dlclose(rpcLib);
         return JNI_FALSE;
     }
     void* systemLib = dlopen((libraryDir + "/libQnnSystem.so").c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!systemLib) {
-        LogWarn(std::string("bundled QNN init: libQnnSystem: ") + (dlerror() ? dlerror() : "unknown"));
+        const char* error = dlerror();
+        LogWarn(std::string("bundled QNN init: libQnnSystem: ") + (error ? error : "unknown"));
+        dlclose(rpcLib);
         return JNI_FALSE;
     }
     void* htpLib = dlopen((libraryDir + "/libQnnHtp.so").c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!htpLib) {
-        LogWarn(std::string("bundled QNN init: libQnnHtp: ") + (dlerror() ? dlerror() : "unknown"));
+        const char* error = dlerror();
+        LogWarn(std::string("bundled QNN init: libQnnHtp: ") + (error ? error : "unknown"));
+        dlclose(systemLib);
+        dlclose(rpcLib);
         return JNI_FALSE;
     }
     LogInfo("bundled QNN init: ADSP_LIBRARY_PATH=" + adsp + " backend open");

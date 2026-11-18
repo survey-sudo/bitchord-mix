@@ -79,9 +79,8 @@ internal fun wholeTrackExecutor(): java.util.concurrent.ExecutorService =
 @UnstableApi
 class TrackAnalyzer(private val context: Context, private val cache: AudioCache) {
 
-    // vc69 NPU: Snapdragon QNN for beat and vocal models with CPU fallback.
-    // Auto-detected from the device; nothing to configure. The context cache
-    // lives in noBackupFilesDir so OS updates never invalidate it wrongly.
+    // vc84: QNN is candidate-beat-only; vocals stay on CPU. EPContext subdirs
+    // fingerprint model/runtime/QAIRT/arch/options/firmware, not just the path.
     private val npuVendor: com.music.bitchord.playback.smart.NpuSupport.Vendor =
         com.music.bitchord.playback.smart.NpuSupport.detectVendor(
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) android.os.Build.SOC_MANUFACTURER else "",
@@ -116,6 +115,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     private val npuPreflightLock = Any()
     @Volatile private var npuPreflightDone = false
+    @Volatile private var npuPreflightReady = false
 
     /**
      * Runs the ADSP preflight (dlopen of the bundled HTP backend) once a
@@ -129,15 +129,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     private fun ensureNpuPreflight(): String? {
         // Dormant by default: QNN_ENABLED=false means no dlopen and no
         // backend path, so both trackers stay on the CPU provider.
-        if (!NpuSupport.QNN_ENABLED) return null
+        if (!NpuSupport.QNN_ENABLED || !NpuSupport.BEAT_QDQ_ENABLED || npuVendor != NpuSupport.Vendor.QUALCOMM) return null
         val dir = npuLibDir ?: return null
         synchronized(npuPreflightLock) {
             if (!npuPreflightDone) {
-                com.music.bitchord.playback.smart.NpuNative.initBundledQnn(dir)
+                npuPreflightReady = com.music.bitchord.playback.smart.NpuNative.initBundledQnn(dir)
                 npuPreflightDone = true
             }
         }
-        return dir
+        return dir.takeIf { npuPreflightReady }
     }
 
     // vc70 NPU: QNN backend is bundled in this APK nativeLibraryDir (QAIRT
@@ -155,16 +155,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             unpackedAsset(BeatTracker.MODEL_ASSET)
         },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
+        npuConfig = { NpuSupport.NpuConfig(deviceFingerprint = android.os.Build.FINGERPRINT) },
         npuVendor = { npuVendor },
         npuBackendPath = { npuBackendPath },
         npuCacheDir = { npuCacheDir },
+        npuPreflightPassed = { npuPreflightReady },
     )
     private val vocals = VocalTracker(
         modelPath = { unpackedAsset(VocalTracker.MODEL_ASSET) },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
-        npuVendor = { npuVendor },
-        npuBackendPath = { npuBackendPath },
-        npuCacheDir = { npuCacheDir },
+        npuConfig = { NpuSupport.NpuConfig(enabled = false) },
     )
 
     init {
@@ -183,6 +183,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         try {
             if (!NpuSupport.QNN_ENABLED) {
                 Log.i(TAG, "BitChordNPU disabled (QNN_ENABLED=false): CPU execution provider")
+            } else if (!NpuSupport.BEAT_QDQ_ENABLED) {
+                Log.i(TAG, "BitChordNPU beat candidate disabled: CPU execution provider")
             } else if (npuVendor == com.music.bitchord.playback.smart.NpuSupport.Vendor.QUALCOMM) {
                 // Deferred while this Service is unattached (null); the
                 // ADSP preflight then runs at first post-attach access via
@@ -195,16 +197,13 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 } else {
                     // NPU observability (one line): the SoC string, the
                     // backend path, and the bundled Skel file(s) present in
-                    // nativeLibraryDir. QNN resolves the arch from the SoC
-                    // at backend open, so the present Skel(s) are the only
-                    // candidates the DSP can load; this line proves which
-                    // arch actually loaded. Dumped once at init, never
-                    // throwing.
+                    // nativeLibraryDir. Presence is NOT dispatch proof; the
+                    // no-fallback probe and HTP node-assignment log are required.
                     runCatching {
                         val skels = java.io.File(libDir).list { _, name ->
                             name.startsWith("libQnnHtpV") && name.endsWith("Skel.so")
                         }?.joinToString(",") ?: "none"
-                        Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " backend=" + (npuBackendPath ?: "missing") + " skels=" + skels)
+                        Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " backend=" + (npuBackendPath ?: "missing") + " htp_arch=" + NpuSupport.HTP_ARCH + " skels=" + skels)
                     }
                 }
             } else {

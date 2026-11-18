@@ -50,6 +50,7 @@ class NpuSupportTest {
         val options = NpuSupport.qnnProviderOptions("/data/app/base.apk/lib/arm64/libQnnHtp.so")
         assertEquals("burst", options["htp_performance_mode"])
         assertEquals("3", options["htp_graph_finalization_optimization_mode"])
+        assertEquals("73", options["htp_arch"])
         assertEquals("/data/app/base.apk/lib/arm64/libQnnHtp.so", options["backend_path"])
     }
 
@@ -57,6 +58,7 @@ class NpuSupportTest {
     fun providerOptionsWithoutBackendPathStillConfiguresBurst() {
         val options = NpuSupport.qnnProviderOptions(null)
         assertEquals("burst", options["htp_performance_mode"])
+        assertEquals("73", options["htp_arch"])
         assertTrue("backend_path" !in options)
     }
 
@@ -84,5 +86,41 @@ class NpuSupportTest {
         val path = NpuSupport.bundledBackendPath("/data/app/base.apk/lib/arm64")
         assertEquals("/data/app/base.apk/lib/arm64/libQnnHtp.so", path)
         assertFalse(path.startsWith("/vendor/"))
+    }
+
+    @Test
+    fun candidateAndQnnStayOffPendingBothEvidenceGates() {
+        assertFalse(NpuSupport.BEAT_QDQ_ENABLED)
+        assertFalse(NpuSupport.QNN_ENABLED)
+    }
+
+    @Test
+    fun htpRequiresBackendAndLinkerVisibleCdspRpc() {
+        assertFalse(NpuSupport.htpPreflightReady(false, false))
+        assertFalse(NpuSupport.htpPreflightReady(true, false))
+        assertFalse(NpuSupport.htpPreflightReady(false, true))
+        assertTrue(NpuSupport.htpPreflightReady(true, true))
+    }
+
+    @Test
+    fun onlyProbeDisablesCpuFallbackAndBypassesContextCache() {
+        val playback = NpuSupport.NpuConfig()
+        val probe = NpuSupport.probeConfig(playback)
+        val entries = NpuSupport.qnnSessionConfig(probe, "/cache/old-context.onnx")
+        assertEquals("1", entries["session.disable_cpu_ep_fallback"])
+        assertTrue("ep.context_enable" !in entries)
+        assertTrue("ep.context_file_path" !in entries)
+        assertFalse(playback.disableCpuFallback)
+        assertTrue(playback.contextCaching)
+    }
+
+    @Test
+    fun providerOptionsHonorExplicitConfig() {
+        val options = NpuSupport.qnnProviderOptions(null, NpuSupport.NpuConfig(
+            htpPerformanceMode = "balanced", graphFinalizationOptMode = "2", htpArch = "75",
+        ))
+        assertEquals("balanced", options["htp_performance_mode"])
+        assertEquals("2", options["htp_graph_finalization_optimization_mode"])
+        assertEquals("75", options["htp_arch"])
     }
 }

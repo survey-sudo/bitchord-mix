@@ -253,8 +253,8 @@ class VocalTracker(
             session = null
             return runCatching {
                 val file = File(modelPath())
-                // vc69 NPU: QNN when supported, CPU otherwise (automatic CPU fallback inside NpuSession).
-                NpuSession.open(file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir())
+                // vc84: umxhq's dynamic-quant/LSTM graph stays on CPU, even when beat QNN is enabled.
+                NpuSession.open(file.absolutePath, threads, npuConfig().copy(enabled = false), NpuSupport.Vendor.NONE, null, null)
                     .also {
                         session = it
                         sessionThreads = threads

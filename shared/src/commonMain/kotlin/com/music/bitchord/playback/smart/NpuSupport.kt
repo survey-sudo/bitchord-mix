@@ -2,13 +2,13 @@ package com.music.bitchord.playback.smart
 
 /**
  * NPU execution provider configuration (vc69 NPU): Snapdragon QNN for the
- * Beat This and umxhq models, with CPU fallback. Orchard ships a separate
+ * beat model, with CPU fallback (vocals stay on CPU). Orchard ships a separate
  * add-on (liborchard_qnn.so over its own ONNX Runtime, QNN execution provider
  * in burst performance mode with context caching, CPU fallback disabled)
  * for its Nirovi and Syvenu models. BitChord keeps one ONNX Runtime
- * (onnxruntime-android 1.31.0 with the bundled source-built QNN runtime
- * from npu-addon/) and resolves the QNN execution provider from inside it,
- * so there is no second runtime to keep in sync. This file is the
+ * (full Maven onnxruntime-android 1.31.0 while dormant; a future validated
+ * source-built QNN replacement from npu-addon/), not a second Orchard
+ * runtime. This file is the
  * pure and testable part: vendor detection and option maps. The
  * SessionOptions plumbing lives in the JVM trackers (BeatTracker and
  * VocalTracker) and the Android wiring in TrackAnalyzer.
@@ -41,6 +41,18 @@ object NpuSupport {
     const val QNN_ENABLED = false
 
     /**
+     * Independently select the fixed-shape nirovi QDQ beat model. Keep OFF
+     * until CUE's real-mel CPU agreement gate passes; QNN_ENABLED stays OFF
+     * until a no-CPU-fallback inference and HTP node-assignment logs pass too.
+     * This is separate so the candidate can be tested on CPU before rebuilding ORT.
+     */
+    const val BEAT_QDQ_ENABLED = false
+
+    /** Poco F6: Orchard's V73 Step A passed; this is not yet BitChord dispatch proof. */
+    const val HTP_ARCH = "73"
+    const val QAIRT_VERSION = "2.51.0.260929"
+
+    /**
      * How inference uses the NPU. Off keeps the CPU execution provider
      * exactly as before vc69; on attempts QNN on Snapdragon and falls back
      * to CPU automatically. The master QNN_ENABLED switch above wins over
@@ -48,16 +60,20 @@ object NpuSupport {
      */
     data class NpuConfig(
         val enabled: Boolean = true,
-        /** Orchard hard-fails without the NPU (1); BitChord stays playable anywhere (0). */
+        /** Only the direct self-test probe disables CPU fallback; playback always keeps it. */
         val disableCpuFallback: Boolean = false,
         /** Hexagon performance mode (Orchard uses burst). */
         val htpPerformanceMode: String = "burst",
         /** HTP graph finalization optimization mode (Orchard uses 3). */
         val graphFinalizationOptMode: String = "3",
+        /** Explicit HTP architecture; do not rely on QAIRT's SoC-to-arch auto-detection. */
+        val htpArch: String = HTP_ARCH,
         /** Cache the compiled context binary so repeat runs skip the compile. */
         val contextCaching: Boolean = true,
         /** Clip the NPU attempt log to one warning per process. */
         val warnOnce: Boolean = true,
+        /** Android Build.FINGERPRINT, to invalidate EPContext after firmware/driver updates. */
+        val deviceFingerprint: String = "",
     )
 
     /** Which vendor silicon the device runs, for execution provider choice. */
@@ -87,6 +103,14 @@ object NpuSupport {
     fun shouldAttemptQnn(config: NpuConfig, vendor: Vendor): Boolean =
         QNN_ENABLED && config.enabled && vendor == Vendor.QUALCOMM
 
+    /** File presence is not enough: libcdsprpc must be dlopen-able in the app's linker namespace. */
+    fun htpPreflightReady(backendPresent: Boolean, cdspRpcAvailable: Boolean): Boolean =
+        backendPresent && cdspRpcAvailable
+
+    /** Probe the original graph, not a cached EPContext, and never hide CPU partitions. */
+    fun probeConfig(config: NpuConfig = NpuConfig()): NpuConfig =
+        config.copy(disableCpuFallback = true, contextCaching = false)
+
     /**
      * QNN execution provider options map, mirroring Orchard qnn_runner.cpp:
      * the HTP backend library, burst performance, and the deepest graph
@@ -94,11 +118,12 @@ object NpuSupport {
      * (see bundledBackendPath); when null the provider resolves its own
      * backend.
      */
-    fun qnnProviderOptions(backendPath: String?): Map<String, String> {
+    fun qnnProviderOptions(backendPath: String?, config: NpuConfig = NpuConfig()): Map<String, String> {
         val options = mutableMapOf<String, String>()
         if (backendPath != null && backendPath.isNotBlank()) options["backend_path"] = backendPath
-        options["htp_performance_mode"] = "burst"
-        options["htp_graph_finalization_optimization_mode"] = "3"
+        options["htp_performance_mode"] = config.htpPerformanceMode
+        options["htp_graph_finalization_optimization_mode"] = config.graphFinalizationOptMode
+        options["htp_arch"] = config.htpArch
         return options
     }
 

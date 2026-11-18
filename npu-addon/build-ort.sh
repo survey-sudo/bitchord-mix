@@ -16,12 +16,16 @@
 #
 # Needs: ORT_SRC (onnxruntime v1.31.0 checkout), QNN_SDK (extracted QAIRT
 # 2.51.0.260929 subset with lib/, include/), ANDROID_HOME with NDK
-# 28.2.13676358, and a venv with cmake>=3.28,<4 ninja flatbuffers onnx.
+# 27.2.12479018 (same as app/build.gradle.kts and CUE), and a venv with
+# cmake>=3.28,<4 ninja flatbuffers onnx. Do NOT build until REAL_MEL_REPORT.md passes.
 set -euo pipefail
 ORT_SRC=${ORT_SRC:?path to onnxruntime v1.31.0 checkout}
 QNN_SDK=${QNN_SDK:?path to extracted qairt/2.51.0.260929}
 SDK=${ANDROID_HOME:-$HOME/.local/share/android/sdk}
-NDK=$SDK/ndk/28.2.13676358
+# The old recipe hard-coded 28.2, which CUE does not have. No silent SDK
+# install: default to the app's pin, with an explicit path/version override.
+NDK=${ANDROID_NDK_HOME:-$SDK/ndk/${ANDROID_NDK_VERSION:-27.2.12479018}}
+test -f "$NDK/source.properties" || { echo "missing NDK: $NDK" >&2; exit 64; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/bitchord-ort-qnn}
 JNI=$HERE/prebuilt/jniLibs/arm64-v8a

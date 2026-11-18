@@ -76,6 +76,10 @@
         android:theme="@style/Theme.BitChord"
         tools:targetApi="34">
 
+        <!-- Optional public FastRPC transport for the default-off QNN HTP path.
+             Missing or namespace-inaccessible transport keeps inference on CPU. -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
         <!--
           Lets a release build be sampled with simpleperf or Perfetto from adb,
           so jank is measured on the build users get rather than on a debug
