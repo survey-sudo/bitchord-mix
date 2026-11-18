@@ -95,7 +95,7 @@ struct TptHighpass {
     ic1eq[channel] = 2.f * v1 - ic1eq[channel];
     ic2eq[channel] = 2.f * v2 - ic2eq[channel];
     // High output: input minus low minus band*k.
-    return v3 - v2 - k * v1;
+    return v0 - v2 - k * v1;
   }
 };
 
@@ -275,6 +275,8 @@ class Renderer {
   void setReverb(int index, float roomSize, float damping, float wet);
   /** djmix24 Cytomic SVF Q. */
   void setSvfQ(int index, float q);
+  /** Optional cross-block true-peak limiter; disabled to preserve zero latency. */
+  void setDelayedTruePeakLimiter(bool enabled) { delayedTruePeakLimiter_ = enabled; }
 
   /** Call once both decks are filled in, before the first [render]. */
   void prepare();
@@ -311,6 +313,8 @@ class Renderer {
   // djmix24 1.5 ms true-peak lookahead ring (pre-allocated in prepare).
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
+  int limitQueued_ = 0;
+  bool delayedTruePeakLimiter_ = false;
 };
 
 }  // namespace bitchord::loopmix
