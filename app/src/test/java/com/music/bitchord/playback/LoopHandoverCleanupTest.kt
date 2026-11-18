@@ -107,7 +107,12 @@ class LoopHandoverCleanupTest {
         val session = LoopMixSession::class.java.getDeclaredConstructor(
             LoopMix.Plan::class.java, LoopMix.Clock::class.java, String::class.java, String::class.java,
             LoopMixRenderer::class.java, Int::class.javaPrimitiveType, Double::class.javaPrimitiveType,
-        ).apply { isAccessible = true }.newInstance(plan, clock, "out", "in", renderer, 48_000, anchor)
+            Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, String::class.java,
+            LoopMixSession.BuildContext::class.java,
+        ).apply { isAccessible = true }.newInstance(
+            plan, clock, "out", "in", renderer, 48_000, anchor,
+            false, true, null, null,
+        )
         val controller = CrossfadeController(
             scope, { if (adopted) inn.player else out.player }, { out.player }, { _, _ -> events.add("adopt") },
             onBlendHeadroom = { completionReason = get("lastCompleteReason") },

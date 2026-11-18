@@ -1661,6 +1661,13 @@ class CrossfadeController(
         tickerJob?.cancel()
         tickerJob = null
         loopBuildJob?.cancel()
+        primeJob?.cancel()
+        primeJob = null
+        buildGeneration++
+        buildContexts.clear()
+        primedSession?.close()
+        primedSession = null
+        primedKey = null
         loopAlignJob?.cancel()
         loopSession?.let {
             it.outPort?.disarm()
