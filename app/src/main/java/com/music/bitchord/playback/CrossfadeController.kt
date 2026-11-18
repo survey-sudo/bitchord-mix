@@ -1640,7 +1640,7 @@ class CrossfadeController(
         val player = readSafely { active() }
         AutomixTelemetry.event(
             "mix.tick.error",
-            eventFields(snapshot, mapOf(
+            eventFields(transitionSnapshot, mapOf(
                 "phase" to phase.name,
                 "currentId" to readSafely { player?.currentMediaItem?.mediaId },
                 "nextId" to readSafely {
@@ -1802,7 +1802,7 @@ class CrossfadeController(
         lastHandoffCompleteAtMs = 0L
         AutomixTelemetry.event(
             "mix.pause.detected",
-            eventFields(snapshot, mapOf(
+            eventFields(transitionSnapshot, mapOf(
                 "site" to "post-handoff",
                 "playWhenReady" to sessionPlayer.playWhenReady,
                 "playbackState" to sessionPlayer.playbackState,
@@ -3569,7 +3569,7 @@ class CrossfadeController(
         tailDurationMs = if (planned) PhraseConfig.EXIT_TAIL_MIN_MS.toLong() else PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong()
         AutomixTelemetry.event(
             "mix.exit.tail",
-            eventFields(snapshot, mapOf(
+            eventFields(transitionSnapshot, mapOf(
                 "tailMs" to tailDurationMs,
                 "mode" to if (planned) "planned" else "emergency",
                 "gain" to vol,
