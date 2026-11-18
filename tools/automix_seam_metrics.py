@@ -70,7 +70,7 @@ def main():
             score = sum(mono[i] * refm[i + candidate] for i in range(s, e))
             if score > best:
                 best, lag = score, candidate
-    print("metrics wav=%s rate=%d frames=%d integrated_lufs=%.3f true_peak_dbtp=%.3f "
+    print("metrics wav=%s rate=%d frames=%d rms_approx_lufs=%.3f true_peak_dbtp=%.3f "
           "boundary_step=%.9f rms_jump_db=%.3f cross_correlation_lag_samples=%d" %
           (args.wav, rate, len(mono), integrated, peak_db, step, jump, lag))
 

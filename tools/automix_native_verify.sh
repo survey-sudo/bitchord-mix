@@ -5,8 +5,22 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MUSIC=${MUSIC_DIR:-/home/hfzhkn/Music}
 BIN=${LOOPMIX_AB:-/tmp/loopmix_ab_automix_verify}
 OUT=${AUTOMIX_VERIFY_DIR:-/tmp/opencode/automix-real}
-mkdir -p "$OUT"
+OUT_TRACK=""
+IN_TRACK=""
+CASE_NAME="cli-pair"
 
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --renderer) BIN="$2"; shift 2 ;;
+    --out-track) OUT_TRACK="$2"; shift 2 ;;
+    --in-track) IN_TRACK="$2"; shift 2 ;;
+    --output-dir) OUT="$2"; shift 2 ;;
+    --name) CASE_NAME="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$OUT"
 command -v ffmpeg >/dev/null
 command -v python3 >/dev/null
 [[ -x "$BIN" ]] || {
@@ -26,31 +40,45 @@ zero_vocal() {
     -t 6 -c:a pcm_s16le "$output"
 }
 
+resolve_track() {
+  local p=$1
+  if [[ -f "$p" ]]; then echo "$p"; else echo "$MUSIC/$p"; fi
+}
+
 run_pair() {
-  local name=$1 out_track=$2 in_track=$3
+  local name=$1
+  local out_src in_src
+  out_src=$(resolve_track "$2")
+  in_src=$(resolve_track "$3")
+  test -f "$out_src" || { echo "Missing out track: $out_src" >&2; exit 2; }
+  test -f "$in_src" || { echo "Missing in track: $in_src" >&2; exit 2; }
   local a="$OUT/${name}-out.wav" b="$OUT/${name}-in.wav" z="$OUT/${name}-zero-voc.wav"
   local prefix="$OUT/${name}"
-  decode "$MUSIC/$out_track" "$a"
-  decode "$MUSIC/$in_track" "$b"
+  decode "$out_src" "$a"
+  decode "$in_src" "$b"
   zero_vocal "$z"
   echo "pair=$name stem-off=true renderer-quality=efficient(highQuality=false)"
   "$BIN" --out-bed "$a" --out-voc "$z" --in-bed "$b" --in-voc "$z" \
     --out-prefix "$prefix" --clashE 0.18
   for wav in "$prefix"_off.wav "$prefix"_fixed015.wav "$prefix"_duckgain.wav; do
     echo "ffmpeg ebur128/astats $wav"
-    ffmpeg -hide_banner -i "$wav" -af ebur128=peak=true,astats=metadata=1 -f null - 2>&1 |
-      grep -E 'Integrated loudness|Peak:|Overall|RMS level dB|Peak level dB' || true
-    python3 "$ROOT/tools/automix_seam_metrics.py" "$wav" --boundary-sec 3.0
+    ffmpeg -nostdin -hide_banner -i "$wav" -af 'ebur128=peak=true,astats=metadata=1:reset=0' -f null - 2>&1 |
+      grep -E 'Integrated loudness|Peak:|RMS level dB|Peak level dB' || true
+    python3 "$ROOT/tools/automix_seam_metrics.py" "$wav" --reference "$prefix"_off.wav --boundary-sec 3.0
   done
 }
 
-run_pair "calvin-onekiss" \
-  "Calvin Harris & Rihanna - This Is What You Came For.mp3" \
-  "Calvin Harris, Dua Lipa - One Kiss.mp3"
-run_pair "aa-control" \
-  "Calvin Harris, Dua Lipa - One Kiss.mp3" \
-  "Calvin Harris, Dua Lipa - One Kiss.mp3"
-run_pair "enhypen-meovv" \
-  "ENHYPEN - Bloody Paradise.flac" \
-  "MEOVV - BURNING UP.mp3"
+if [[ -n "$OUT_TRACK" && -n "$IN_TRACK" ]]; then
+  run_pair "$CASE_NAME" "$OUT_TRACK" "$IN_TRACK"
+else
+  run_pair "calvin-onekiss" \
+    "Calvin Harris & Rihanna - This Is What You Came For.mp3" \
+    "Calvin Harris, Dua Lipa - One Kiss.mp3"
+  run_pair "aa-control" \
+    "Calvin Harris, Dua Lipa - One Kiss.mp3" \
+    "Calvin Harris, Dua Lipa - One Kiss.mp3"
+  run_pair "enhypen-meovv" \
+    "ENHYPEN - Bloody Paradise.flac" \
+    "MEOVV - BURNING UP.mp3"
+fi
 echo "automix native real-audio verification complete: output=$OUT stem-off=true"

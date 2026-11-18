@@ -1401,6 +1401,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     startedMs = started,
                     now = { SystemClock.elapsedRealtime() },
                     fullTrackDurationSec = effectiveDuration,
+                    downbeats = features.downbeats.toDoubleArray().takeIf { it.isNotEmpty() },
+                    gridConfidence = features.beatConfidence.toFloat(),
+                    gridMeasured = false,
                 )
             }.onFailure { Log.i("BitChordPhrase", "structure skipped: ${it.message}") }.getOrNull()
             // djmix18: when the head path truncates (pcm < effectiveDuration), the map
@@ -2016,13 +2019,8 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
      * nothing but [NEUTRAL_VOCAL].
      */
     private fun mergeMasks(size: Int, masks: List<DoubleArray>): List<Double>? {
-        if (size <= 0 || masks.isEmpty()) return null
-        val merged = DoubleArray(size) { NEUTRAL_VOCAL }
-        for (source in masks) {
-            for (index in merged.indices) {
-                if (index < source.size && source[index] != NEUTRAL_VOCAL) merged[index] = source[index]
-            }
-        }
+        val merged = com.music.bitchord.playback.smart.SongMaps.mergeMeasuredMasks(size, masks, NEUTRAL_VOCAL) ?: return null
+        if (merged.none { it != NEUTRAL_VOCAL }) return null
         return merged.toList()
     }
 

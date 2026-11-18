@@ -5766,18 +5766,29 @@ class CrossfadeController(
         runCatching {
             val aligned = session.alignedErrorMs
             val phaseErr = if (wasIncomingStarted && aligned.isFinite()) aligned else Double.NaN
-            val vr = com.music.bitchord.playback.smart.MixVerify.verify(0.0, 0.0f, phaseErr, violations)
+            val measuredPhase = phaseErr.takeIf { it.isFinite() }
+            val vr = com.music.bitchord.playback.smart.MixVerify.verifyMeasured(
+                lufsDeltaDb = null,
+                peakLinear = null,
+                phaseErrorMs = measuredPhase,
+                exitGateViolations = violations,
+            )
+            val phaseAndGateOk = measuredPhase != null &&
+                kotlin.math.abs(measuredPhase) <= com.music.bitchord.playback.smart.MixVerify.MAX_PHASE_ERROR_MS &&
+                violations == 0
             AutomixTelemetry.event(
                 "mix.verify",
                 mapOf(
-                    "ok" to (vr.ok && phaseErr.isFinite()),
-                    "reasons" to if (phaseErr.isFinite()) vr.reasons.joinToString(",") else "phase-unmeasured",
-                    "phaseErrorMs" to phaseErr.takeIf { it.isFinite() },
+                    "ok" to vr.ok,
+                    "phaseAndGateOk" to phaseAndGateOk,
+                    "reasons" to vr.reasons.joinToString(","),
+                    "phaseErrorMs" to measuredPhase,
                     "exitGateViolations" to violations,
                     "scope" to "phase-and-exit-gate-only",
-                    "lufsStatus" to "unmeasured",
-                    "peakStatus" to "unmeasured",
-                    "phaseStatus" to if (phaseErr.isFinite()) "measured" else "unmeasured",
+                    "lufsStatus" to if (vr.lufsMeasured) "measured" else "unmeasured",
+                    "peakStatus" to if (vr.samplePeakMeasured) "measured" else "unmeasured",
+                    "truePeakStatus" to if (vr.truePeakMeasured) "measured" else "unmeasured",
+                    "phaseStatus" to if (vr.phaseMeasured) "measured" else "unmeasured",
                 ) + snapshotFields(transitionSnapshot),
             )
         }
