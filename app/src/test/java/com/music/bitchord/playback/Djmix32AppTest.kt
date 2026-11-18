@@ -125,6 +125,7 @@ class Djmix32AppTest {
 
     @Test
     fun `single-pass stem arithmetic is dry minus vocal`() {
+        // Existing far-prime contract above is intentionally retained.
         val dry = floatArrayOf(0.5f, -0.25f, 1.0f, 0.0f, -0.75f)
         val vocal = floatArrayOf(0.2f, -0.1f, 0.9f, 0.0f, -0.3f)
         val inst = dryMinusVocal(dry, vocal)
@@ -149,5 +150,15 @@ class Djmix32AppTest {
     @Test
     fun `structure timeout has realistic headroom`() {
         assertEquals(20_000L, PhraseConfig.STRUCT_TIMEOUT_MS)
+    }
+
+    @Test fun `busy prime uses the strict 8500ms effective budget`() {
+        val now = 1_000_000L
+        assertTrue(shouldSkipStemAtLaunch(8_400L, now + 8_400L, now, true, false))
+        assertFalse(shouldSkipStemAtLaunch(8_500L, now + 8_500L, now, true, false))
+        assertFalse(shouldSkipStemAtLaunch(30_000L, DeckBudget.NO_DEADLINE_MS, now, true, false))
+        assertTrue(shouldSkipStemAtLaunch(Long.MAX_VALUE, now + 8_000L, now, true, false))
+        assertFalse(shouldSkipStemAtLaunch(Long.MAX_VALUE, now + 8_500L, now, true, false))
+        assertTrue(shouldSkipStemAtLaunch(Long.MAX_VALUE, now + 2_000L, now, false, false))
     }
 }

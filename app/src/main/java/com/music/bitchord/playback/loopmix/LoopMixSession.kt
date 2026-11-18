@@ -238,10 +238,12 @@ class LoopMixSession private constructor(
             inAnalysis: TrackAnalysis? = null,
             sungOut: List<LoopMix.Span>? = null,
             sungIn: List<LoopMix.Span>? = null,
+            control: LoopBuildControl = LoopBuildControl({ System.nanoTime() / 1_000_000L }),
+            onDecodeStep: (LoopMix.Side, String) -> Unit = { _, _ -> },
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
-            if (!LoopMixRenderer.available || sampleRate <= 0) return null
+            if (!LoopMixRenderer.available || sampleRate <= 0 || control.shouldStop()) return null
             // djmix18: the script hold is the truth for the handover: pass it into the
             // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
             // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
@@ -276,19 +278,12 @@ class LoopMixSession private constructor(
             // Only repeated OUT audio needs a complete loop body and seam.
             val requiredOutEnd = if (effectivePlan.outLoops) effectivePlan.out.loopEnd + 0.008 else null
             val actualOutTo = outTo
-            val (outDecoded, inDecoded) = try {
-                val outFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) },
-                    DECODE_EXECUTOR,
-                )
-                val inFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    { decode(LoopMix.Side.IN, bounds.inFrom, actualInTo) },
-                    DECODE_EXECUTOR,
-                )
-                outFuture.get() to inFuture.get()
-            } catch (e: Exception) {
-                decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) to decode(LoopMix.Side.IN, bounds.inFrom, actualInTo)
-            }
+            val (outDecoded, inDecoded) = decodeLoopRegions(
+                DECODE_EXECUTOR, control, onDecodeStep,
+                { decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) },
+                { decode(LoopMix.Side.IN, bounds.inFrom, actualInTo) },
+            ) ?: return null
+            if (control.shouldStop()) return null
             var outRegion = outDecoded ?: return null
             var inRegion = inDecoded ?: return null
             if (outRegion.start > plan.out.loopStart || inRegion.start > plan.inn.loopStart) {
@@ -306,11 +301,13 @@ class LoopMixSession private constructor(
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
             // instrumental when windowed stems are enabled. Worker thread only; null
             // falls back to the dry region so the build never fails on separation.
+            if (control.shouldStop()) return null
             if (effectivePlan.acapella && separateStem != null) {
                 if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                     val split = runCatching {
                         separateStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate, true)
                     }.getOrNull()
+                    if (control.shouldStop()) return null
                     if (split != null && split.first.size == outRegion.left.size && split.second.size == outRegion.right.size) {
                         val bl = FloatArray(outRegion.left.size) { 0.88f * split.first[it] + 0.12f * outRegion.left[it] }
                         val br = FloatArray(outRegion.right.size) { 0.88f * split.second[it] + 0.12f * outRegion.right[it] }
@@ -318,10 +315,12 @@ class LoopMixSession private constructor(
                     }
                 }
                 val stemsOn = runCatching { com.music.bitchord.data.settings.AppSettings.automixWindowedStemsEnabled.value }.getOrDefault(false)
+                if (control.shouldStop()) return null
                 if (stemsOn && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
                     val splitIn = runCatching {
                         separateStem(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate, false)
                     }.getOrNull()
+                    if (control.shouldStop()) return null
                     if (splitIn != null && splitIn.first.size == inRegion.left.size && splitIn.second.size == inRegion.right.size) {
                         inRegion = LoopRegion(splitIn.first, splitIn.second, inRegion.start)
                     }
@@ -335,6 +334,7 @@ class LoopMixSession private constructor(
             // ran when the count-based test fired, which is exactly the noisy
             // case. Feasibility is the 21.5 s window and a separator that
             // actually answers; both are checked where they arise below.
+            if (control.shouldStop()) return null
             if (!effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
                 val inWinFrom = plan.inn.loopStart
                 val inWinTo = maxOf(inWinFrom + 1.0, clock.elementTrackTime)
@@ -393,6 +393,7 @@ class LoopMixSession private constructor(
                             val pair = if (separateVocalPair != null) {
                                 runCatching { separateVocalPair(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate) }.getOrNull()
                             } else null
+                            if (control.shouldStop()) return null
                             if (pair != null &&
                                 pair.first.first.size == outRegion.left.size && pair.first.second.size == outRegion.right.size &&
                                 pair.second.first.size == outRegion.left.size && pair.second.second.size == outRegion.right.size
@@ -406,6 +407,7 @@ class LoopMixSession private constructor(
                             }
                         }
                         if (voc != null && instL != null && instR != null) {
+                            if (control.shouldStop()) return null
                             var fadeStartSec = maxOf(0.0, clock.handoffAt - 2 * beatSec73)
                             var fadeEndSec = minOf(clock.releaseAt, clock.handoffAt)
                             if (fadeEndSec <= fadeStartSec) {
@@ -449,6 +451,7 @@ class LoopMixSession private constructor(
                             val pair = if (separateVocalPair != null) {
                                 runCatching { separateVocalPair(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
                             } else null
+                            if (control.shouldStop()) return null
                             if (pair != null &&
                                 pair.first.first.size == inRegion.left.size && pair.first.second.size == inRegion.right.size &&
                                 pair.second.first.size == inRegion.left.size && pair.second.second.size == inRegion.right.size
@@ -462,6 +465,7 @@ class LoopMixSession private constructor(
                             }
                         }
                         if (vocIn != null && instInL != null && instInR != null) {
+                            if (control.shouldStop()) return null
                             val duckStartTrack = clock.inTrackTimeAt((clock.handoffAt - beatSec73).coerceAtLeast(0.0))
                             val duckEndTrack = clock.inTrackTimeAt(clock.handoffAt + 1.5 * beatSec73)
                             val duckStartSample = ((duckStartTrack - inRegion.start) * sampleRate.toDouble()).roundToLong().coerceIn(0, inRegion.left.size.toLong())
@@ -488,8 +492,11 @@ class LoopMixSession private constructor(
                     }
                 }
             }
+            if (control.shouldStop()) return null
             val renderer = LoopMixRenderer(sampleRate)
-            if (!renderer.isValid) return null
+            if (!renderer.isValid) { renderer.close(); return null }
+            var retained = false
+            try {
             val sr = sampleRate.toDouble()
             fun samplesOf(region: LoopRegion, trackSeconds: Double) = (trackSeconds - region.start) * sr
 
@@ -872,8 +879,15 @@ class LoopMixSession private constructor(
             }
             renderer.setHighQuality(highQuality)
             renderer.prepare()
+            if (control.shouldStop()) return null // The finally block owns unretained renderers.
             renderer.setFadeOut(LoopMixRenderer.IN, handoverTrackSec)
-            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec).also { it.planIncomingStart() }
+            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec).also {
+                it.planIncomingStart()
+                retained = true
+            }
+            } finally {
+                if (!retained) renderer.close()
+            }
         }
 
         /**

@@ -2078,25 +2078,25 @@ class PlaybackService : MediaLibraryService() {
                     else -> null
                 }
             },
-            loopRegion = { item, durationMs, from, to, rate ->
+            loopRegion = { item, durationMs, from, to, rate, onStep, isCancelled ->
                 item.localConfiguration?.uri?.let { uri ->
-                    trackAnalyzer.loopRegion(item.mediaId, uri, durationMs / 1000.0, from, to, rate) { step ->
-                        crossfade?.markDeckStep(step)
-                    }
+                    trackAnalyzer.loopRegion(item.mediaId, uri, durationMs / 1000.0, from, to, rate,
+                        onStep = onStep, isCancelled = isCancelled)
                 }
             },
             loopRegionCached = { trackId, rate, from, to ->
                 trackAnalyzer.loopRegionCached(trackId, rate, from, to)
             },
-            separateTransitionWindow = { left, right, rate, keep ->
-                trackAnalyzer.separateTransitionWindow(left, right, rate, keep)
+            separateTransitionWindow = { left, right, rate, keep, deadline, isCancelled, onStep ->
+                trackAnalyzer.separateTransitionWindow(left, right, rate, keep, deadline, isCancelled, onStep)
             },
             wholeTrackBusy = { trackAnalyzer.wholeTrackBusy() },
-            separateTransitionBothWindows = { left, right, rate ->
-                trackAnalyzer.separateTransitionBothWindows(left, right, rate)
+            analysisYieldRemainingMs = { trackAnalyzer.playbackYieldRemainingMs() },
+            separateTransitionBothWindows = { left, right, rate, deadline, isCancelled, onStep ->
+                trackAnalyzer.separateTransitionBothWindows(left, right, rate, deadline, isCancelled, onStep)
             },
-            separateTransitionPair = { left, right, rate ->
-                trackAnalyzer.separateTransitionBothWindows(left, right, rate)
+            separateTransitionPair = { left, right, rate, deadline, isCancelled, onStep ->
+                trackAnalyzer.separateTransitionBothWindows(left, right, rate, deadline, isCancelled, onStep)
             },
             syncedLines = ::loopMixLyrics,
             loudnessGain = ::loudnessGainFor,

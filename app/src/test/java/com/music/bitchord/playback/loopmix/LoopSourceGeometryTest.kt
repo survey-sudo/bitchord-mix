@@ -64,6 +64,12 @@ class LoopSourceGeometryTest {
         assertEquals(k.inPositionsSec.last(), g.handoverTrack, 1e-9)
         assertTrue(g.handoverTrack > c.elementTrackTime)
         assertTrue(g.requiredEnd >= g.handoverTrack + .025)
+        val nominal = LoopMix.regionBounds(p)
+        val physical = loopPhysicalBounds(p, 48_000, null, null, analysis)
+        assertEquals(nominal.outFrom, physical.outFrom, 0.0)
+        assertEquals(nominal.outTo, physical.outTo, 0.0)
+        assertTrue("a nominal cache hit cannot claim tracked IN coverage", physical.inTo > nominal.inTo)
+        assertEquals(maxOf(nominal.inTo, g.handoverTrack + nominal.inTo - c.elementTrackTime, g.requiredEnd), physical.inTo, 1e-9)
         val lastRate = (k.inPositionsSec.last() - k.inPositionsSec[k.inPositionsSec.lastIndex - 1]) /
             ((k.inFrames.last() - k.inFrames[k.inFrames.lastIndex - 1]) / 48_000)
         assertEquals(1.0, lastRate, 1e-8)

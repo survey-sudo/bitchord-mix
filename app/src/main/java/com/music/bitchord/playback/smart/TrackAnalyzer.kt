@@ -47,6 +47,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
@@ -440,7 +442,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     /** The cache itself (tests + budget gate). */
     fun loopRegionCache(): LoopRegionCache = loopCache
 
-    private val modelLock = Any()
+    private val modelLock = ReentrantLock()
 
     /**
      * What is known about [trackId] right now: never a computation, never a
@@ -493,6 +495,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * (and correct) choice. Allocation-light and non-blocking.
      */
     fun wholeTrackBusy(): Boolean = running.isNotEmpty()
+
+    /** Nonblocking snapshot; foreground loop work never sleeps behind this analysis-only yield. */
+    fun playbackYieldRemainingMs(): Long = (yieldUntilElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
 
     /**
      * Queues [trackId] (playing at [uri]) for analysis if it is not already
@@ -1686,12 +1691,23 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // process was dying. Same reasoning [derived] already had, one level further out.
         val inputs = regionInputs(stereo, seconds, deriveFeatures)
 
-        playbackFirst()
-        val (rawGrid, vocalValues) = synchronized(modelLock) {
-            val grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) }
-            val vocals = if (features != null) vocalValues(stereo) else null
-            grid to vocals
+        var rawGrid: BeatTracker.Grid? = null
+        var modelVocals: FloatArray? = null
+        while (true) {
+            // The yield may begin while we wait for the model. Release and wait
+            // outside the lock, then recheck; no sleep ever owns modelLock.
+            if (yieldOrStopped() || Thread.currentThread().isInterrupted) return null
+            val ran = modelLock.withLock {
+                if (stopped || Thread.currentThread().isInterrupted) return null
+                if (playbackYieldRemainingMs() > 0L) false else {
+                    rawGrid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) }
+                    modelVocals = if (features != null) vocalValues(stereo) else null
+                    true
+                }
+            }
+            if (ran) break
         }
+        val vocalValues = modelVocals
         return Region(
             grid = rawGrid?.let { snapGrid(it, stereo, actualStart) },
             vocalMask = if (features != null && vocalValues != null) vocalMask(vocalValues, features, actualStart) else null,
@@ -1881,26 +1897,39 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * below the policy's own VOCAL_ACTIVE_THRESHOLD, so unmeasured material can never trip vocal
      * logic in either direction.
      */
-        fun separateTransitionWindow(
+    fun separateTransitionWindow(
         left: FloatArray,
         right: FloatArray,
         sampleRate: Int,
         keepVocals: Boolean,
+        deadlineMs: Long = DeckBudget.NO_DEADLINE_MS,
+        isCancelled: () -> Boolean = { false },
+        onStep: ((String) -> Unit)? = null,
     ): Pair<FloatArray, FloatArray>? {
-        if (yieldOrStopped()) return null
-        return synchronized(modelLock) {
-            if (yieldOrStopped()) null else vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
+        return tryTransitionModel(modelLock, { transitionStemDecline(deadlineMs, isCancelled) }, onStep) {
+            vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
         }
     }
 
-        fun separateTransitionBothWindows(
+    fun separateTransitionBothWindows(
         left: FloatArray,
         right: FloatArray,
         sampleRate: Int,
+        deadlineMs: Long = DeckBudget.NO_DEADLINE_MS,
+        isCancelled: () -> Boolean = { false },
+        onStep: ((String) -> Unit)? = null,
     ): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
-        return synchronized(modelLock) {
-            if (yieldOrStopped()) null else vocals.separateBothWindows(left, right, sampleRate.toDouble())
+        return tryTransitionModel(modelLock, { transitionStemDecline(deadlineMs, isCancelled) }, onStep) {
+            vocals.separateBothWindows(left, right, sampleRate.toDouble())
         }
+    }
+
+    private fun transitionStemDecline(deadlineMs: Long, isCancelled: () -> Boolean): String? = when {
+        stopped || isCancelled() -> "cancelled"
+        playbackYieldRemainingMs() > 0L -> "playback-yield"
+        deadlineMs != DeckBudget.NO_DEADLINE_MS && deadlineMs > 0L &&
+            deadlineMs - SystemClock.elapsedRealtime() <= 2_000L -> "deadline"
+        else -> null
     }
  
 private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
@@ -1973,7 +2002,10 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         sampleRate: Int,
         /** Called on this thread at the start of each slice, so a late one can be named. */
         onStep: ((String) -> Unit)? = null,
+        isCancelled: () -> Boolean = { false },
     ): com.music.bitchord.playback.loopmix.LoopRegion? {
+        fun loopStopped(): Boolean = stopped || isCancelled() || Thread.currentThread().isInterrupted
+        if (loopStopped()) return null
         // djmix25: source-backed URIs (Radio, podcasts, uploads, YouTube Music
         // radio) used to return null here, disabling loop mixes for a huge
         // share of lazy crossfades. They now flow through the same path:
@@ -1981,6 +2013,7 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         // URI, else a streaming (partial-rendition) decode below.
         // djmix14: RAM cache first — a covering entry is sub-sliced, no network.
         loopCache.get(trackId, sampleRate, max(0.0, fromSeconds), toSeconds)?.let { slice ->
+            onStep?.invoke("pcm-cache")
             Log.d(TAG, "Loop region $trackId cache hit ${slice.startSec}s..${slice.endSec}s at ${sampleRate}Hz")
             return com.music.bitchord.playback.loopmix.LoopRegion(slice.left, slice.right, slice.startSec)
         }
@@ -1994,11 +2027,14 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         val copy = runCatching { copyToRead(trackId, uri, durationSeconds) }.getOrNull()
             ?: runCatching { streamingCopyForLoop(trackId, uri, durationSeconds) }.getOrNull()
             ?: return null
+        if (loopStopped()) return null
         onStep?.invoke("decode")
         val (stereo, start) = copy.open()?.use { source ->
-            AudioDecoder.decodeRegionStereo(source, max(0.0, fromSeconds), toSeconds) { yieldOrStopped() }
+            // Foreground decks honor stop/cancel/interruption, not the 10s
+            // playback-first sleep reserved for background whole/head analysis.
+            AudioDecoder.decodeRegionStereo(source, max(0.0, fromSeconds), toSeconds) { loopStopped() }
         } ?: return null
-        if (stereo.left.isEmpty()) return null
+        if (stereo.left.isEmpty() || loopStopped()) return null
         val rate = sampleRate.toDouble()
         val left: FloatArray
         val right: FloatArray
@@ -2017,6 +2053,7 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
                 "at ${stereo.sampleRate.toInt()}->$sampleRate Hz in ${SystemClock.elapsedRealtime() - began}ms",
         )
         loopCache.put(trackId, sampleRate, start, start + left.size / rate, left, right)
+        if (loopStopped()) return null
         return com.music.bitchord.playback.loopmix.LoopRegion(left, right, start)
     }
 
