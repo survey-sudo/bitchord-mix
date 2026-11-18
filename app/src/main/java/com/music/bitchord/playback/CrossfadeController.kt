@@ -5351,6 +5351,7 @@ class CrossfadeController(
                     "inStartAtMs" to ((loopSession?.inStartAt?.times(1000))?.roundToLong() ?: -1L),
                     "handoffAtMs" to ((loopSession?.clock?.handoffAt?.times(1000))?.roundToLong() ?: -1L),
                 ),
+                ),
             )
             return loopBail("paused before the loop")
         }
