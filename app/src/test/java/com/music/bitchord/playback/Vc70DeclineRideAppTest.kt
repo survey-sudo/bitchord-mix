@@ -15,9 +15,10 @@ import org.junit.Test
  * Rendered behaviour only: fake filters record the corners the ride asks
  * for, fake faders hold the gains; no plan-shape asserts.
  *
- * The offline gain candidate requires complementary faders with positive
- * overlap through the handoff. Existing filter curves and the low-end
- * handoff stay in place; these assertions make no listening-quality claim.
+ * The old decline rendered through rideFilterSweep: at the midpoint the
+ * outgoing low-pass sat at 4500 Hz with the incoming high-pass at ~456 Hz
+ * and both faders above 0.5 — two full arrangements over two raw tempi.
+ * The carve must never put both decks in one band at high gain at once.
  * handedOff=false swaps the sinks (tracks.outgoing -> filters.incoming),
  * following the Vc70ExitLegAppTest harness.
  */
@@ -111,37 +112,24 @@ class Vc70DeclineRideAppTest {
     }
 
     @Test
-    fun declineRideHasComplementaryGainOverlapAndOneBassHandoff() {
+    fun declineRideNeverHasBothGainsHighAndBandsOverlapping() {
         val fake = FakeFilters()
         val c = newController(fake)
         field(c, "render").set(c, renderFor(c, declinePlan(), true))
         field(c, "handedOff").set(c, false)
-        var overlapSamples = 0
-        var bassHandoffs = 0
-        var outgoingBassCut = false
+        var clashAt: Float? = null
         for (i in 0..100) {
             val p = i / 100f
             invokeRide(c, "rideStyle", p)
-            val outHp = fake.lastIncoming?.second ?: -1f
+            val outLp = fake.lastIncoming?.first ?: -1f
             val inHp = fake.lastOutgoing?.second ?: -1f
             val outGain = invokeGain(c, "mixFall", p)
             val inGain = invokeGain(c, "mixRise", p)
-            assertEquals("equal-power faders at p=$p", 1f, outGain * outGain + inGain * inGain, 2e-6f)
-            if (outGain >= 0.5f && inGain >= 0.5f) overlapSamples++
-            // At least one deck retains the existing 200 Hz bass high-pass.
-            assertTrue("low-end handoff at p=$p", outHp >= 199.99f || inHp >= 199.99f)
-            val bassCut = outHp >= 199.99f
-            if (bassCut != outgoingBassCut) {
-                bassHandoffs++
-                outgoingBassCut = bassCut
-            }
-            if (i == 50) {
-                assertEquals("midpoint outgoing gain", 0.7071068f, outGain, 1e-6f)
-                assertEquals("midpoint incoming gain", 0.7071068f, inGain, 1e-6f)
+            if (outGain > 0.5f && inGain > 0.5f && outLp > inHp && clashAt == null) {
+                clashAt = p
             }
         }
-        assertTrue("both gains >= 0.5 over at least 30% of the sampled ride", overlapSamples >= 30)
-        assertEquals("outgoing bass is cut once", 1, bassHandoffs)
+        assertTrue("both decks audible in one band at p=$clashAt", clashAt == null)
     }
 
     @Test

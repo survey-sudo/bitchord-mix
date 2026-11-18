@@ -293,7 +293,8 @@ object PhrasePlanner {
     ): PhraseChoice? {
         if (outBpm <= 0 || inBpm <= 0) return null
         if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
-        val exit = exits.lastOrNull() ?: return null
+        val exit = exits.filter { it.roomBars >= 1 }.maxByOrNull { it.releaseSec }
+            ?: exits.lastOrNull() ?: return null
         val entry = entries.firstOrNull() ?: return null
         // Respect the musical tension veto: tension only resolves to a
         // release. A rescue must not route tension into ambient.
@@ -485,11 +486,12 @@ object PhrasePlanner {
             val overlap = overlapOf(template, exit, entry, outBpm, steps)
             val clash = vocalClashBeats(out, inn, exit, entry, overlap)
             val clashEnergy = vocalClashEnergy(out, inn, exit, entry, overlap)
-            val blocked = if (clashEnergy != null) {
-                clashEnergy > CLASH_VETO_ENERGY
-            } else {
-                clash > 1.0
-            }
+            // Peak-aware: mean alone dilutes a single loud bar (0.81/8=0.101).
+            // Restore the beat-count floor unless the measured energy is
+            // clearly soft (<0.05); unmeasured pairs stay on the count.
+            val blocked = (clashEnergy != null && clashEnergy > CLASH_VETO_ENERGY) ||
+                (clashEnergy == null && clash > 1.0) ||
+                (clashEnergy != null && clashEnergy > 0.05 && clash > 1.0)
             if (blocked) return "vocal clash"
         }
         val vocal = inn.firstVocalBar
@@ -575,6 +577,9 @@ object PhrasePlanner {
      * [veto], where the question genuinely is "did the mask cross a line".
      */
     private fun vocalClashEnergy(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double? {
+        // Zero dry overlap (echo/cut templates) has no simultaneous collision
+        // to measure; lead-in bars are not dried over the outgoing tail.
+        if (overlapBars == 0) return if (out.vocalEnergy.isNotEmpty() && inn.vocalEnergy.isNotEmpty()) 0.0 else null
         val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
         if (bars <= 0) return null
         if (out.vocalEnergy.isEmpty() || inn.vocalEnergy.isEmpty()) return null
@@ -597,6 +602,7 @@ object PhrasePlanner {
     }
 
     private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int = 0): Double {
+        if (overlapBars == 0) return 0.0
         val bars = minOf(exit.roomBars, maxOf(entry.leadInBars, overlapBars), PhraseConfig.O_MAX_BARS)
         var beats = 0
         for (i in 0 until bars) {
@@ -622,7 +628,7 @@ object PhrasePlanner {
         outBpm: Double,
         inBpm: Double,
     ): PhraseChoice {
-        val overlap = overlapOf(template, exit, entry, outBpm)
+        val overlap = overlapOf(template, exit, entry, outBpm, steps)
         val struct = structScore(template, exit, entry, out)
         val clashBeats = vocalClashBeats(out, inn, exit, entry, overlap)
         // Energy-weighted collision where it was measured, and the old beat
@@ -735,11 +741,7 @@ object PhrasePlanner {
             MixTemplate.M1, MixTemplate.M3 -> 1.0
             else -> 0.0
         }
-        val loopK = if (template == MixTemplate.M2) {
-            val need = entry.leadInBars.coerceAtLeast(16)
-            val loopLen = 4
-            ((need - exit.roomBars).coerceAtLeast(0) + loopLen - 1) / loopLen
-        } else 0
+        val loopK = 0
         val prep = tempoPrepBars(outBpm, inBpm, entry.leadInVocal > 0.2f || exit.vocalRoomBars > 0)
         var product = 0f
         val bars = minOf(exit.roomBars, entry.leadInBars, overlap)

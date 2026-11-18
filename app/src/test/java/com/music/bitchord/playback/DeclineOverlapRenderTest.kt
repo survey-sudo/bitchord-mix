@@ -17,6 +17,8 @@ import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionEvidenceCache
 import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
+import com.music.bitchord.playback.TransitionFilterProcessor.Companion.OFF_HZ
+import com.music.bitchord.playback.TransitionFilterProcessor.Companion.OPEN_HZ
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.file.Files
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.nio.ByteBuffer
@@ -77,6 +80,418 @@ class DeclineOverlapRenderTest {
 
     @Test fun unequalPhysicalSinkLeadsStayWithTheirDeckAcrossOneHandoff() =
         runProbe(Probe.MULTITONE, routingOnly = true)
+
+    @Test fun delayedIncomingReadinessKeepsSoloOutgoingOpenAndStartsFadeWithoutReopen() {
+        for ((late, leads) in listOf(
+            true to (0L to 0L),
+            true to (2_500L to 2_500L),
+            false to (2_500L to 2_500L),
+        )) withRig(compatible = false, leads = leads) { r ->
+            r.second.delayPrepareCompletion = late
+            val plan = r.startAndPlan()
+            assertEquals(FilterTransitionVariant.DECLINE, plan.filterVariant)
+            assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
+            assertEquals(4_000L, plan.fadeMs)
+            val delayMs = if (late) 2_000L else 0L
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            val preRollMs = 3_000L
+            r.first.position = start - preRollMs
+            r.tick()
+            assertEquals("ARMING", r.phase)
+            assertEquals(listOf("B"), r.armedItems)
+            assertEquals(1, r.second.prepares)
+
+            val outBlock = AudioBlock(CHANNELS, BLOCK_FRAMES)
+            val inBlock = AudioBlock(CHANNELS, BLOCK_FRAMES)
+            var sawStart = false
+            var sawReadyPreFilter = false
+            var fadingBlocks = 0
+            var prevFadingLow = Float.MAX_VALUE
+
+            for (t in -preRollMs until 7_000L step BLOCK_MS) {
+                if (late && t == delayMs) {
+                    r.second.completePrepare()
+                }
+                r.tick()
+                if (late && t < delayMs) {
+                    assertEquals("ARMING at t=$t (leads=$leads)", "ARMING", r.phase)
+                    assertEquals(Player.STATE_BUFFERING, r.second.player.playbackState)
+                    assertFalse(r.second.playWhenReady)
+                    assertEquals(0f, r.second.player.volume, 0f)
+                    assertEquals(1f, r.first.player.volume, 0f)
+                    assertTrue(r.handoffs.isEmpty())
+                    assertEquals("solo A must stay LP-open while B buffers at t=$t", OPEN_HZ, r.first.lowCommand, 0f)
+                    assertEquals("solo A must stay HP-off while B buffers at t=$t", OFF_HZ, r.first.highCommand, 0f)
+                    assertEquals(OPEN_HZ, r.first.filterValue("currentLowPassHz"), 0f)
+                    assertEquals(OFF_HZ, r.first.filterValue("currentHighPassHz"), 0f)
+                    assertEquals(0f, r.first.midDbCommand, 0f)
+                }
+                if (!late && t == -1_000L) {
+                    assertEquals("ARMING", r.phase)
+                    assertTrue("READY incoming with 2.5s lead must preserve pre-filter at t=-1000", r.first.lowCommand < OPEN_HZ)
+                    sawReadyPreFilter = true
+                }
+                if (r.phase == "FADING") {
+                    if (!sawStart) {
+                        assertEquals(delayMs, t)
+                        assertEquals(start + delayMs, r.get("fadeOutOriginMs"))
+                        assertEquals(4_000L, r.get("fadeOutBudgetMs"))
+                        assertEquals(Player.STATE_READY, r.second.player.playbackState)
+                        assertTrue(r.second.playWhenReady)
+                        if (!late && leads.first > 0L) {
+                            // Continuity from on-time READY pre-filter into startFade.
+                            assertTrue(r.first.lowCommand <= prevFadingLow + 1f)
+                        }
+                        if (late && leads.first == 0L) {
+                            assertTrue("zero-lead late start must not retain 800Hz solo muffle (${r.first.lowCommand})", r.first.lowCommand >= 6_999f)
+                        }
+                        sawStart = true
+                    } else {
+                        assertTrue(
+                            "outgoing LP must not reopen upward during FADING (t=$t prev=$prevFadingLow cur=${r.first.lowCommand}, leads=$leads)",
+                            r.first.lowCommand <= prevFadingLow + 1f,
+                        )
+                    }
+                    prevFadingLow = r.first.lowCommand
+                    fadingBlocks++
+                } else if (!late && r.phase == "ARMING") {
+                    assertTrue("on-time READY pre-filter must stay non-increasing ($prevFadingLow -> ${r.first.lowCommand})", r.first.lowCommand <= prevFadingLow + 1f)
+                    prevFadingLow = r.first.lowCommand
+                }
+                for ((side, deck) in listOf(r.first, r.second).withIndex()) {
+                    val block = if (side == 0) outBlock else inBlock
+                    block.reset(BLOCK_FRAMES)
+                    val sounding = deck.playWhenReady && deck.ready && deck.items.isNotEmpty()
+                    for (frame in 0 until BLOCK_FRAMES) for (channel in 0 until CHANNELS) {
+                        val seconds = deck.position / 1_000.0 + frame.toDouble() / RATE
+                        block.samples[frame * CHANNELS + channel] = if (sounding) {
+                            (0.12 * sin(2 * PI * (if (side == 0) 173 else 227) * seconds + channel * 0.19) +
+                                0.12 * sin(2 * PI * (if (side == 0) 5_000 else 6_197) * seconds + side + channel * 0.19)).toFloat()
+                        } else 0f
+                    }
+                    deck.filter.process(block)
+                }
+                assertTrue(r.handoffs.size <= 1)
+                r.advanceBlock()
+            }
+
+            assertTrue(sawStart)
+            if (!late) assertTrue(sawReadyPreFilter)
+            assertTrue(fadingBlocks >= 190)
+            assertEquals("IDLE", r.phase)
+            assertEquals(1, r.settled)
+            assertEquals(listOf("A->B"), r.handoffs)
+            assertSame(r.second, r.activeDeck)
+            assertSame(r.first, r.spareDeck)
+            assertEquals(1, r.first.stops)
+            assertEquals(1, r.first.clears)
+            assertEquals(0, r.second.stops)
+            assertEquals(0, r.second.clears)
+            assertEquals(0, r.second.seeks)
+            assertTrue(r.first.items.isEmpty())
+            assertEquals(listOf("A", "B", "C"), r.second.items.map { it.mediaId })
+            assertEquals((plan.incomingCueTime * 1_000).roundToLong() + 7_000L - delayMs, r.second.position)
+            assertEquals(false, r.get("handedOff"))
+            assertEquals(0, r.get("queuedItemCount"))
+
+            r.second.exactClock = false
+            r.second.position = maxOf(r.second.position, 36_000L)
+            r.tick()
+            assertEquals("IDLE", r.phase)
+            assertNotNull(r.controller.plannedTransitionFor("B"))
+            val evidence = TransitionEvidenceCache.recent(1).single()
+            assertEquals("B", evidence.outId)
+            assertEquals("C", evidence.inId)
+            r.assertTicker()
+        }
+    }
+
+    @Test fun readyThenRebufferRestoresSoloOutgoingOpenBeforeFade() {
+        withRig(compatible = false, leads = 2_500L to 2_500L) { r ->
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            val preRollMs = 3_000L
+            r.first.position = start - preRollMs
+            r.tick()
+            assertEquals("ARMING", r.phase)
+
+            val outBlock = AudioBlock(CHANNELS, BLOCK_FRAMES)
+            var sawPreFilter = false
+            var sawRecoveryAfterRebuffer = false
+            var sawStart = false
+            for (t in -preRollMs until 7_000L step BLOCK_MS) {
+                if (t == -500L) r.second.rebuffer()
+                if (t == 2_000L) r.second.completePrepare()
+                r.tick()
+                outBlock.reset(BLOCK_FRAMES)
+                r.first.filter.process(outBlock)
+                if (t == -1_000L) {
+                    assertEquals("ARMING", r.phase)
+                    assertTrue("READY incoming with 2.5s lead should pre-filter A", r.first.lowCommand < OPEN_HZ)
+                    sawPreFilter = true
+                }
+                if (t in -500L until 2_000L) {
+                    assertEquals("ARMING", r.phase)
+                    assertEquals("rebuffer must restore solo A LP open at t=$t", OPEN_HZ, r.first.lowCommand, 0f)
+                    assertEquals("rebuffer must restore solo A HP off at t=$t", OFF_HZ, r.first.highCommand, 0f)
+                    assertEquals(0f, r.first.midDbCommand, 0f)
+                    if (t == 1_500L) {
+                        assertTrue(
+                            "filter currentLowPassHz must recover to open after rebuffer, got ${r.first.filterValue("currentLowPassHz")}",
+                            r.first.filterValue("currentLowPassHz") >= 19_000f,
+                        )
+                        sawRecoveryAfterRebuffer = true
+                    }
+                }
+                if (r.phase == "FADING" && !sawStart) {
+                    assertEquals(2_000L, t)
+                    assertEquals(start + 2_000L, r.get("fadeOutOriginMs"))
+                    sawStart = true
+                }
+                r.advanceBlock()
+            }
+            assertTrue(sawPreFilter)
+            assertTrue(sawRecoveryAfterRebuffer)
+            assertTrue(sawStart)
+            assertEquals("IDLE", r.phase)
+            assertEquals(listOf("A->B"), r.handoffs)
+            r.second.exactClock = false
+            r.second.position = maxOf(r.second.position, 36_000L)
+            r.tick()
+            assertNotNull(r.controller.plannedTransitionFor("B"))
+            r.assertTicker()
+        }
+    }
+
+    @Test fun disablingSmartFadeAndPausingDuringArmingCancelCleanlyWithoutFreezingOrMuffling() {
+        // Case A: disabling smartFade while in ARMING with an already pre-filtered solo A
+        withRig(compatible = false, leads = 2_500L to 2_500L) { r ->
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            r.first.position = start - 3_000L
+            r.tick()
+            for (t in -3_000L until -980L step BLOCK_MS) {
+                r.tick()
+                r.advanceBlock()
+            }
+            assertEquals("ARMING", r.phase)
+            assertTrue("precondition: solo A was pre-filtered while READY", r.first.lowCommand < OPEN_HZ)
+            val opensBefore = r.globalOpens
+            val posBefore = r.first.position
+
+            AppSettings.smartFadeEnabled.value = false
+            r.tick()
+
+            assertEquals("IDLE", r.phase)
+            assertEquals(1f, r.first.player.volume, 0f)
+            assertTrue(r.first.playWhenReady)
+            assertEquals(posBefore, r.first.position)
+            assertEquals(0, r.first.stops)
+            assertEquals(0, r.first.clears)
+            assertEquals(0, r.first.seeks)
+            assertEquals(listOf("A", "B", "C"), r.first.items.map { it.mediaId })
+            assertTrue(r.second.stops >= 1)
+            assertTrue(r.second.items.isEmpty())
+            assertTrue(r.handoffs.isEmpty())
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(0f, r.first.midDbCommand, 0f)
+            assertEquals("Seam A: must not call global filters.open() while solo A is audible", opensBefore, r.globalOpens)
+
+            AppSettings.smartFadeEnabled.value = true
+            r.tick()
+            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            r.assertTicker()
+        }
+
+        // Case B: pausing outgoing while in ARMING cancels cleanly without auto-resuming
+        withRig(compatible = false, leads = 2_500L to 2_500L) { r ->
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            r.first.position = start - 3_000L
+            r.tick()
+            for (t in -3_000L until -980L step BLOCK_MS) {
+                r.tick()
+                r.advanceBlock()
+            }
+            assertEquals("ARMING", r.phase)
+            assertTrue(r.first.lowCommand < OPEN_HZ)
+            val opensBefore = r.globalOpens
+
+            r.first.player.pause()
+            r.tick()
+
+            assertEquals("IDLE", r.phase)
+            assertFalse("paused outgoing must not auto-resume", r.first.playWhenReady)
+            assertEquals(1f, r.first.player.volume, 0f)
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(0f, r.first.midDbCommand, 0f)
+            assertEquals("Seam A: must not call global filters.open() while solo A is audible", opensBefore, r.globalOpens)
+            assertEquals(listOf("A", "B", "C"), r.first.items.map { it.mediaId })
+            assertTrue(r.handoffs.isEmpty())
+
+            repeat(3) {
+                r.scheduler.advanceTimeBy(500L)
+                r.scheduler.runCurrent()
+                r.tick()
+            }
+            assertFalse("sticky pause must persist across subsequent ticks", r.first.playWhenReady)
+            assertEquals("IDLE", r.phase)
+
+            r.first.player.play()
+            r.tick()
+            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            r.assertTicker()
+        }
+    }
+
+    @Test fun armingTimeoutWithGraceReleasesToIdleAndKeepsSoloOpen() {
+        withRig(compatible = false, leads = 2_500L to 2_500L, captureTelemetry = true) { r ->
+            r.second.delayPrepareCompletion = true
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            r.first.position = start - 1_000L
+            r.wallMs = 1_000L
+            r.tick()
+            assertEquals("ARMING", r.phase)
+            val initialDeadline = r.get("armDeadline") as Long
+            assertTrue(initialDeadline > r.wallMs)
+            val opensBefore = r.globalOpens
+
+            // At exact initial deadline: not yet expired; solo A remains open.
+            r.wallMs = initialDeadline
+            r.tick()
+            assertEquals("ARMING", r.phase)
+            assertTrue(r.telemetry("mix.arm.grace").isEmpty())
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+
+            // Past initial deadline: single grace extension, still ARMING, solo A open.
+            r.wallMs = initialDeadline + 1L
+            r.tick()
+            assertEquals("ARMING", r.phase)
+            assertEquals(1, r.telemetry("mix.arm.grace").size)
+            assertTrue(r.telemetry("mix.arm.death").isEmpty())
+            val graceDeadline = r.get("armDeadline") as Long
+            assertTrue(graceDeadline > initialDeadline + 1L)
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+
+            // Past grace deadline: terminal arm-expired releases to IDLE cleanly.
+            r.wallMs = graceDeadline + 1L
+            r.first.position = start + 1_000L
+            r.tick()
+            assertEquals("IDLE", r.phase)
+            assertEquals(1f, r.first.player.volume, 0f)
+            assertTrue(r.first.playWhenReady)
+            assertEquals(0, r.first.stops)
+            assertEquals(0, r.first.clears)
+            assertEquals(0, r.first.seeks)
+            assertEquals(listOf("A", "B", "C"), r.first.items.map { it.mediaId })
+            assertTrue(r.second.stops >= 1)
+            assertTrue(r.second.items.isEmpty())
+            assertTrue(r.handoffs.isEmpty())
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(0f, r.first.midDbCommand, 0f)
+            assertEquals("Seam A: audible solo survivor must not trigger global open()", opensBefore, r.globalOpens)
+            assertEquals(1, r.telemetry("mix.arm.grace").size)
+            assertEquals(1, r.telemetry("mix.arm.expired").size)
+            val death = r.telemetry("mix.arm.death").single()
+            assertTrue(death.contains("\"reason\":\"arm-expired\""))
+            val complete = r.telemetry("mix.complete").single()
+            assertTrue(complete.contains("\"handoff\":false"))
+            assertTrue(complete.contains("\"reason\":\"arm-expired\""))
+            r.assertTicker()
+        }
+
+        // Subcase: B was READY (solo A pre-filtered), then rebuffers on the exact grace tick.
+        withRig(compatible = false, leads = 2_500L to 2_500L, captureTelemetry = true) { r ->
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            r.first.position = start - 3_000L
+            r.wallMs = 1_000L
+            r.tick()
+            for (t in -3_000L until -980L step BLOCK_MS) {
+                r.tick()
+                r.advanceBlock()
+            }
+            assertEquals("ARMING", r.phase)
+            assertTrue("precondition: solo A pre-filtered before grace tick", r.first.lowCommand < OPEN_HZ)
+            val opensBefore = r.globalOpens
+            val graceAt = (r.get("armDeadline") as Long) + 1L
+
+            r.second.rebuffer()
+            r.wallMs = graceAt
+            r.tick()
+            assertEquals("ARMING", r.phase)
+            assertEquals("grace tick after rebuffer must immediately restore solo A LP open", OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(1, r.telemetry("mix.arm.grace").size)
+
+            val expireAt = (r.get("armDeadline") as Long) + 1L
+            r.wallMs = expireAt
+            r.tick()
+            assertEquals("IDLE", r.phase)
+            assertEquals(OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals(OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(0f, r.first.midDbCommand, 0f)
+            assertEquals("Seam A: audible solo survivor must not trigger global open()", opensBefore, r.globalOpens)
+            assertEquals(listOf("A", "B", "C"), r.first.items.map { it.mediaId })
+            r.assertTicker()
+        }
+    }
+
+    @Test fun seekDuringPreFilteredArmingRestoresSoloOutgoingWithoutGlobalOpen() {
+        withRig(compatible = false, leads = 2_500L to 2_500L, captureTelemetry = true) { r ->
+            val plan = r.startAndPlan()
+            val start = (plan.transitionStart * 1_000).roundToLong()
+            r.first.position = start - 3_000L
+            r.tick()
+            for (t in -3_000L until -980L step BLOCK_MS) {
+                r.tick()
+                r.advanceBlock()
+            }
+            assertEquals("ARMING", r.phase)
+            assertTrue("precondition: solo A pre-filtered before scrub", r.first.lowCommand < OPEN_HZ)
+            val opensBefore = r.globalOpens
+
+            // Real listener seek during pre-filtered ARMING triggers SeekAction.Action.CANCEL.
+            r.first.player.seekTo(10_000L)
+
+            assertEquals("IDLE", r.phase)
+            assertEquals(1f, r.first.player.volume, 0f)
+            assertTrue(r.first.playWhenReady)
+            assertEquals(10_000L, r.first.position)
+            assertEquals(listOf("A", "B", "C"), r.first.items.map { it.mediaId })
+            assertTrue(r.second.stops >= 1)
+            assertTrue(r.second.items.isEmpty())
+            assertTrue(r.handoffs.isEmpty())
+            assertEquals("seek cancel must restore solo A LP open", OPEN_HZ, r.first.lowCommand, 0f)
+            assertEquals("seek cancel must restore solo A HP off", OFF_HZ, r.first.highCommand, 0f)
+            assertEquals(0f, r.first.midDbCommand, 0f)
+            assertEquals("Seam A: audible solo survivor must not trigger global open()", opensBefore, r.globalOpens)
+
+            val block = AudioBlock(CHANNELS, BLOCK_FRAMES)
+            repeat(10) {
+                block.reset(BLOCK_FRAMES)
+                r.first.filter.process(block)
+            }
+            assertTrue(
+                "filter processor must glide back toward OPEN_HZ, got ${r.first.filterValue("currentLowPassHz")}",
+                r.first.filterValue("currentLowPassHz") >= 19_000f,
+            )
+
+            // Advance past SCRUB_SETTLE_MS on the shared injected wall clock and verify clean replan.
+            r.wallMs += 400L
+            r.tick()
+            assertEquals("IDLE", r.phase)
+            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            assertFalse(AppSettings.automixStatus.value?.headline?.contains("Replanning") == true)
+            r.assertTicker()
+        }
+    }
 
     private enum class Probe(val fileName: String) {
         MULTITONE("decline-multitone"), PERCUSSION("decline-percussion-120-87"),
@@ -214,10 +629,24 @@ class DeclineOverlapRenderTest {
         }
     }
 
-    private class Rig(val scheduler: TestCoroutineScheduler, compatible: Boolean, leads: Pair<Long, Long>) : AutoCloseable {
+    private class Rig(
+        val scheduler: TestCoroutineScheduler,
+        compatible: Boolean,
+        leads: Pair<Long, Long>,
+        captureTelemetry: Boolean = false,
+    ) : AutoCloseable {
         private val failures = Collections.synchronizedList(mutableListOf<Throwable>())
         private val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler) +
             CoroutineExceptionHandler { _, failure -> failures.add(failure) })
+        private val telemetryField = if (captureTelemetry) {
+            AutomixTelemetry::class.java.getDeclaredField("dir").apply { isAccessible = true }
+        } else null
+        private val savedTelemetryDir = telemetryField?.get(AutomixTelemetry)
+        private val telemetryDir = if (captureTelemetry) Files.createTempDirectory("decline-overlap-telemetry").toFile() else null
+        init {
+            telemetryField?.set(AutomixTelemetry, telemetryDir)
+        }
+        var wallMs = 1_000L
         private val items = listOf("A", "B", "C").map { MediaItem.Builder().setMediaId(it).build() }
         private val analyses = items.associate { it.mediaId to analysis(it.mediaId, compatible) }
         val first = Deck("first", items, 10_000L, true, leads.first)
@@ -240,6 +669,8 @@ class DeclineOverlapRenderTest {
             private set
         var settled = 0
             private set
+        var globalOpens = 0
+            private set
         private var ticker: Job? = null
         private val tickMethod = CrossfadeController::class.java.getDeclaredMethod("tick").apply { isAccessible = true }
         val phase get() = get("phase").toString()
@@ -260,8 +691,14 @@ class DeclineOverlapRenderTest {
             override fun outgoing(lowPassHz: Float, highPassHz: Float) = cutoffs(spareDeck, lowPassHz, highPassHz)
             override fun incomingLeadMs() = lead(activeDeck, true)
             override fun outgoingLeadMs() = lead(spareDeck, false)
-            override fun incomingMidDb(gainDb: Float) = activeDeck.filter.setMidGainDb(gainDb)
-            override fun outgoingMidDb(gainDb: Float) = spareDeck.filter.setMidGainDb(gainDb)
+            override fun incomingMidDb(gainDb: Float) {
+                activeDeck.midDbCommand = gainDb
+                activeDeck.filter.setMidGainDb(gainDb)
+            }
+            override fun outgoingMidDb(gainDb: Float) {
+                spareDeck.midDbCommand = gainDb
+                spareDeck.filter.setMidGainDb(gainDb)
+            }
             override fun incomingTempo(rate: Float) = activeDeck.filter.setBeatmatchTempo(rate)
             override fun outgoingTempo(rate: Float) = spareDeck.filter.setBeatmatchTempo(rate)
             override fun incomingEcho(delaySeconds: Float, send: Float, dry: Float) = activeDeck.filter.setEcho(delaySeconds, send, dry)
@@ -272,6 +709,10 @@ class DeclineOverlapRenderTest {
                 spareDeck.filter.setColour(effect, amount, beatSeconds, scoop)
             override fun parkEchoes() { first.filter.parkEcho(); second.filter.parkEcho() }
             override fun releaseColour() { first.filter.releaseColour(); second.filter.releaseColour() }
+            override fun open() {
+                globalOpens++
+                super.open()
+            }
         }
         val controller = CrossfadeController(
             scope = scope, active = { activeDeck.player }, standby = { spareDeck.player },
@@ -288,8 +729,16 @@ class DeclineOverlapRenderTest {
             analysisFor = { analyses.getValue(it.mediaId) }, filters = filters,
             onArmIncoming = { item, _ -> armedItems.add(item.mediaId) },
             onBlendHeadroom = { headroom = it }, onSettled = { settled++ },
+            nowMs = { wallMs },
             // Deliberately no loop ports or decoded loop regions.
         )
+
+        fun telemetry(event: String): List<String> = telemetryDir
+            ?.let { File(it, "automix-telemetry.jsonl") }
+            ?.takeIf { it.exists() }
+            ?.readLines()
+            ?.filter { it.contains("\"ev\":\"$event\"") }
+            .orEmpty()
 
         fun get(name: String): Any? = CrossfadeController::class.java.getDeclaredField(name)
             .apply { isAccessible = true }.get(controller)
@@ -322,6 +771,7 @@ class DeclineOverlapRenderTest {
                 assertEquals("these probes isolate unit-rate playback", 1f, deck.player.playbackParameters.speed, 0f)
                 deck.position += BLOCK_MS
             }
+            wallMs += BLOCK_MS
             // Keep the original production ticker and scheduled jobs alive. The explicit
             // tick at every PCM block provides 20 ms command sampling; scheduled ticks can
             // also see that exact media report, with no extra PCM and no wall-clock drift.
@@ -353,7 +803,12 @@ class DeclineOverlapRenderTest {
             assertEquals(0, second.seeks)
         }
 
-        override fun close() { controller.release(); scope.cancel() }
+        override fun close() {
+            controller.release()
+            scope.cancel()
+            telemetryField?.set(AutomixTelemetry, savedTelemetryDir)
+            telemetryDir?.deleteRecursively()
+        }
     }
 
     private data class LeadRead(val afterHandoff: Boolean, val activeRole: Boolean, val deck: Deck, val value: Long)
@@ -366,12 +821,26 @@ class DeclineOverlapRenderTest {
         val filter = TransitionFilterProcessor().apply { configure(RATE, CHANNELS); flush(); leadUs = leadMs * 1_000 }
         var lowCommand = TransitionFilterProcessor.OPEN_HZ
         var highCommand = TransitionFilterProcessor.OFF_HZ
+        var midDbCommand = 0f
         val items = initialItems.toMutableList()
         private var index = if (items.isEmpty()) C.INDEX_UNSET else 0
         private var state = if (items.isEmpty()) Player.STATE_IDLE else Player.STATE_READY
         val ready get() = state == Player.STATE_READY
         var exactClock = false
         var onStart: (() -> Unit)? = null
+        var delayPrepareCompletion = false
+        fun completePrepare() {
+            check(state == Player.STATE_BUFFERING)
+            state = Player.STATE_READY
+            listeners.toList().forEach { it.onPlaybackStateChanged(state) }
+        }
+        fun rebuffer() {
+            check(state == Player.STATE_READY)
+            state = Player.STATE_BUFFERING
+            listeners.toList().forEach { it.onPlaybackStateChanged(state) }
+        }
+        fun filterValue(name: String): Float = TransitionFilterProcessor::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }.getFloat(filter)
         private fun playing(wanted: Boolean) {
             val starting = wanted && !playWhenReady
             playWhenReady = wanted
@@ -438,7 +907,7 @@ class DeclineOverlapRenderTest {
                     state = Player.STATE_IDLE
                     null
                 }
-                "prepare" -> { prepares++; state = Player.STATE_READY; null }
+                "prepare" -> { prepares++; state = if (delayPrepareCompletion) Player.STATE_BUFFERING else Player.STATE_READY; null }
                 "removeMediaItems" -> { items.subList(args!![0] as Int, args[1] as Int).clear(); null }
                 "addMediaItems" -> {
                     @Suppress("UNCHECKED_CAST") val appended = args!![0] as List<MediaItem>
@@ -570,7 +1039,7 @@ class DeclineOverlapRenderTest {
         }
     }
 
-    private fun withRig(compatible: Boolean, leads: Pair<Long, Long>, test: (Rig) -> Unit) {
+    private fun withRig(compatible: Boolean, leads: Pair<Long, Long>, captureTelemetry: Boolean = false, test: (Rig) -> Unit) {
         val restore = listOf(
             preserve(AppSettings.smartFadeEnabled), preserve(AppSettings.crossfadeSeconds),
             preserve(AppSettings.playbackSpeed), preserve(AppSettings.mixViewOpen), preserve(SleepTimer.afterTrack),
@@ -590,7 +1059,7 @@ class DeclineOverlapRenderTest {
             AppSettings.smartMixView.value = null
             AppSettings.smartMixPreview.value = null
             SleepTimer.afterTrack.value = false
-            Rig(scheduler, compatible, leads).use(test)
+            Rig(scheduler, compatible, leads, captureTelemetry).use(test)
         } finally { restore.forEach { it() }; Dispatchers.resetMain() }
     }
 

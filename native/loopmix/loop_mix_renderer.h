@@ -95,7 +95,7 @@ struct TptHighpass {
     ic1eq[channel] = 2.f * v1 - ic1eq[channel];
     ic2eq[channel] = 2.f * v2 - ic2eq[channel];
     // High output: input minus low minus band*k.
-    return v3 - v2 - k * v1;
+    return v0 - v2 - k * v1;
   }
 };
 
@@ -308,7 +308,7 @@ class Renderer {
   std::atomic<int> exitGateViolations_{0};
   std::vector<float> inLeft_, inRight_, outLeft_, outRight_;
   std::vector<float> mixLeft_, mixRight_;
-  // djmix24 1.5 ms true-peak lookahead ring (pre-allocated in prepare).
+  // Legacy input history; limit() detects sample peaks within each callback.
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
 };

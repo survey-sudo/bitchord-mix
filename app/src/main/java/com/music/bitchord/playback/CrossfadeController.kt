@@ -551,6 +551,8 @@ class CrossfadeController(
     private val wholeTrackBusy: () -> Boolean = { false },
     /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
     private val onMixPositionJump: (wrapped: Boolean) -> Unit = {},
+    /** Monotonic wall clock (ms) for arming/fade deadlines; production uses [SystemClock.elapsedRealtime]. */
+    private val nowMs: () -> Long = SystemClock::elapsedRealtime,
 ) {
 
     private enum class Phase {
@@ -874,11 +876,11 @@ class CrossfadeController(
         prepListener?.let { previous ->
             runCatching { player.removeListener(previous) }
         }
-        incomingPreparedAt = SystemClock.elapsedRealtime()
+        incomingPreparedAt = nowMs()
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState != Player.STATE_READY || incomingPreparedAt == 0L) return
-                val prep = SystemClock.elapsedRealtime() - incomingPreparedAt
+                val prep = nowMs() - incomingPreparedAt
                 incomingPreparedAt = 0L
                 blendArmLeadMs = com.music.bitchord.playback.smart.PrepLead.next(blendArmLeadMs, prep)
                 player.removeListener(this)
@@ -942,6 +944,7 @@ class CrossfadeController(
     private var inFallbackReplan = false
     private var armGraceUsed = false
     private var armDeadline = 0L
+    private var armOutgoingPreFiltered = false
 
     /** Length of the fade-out driven by [Phase.SLEEP_FADE], in ms. Fixed when it begins. */
     private var sleepFadeMs = 0L
@@ -1124,7 +1127,7 @@ class CrossfadeController(
      * to ask.
      */
     fun msSinceTransition(): Long? =
-        settledAt.takeIf { it != 0L }?.let { SystemClock.elapsedRealtime() - it }
+        settledAt.takeIf { it != 0L }?.let { nowMs() - it }
 
     private val listener = object : Player.Listener {
         override fun onPositionDiscontinuity(
@@ -1137,7 +1140,7 @@ class CrossfadeController(
             if (reason == Player.DISCONTINUITY_REASON_SEEK) {
                 // djmix18 (Bug 2): the loop-mix handover's own corrective seek is not a
                 // scrub. Ignore it entirely — no resetPlansForScrub, no second seek.
-                val nowMs0 = SystemClock.elapsedRealtime()
+                val nowMs0 = nowMs()
                 if (internalHandoverSeek || nowMs0 < suppressScrubUntilMs) {
                     internalHandoverSeek = false
                     AutomixTelemetry.event(
@@ -1152,7 +1155,7 @@ class CrossfadeController(
                     )
                     return
                 }
-                val nowMs = SystemClock.elapsedRealtime()
+                val now = nowMs()
                 val tookOver = loopSession?.outPort?.tookOver == true
                 val seekPhase = when (phase) {
                     Phase.IDLE -> SeekAction.Phase.IDLE
@@ -1173,7 +1176,7 @@ class CrossfadeController(
                             "positionBeforeMs" to oldPosition.positionMs,
                             "positionAfterMs" to newPosition.positionMs,
                             "action" to "spurious-ignored",
-                            "planAgeMs" to (nowMs - lastPlanStartedAtMs),
+                            "planAgeMs" to (now - lastPlanStartedAtMs),
                         ),
                     )
                     return
@@ -1189,7 +1192,7 @@ class CrossfadeController(
                         "positionBeforeMs" to oldPosition.positionMs,
                         "positionAfterMs" to newPosition.positionMs,
                         "action" to action.name.lowercase(),
-                        "planAgeMs" to (nowMs - lastPlanStartedAtMs),
+                        "planAgeMs" to (now - lastPlanStartedAtMs),
                     ),
                 )
                 when (action) {
@@ -1200,7 +1203,7 @@ class CrossfadeController(
                         // inaudible player — silent teardown, instant replan.
                         resetPlansForScrub()
                         AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "scrub-cancelled", "reason" to "scrub", "phase" to phase.name))
-                        bail(force = true)
+                        if (phase == Phase.ARMING) cancelArming("scrub-cancelled") else bail(force = true)
                     }
                     SeekAction.Action.EMERGENCY_TAIL -> {
                         resetPlansForScrub()
@@ -1292,7 +1295,7 @@ class CrossfadeController(
             }
             // No blend to hand to. Let the queue move on as it would have.
             releaseHold()
-            if (phase == Phase.ARMING) bail()
+            if (phase == Phase.ARMING) cancelArming("outgoing-ended-while-arming")
             held.play()
         }
     }
@@ -1362,7 +1365,7 @@ class CrossfadeController(
     private fun resetPlansForScrub() {
         scrubEpoch++
         countdownStabilizer.reset()
-        scrubSettledAtMs = SystemClock.elapsedRealtime() + SCRUB_SETTLE_MS
+        scrubSettledAtMs = nowMs() + SCRUB_SETTLE_MS
         pinnedCatchUpKey = null
         pinnedCatchUpPlan = null
         shownCountdownKey = null
@@ -1440,7 +1443,8 @@ class CrossfadeController(
     private fun ranOutBeforeHandoff() {
         if (handedOff) return
         when (phase) {
-            Phase.ARMING, Phase.LOOP_ARMING, Phase.LOOP_RUNNING -> bail()
+            Phase.ARMING -> cancelArming("outgoing-ran-on-while-arming")
+            Phase.LOOP_ARMING, Phase.LOOP_RUNNING -> bail()
             Phase.FADING -> {
                 val out = outgoing ?: return bail()
                 val into = incoming ?: return bail()
@@ -1611,7 +1615,7 @@ class CrossfadeController(
             "inParty" to ListenTogether.state.value.inParty,
             "bitPerfect" to BitPerfectOutput.status.value.active,
         )
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         if (state != lastTickState || (enabled && now - lastTickStateAtMs >= 30_000L)) {
             AutomixTelemetry.event("mix.state", state + ("positionMs" to player.currentPosition))
             lastTickState = state
@@ -1676,7 +1680,7 @@ class CrossfadeController(
      */
     private fun checkHandoffPauseWatch() {
         if (phase != Phase.IDLE || lastHandoffCompleteAtMs <= 0L) return
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         if (now - lastHandoffCompleteAtMs > 3000L) {
             lastHandoffCompleteAtMs = 0L
             return
@@ -1719,11 +1723,11 @@ class CrossfadeController(
             AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to shownLoopStartMs))
             Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$shownLoopStartMs")
             loopSuppressedPair = key.substringBefore("|")
-            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+            loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
             shownCountdownKey = null
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
             )
             loopFallBack(reason)
             return
@@ -1744,12 +1748,12 @@ class CrossfadeController(
             AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to loopTargetStartMs))
             Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$loopTargetStartMs")
             loopSuppressedPair = key.substringBefore("|")
-            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+            loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
             shownCountdownKey = null
             watchdogFired = true
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
             )
             loopFallBack(reason)
         }
@@ -1788,7 +1792,7 @@ class CrossfadeController(
      */
     private fun refreshMarkerWhilePaused(player: ExoPlayer) {
         if (!AppSettings.smartFadeEnabled.value) return
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         // The mix popup reads the same plan, and someone looking at it is
         // waiting on the next answer rather than glancing at a marker.
         val step = if (AppSettings.mixViewOpen.value) IDLE_STEP_MS else PAUSED_MARKER_STEP_MS
@@ -1965,7 +1969,7 @@ class CrossfadeController(
 
         // djmix26: brief post-scrub settle window so rapid/midway seeks pick
         // one stable plan instead of flickering before the playhead settles.
-        val nowWall0 = SystemClock.elapsedRealtime()
+        val nowWall0 = nowMs()
         if (phase == Phase.IDLE && nowWall0 < scrubSettledAtMs) {
             if (duration - player.currentPosition <= 5_000L) {
                 scrubSettledAtMs = 0L
@@ -2126,7 +2130,7 @@ class CrossfadeController(
         // The loop mix first: a pair it can do never reaches the blend below.
         // djmix13: a loop that just died for this shown pair stays suppressed
         // briefly, so the classic plan gets time to actually complete.
-        val suppressingLoop = (loopSuppressedPair == pairKey && SystemClock.elapsedRealtime() < loopSuppressedUntil) ||
+        val suppressingLoop = (loopSuppressedPair == pairKey && nowMs() < loopSuppressedUntil) ||
             countdownStabilizer.isFamilySuppressed(pairKey, scrubEpoch, CountdownStabilizer.Family.LOOP)
         val suppressingBridge = suppressingLoop ||
             countdownStabilizer.isFamilySuppressed(pairKey, scrubEpoch, CountdownStabilizer.Family.NATIVE_BRIDGE)
@@ -2243,7 +2247,7 @@ class CrossfadeController(
             val retryPendingTmp = !fastReadyTmp && !buildingTmp &&
                 remainingMsEarly >= hardColdAbortMs &&
                 remainingMsEarly <= primeLeadMsTmp &&
-                SystemClock.elapsedRealtime() < primeRetryAt
+                nowMs() < primeRetryAt
             // djmix18 (Bug 4): a LoopMix.plan that returned null once both tracks are analysed
             // is deterministically ineligible — do not keep waiting on a cold loop until
             // 10s-14s before contentEnd. Task 2B: never yield a valid nativeBridge while >= 8s
@@ -2284,7 +2288,7 @@ class CrossfadeController(
                     loopScript = null
                     loopPlanKey = null
                     loopSuppressedPair = pairKey
-                    loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+                    loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
                     discardPrime()
                 }
             }
@@ -2324,7 +2328,7 @@ class CrossfadeController(
                     loopScript = null
                     loopPlanKey = null
                     loopSuppressedPair = pairKey
-                    loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+                    loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
                     discardPrime()
                 } else {
                     countdownStabilizer.onRungFailed(
@@ -2353,7 +2357,7 @@ class CrossfadeController(
                 player.currentPosition,
             )
             lastSmartPlan = plan
-            lastPlanStartedAtMs = SystemClock.elapsedRealtime()
+            lastPlanStartedAtMs = nowMs()
             lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
             publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
             AppSettings.smartTransitionWindow.value = TransitionWindow(
@@ -2457,7 +2461,7 @@ class CrossfadeController(
             allowCommit = allowClassicCommit,
         )
         lastSmartPlan = plan
-        lastPlanStartedAtMs = SystemClock.elapsedRealtime()
+        lastPlanStartedAtMs = nowMs()
         lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
         publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
 
@@ -2780,8 +2784,9 @@ class CrossfadeController(
         rampStep = 0
         render = renderStyle
         planInFlight = plan
-        armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS + rampSteps * beatMs
+        armDeadline = nowMs() + ARM_TIMEOUT_MS + rampSteps * beatMs
         armGraceUsed = false
+        armOutgoingPreFiltered = false
         handedOff = false
         outgoing = out
         incoming = into
@@ -2966,15 +2971,16 @@ class CrossfadeController(
      * this is only ever waiting on a buffer.
      */
     private fun driveArming() {
-        val out = outgoing ?: return bail()
-        val into = incoming ?: return bail()
-        if (!stillWorthFading()) return bail()
+        val out = outgoing ?: return cancelArming("missing-outgoing-player")
+        val into = incoming ?: return cancelArming("missing-incoming-player")
+        if (!stillWorthFading()) return cancelArming("mix-disabled-or-no-next")
         // Paused while armed: the transition is no longer imminent, and holding
         // a prepared decoder open against a stopped player is worse than arming
         // again when playback resumes.
-        if (!out.playWhenReady) return bail()
+        if (!out.playWhenReady) return cancelArming("paused-before-fade")
 
-        val expired = SystemClock.elapsedRealtime() > armDeadline
+        val now = nowMs()
+        val expired = now > armDeadline
         val ready = into.playbackState == Player.STATE_READY
 
         // A standby that never got the incoming track ready has nothing to fade
@@ -2985,16 +2991,26 @@ class CrossfadeController(
         if (expired && !ready) {
             if (!armGraceUsed) {
                 armGraceUsed = true
-                armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS
+                armDeadline = now + ARM_TIMEOUT_MS
                 AutomixTelemetry.event("mix.arm.grace", mapOf("phase" to phase.name))
+                if (armOutgoingPreFiltered) {
+                    armOutgoingPreFiltered = false
+                    resetPreFilteredOutgoing()
+                    rideFilters(0f, null)
+                }
                 return
             }
             AutomixTelemetry.event("mix.arm.expired", mapOf("phase" to phase.name))
-            AutomixTelemetry.event(
-                "mix.arm.death",
-                mapOf("reason" to "arm-expired", "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
-            )
-            return bail()
+            return cancelArming("arm-expired")
+        }
+
+        // Wait for the track to actually reach the fade point. [fadeEndMs] is
+        // the track's own duration in standard mode, or a Automix plan's
+        // analyzed mix-out anchor when it ends before the file does.
+        val atFadePoint = fadeEndMs <= 0L || fadeEndMs - out.currentPosition <= fadeMs
+        if (atFadePoint && ready) {
+            startFade()
+            return
         }
 
         // Both sinks write seconds ahead of the speaker. The standby fills its
@@ -3002,21 +3018,55 @@ class CrossfadeController(
         // blend's opening position before that audio is written, not once the
         // fade starts — otherwise the incoming track's first seconds are heard
         // unfiltered. The outgoing sink crosses into the blend its lead before
-        // the listener does, and its filter has to start moving then.
-        val outgoingAt = if (fadeMs > 0L && fadeEndMs > 0L) {
-            (out.currentPosition + tracks.outgoingLeadMs() - (fadeEndMs - fadeMs)).toFloat() / fadeMs
+        // the listener does, so its filter only moves ahead once incoming is
+        // ready and the fade start has not already passed; otherwise solo A
+        // darkens/colours alone and jumps when [startFade] re-anchors
+        // [fadeOutOriginMs].
+        val outgoingAt = if (ready && !atFadePoint && fadeMs > 0L && fadeEndMs > 0L) {
+            ((out.currentPosition + tracks.outgoingLeadMs() - (fadeEndMs - fadeMs)).toFloat() / fadeMs)
+                .takeIf { it > 0f }
+                ?.coerceAtMost(1f)
         } else {
-            0f
+            null
         }
-        rideFilters(0f, outgoingAt.takeIf { it > 0f }?.coerceAtMost(1f))
+        if (outgoingAt != null) {
+            armOutgoingPreFiltered = true
+            rideFilters(0f, outgoingAt)
+        } else {
+            if (armOutgoingPreFiltered) {
+                armOutgoingPreFiltered = false
+                resetPreFilteredOutgoing()
+            }
+            rideFilters(0f, null)
+        }
         if (rampSteps > 0) rampOutgoing(out)
+    }
 
-        // Wait for the track to actually reach the fade point. [fadeEndMs] is
-        // the track's own duration in standard mode, or a Automix plan's
-        // analyzed mix-out anchor when it ends before the file does.
-        val atFadePoint = fadeEndMs <= 0L || fadeEndMs - out.currentPosition <= fadeMs
-        if (!atFadePoint) return
-        if (ready) startFade()
+    /** Restores solo outgoing filter/colour/echo state if [driveArming] pre-filtered before rebuffering. */
+    private fun resetPreFilteredOutgoing() {
+        tracks.outgoing(TransitionFilterProcessor.OPEN_HZ, TransitionFilterProcessor.OFF_HZ)
+        tracks.outgoingMidDb(0f)
+        tracks.outgoingColour(com.music.bitchord.playback.smart.DjEffect.NONE, 0f, render.beatSecondsF, 0f)
+        if (render.echo) tracks.outgoingEcho(render.echoSecondsF, 0f, 1f)
+    }
+
+    /** Releases a pre-fade arm cleanly without calling global [TransitionFilters.open] while solo A is audible. */
+    private fun cancelArming(reason: String) {
+        if (phase != Phase.ARMING) return
+        lastCompleteReason = reason
+        AutomixTelemetry.event(
+            "mix.arm.death",
+            mapOf(
+                "reason" to reason,
+                "phase" to phase.name,
+                "msSincePlan" to (nowMs() - lastPlanStartedAtMs),
+            ),
+        )
+        if (armOutgoingPreFiltered) {
+            armOutgoingPreFiltered = false
+            survivorRecoveryPending = true
+        }
+        bail(force = true)
     }
 
     /**
@@ -3029,12 +3079,13 @@ class CrossfadeController(
      * one that was still plainly playing.
      */
     private fun startFade() {
-        val out = outgoing ?: return bail()
-        val into = incoming ?: return bail()
+        val out = outgoing ?: return cancelArming("missing-outgoing-at-fade")
+        val into = incoming ?: return cancelArming("missing-incoming-at-fade")
 
+        armOutgoingPreFiltered = false
         into.volume = 0f
         into.playWhenReady = true
-        fadeStartedAt = SystemClock.elapsedRealtime()
+        fadeStartedAt = nowMs()
         // djmix13: record firing accuracy at the moment the blend starts.
         // djmix14: cueErrorMs was seconds-minus-ms (5000-5=4995). Convert first.
         val targetCueMs = ((lastSmartPlan?.incomingCueTime ?: 0.0) * 1000.0).roundToLong()
@@ -3080,6 +3131,7 @@ class CrossfadeController(
         // would run straight over the marker for the transition now under way.
         AppSettings.smartTransitionWindow.value = null
         phase = Phase.FADING
+        driveFade()
     }
 
     /**
@@ -3278,9 +3330,9 @@ class CrossfadeController(
         // Track the stall: try prepare() once after 1.5 s, then force-exit so
         // the blend never hangs; an outgoing about to run out forces at once.
         if (!handedOff && player.playbackState == Player.STATE_IDLE) {
-            val nowMs = SystemClock.elapsedRealtime()
-            if (idleStallSinceMs == 0L) idleStallSinceMs = nowMs
-            val stalledMs = nowMs - idleStallSinceMs
+            val now = nowMs()
+            if (idleStallSinceMs == 0L) idleStallSinceMs = now
+            val stalledMs = now - idleStallSinceMs
             val outExhausted = outRemaining != null && outRemaining <= HANDOFF_GUARD_MS
             return when (idleStallDecision(stalledMs, outExhausted, idleStallPrepared)) {
                 IdleStallAction.WAIT_AND_FREEZE -> bail()
@@ -3362,16 +3414,16 @@ class CrossfadeController(
         // STATE_READY, never BUFFERING, so an intentional hold never trips
         // this, and a stall that recovers first completes normally.
         if (!done) {
-            val nowMs = SystemClock.elapsedRealtime()
+            val now = nowMs()
             val buffering = player.playbackState == Player.STATE_BUFFERING
             val blockedAtOne = progress >= 1f && !incomingReady && !outAboutToEof && buffering
             if (blockedAtOne) {
-                if (fadingStallSinceMs == 0L) fadingStallSinceMs = nowMs
+                if (fadingStallSinceMs == 0L) fadingStallSinceMs = now
             } else {
                 fadingStallSinceMs = 0L
             }
             if (fadingStallSinceMs != 0L) {
-                val stalledMs = nowMs - fadingStallSinceMs
+                val stalledMs = now - fadingStallSinceMs
                 if (fadingStallShouldBail(stalledMs, progress >= 1f, incomingReady, outAboutToEof, buffering)) {
                     fadingStallSinceMs = 0L
                     AutomixTelemetry.event(
@@ -3444,7 +3496,7 @@ class CrossfadeController(
             return
         }
         tailFromGain = vol
-        tailStartMs = SystemClock.elapsedRealtime()
+        tailStartMs = nowMs()
         tailTarget = out
         val planned = fadeMs > 0L
         tailDurationMs = if (planned) PhraseConfig.EXIT_TAIL_MIN_MS.toLong() else PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong()
@@ -3477,7 +3529,7 @@ class CrossfadeController(
             finish()
             return
         }
-        val p = (SystemClock.elapsedRealtime() - tailStartMs).toFloat() / tailDurationMs.coerceAtLeast(1L)
+        val p = (nowMs() - tailStartMs).toFloat() / tailDurationMs.coerceAtLeast(1L)
         if (p >= 1f) {
             out.volume = 0f
             disarmTailLoopSession()
@@ -3592,7 +3644,7 @@ class CrossfadeController(
     private val failedWaveAt = mutableMapOf<String, Long>()
 
     private fun waveFailedRecently(id: String) =
-        failedWaveAt[id]?.let { SystemClock.elapsedRealtime() - it < MIX_WAVE_RETRY_MS } == true
+        failedWaveAt[id]?.let { nowMs() - it < MIX_WAVE_RETRY_MS } == true
 
     /**
      * Decodes both waveforms the mix popup will draw, once the next
@@ -3640,7 +3692,7 @@ class CrossfadeController(
         mixViewJob = scope.launch {
             suspend fun wave(item: MediaItem, durationMs: Long, from: Double, to: Double): DeckWave? =
                 withContext(Dispatchers.IO) {
-                    val began = SystemClock.elapsedRealtime()
+                    val began = nowMs()
                     val bins = ((to - from) * MIX_WAVE_BINS_PER_SECOND).toInt().coerceIn(64, MIX_WAVE_MAX_BINS)
                     val bands = runCatching { mixWaveform(item, durationMs, from, to, bins) }
                         .onFailure { Log.w(TAG, "mix waveform failed for ${item.mediaId}", it) }
@@ -3649,19 +3701,19 @@ class CrossfadeController(
                         TAG,
                         "mix waveform ${item.mediaId} " +
                             String.format(Locale.ROOT, "%.1f-%.1fs", from, to) +
-                            ": ${if (bands == null) "none" else "ok"} in ${SystemClock.elapsedRealtime() - began}ms",
+                            ": ${if (bands == null) "none" else "ok"} in ${nowMs() - began}ms",
                     )
                     bands?.let { DeckWave(item.mediaId, from, to, it) }
                 }
             if (!outReady) {
                 outgoingWave = wave(outItem, outDurationMs, outFrom, outTo)
-                if (outgoingWave == null) failedWaveAt[outItem.mediaId] = SystemClock.elapsedRealtime()
+                if (outgoingWave == null) failedWaveAt[outItem.mediaId] = nowMs()
                 pendingWaveIds -= outItem.mediaId
                 republishWaves()
             }
             if (!inReady) {
                 incomingWave = wave(inItem, inDurationMs, inFrom, inTo)
-                if (incomingWave == null) failedWaveAt[inItem.mediaId] = SystemClock.elapsedRealtime()
+                if (incomingWave == null) failedWaveAt[inItem.mediaId] = nowMs()
                 pendingWaveIds -= inItem.mediaId
                 republishWaves()
             }
@@ -3725,7 +3777,7 @@ class CrossfadeController(
         advanced: Boolean,
     ) {
         if (!AppSettings.mixViewOpen.value || AppSettings.smartMixView.value != null) return
-        mixPreviewAt = SystemClock.elapsedRealtime()
+        mixPreviewAt = nowMs()
         val outStart = plan.transitionStart
         val outEnd = maxOf(plan.transitionEnd, outStart + 0.5)
         val inStart = plan.incomingCueTime
@@ -3813,7 +3865,7 @@ class CrossfadeController(
      */
     private fun expireMixPreview() {
         if (AppSettings.smartMixPreview.value == null) return
-        val stale = phase == Phase.IDLE && SystemClock.elapsedRealtime() - mixPreviewAt > MIX_PREVIEW_STALE_MS
+        val stale = phase == Phase.IDLE && nowMs() - mixPreviewAt > MIX_PREVIEW_STALE_MS
         if (AppSettings.mixViewOpen.value && AppSettings.smartMixView.value == null && !stale) return
         AppSettings.smartMixPreview.value = null
         mixPreviewIds = null
@@ -3980,7 +4032,7 @@ class CrossfadeController(
             return
         }
         // djmix11: even bail (emergency) takes the shortened dissolve.
-        val progress = (SystemClock.elapsedRealtime() - bailStartedAt).toFloat() /
+        val progress = (nowMs() - bailStartedAt).toFloat() /
             maxOf(BAIL_MS, PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong())
         if (progress < 1f) {
             val fall = if (leaving === outgoing && ranOn(leaving)) 0f else bailFromGain * fallGain(progress)
@@ -4012,7 +4064,7 @@ class CrossfadeController(
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
-    private val deckTiming = DeckTiming()
+    private val deckTiming = DeckTiming(nowMs)
     @Volatile private var deckSide: String = "outgoing"
 
     /** The loop currently being armed, and the analyses the shift re-checks against. */
@@ -4072,7 +4124,7 @@ class CrossfadeController(
     private fun askLyrics(item: MediaItem, durationMs: Long) {
         val id = item.mediaId
         if (!lyricsAsked.add(id)) return
-        lyricsAskedAt[id] = SystemClock.elapsedRealtime()
+        lyricsAskedAt[id] = nowMs()
         scope.launch(Dispatchers.IO) {
             val lines = runCatching { syncedLines(item, durationMs) }.getOrNull()
             // Only line-synced lyrics say where a voice is; plain text says nothing about time.
@@ -4269,7 +4321,7 @@ class CrossfadeController(
         if (lyricSpans.containsKey(id)) return false
         if (analysis.vocalWindows.isNotEmpty()) return false
         val asked = lyricsAskedAt[id] ?: return false
-        return SystemClock.elapsedRealtime() - asked < 1_500L
+        return nowMs() - asked < 1_500L
     }
 
     /** A head and a tail are enough. The whole-track pass can still be running. */
@@ -4474,7 +4526,7 @@ class CrossfadeController(
         if (!phraseLock.locked && (lyricsPending(current.mediaId, out) || lyricsPending(next.mediaId, inn))) {
             return null
         }
-        val now = SystemClock.elapsedRealtime() / 1000.0
+        val now = nowMs() / 1000.0
         val release = fresh?.exit?.releaseSec ?: (durationMs / 1000.0)
         val left = release - player.currentPosition / 1000.0
         val chosen = phraseLock.consider(now, left, fresh) ?: return null
@@ -4635,10 +4687,10 @@ class CrossfadeController(
         val key = primeKey(plan, outItem, inItem, sampleRate)
         if (primedKey == key && primedSession != null) return
         if (primeJob?.isActive == true && primedKey == key) return
-        if (primedKey == key && SystemClock.elapsedRealtime() < primeRetryAt) return
+        if (primedKey == key && nowMs() < primeRetryAt) return
         discardPrime()
         val lead = (plan.out.loopStart * 1000).roundToLong() - player.currentPosition
-        deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
+        deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
         Log.d(
             TAG,
             "loop prime ${outItem.mediaId}->${inItem.mediaId} at ${sampleRate}Hz, " +
@@ -4657,7 +4709,7 @@ class CrossfadeController(
             lastArmDeathKey = key
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
             )
         }
         return false
@@ -4687,7 +4739,7 @@ class CrossfadeController(
                 AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
             }
             loopSuppressedPair = pairKey
-            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+            loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
             return false
         }
         if (out === into) return refuse("same-player")
@@ -4723,7 +4775,7 @@ class CrossfadeController(
             // blind until the watchdog. Recompute if missing so a slow
             // hung primeJob is still judged against this loop's wall.
             if (deckTiming.deadlineMs == DeckBudget.NO_DEADLINE_MS || deckTiming.deadlineMs <= 0L) {
-                deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+                deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), out.isPlaying, loopTargetStartMs, out.currentPosition)
             }
             Log.d(TAG, "loop decks still building ${loopTargetStartMs - out.currentPosition}ms ahead")
             return true
@@ -4731,7 +4783,7 @@ class CrossfadeController(
         // djmix15: fresh build — drop any stale spans/deadline from a prior
         // pair before installing this build's wall deadline.
         deckTiming.clear()
-        deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+        deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), out.isPlaying, loopTargetStartMs, out.currentPosition)
         startLoopBuild(key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = true)
         return true
     }
@@ -4758,19 +4810,19 @@ class CrossfadeController(
         val skipStemAtLaunch = shouldSkipStemAtLaunch(
             spliceRemainingAtLaunch,
             deckTiming.deadlineMs,
-            SystemClock.elapsedRealtime(),
+            nowMs(),
             wholeTrackBusy(),
             armWhenReady,
         )
         val job = scope.launch {
-            val began = SystemClock.elapsedRealtime()
+            val began = nowMs()
             var buildFailure: String? = null
             val session = withContext(Dispatchers.Default) {
                 runCatching {
                     val stemFn = if (skipStemAtLaunch) null else separateTransitionWindow
                     val sepStem: ((LoopMix.Side, FloatArray, FloatArray, Int, Boolean) -> Pair<FloatArray, FloatArray>?)? = stemFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int, keep: Boolean ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, nowMs())) {
                                 null
                             } else {
                                 sep(left, right, sr, keep)
@@ -4782,7 +4834,7 @@ class CrossfadeController(
                     val vocalFn = if (skipStemAtLaunch) null else separateTransitionWindow
                     val sepVocal: ((LoopMix.Side, FloatArray, FloatArray, Int) -> Pair<FloatArray, FloatArray>?)? = vocalFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, nowMs())) {
                                 null
                             } else {
                                 sep(left, right, sr, true)
@@ -4795,7 +4847,7 @@ class CrossfadeController(
                     val pairFn = if (skipStemAtLaunch) null else separateTransitionPair
                     val sepVocalPair: ((LoopMix.Side, FloatArray, FloatArray, Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = pairFn?.let { sep ->
                         { _: LoopMix.Side, left: FloatArray, right: FloatArray, sr: Int ->
-                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, SystemClock.elapsedRealtime())) {
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, nowMs())) {
                                 null
                             } else {
                                 sep(left, right, sr)
@@ -4826,11 +4878,11 @@ class CrossfadeController(
                 session?.close()
                 return@launch
             }
-            val steps = deckTiming.snapshot(SystemClock.elapsedRealtime())
+            val steps = deckTiming.snapshot(nowMs())
                 .joinToString { "${it.step} ${it.endedMs - it.startedMs}ms" }
             if (session == null) {
                 Log.w(TAG, "loop build produced no decks ($steps)")
-                primeRetryAt = SystemClock.elapsedRealtime() + LOOP_PRIME_RETRY_MS
+                primeRetryAt = nowMs() + LOOP_PRIME_RETRY_MS
                 // djmix16: a null build while already LOOP_ARMING yields
                 // to classic immediately (loopFallBack), not only 400 ms
                 // before the splice. The old gate kept phase LOOP_ARMING
@@ -4841,9 +4893,9 @@ class CrossfadeController(
                 // IDLE primes keep the 2 s retry (a retry may find the
                 // file once the DirectSourceGate window opens).
                 if (phase == Phase.LOOP_ARMING && outgoing === out) {
-                    val nowMs = SystemClock.elapsedRealtime()
+                    val now = nowMs()
                     val deadline = deckTiming.deadlineMs
-                    val reason = if (deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && nowMs <= deadline) {
+                    val reason = if (deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && now <= deadline) {
                         buildFailure ?: "${deckSide.ifEmpty { "deck" }} build-null"
                     } else {
                         lateDeckReason()
@@ -4852,7 +4904,7 @@ class CrossfadeController(
                 }
                 return@launch
             }
-            val builtMs = SystemClock.elapsedRealtime() - began
+            val builtMs = nowMs() - began
             blendArmLeadMs = com.music.bitchord.playback.smart.PrepLead.next(blendArmLeadMs, builtMs)
             Log.d(TAG, "loop decks built in ${builtMs}ms ($steps), next arm ${blendArmLeadMs}ms")
             when {
@@ -5011,9 +5063,9 @@ class CrossfadeController(
                 }
             }
         }
-        val nowMs = SystemClock.elapsedRealtime()
+        val now = nowMs()
         val deadline = deckTiming.deadlineMs
-        val notLate = deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && nowMs <= deadline
+        val notLate = deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && now <= deadline
         val reason = if (notLate) "shift-bar-null" else lateDeckReason()
         if (candidate == null) {
             Log.d(TAG, "loop has no later bar ($why)")
@@ -5053,7 +5105,7 @@ class CrossfadeController(
             return
         }
         deckTiming.clear()
-          deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+          deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), out.isPlaying, loopTargetStartMs, out.currentPosition)
         // The reason stays on the refusal until the shifted mix actually arms,
         // so a later fallback still says what was late the first time if this
         // attempt records nothing of its own.
@@ -5066,7 +5118,7 @@ class CrossfadeController(
     }
 
     private fun lateDeckReason(): String {
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         return LoopMix.lateStepReason(deckTiming.snapshot(now), now, deckTiming.deadlineMs)
     }
 
@@ -5181,7 +5233,7 @@ class CrossfadeController(
             if (building && out.currentPosition >= loopTargetStartMs - LOOP_COMMIT_MS) {
                 val key = loopPlanKey ?: "loop-arming"
                 loopSuppressedPair = key.substringBefore("|")
-                loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+                loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
                 loopFallBack("build-missed-splice")
                 return
             }
@@ -5189,14 +5241,14 @@ class CrossfadeController(
                 shiftLoopOrFallback(out)
                 return
             }
-            if (!building && SystemClock.elapsedRealtime() >= primeRetryAt) {
+            if (!building && nowMs() >= primeRetryAt) {
                 val plan = loopTarget
                 val outItem = loopOutItem
                 val inItem = loopInItem
                 val into = incoming
                 val sampleRate = loopPortOf(out)?.sampleRate ?: 0
                 if (plan != null && outItem != null && inItem != null && into != null && sampleRate > 0) {
-                    primeRetryAt = SystemClock.elapsedRealtime() + LOOP_PRIME_RETRY_MS
+                    primeRetryAt = nowMs() + LOOP_PRIME_RETRY_MS
                     startLoopBuild(
                         primeKey(plan, outItem, inItem, sampleRate),
                         plan, out, into, outItem, inItem, loopOutDurationMs, loopInDurationMs, sampleRate,
@@ -5243,7 +5295,7 @@ class CrossfadeController(
             // 41 ms after arming, growing 1:1 with wall). Record the
             // splice step in wall time only (now -> now against the
             // wall deadline); the shift decision stays a media decision.
-            val now = SystemClock.elapsedRealtime()
+            val now = nowMs()
             deckTiming.addClosed("outgoing splice", now, now, deckTiming.deadlineMs)
             shiftLoopOrFallback(out)
         }
@@ -5386,7 +5438,7 @@ class CrossfadeController(
      */
     private fun announceLoopPosition() {
         val position = loopPositionMs() ?: return
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         val wrapped = lastLoopPositionMs >= 0 && position < lastLoopPositionMs - LOOP_WRAP_MS
         lastLoopPositionMs = position
         if (wrapped || now - lastLoopAnnounceAt >= LOOP_ANNOUNCE_MS) {
@@ -5504,7 +5556,7 @@ class CrossfadeController(
                     "driftMs" to driftMs),
             )
             internalHandoverSeek = true
-            suppressScrubUntilMs = SystemClock.elapsedRealtime() + 1_200L
+            suppressScrubUntilMs = nowMs() + 1_200L
             try {
                 // Explicitly INCOMING, including a never-started buffering
                 // decoder. Seek before play/adopt; READY is not required.
@@ -5650,7 +5702,7 @@ class CrossfadeController(
         // djmix13: count every arm death so regressions are visible.
         AutomixTelemetry.event(
             "mix.arm.death",
-            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
         )
         val fbKey = "$reason|${phase.name}"
         if (fbKey != lastFallbackLogKey) {
@@ -5665,7 +5717,7 @@ class CrossfadeController(
                 pairKey, scrubEpoch, CountdownStabilizer.Family.LOOP, suppressBridgeToo = true,
             )
             loopSuppressedPair = pairKey
-            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+            loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
         }
         loopPlanned = null
         loopScript = null
@@ -5747,7 +5799,7 @@ class CrossfadeController(
         ((startMs - player.currentPosition) / 1000.0).coerceIn(0.0, 3600.0)
 
     private fun describeAutomix(player: ExoPlayer, item: MediaItem): AutomixStatus {
-        if (phase == Phase.IDLE && SystemClock.elapsedRealtime() < scrubSettledAtMs) {
+        if (phase == Phase.IDLE && nowMs() < scrubSettledAtMs) {
             return status(
                 headline = "Replanning…",
                 detail = "Replanning transition…",
@@ -5791,7 +5843,7 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         val next = if (nextIndex == C.INDEX_UNSET) null else player.getMediaItemAt(nextIndex)
         val pairKey = next?.let { "${item.mediaId}->${it.mediaId}" }
-        val suppressingLoop = pairKey != null && loopSuppressedPair == pairKey && SystemClock.elapsedRealtime() < loopSuppressedUntil
+        val suppressingLoop = pairKey != null && loopSuppressedPair == pairKey && nowMs() < loopSuppressedUntil
         val planned = if (suppressingLoop) null else loopPlanned
         // Honest countdown: a start already behind the playhead (-600 ms)
         // must never read as 0s/locked. Show replanning until the catch-up
@@ -6076,6 +6128,10 @@ class CrossfadeController(
         AppSettings.smartMixBlend.value = null
         clearMixView()
         if (!handedOff && phase != Phase.FADING) {
+            if (armOutgoingPreFiltered) {
+                armOutgoingPreFiltered = false
+                survivorRecoveryPending = true
+            }
             // Nothing was ever audible; no ramp to run.
             finish()
             return
@@ -6092,7 +6148,7 @@ class CrossfadeController(
         // the survivor would strand parked if finish() only opened the spare.
         survivorRecoveryPending = true
         bailFromGain = leavingOnBail()?.volume ?: 0f
-        bailStartedAt = SystemClock.elapsedRealtime()
+        bailStartedAt = nowMs()
         phase = Phase.BAILING
     }
 
@@ -6176,10 +6232,11 @@ class CrossfadeController(
             // nothing in flight: marking every one of those as a transition
             // just ended would keep pushing the mark forward and hold a waiting
             // caller off for as long as the calls kept coming.
-            settledAt = SystemClock.elapsedRealtime()
+            settledAt = nowMs()
             // djmix22: arm the 3 s post-handoff pause watch (tick() clears it).
             if (didHandoff) lastHandoffCompleteAtMs = settledAt
         }
+        armOutgoingPreFiltered = false
         AppSettings.smartMixInProgress.value = false
         AppSettings.smartMixBlend.value = null
         clearMixView()
@@ -6920,8 +6977,8 @@ class CrossfadeController(
      * [headroomFor] keeps two faders at full from summing past full scale.
      */
     private fun mixRise(progress: Float): Float {
-        // The decline owns complementary faders over common progress; its
-        // existing filters and bass handoff still shape the overlap.
+        // The decline carve owns its faders: its loud regions never coincide,
+        // which is what hides the raw-tempo flam. Same numbers as the tests.
         if (render.filterVariant == FilterTransitionVariant.DECLINE) {
             return TransitionAlternatives.declineInGainAt(progress.toDouble()).toFloat()
         }
@@ -6946,7 +7003,7 @@ class CrossfadeController(
      * low-pass is already taking it away.
      */
     private fun mixFall(progress: Float): Float {
-        // See mixRise: the decline's faders share the same progress.
+        // See mixRise: the carve's early fall keeps the loud regions disjoint.
         if (render.filterVariant == FilterTransitionVariant.DECLINE) {
             return TransitionAlternatives.declineOutGainAt(progress.toDouble()).toFloat()
         }
@@ -7007,7 +7064,7 @@ class CrossfadeController(
      * already runs through, moved briefly.
      */
     private fun holdPhase(out: ExoPlayer, into: ExoPlayer, progress: Float) {
-        val now = SystemClock.elapsedRealtime()
+        val now = nowMs()
         if (nudgeUntil != 0L) {
             // A pause mid-pulse ends it early; the next reading picks up the rest.
             if (now < nudgeUntil && into.isPlaying) return
@@ -7830,7 +7887,7 @@ class CrossfadeController(
      * Wall-clock slices of one deck build. Written on the decode thread and
      * read on the playback thread; the lock is the whole protocol.
      */
-    private class DeckTiming {
+    private class DeckTiming(private val nowMs: () -> Long) {
         private val lock = Any()
         private val spans = ArrayList<LoopMix.PrepSpan>()
         private var openStep: String? = null
@@ -7840,16 +7897,16 @@ class CrossfadeController(
         var deadlineMs: Long = DeckBudget.NO_DEADLINE_MS
 
         fun begin(step: String) = synchronized(lock) {
-            val now = SystemClock.elapsedRealtime()
+            val now = nowMs()
             closeOpen(now)
             openStep = step
             openStarted = now
         }
 
-        fun endOpen() = synchronized(lock) { closeOpen(SystemClock.elapsedRealtime()) }
+        fun endOpen() = synchronized(lock) { closeOpen(nowMs()) }
 
         fun endOpenIf(step: String) = synchronized(lock) {
-            if (openStep == step) closeOpen(SystemClock.elapsedRealtime())
+            if (openStep == step) closeOpen(nowMs())
         }
 
         fun addClosed(step: String, startedMs: Long, endedMs: Long, deadline: Long) = synchronized(lock) {

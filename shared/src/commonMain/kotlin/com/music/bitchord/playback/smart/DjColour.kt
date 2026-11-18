@@ -85,7 +85,9 @@ class DjColour {
             rolling = false
         } else if (!rolling && beatFrames > 0) {
             rolling = true
-            rollLen = beatFrames.coerceAtMost(roll.size / channels.coerceAtLeast(1))
+            val ringFrames = roll.size / channels.coerceAtLeast(1)
+            val settings = effectSettings(DjEffect.LOOP_ROLL)
+            rollLen = (settings.beats * beatFrames).toInt().coerceAtMost((ringFrames / 2).coerceAtLeast(1))
             rollCursor = 0
             rollSince = 0
             val frames = roll.size / channels.coerceAtLeast(1)
@@ -253,7 +255,7 @@ class DjColour {
             val index = (rollAnchor + rollCursor) % frames
             val fadeFrames = (sampleRate * 0.005f).toInt().coerceAtLeast(1)
             val fade = if (rollCursor < fadeFrames) rollCursor.toFloat() / fadeFrames else 1f
-            val wet = amount.coerceIn(0f, 1f) * fade
+            val wet = amount.coerceIn(0f, 1f) * 0.7f * fade
             for (c in 0 until channels) {
                 val looped = roll[index * channels + c]
                 val dry = samples[base + c]

@@ -168,8 +168,11 @@ class DjMixTest {
     @Test
     fun anInstrumentalBlendCanFlangeAndTwoSingersDoNotGetThatFlanger() {
         val id = (0 until 24).first { pairHash("out", "fx-$it") % 4 == 0 }
-        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id"))
-        assertEquals(DjEffect.NONE, blendColour(0.5, "out", "fx-$id"))
+        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id", measured = true))
+        assertEquals(DjEffect.NONE, blendColour(0.0, "out", "fx-$id"))
+        assertEquals(DjEffect.NONE, blendColour(0.5, "out", "fx-$id", measured = true))
+        val echoId = (0 until 64).first { pairHash("out", "fx-$it") % 4 == 2 }
+        assertEquals(DjEffect.ECHO, blendColour(0.0, "out", "fx-$echoId", measured = true))
     }
 
     @Test
@@ -302,6 +305,107 @@ class DjMixTest {
         }
         assertTrue(MixGain.filterFall(0f) > 0.98f)
         assertTrue(MixGain.filterFall(1f) < 0.02f)
+    }
+
+    @Test
+    fun tempoGapWithWeakConfidenceIsClean() {
+        val weakOut = track(100.0).copy(beatConfidence = 0.1)
+        val weakIn = track(140.0).copy(beatConfidence = 0.1)
+        val weak = DjMix.annotate(gap(), weakOut, weakIn, outgoingId = "a", incomingId = "b")
+        assertEquals(DjEffect.NONE, weak.djEffect)
+        assertEquals(0.0, weak.echoSeconds)
+        val halfWeak = DjMix.annotate(
+            gap(),
+            track(100.0).copy(beatConfidence = 0.1),
+            track(140.0),
+            outgoingId = "a",
+            incomingId = "b",
+        )
+        assertEquals(DjEffect.NONE, halfWeak.djEffect)
+        assertEquals(0.0, halfWeak.echoSeconds)
+    }
+
+    @Test
+    fun fxPolicyIsCleanWhenUnmeasuredOrDualVocal() {
+        val slot0 = (0 until 64).first { FxPolicy.fxSlot("out", "fx-$it") == 0 }
+        assertEquals(
+            DjEffect.NONE,
+            FxPolicy.select("out", "fx-$slot0", true, measured = false, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false),
+        )
+        assertEquals(
+            DjEffect.NONE,
+            FxPolicy.select("out", "fx-$slot0", true, measured = true, vocalClash = 0.5, speechLike = false, drifting = false, buildup = false, cleanSpace = false),
+        )
+        assertEquals(
+            DjEffect.NONE,
+            FxPolicy.select("out", "fx-$slot0", true, measured = true, vocalClash = 0.0, speechLike = true, drifting = false, buildup = false, cleanSpace = false),
+        )
+        assertEquals(
+            DjEffect.NONE,
+            FxPolicy.select("out", "fx-$slot0", true, measured = true, vocalClash = 0.0, speechLike = false, drifting = true, buildup = false, cleanSpace = false),
+        )
+        assertEquals(
+            DjEffect.NONE,
+            FxPolicy.select("out", "fx-$slot0", true, measured = true, vocalClash = Double.NaN, speechLike = false, drifting = false, buildup = false, cleanSpace = false),
+        )
+    }
+
+    @Test
+    fun fxPolicyCleanInstrumentalBallotPreservesFlangerAndEcho() {
+        val flangerId = (0 until 64).first { FxPolicy.fxSlot("out", "fx-$it") == 0 }
+        assertEquals(
+            DjEffect.FLANGER,
+            FxPolicy.select("out", "fx-$flangerId", true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false),
+        )
+        val echoId = (0 until 64).first { FxPolicy.fxSlot("out", "fx-$it") == 2 }
+        assertEquals(
+            DjEffect.ECHO,
+            FxPolicy.select("out", "fx-$echoId", true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false),
+        )
+        val clean = FxPolicy.select("a", "b", rhythmic = false, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = true)
+        assertTrue(clean == DjEffect.ECHO || clean == DjEffect.REVERB, "cleanSpace must be ECHO/REVERB got $clean")
+        assertEquals(
+            DjEffect.FLANGER,
+            blendColour(0.0, "out", "fx-$flangerId", measured = true, buildup = true),
+        )
+    }
+
+    @Test
+    fun phraseExtendFilterKeepsBarsWithoutLoopRoll() {
+        val lyrics = listOf(
+            LyricCue(20.0, 24.0, "first line"),
+            LyricCue(40.0, 44.0, "second line"),
+        )
+        val energy = List(170) { EnergySample(it.toDouble(), if (it >= 160) 0.2 else 1.0) }
+        val out = track(120.0).copy(
+            duration = 170.0,
+            contentEndTime = 168.0,
+            energyCurve = energy,
+            vocalActivityMask = List(170) { 0.05 },
+        )
+        val inn = track(120.0).copy(trackId = "inn")
+        val filterPlan = TransitionPlan(
+            transitionStyle = TransitionStyle.DJ_FILTER,
+            transitionStart = 160.0,
+            transitionEnd = 168.0,
+            fadeSeconds = 8.0,
+            beatSeconds = 0.5,
+            vocalOverlap = 0.0,
+        )
+        val filtered = DjMix.annotate(filterPlan, out, inn, lyrics, emptyList(), "out-filter", "in-filter")
+        assertEquals(4, filtered.phraseExtendBars, "filter must keep bars; summary=${filtered.mixSummary} effect=${filtered.djEffect}")
+        assertTrue(filtered.djEffect != DjEffect.LOOP_ROLL, "filter must not get LOOP_ROLL got ${filtered.djEffect}")
+        val blendPlan = TransitionPlan(
+            transitionStyle = TransitionStyle.DJ_BLEND,
+            transitionStart = 152.0,
+            transitionEnd = 168.0,
+            fadeSeconds = 16.0,
+            beatSeconds = 0.5,
+            vocalOverlap = 0.0,
+        )
+        val blended = DjMix.annotate(blendPlan, out, inn, lyrics, emptyList(), "out-blend", "in-blend")
+        assertEquals(4, blended.phraseExtendBars, "blend must keep bars; summary=${blended.mixSummary} effect=${blended.djEffect}")
+        assertEquals(DjEffect.LOOP_ROLL, blended.djEffect, "blend must get LOOP_ROLL")
     }
 
     @Test

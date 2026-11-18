@@ -276,7 +276,7 @@ class TransitionAlternativesTest {
     fun curveLessNoClashDeclineKeepsBoundedCarve() {
         // (d) no clash, no curves: no family can physically run, so the
         // bounded decline plays — now the DECLINE carve, still at native
-        // tempo (rate 1.0) with the existing filter envelopes.
+        // tempo (rate 1.0) with the separated envelopes.
         TransitionEvidenceCache.clear()
         val bareOut = build("o", 120.0, "C major")
         val bareIn = build("i", 109.0, "C major").copy(lowEnergyCurve = emptyList())
@@ -293,9 +293,11 @@ class TransitionAlternativesTest {
     }
 
     @Test
-    fun declineEnvelopeHasComplementaryGainsAndUnchangedFilters() {
-        // Positive fader overlap and constant squared-gain sum are policy
-        // contracts; the overlapping filter corners do not prove listening quality.
+    fun declineEnvelopeSeparatesDecks() {
+        // Rendered behaviour of the carve, asserted on the shared numbers
+        // the renderer delegates to: midpoint floors, and no progress
+        // point where both gains exceed 0.5 while the bands overlap. The
+        // old sweep envelope fails this (both >0.5 for 9% of the ride).
         val outLp = { p: Double -> TransitionAlternatives.declineOutLpAt(p, 1.0) }
         val inHp = { p: Double -> TransitionAlternatives.declineInHpAt(p, 1.0) }
         val outGain = { p: Double -> TransitionAlternatives.declineOutGainAt(p) }
@@ -306,29 +308,11 @@ class TransitionAlternativesTest {
         assertEquals(2800.0, inHp(0.0), 1e-6)
         assertTrue(inHp(0.5) > 300.0, "midpoint HP=" + inHp(0.5))
         assertEquals(20.0, inHp(1.0), 1e-6)
-        assertTrue(outLp(0.5) > inHp(0.5), "midpoint filter bands overlap")
-        assertEquals(1.0, outGain(0.0), 1e-6)
-        assertEquals(0.0, inGain(0.0), 1e-6)
-        assertEquals(0.0, outGain(1.0), 1e-6)
-        assertEquals(1.0, inGain(1.0), 1e-6)
-        assertEquals(kotlin.math.sqrt(0.5), outGain(0.5), 1e-6)
-        assertEquals(kotlin.math.sqrt(0.5), inGain(0.5), 1e-6)
-        var previousOut = outGain(0.0)
-        var previousIn = inGain(0.0)
-        var overlapSamples = 0
-        for (i in 0..100) {
-            val p = i / 100.0
-            val outgoing = outGain(p)
-            val incoming = inGain(p)
-            // Float sin/cos permits a tiny negative outgoing endpoint.
-            assertTrue(outgoing in -1e-6..1.0 && incoming in 0.0..1.0, "bounded gains at p=$p")
-            assertTrue(outgoing <= previousOut && incoming >= previousIn, "monotonic gains at p=$p")
-            assertEquals(1.0, outgoing * outgoing + incoming * incoming, 2e-6, "power at p=$p")
-            if (outgoing >= 0.5 && incoming >= 0.5) overlapSamples++
-            previousOut = outgoing
-            previousIn = incoming
+        assertTrue(outGain(0.5) < 0.5 && inGain(0.5) < 0.5, "midpoint gains out=" + outGain(0.5) + " in=" + inGain(0.5))
+        val clashAt = (0..1000).map { it / 1000.0 }.firstOrNull { p ->
+            outGain(p) > 0.5 && inGain(p) > 0.5 && outLp(p) > inHp(p)
         }
-        assertTrue(overlapSamples >= 30, "both gains >= 0.5 over at least 30% of the sampled ride")
+        assertNull(clashAt, "both decks audible in one band at p=" + clashAt)
     }
 
     @Test

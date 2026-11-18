@@ -219,11 +219,13 @@ object TransitionMoves {
         // fade-out) is respected by CuePoints' release choice — this
         // only extends when loopableRoom is already true.
         val needsExtension = choice.exit.loopableRoom && choice.exit.roomBars < overlap && choice.exit.roomBars >= 1
-        val looping = choice.template == MixTemplate.M2 || needsExtension || interpolationExtendBars > 0
         // djmix25 P1.2: "extend the original loop by N bars" instead of the
         // hard 4-bar cap, when a repeated phrase lets the outro replay.
-        val loopBars = if (choice.exit.roomBars in 1..2) 2 else 4 + interpolationExtendBars.coerceAtLeast(0)
-        val loopLen = loopBars.toDouble() * outBeat
+        val requestedLoopBars = if (choice.exit.roomBars in 1..2) 2 else 4 + interpolationExtendBars.coerceAtLeast(0)
+        val availableBars = (release / bar).toInt().coerceAtLeast(0)
+        val loopBars = minOf(requestedLoopBars, availableBars, choice.exit.roomBars.coerceAtLeast(0))
+        val looping = (choice.template == MixTemplate.M2 || needsExtension || interpolationExtendBars > 0) && loopBars > 0
+        val loopLen = loopBars.toDouble() * bar
         val outPick = if (looping) {
             LoopMix.Pick(
                 loopStart = (release - loopLen).coerceAtLeast(0.0),

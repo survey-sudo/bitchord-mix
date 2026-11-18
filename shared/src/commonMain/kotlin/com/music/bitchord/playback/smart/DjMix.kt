@@ -81,15 +81,74 @@ fun buildupFits(
     return false
 }
 
-fun blendColour(vocalOverlap: Double, outgoingId: String, incomingId: String): DjEffect {
-    if (outgoingId.isEmpty() && incomingId.isEmpty()) return DjEffect.NONE
-    val slot = pairHash(outgoingId, incomingId) % 4
-    if (vocalOverlap >= 0.18) return if (slot == 1) DjEffect.ECHO else DjEffect.NONE
-    return when (slot) {
-        0, 1 -> DjEffect.FLANGER
-        2 -> DjEffect.ECHO
-        else -> DjEffect.NONE
+fun blendColour(
+    vocalOverlap: Double,
+    outgoingId: String,
+    incomingId: String,
+    measured: Boolean = false,
+    buildup: Boolean = false,
+): DjEffect {
+    return FxPolicy.select(
+        outgoingId, incomingId, rhythmic = true, measured = measured,
+        vocalClash = vocalOverlap, speechLike = false, drifting = false,
+        buildup = buildup, cleanSpace = false,
+    )
+}
+
+/** Pair hash selects only among effects already justified by measured musical evidence. */
+object FxPolicy {
+    fun fxSlot(outgoingId: String, incomingId: String): Int =
+        ((pairHash(outgoingId, incomingId) % 4) + 4) % 4
+
+    fun select(
+        outgoingId: String,
+        incomingId: String,
+        rhythmic: Boolean,
+        measured: Boolean,
+        vocalClash: Double,
+        speechLike: Boolean,
+        drifting: Boolean,
+        buildup: Boolean,
+        cleanSpace: Boolean,
+    ): DjEffect {
+        if (outgoingId.isBlank() || incomingId.isBlank() || !measured || speechLike || drifting ||
+            !vocalClash.isFinite() || vocalClash > 0.20
+        ) return DjEffect.NONE
+        val slot = fxSlot(outgoingId, incomingId)
+        if (cleanSpace) {
+            val hash = pairHash(outgoingId, incomingId)
+            return if (((hash % 3) + 3) % 3 == 2) DjEffect.REVERB else DjEffect.ECHO
+        }
+        if (!rhythmic) return DjEffect.NONE
+        if (vocalClash >= 0.18) return if (slot == 1) DjEffect.ECHO else DjEffect.NONE
+        if (buildup) return when (slot) {
+            0 -> DjEffect.FLANGER
+            1 -> DjEffect.LOOP_ROLL
+            else -> DjEffect.NONE
+        }
+        return when (slot) {
+            0, 1 -> DjEffect.FLANGER
+            2 -> DjEffect.ECHO
+            else -> DjEffect.NONE
+        }
     }
+
+    internal fun measuredVocal(analysis: TrackAnalysis, from: Double, to: Double): Double? {
+        if (!from.isFinite() || !to.isFinite() || to <= from) return null
+        // Require window coverage; whole-track vocalProbability is not measurement of this seam.
+        if (analysis.vocalWindows.any { it.values.isNotEmpty() && it.frameRate > 0.0 &&
+                it.startTime <= from && it.startTime + it.values.size / it.frameRate >= to &&
+                it.values.all { v -> v.isFinite() } }) return vocalShare(analysis, from, to)
+        val curve = analysis.energyCurve
+        if (curve.isEmpty() || curve.first().time > from || curve.last().time < to ||
+            analysis.vocalActivityMask.size != curve.size || analysis.vocalActivityMask.any { !it.isFinite() }
+        ) return null
+        return vocalActivityBetween(analysis, from, to)
+    }
+
+    internal fun drifting(out: TrackAnalysis, inn: TrackAnalysis): Boolean =
+        (out.tailBeats?.beats?.let { it.size >= 8 && fittedBpm(it, atEnd = true) == null } == true) ||
+            (inn.headBeats?.beats?.let { it.size >= 8 && fittedBpm(it, atEnd = false) == null } == true)
 }
 
 /**
@@ -143,16 +202,21 @@ object DjMix {
         next = placeOnStructure(next, analysis, nextAnalysis, lyricsOut, lyricsIn, outSections, inSections)
         next = clashFilter(next, analysis, nextAnalysis)
         next = ensureOverlap(next, analysis)
-        next = tempoGap(next, outgoingId, incomingId)
-        next = colour(next, outgoingId, incomingId)
+        next = tempoGap(next, analysis, nextAnalysis, outgoingId, incomingId)
+        next = colour(next, analysis, nextAnalysis, outgoingId, incomingId)
         val handoff = vocalHandoff(next, analysis, nextAnalysis)
         val extend = phraseExtend(next, analysis, lyricsOut, outSections)
         // djmix20: phrase extension never overwrites a chosen FLANGER (or
-        // any non-NONE colour); it only fills a NONE slot with LOOP_ROLL.
-        if (extend > 0 && next.djEffect == DjEffect.NONE) {
-            next = next.copy(djEffect = DjEffect.LOOP_ROLL, phraseExtendBars = extend)
-        } else if (extend > 0) {
-            next = next.copy(phraseExtendBars = extend)
+        // any non-NONE colour); it only fills a NONE slot with LOOP_ROLL,
+        // and only on a beatmix. phraseExtendBars is kept for every style
+        // so the summary can still name the outro phrase.
+        if (extend > 0) {
+            val outroMeasured = FxPolicy.measuredVocal(analysis, next.transitionStart, next.transitionEnd) != null
+            if (next.transitionStyle == TransitionStyle.DJ_BLEND && next.djEffect == DjEffect.NONE && outroMeasured) {
+                next = next.copy(djEffect = DjEffect.LOOP_ROLL, phraseExtendBars = extend)
+            } else {
+                next = next.copy(phraseExtendBars = extend)
+            }
         }
         val outAt = sectionAt(outSections, next.transitionEnd)?.kind
         val inAt = sectionAt(inSections, next.incomingCueTime)?.kind
@@ -355,24 +419,66 @@ object DjMix {
     }
 
     /** Past the stretch limit: echo (2/3) or a reverb wash (1/3). Echo stays the default. */
-    private fun tempoGap(plan: TransitionPlan, outgoingId: String, incomingId: String): TransitionPlan {
+    private fun tempoGap(
+        plan: TransitionPlan,
+        analysis: TrackAnalysis,
+        nextAnalysis: TrackAnalysis,
+        outgoingId: String,
+        incomingId: String,
+    ): TransitionPlan {
         val gap = plan.filterVariant == FilterTransitionVariant.ECHO_RIDE || plan.echoSeconds > 0.0
         if (!gap || plan.transitionStyle == TransitionStyle.EQUAL_POWER) return plan
-        if (outgoingId.isEmpty() || incomingId.isEmpty()) {
-            return plan.copy(djEffect = DjEffect.ECHO)
-        }
-        return if (pairHash(outgoingId, incomingId) % 3 == 2) {
-            plan.copy(djEffect = DjEffect.REVERB, echoSeconds = 0.0)
-        } else {
-            plan.copy(djEffect = DjEffect.ECHO)
+        val confident = analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE &&
+            nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE
+        if (!confident) return plan.copy(djEffect = DjEffect.NONE, echoSeconds = 0.0)
+        val a = FxPolicy.measuredVocal(analysis, plan.transitionStart, plan.transitionEnd)
+        val b = FxPolicy.measuredVocal(nextAnalysis, plan.incomingCueTime, plan.incomingCueTime + plan.fadeSeconds * plan.incomingPlaybackRate)
+        val vocalClash = maxOf(plan.vocalOverlap, (a ?: 0.0) * (b ?: 0.0))
+        val cleanSpace = (a == null || a < VOCAL_ACTIVE_THRESHOLD) && (b == null || b < VOCAL_ACTIVE_THRESHOLD)
+        val eligible = FxPolicy.select(
+            outgoingId, incomingId,
+            rhythmic = false,
+            measured = confident,
+            vocalClash = vocalClash,
+            speechLike = false,
+            drifting = FxPolicy.drifting(analysis, nextAnalysis),
+            buildup = false,
+            cleanSpace = cleanSpace,
+        )
+        return when (eligible) {
+            DjEffect.REVERB -> plan.copy(djEffect = DjEffect.REVERB, echoSeconds = 0.0)
+            DjEffect.ECHO -> plan.copy(djEffect = DjEffect.ECHO)
+            else -> plan.copy(djEffect = DjEffect.NONE, echoSeconds = 0.0)
         }
     }
 
     /** Flanger or a late throw. Never replaces an echo, roll or reverb already chosen. */
-    private fun colour(plan: TransitionPlan, outgoingId: String, incomingId: String): TransitionPlan {
+    private fun colour(
+        plan: TransitionPlan,
+        analysis: TrackAnalysis,
+        nextAnalysis: TrackAnalysis,
+        outgoingId: String,
+        incomingId: String,
+    ): TransitionPlan {
         if (plan.djEffect != DjEffect.NONE) return plan
         if (plan.transitionStyle != TransitionStyle.DJ_BLEND) return plan
-        val effect = blendColour(plan.vocalOverlap, outgoingId, incomingId)
+        val a = FxPolicy.measuredVocal(analysis, plan.transitionStart, plan.transitionEnd)
+        val b = FxPolicy.measuredVocal(nextAnalysis, plan.incomingCueTime, plan.incomingCueTime + plan.fadeSeconds * plan.incomingPlaybackRate)
+        val confident = analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE &&
+            nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE
+        val measured = a != null && b != null && confident
+        val vocalClash = maxOf(plan.vocalOverlap, (a ?: 1.0) * (b ?: 1.0))
+        val effect = FxPolicy.select(
+            outgoingId, incomingId,
+            rhythmic = true,
+            measured = measured,
+            vocalClash = vocalClash,
+            speechLike = (analysis.vocalProbability > 0.85 && analysis.beatConfidence < 0.35) ||
+                (nextAnalysis.vocalProbability > 0.85 && nextAnalysis.beatConfidence < 0.35),
+            drifting = FxPolicy.drifting(analysis, nextAnalysis) || !stretchReachable(analysis.bpm, nextAnalysis.bpm),
+            buildup = plan.buildup,
+            cleanSpace = plan.echoSeconds > 0.0,
+        )
         return if (effect == DjEffect.NONE) plan else plan.copy(djEffect = effect)
     }
 
