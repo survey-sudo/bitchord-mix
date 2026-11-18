@@ -1,6 +1,12 @@
 package com.music.bitchord.playback.smart
 
+import kotlin.math.PI
+import kotlin.math.ceil
+import kotlin.math.log10
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * One automation lane. Times are master beats relative to the landing L = 0.
@@ -187,7 +193,8 @@ object TransitionMoves {
         val rawFold = if (outBpm > 1.0 && inBpm > 1.0) alignedFold(outBpm, inBpm) else 1.0
         val foldedInBpm = if (inBpm > 1.0) inBpm / rawFold else outBpm
         val tempoDelta = if (outBpm > 1.0 && inBpm > 1.0) kotlin.math.abs(foldedInBpm / outBpm - 1.0) else Double.POSITIVE_INFINITY
-        val forceUnity = nonBeatmatched || outBpm <= 1.0 || inBpm <= 1.0 || tempoDelta > PhraseConfig.TEMPO_HARD_DELTA
+        val forceUnity = nonBeatmatched || outBpm <= 1.0 || inBpm <= 1.0 ||
+            tempoDelta > PhraseConfig.TEMPO_HARD_DELTA + 1e-9
 
         val effectiveFold = if (forceUnity) 1.0 else rawFold
         val targetBpmOverride = if (forceUnity) outBpm else null
@@ -292,20 +299,88 @@ object TransitionMoves {
         // Sync incomingHoldSec to LoopMix.Clock's exact ramped beat-time integral
         // beatTimes[rampTo] so Song B enters on the exact beat/downbeat when
         // outBpm != inBpm (constant ramp * bar drifted by up to ~1.5 beats).
-        val hold = if (ramp > 0) {
-            val clock = LoopMix.Clock(basePlan)
-            clock.beatTimes[clock.rampTo]
-        } else {
-            0.0
-        }
-        val plan = basePlan.copy(incomingHoldSec = hold)
+        val clock = LoopMix.Clock(basePlan)
+        val rampHold = if (ramp > 0) clock.beatTimes[clock.rampTo] else 0.0
+        // B is native/unity: its bars are not A's bars under a half/double-time
+        // fold, and non-beatmatched templates have different beat durations too.
+        // Solve cue/hold from the exact release integral, not `leadInBars - exit`.
+        val entrySpan = choice.entry.leadInBars.coerceAtLeast(0) * inBar +
+            if (choice.entry.leadInBars == 0) choice.entry.pickupBeats.coerceAtLeast(0f) * inBeat else 0.0
+        val hold = maxOf(rampHold, clock.releaseAt - entrySpan).coerceIn(0.0, clock.releaseAt)
+        val cue = (choice.entry.startSec + entrySpan - (clock.releaseAt - hold)).coerceAtLeast(choice.entry.startSec)
+        val plan = basePlan.copy(inn = inPick.copy(loopStart = cue, loopEnd = cue), incomingHoldSec = hold)
         return sheet(choice, plan, wantFlanger && !keyClash, hold, delaySec, echoFeedbackForPlan)
     }
 
     /** Beats from t0 to the landing, for a compiled plan: the ramp, then the overlap. */
     fun landingBeat(script: PhraseScript): Double {
-        val plan = script.plan
-        return (plan.rampBars + plan.exitBars).coerceAtLeast(1) * 4.0
+        return script.plan.totalBars * 4.0
+    }
+
+    /** The same master beat clock used by the deck knots, including pre-roll and exit tails. */
+    fun laneSeconds(clock: LoopMix.Clock, beatFromLanding: Double): Double {
+        val beat = clock.beats + beatFromLanding
+        if (beat <= 0.0) return beat * clock.plan.out.beatSec
+        val times = clock.beatTimes
+        val last = times.lastIndex
+        if (beat >= last) return times[last] + (beat - last) * 60.0 / clock.tempo(last)
+        val k = beat.toInt()
+        return times[k] + (times[k + 1] - times[k]) * (beat - k)
+    }
+
+    /**
+     * Bake a score lane into the renderer's existing linear/log envelopes, not
+     * a second renderer. Gain knots are converted to amplitude first: `ep`
+     * interpolates their power with the sin/cos fader law, `cos` eases the
+     * rendered value, and `lin` retains linear interpolation. Frequencies keep
+     * their log-domain sweep. Samples are <=10 ms apart, on the master clock;
+     * every original knot survives exactly, including L=0 and the bass swap.
+     */
+    fun laneEnvelope(lane: Lane, clock: LoopMix.Clock, asGain: Boolean = false): Pair<DoubleArray, FloatArray> {
+        require(lane.beats.size == lane.values.size) { "lane beat/value count" }
+        require(lane.beats.all { it.isFinite() } && lane.values.all { it.isFinite() }) { "non-finite lane" }
+        if (lane.beats.isEmpty()) return DoubleArray(0) to FloatArray(0)
+        // A zero-length hold (pickup=0) is legal. Coalesce equal-time knots,
+        // last one wins, so native never receives an ambiguous zero-width span.
+        val sorted = lane.beats.indices.sortedBy { lane.beats[it] }
+        val beats = ArrayList<Double>()
+        val values = ArrayList<Float>()
+        fun gain(db: Float) = if (db <= MUTE_DB) 0f else 10.0.pow(db / 20.0).toFloat()
+        for (i in sorted) {
+            val value = if (asGain) gain(lane.values[i]) else lane.values[i]
+            if (beats.lastOrNull() == lane.beats[i]) values[values.lastIndex] = value else {
+                beats.add(lane.beats[i])
+                values.add(value)
+            }
+        }
+        val times = ArrayList<Double>()
+        val rendered = ArrayList<Float>()
+        times.add(laneSeconds(clock, beats.first()))
+        rendered.add(values.first())
+        for (i in 1 until beats.size) {
+            val from = beats[i - 1]
+            val to = beats[i]
+            val a = values[i - 1].toDouble()
+            val b = values[i].toDouble()
+            val duration = laneSeconds(clock, to) - laneSeconds(clock, from)
+            val steps = if (a == b) 1 else maxOf(1, ceil(duration / 0.010).toInt(), ceil((to - from) * 16).toInt())
+            for (s in 1..steps) {
+                val p = s.toDouble() / steps
+                val ease = when (lane.shape) {
+                    "ep", "cos" -> sin(PI * p / 2.0).let { it * it }
+                    else -> p
+                }
+                val value = when {
+                    s == steps -> b
+                    asGain && lane.shape == "ep" -> sqrt((a * a * (1.0 - ease) + b * b * ease).coerceAtLeast(0.0))
+                    lane.exponential && !asGain && a > 0.0 && b > 0.0 -> a * (b / a).pow(ease)
+                    else -> a + (b - a) * ease
+                }
+                times.add(laneSeconds(clock, from + (to - from) * p))
+                rendered.add(value.toFloat())
+            }
+        }
+        return times.toDoubleArray() to rendered.toFloatArray()
     }
 
     private fun sheet(
@@ -445,11 +520,14 @@ object TransitionMoves {
         val phase = if (o >= PhraseConfig.PHASE_GATE_LONG_BARS) PhraseConfig.PHASE_GATE_LONG_MS.toDouble()
         else PhraseConfig.PHASE_GATE_SHORT_MS.toDouble()
         val tailBeats = PhraseConfig.exitTailSeconds(plan.out.beatSec) / plan.out.beatSec
+        // The sheet owns LP too. Carry it on Plan so script-less build paths
+        // cannot silently fall back to a generic carve instead of the authored lane.
+        val outLp = plan.outLp ?: lane(0.0, 20000f)
         return PhraseScript(
             choice = choice,
-            plan = plan,
+            plan = plan.copy(outLp = outLp),
             outGain = withExitTail(outGain, tailBeats),
-            inGain = inGain,
+            inGain = withIncomingHold(inGain, LoopMix.Clock(plan), holdSec),
             outLow = outLow,
             inLow = inLow,
             outMid = outMid,
@@ -458,7 +536,7 @@ object TransitionMoves {
             inHigh = inHigh,
             outHp = outHp,
             inHp = lane(0.0, 20f),
-            outLp = lane(0.0, 20000f),
+            outLp = outLp,
             echoSend = echoSend,
             echoDelaySec = echoDelaySec,
             echoFeedback = echoFeedback,
@@ -470,6 +548,35 @@ object TransitionMoves {
                 choice.template == MixTemplate.ROLLING || choice.template == MixTemplate.M2),
             bTrimDb = 0f,
             phaseMs = phase,
+        )
+    }
+
+    /** A late native hold cannot start B at an already-raised gain (notably fold=2). */
+    private fun withIncomingHold(lane: Lane, clock: LoopMix.Clock, holdSec: Double): Lane {
+        if (holdSec <= 0.0 || lane.beats.isEmpty()) return lane
+        val (k, fraction) = clock.beatAt(holdSec)
+        val holdBeat = k + fraction - clock.beats
+        if (holdBeat <= lane.beats.first() + 1e-9) return lane
+        val endBeat = if (holdBeat < 0.0) minOf(0.0, holdBeat + 1.0) else {
+            holdBeat + 0.025 / (60.0 / clock.tempo(clock.beats))
+        }
+        val (times, values) = laneEnvelope(lane, clock, asGain = true)
+        val at = laneSeconds(clock, endBeat)
+        val i = times.indexOfFirst { it >= at }
+        val gain = when {
+            i < 0 -> values.last()
+            i == 0 -> values.first()
+            else -> {
+                val f = ((at - times[i - 1]) / (times[i] - times[i - 1])).toFloat()
+                values[i - 1] + (values[i] - values[i - 1]) * f
+            }
+        }
+        val db = if (gain <= 0f) MUTE_DB else (20.0 * log10(gain.toDouble())).toFloat()
+        val rest = lane.beats.indices.filter { lane.beats[it] > endBeat }
+        return Lane(
+            doubleArrayOf(holdBeat, endBeat, *rest.map { lane.beats[it] }.toDoubleArray()),
+            floatArrayOf(MUTE_DB, db, *rest.map { lane.values[it] }.toFloatArray()),
+            lane.shape, lane.exponential,
         )
     }
 

@@ -71,7 +71,7 @@ class DjMixTest {
     }
 
     @Test
-    fun aKeyClashBecomesAShortFilterAndALoopPlanIsUntouched() {
+    fun aKeyClashBecomesAShortBassRescueAndALoopPlanIsUntouched() {
         val out = track(120.0, "C major")
         val clash = track(120.0, "F# major")
         val blend = TransitionPlan(
@@ -86,7 +86,8 @@ class DjMixTest {
         val filtered = DjMix.annotate(blend, out, clash, outgoingId = "a", incomingId = "b")
         assertEquals(TransitionStyle.DJ_FILTER, filtered.transitionStyle)
         val bars = filtered.fadeSeconds / (4 * 0.5)
-        assertTrue(bars in 4.0..8.05, "key clash should run 4 to 8 bars, was $bars")
+        assertEquals(FilterTransitionVariant.BASS_HANDOFF, filtered.filterVariant)
+        assertTrue(bars <= 2.0 && filtered.fadeSeconds <= 6.0, "bass-only key-clash rescue was $bars bars")
         assertTrue(filtered.mixSummary.contains("clash"))
     }
 

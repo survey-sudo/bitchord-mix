@@ -146,9 +146,14 @@ float Envelope::at(double time) const {
   if (times.empty()) return 0;
   if (time <= times.front()) return values.front();
   if (time >= times.back()) return values.back();
-  // Envelopes are a handful of points; a linear scan beats a search's branches.
+  // Legacy envelopes are a handful of points. Baked PHRASE shapes can be
+  // longer: avoid scanning thousands of knots in every 64-frame control block.
   size_t i = 1;
-  while (i < times.size() && times[i] < time) ++i;
+  if (times.size() <= 32) {
+    while (i < times.size() && times[i] < time) ++i;
+  } else {
+    i = size_t(std::lower_bound(times.begin() + 1, times.end(), time) - times.begin());
+  }
   const double t0 = times[i - 1], t1 = times[i];
   const double f = t1 > t0 ? (time - t0) / (t1 - t0) : 1.0;
   const double v0 = values[i - 1], v1 = values[i];
@@ -607,7 +612,18 @@ void Renderer::setFlanger(int index, double lfoHz, double depthSeconds, float fe
 void Renderer::setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats) {
   if (index < 0 || index > 1) return;
   Deck& d = decks_[index];
-  d.loopRoll = enabled;
+  const int64_t size = int64_t(std::min(d.left.size(), d.right.size()));
+  const int64_t seam = std::max<int64_t>(1, std::llround(kLoopSeamSeconds * sampleRate_));
+  const double body = 4.0 * beatSec * sampleRate_;
+  // Belt-and-braces for callers other than LoopMixSession: no complete
+  // four-beat PCM body means NONE, not a roll flag over straight/no-op bounds.
+  d.loopRoll = enabled && sampleRate_ > 0 && d.left.size() == d.right.size() &&
+      std::isfinite(beatSec) && beatSec > 0 && std::isfinite(body) &&
+      std::isfinite(rollStartSec) && std::isfinite(releaseSec) && releaseSec > rollStartSec &&
+      std::isfinite(totalRollBeats) && totalRollBeats >= 4 && d.loopStart >= 0 &&
+      d.loopEnd > d.loopStart && double(d.loopEnd - d.loopStart) + 1 >= body &&
+      d.loopEnd <= size && seam - 1 <= size - d.loopEnd;
+  d.effectiveLoopEnd = -1;
   d.rollStartMixSec = rollStartSec;
   d.rollBeatSec = beatSec;
   d.rollReleaseMixSec = releaseSec;

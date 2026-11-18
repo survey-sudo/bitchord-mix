@@ -27,11 +27,12 @@ class Djmix19RegressionTest {
         val ch = 2
         val colour = DjColour()
         colour.configure(sr, ch)
-        colour.set(DjEffect.LOOP_ROLL, 1f, 0.5f, 0f)
+        colour.set(DjEffect.NONE, 0f, 0.5f, 0f)
         val blockFrames = 4800
         val block = FloatArray(blockFrames * ch)
         var frame = 0
-        // Warmup 4 s (192k frames) so the 2 s ring wraps and the loop is live.
+        // Prime real history before capture. Starting a roll over an empty
+        // ring used to pass this test by replaying silence or bypassing it.
         repeat(40) {
             for (i in 0 until blockFrames) {
                 val v = frame.toFloat()
@@ -41,6 +42,7 @@ class Djmix19RegressionTest {
             }
             colour.process(block, blockFrames, ch)
         }
+        assertEquals(DjEffect.LOOP_ROLL, colour.set(DjEffect.LOOP_ROLL, 1f, 0.5f, 0f))
         // Test block: a fresh ramp; within one roll window the output must be
         // the same ramp delayed, i.e. step 1 per frame, never 2.
         for (i in 0 until blockFrames) {
@@ -50,6 +52,8 @@ class Djmix19RegressionTest {
             frame++
         }
         colour.process(block, blockFrames, ch)
+        assertEquals(4 * 24_000, colour.rollBodyFrames)
+        assertTrue(block.last() < frame - 10_000f, "test must hear a real delayed body, not bypass")
         assertTrue(block.all { it.isFinite() })
         var oneCount = 0
         var twoCount = 0

@@ -1,11 +1,12 @@
 package com.music.bitchord.playback.loopmix
 
 import android.util.Log
+import com.music.bitchord.playback.smart.DjEffect
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.LoopMixDuck
 import com.music.bitchord.playback.smart.MixGain
 import com.music.bitchord.playback.smart.TransitionAlternatives
-import com.music.bitchord.playback.smart.MixTemplate
+import com.music.bitchord.playback.smart.TransitionMoves
 import com.music.bitchord.playback.smart.PhraseConfig
 import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.ReleaseSplice
@@ -17,7 +18,6 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.pow
 import kotlin.math.roundToLong
 
 /**
@@ -249,7 +249,7 @@ class LoopMixSession private constructor(
             // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
             // read script?.incomingHoldSec — up to seconds apart on phrase plans).
             val effectiveHoldSec = script?.incomingHoldSec ?: plan.incomingHoldSec
-            val effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec) {
+            var effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec) {
                 plan.copy(incomingHoldSec = effectiveHoldSec)
             } else plan
             val clock = LoopMix.Clock(effectivePlan)
@@ -296,6 +296,11 @@ class LoopMixSession private constructor(
                 Log.i(TAG, "loop-domain rejected: incomplete physical PCM out=${outRegion.left.size}/${outRegion.right.size} in=${inRegion.left.size}/${inRegion.right.size} requiredOut=$requiredOutEnd requiredIn=${incomingGeometry.requiredEnd}")
                 return null
             }
+            val rollBody = outgoingRollBody(effectivePlan, clock, knots, outRegion, sampleRate)
+            if (effectivePlan.buildupRoll && rollBody.effect == DjEffect.NONE) {
+                Log.i(TAG, "roll-domain rejected: no complete beat-aligned body; effect=NONE")
+            }
+            effectivePlan = planForRollBody(effectivePlan, rollBody)
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
@@ -538,16 +543,25 @@ class LoopMixSession private constructor(
             val outKnotPositions = DoubleArray(knots.outPositionsSec.size) {
                 samplesOf(outRegion, knots.outPositionsSec[it])
             }
-            val outLoopEnd = if (effectivePlan.outLoops) effectivePlan.out.loopEnd else effectivePlan.out.loopStart
+            // Straight PHRASE/Beat blend rolls need real PCM bounds too. Keep
+            // the takeover/knots straight until the late roll body, rather than
+            // advertising a roll with loopEnd == loopStart (native no-op).
+            val straightRoll = !effectivePlan.outLoops && rollBody.effect == DjEffect.LOOP_ROLL
+            val outLoopStart = if (straightRoll) rollBody.startTrack else effectivePlan.out.loopStart
+            val outLoopEnd = when {
+                effectivePlan.outLoops -> effectivePlan.out.loopEnd
+                straightRoll -> rollBody.endTrack
+                else -> effectivePlan.out.loopStart
+            }
             renderer.setDeck(
                 LoopMixRenderer.OUT,
                 LoopMixRenderer.DeckSetup(
                     left = outRegion.left,
                     right = outRegion.right,
                     regionStart = outRegion.start,
-                    loopStart = samplesOf(outRegion, effectivePlan.out.loopStart).roundToLong(),
+                    loopStart = samplesOf(outRegion, outLoopStart).roundToLong(),
                     loopEnd = samplesOf(outRegion, outLoopEnd).roundToLong(),
-                    releaseAt = 1e18,
+                    releaseAt = if (straightRoll) samplesOf(outRegion, knots.outPositionsSec[clock.beats]) else 1e18,
                     knotFrames = outKnotFrames,
                     knotPositions = outKnotPositions,
                     runOn = false,
@@ -664,17 +678,15 @@ class LoopMixSession private constructor(
                     )
                 }
                 if (effectivePlan.buildupRoll) {
-                    val beatSec = effectivePlan.out.beatSec.coerceAtLeast(0.1)
-                    val totalBeats = clock.beats.toDouble()
-                    val rollBeats = if (totalBeats >= 16.0) 16.0 else 8.0
-                    val rollStartSec = (clock.releaseAt - rollBeats * beatSec).coerceAtLeast(0.0)
+                    val beatSec = rollBody.beatSec
+                    val rollStartSec = rollBody.startMixSec
                     renderer.setLoopRoll(
                         LoopMixRenderer.OUT,
                         enabled = true,
                         rollStartSec = rollStartSec,
                         beatSec = beatSec,
                         releaseSec = clock.releaseAt,
-                        totalRollBeats = rollBeats,
+                        totalRollBeats = rollBody.beats,
                     )
                     val hpEnd = effectivePlan.hpSweepEndHz.takeIf { it > 0f } ?: LoopMix.BUILDUP_HP_END_HZ
                     renderer.setEnvelope(
@@ -863,6 +875,11 @@ class LoopMixSession private constructor(
                     renderer.setIsolate(LoopMixRenderer.OUT, true)
                     renderer.setIsolate(LoopMixRenderer.IN, true)
                 }
+                if (script == null) effectivePlan.outLp?.let { lane ->
+                    val (times, values) = TransitionMoves.laneEnvelope(lane, clock)
+                    renderer.setEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ,
+                        times, values, lane.exponential)
+                }
                 val midCarve = computeVocalMidCarve(effectivePlan, clock, script, inAnalysis, sungIn)
                 if (midCarve.apply) {
                     renderer.setIsolate(LoopMixRenderer.OUT, true)
@@ -901,35 +918,36 @@ class LoopMixSession private constructor(
             plan: LoopMix.Plan,
             script: com.music.bitchord.playback.smart.PhraseScript,
         ) {
-            fun seconds(beatFromLanding: Double): Double {
-                val landing = (plan.rampBars + plan.exitBars).coerceAtLeast(1) * 4.0
-                val beat = landing + beatFromLanding
-                if (beat <= 0.0) return beat * plan.out.beatSec
-                val last = clock.beatTimes.lastIndex
-                val k = beat.toInt().coerceIn(0, (last - 1).coerceAtLeast(0))
-                val frac = (beat - k).coerceIn(0.0, 1.0)
-                val t0 = clock.beatTimes[k]
-                val t1 = clock.beatTimes[(k + 1).coerceAtMost(last)]
-                return t0 + (t1 - t0) * frac
+            for (env in computePhraseEnvelopes(clock, plan, script)) {
+                renderer.setEnvelope(env.deck, env.kind, env.times, env.values, env.exponential)
             }
-            fun db(value: Float): Float = if (value <= -80f) 0f else 10.0.pow(value / 20.0).toFloat()
-            fun put(deck: Int, kind: Int, lane: com.music.bitchord.playback.smart.Lane, asDb: Boolean, exponential: Boolean = lane.exponential) {
+        }
+
+        internal data class PhraseEnvelope(
+            val deck: Int, val kind: Int, val times: DoubleArray, val values: FloatArray, val exponential: Boolean,
+        )
+
+        /** Pure wire arrays consumed by applyPhraseLanes; testable without loading JNI. */
+        internal fun computePhraseEnvelopes(clock: LoopMix.Clock, plan: LoopMix.Plan, script: PhraseScript): List<PhraseEnvelope> {
+            val result = ArrayList<PhraseEnvelope>()
+            fun put(deck: Int, kind: Int, lane: com.music.bitchord.playback.smart.Lane, asGain: Boolean = false) {
                 if (lane.beats.isEmpty()) return
-                val times = DoubleArray(lane.beats.size) { seconds(lane.beats[it]) }
-                val values = FloatArray(lane.values.size) { if (asDb) db(lane.values[it]) else lane.values[it] }
-                renderer.setEnvelope(deck, kind, times, values, exponential)
+                val (times, values) = TransitionMoves.laneEnvelope(lane, clock, asGain)
+                result.add(PhraseEnvelope(deck, kind, times, values, lane.exponential && !asGain))
             }
-            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN, script.outGain, asDb = true)
-            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN, script.inGain, asDb = true)
-            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_DB, script.outLow, asDb = false)
-            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB, script.inLow, asDb = false)
-            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_MID_DB, script.outMid, asDb = false)
-            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_MID_DB, script.inMid, asDb = false)
-            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_DB, script.outHigh, asDb = false)
-            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_HIGH_DB, script.inHigh, asDb = false)
-            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_PASS_HZ, script.outHp, asDb = false, exponential = true)
-            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_HIGH_PASS_HZ, script.inHp, asDb = false, exponential = true)
-            if (plan.echoTail) put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_ECHO_SEND, script.echoSend, asDb = false)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN, script.outGain, asGain = true)
+            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN, script.inGain, asGain = true)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_DB, script.outLow)
+            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB, script.inLow)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_MID_DB, script.outMid)
+            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_MID_DB, script.inMid)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_DB, script.outHigh)
+            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_HIGH_DB, script.inHigh)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_PASS_HZ, script.outHp)
+            put(LoopMixRenderer.IN, LoopMixRenderer.KIND_HIGH_PASS_HZ, script.inHp)
+            put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ, script.outLp)
+            if (plan.echoTail) put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_ECHO_SEND, script.echoSend)
+            return result
         }
 
         internal class DeckKnots(
@@ -938,6 +956,41 @@ class LoopMixSession private constructor(
             val inFrames: DoubleArray,
             val inPositionsSec: DoubleArray,
         )
+
+        internal data class RollBody(
+            val effect: DjEffect = DjEffect.NONE,
+            val startTrack: Double = 0.0,
+            val endTrack: Double = 0.0,
+            val startMixSec: Double = 0.0,
+            val beatSec: Double = 0.0,
+            val beats: Double = 0.0,
+        )
+
+        /** Real four-beat body for the existing native roll, or an explicit NONE. */
+        internal fun outgoingRollBody(
+            plan: LoopMix.Plan, clock: LoopMix.Clock, knots: DeckKnots, region: LoopRegion, sampleRate: Int,
+        ): RollBody {
+            if (!plan.buildupRoll || clock.beats < 4 || !plan.out.beatSec.isFinite() || plan.out.beatSec <= 0.05 ||
+                knots.outPositionsSec.size <= clock.beats
+            ) return RollBody()
+            val rollBeats = minOf(if (clock.beats >= 16) 16 else 8, clock.beats)
+            val startBeat = clock.beats - rollBeats
+            val start = if (plan.outLoops) plan.out.loopStart else knots.outPositionsSec[startBeat]
+            val end = if (plan.outLoops) plan.out.loopEnd else knots.outPositionsSec[startBeat + 4]
+            val beatSec = if (plan.outLoops) plan.out.beatSec else (end - start) / 4.0
+            if (!start.isFinite() || !end.isFinite() || !beatSec.isFinite() || beatSec <= 0.05 ||
+                end - start + 1e-9 < 4 * beatSec || !coversPhysical(region, sampleRate, start, end + 0.008)
+            ) return RollBody()
+            if (!plan.outLoops && (1..4).any {
+                    val dt = knots.outPositionsSec[startBeat + it] - knots.outPositionsSec[startBeat + it - 1]
+                    !dt.isFinite() || dt <= 0.05 || abs(dt - beatSec) > LoopMix.PHASE_GATE_MS / 1000.0
+                }) return RollBody()
+            return RollBody(DjEffect.LOOP_ROLL, start, end, clock.beatTimes[startBeat], beatSec, rollBeats.toDouble())
+        }
+
+        /** Published session plan describes the FX actually armed, not an unsupported requested roll. */
+        internal fun planForRollBody(plan: LoopMix.Plan, body: RollBody): LoopMix.Plan =
+            if (plan.buildupRoll && body.effect == DjEffect.NONE) plan.copy(buildupRoll = false) else plan
 
         internal class VocalMidCarve(
             val apply: Boolean,
@@ -1092,7 +1145,10 @@ class LoopMixSession private constructor(
 
             val inSideBeats = inAnalysis?.headBeats?.beats?.takeIf { it.isNotEmpty() }
                 ?: inAnalysis?.tailBeats?.beats
-            if (plan.rung != "Echo" && !plan.inLoops && inSideBeats != null) {
+            // PHRASE policy b has already solved its native cue/hold for L.
+            // Re-indexing native B by A's beats (or rounding a fractional hold
+            // up to a beat) would stretch B and move that selected landing.
+            if (plan.rung != "Echo" && !plan.nativeIncoming && !plan.inLoops && inSideBeats != null) {
                 val holdIdx = if (clock.incomingHoldSec > 1e-9) {
                     (0..totalInBeats).firstOrNull { clock.beatTimes[it] >= clock.incomingHoldSec - 1e-6 } ?: beats
                 } else 0
@@ -1146,12 +1202,9 @@ class LoopMixSession private constructor(
             inAnalysis: TrackAnalysis?,
             sungIn: List<LoopMix.Span>?,
         ): VocalMidCarve {
-            if (plan.rung == "Echo") return VocalMidCarve(apply = false)
-            val scriptInVocal = script != null && (
-                script.choice.entry.leadInVocal >= 0.2f ||
-                    script.choice.vocalOverlapBeats >= 1.0 ||
-                    script.choice.template in setOf(MixTemplate.M4, MixTemplate.M5, MixTemplate.VOCAL_OVER_OUTRO)
-                )
+            // An authored PHRASE sheet owns its mid/vocal lanes, including
+            // deliberate flat lanes. Generic rescue must not rewrite the template.
+            if (plan.rung == "Echo" || script != null) return VocalMidCarve(apply = false)
             val inWinFrom = plan.inn.loopStart
             val inWinTo = maxOf(inWinFrom + 2.0, clock.elementTrackTime)
             val earliestSung = sungIn
@@ -1163,23 +1216,13 @@ class LoopMixSession private constructor(
             val maskInVocal = maskIn != null && (maskIn.share >= 0.15 || maskIn.longestRunSec >= 0.30)
             val probInVocal = sungIn == null && inAnalysis != null &&
                 inAnalysis.vocalWindows.isEmpty() && inAnalysis.vocalProbability >= 0.45 && !plan.inLoops
-            val incomingHasVocal = scriptInVocal || earliestSung != null || maskInVocal || probInVocal
+            val incomingHasVocal = earliestSung != null || maskInVocal || probInVocal
             if (!incomingHasVocal) return VocalMidCarve(apply = false)
-
-            // Do not clobber applyPhraseLanes if the script already wrote a mid carve.
-            if (script != null && script.outMid.values.any { it <= -4.5f }) {
-                return VocalMidCarve(apply = false)
-            }
 
             val beatSec = plan.out.beatSec.coerceAtLeast(0.1)
             val release = clock.releaseAt.coerceAtLeast(0.25)
             val targetSec = when {
                 earliestSung != null -> (clock.incomingHoldSec + (earliestSung - inWinFrom)).coerceIn(0.2, release)
-                script != null -> {
-                    val landingIdx = ((plan.rampBars + plan.exitBars).coerceAtLeast(1) * 4)
-                        .coerceIn(1, clock.beatTimes.lastIndex)
-                    clock.beatTimes[landingIdx].coerceIn(0.2, release)
-                }
                 else -> clock.handoffAt.coerceIn(minOf(2.0 * beatSec, release * 0.5), release)
             }
             val scoopDur = (4.0 * beatSec).coerceAtLeast(0.5)

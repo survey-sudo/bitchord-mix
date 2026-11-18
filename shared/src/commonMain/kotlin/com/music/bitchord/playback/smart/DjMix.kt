@@ -201,7 +201,7 @@ object DjMix {
         val inSections = labelSections(nextAnalysis, lyricsIn)
         next = placeOnStructure(next, analysis, nextAnalysis, lyricsOut, lyricsIn, outSections, inSections)
         next = clashFilter(next, analysis, nextAnalysis)
-        next = ensureOverlap(next, analysis)
+        next = ensureOverlap(next, analysis, nextAnalysis)
         next = tempoGap(next, analysis, nextAnalysis, outgoingId, incomingId)
         next = colour(next, analysis, nextAnalysis, outgoingId, incomingId)
         val handoff = vocalHandoff(next, analysis, nextAnalysis)
@@ -241,6 +241,11 @@ object DjMix {
         }
         if (build && next.djEffect != DjEffect.LOOP_ROLL && next.djEffect != DjEffect.REVERB) {
             next = next.copy(djEffect = DjEffect.FLANGER)
+        }
+        // A roll needs a complete four-beat body at a supported tempo. Do not
+        // label an unknown/unsupported beat length as a roll that the sink cannot play.
+        if (next.djEffect == DjEffect.LOOP_ROLL && !DjColour.supportsRoll(next.beatSeconds.toFloat())) {
+            next = next.copy(djEffect = DjEffect.NONE)
         }
         return next.copy(
             vocalHandoff = handoff,
@@ -373,14 +378,16 @@ object DjMix {
     /**
      * A beatmix shares at least 8 bars and at most 16. A filter, echo or
      * roll shares at least 4 and at most 8, when the outgoing track has
-     * that much music left before [TransitionPlan.transitionEnd].
+     * that much music left before [TransitionPlan.transitionEnd]. A bass-only
+     * handoff without a supported grid/key match is a short rescue, not a club blend.
      */
-    private fun ensureOverlap(plan: TransitionPlan, analysis: TrackAnalysis): TransitionPlan {
+    private fun ensureOverlap(plan: TransitionPlan, analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): TransitionPlan {
         // djmix15: catch-up quick dissolves (1.2-3.5 s in <2.5 s of room)
         // are intentionally shorter than the 4-bar club minimum. Lengthening
         // them moves the start behind the playhead and recreates the dead
-        // stale window. Never re-size a catch-up.
-        if (plan.reason.endsWith(":catch-up")) return plan
+        // stale window. A bounded bass rescue below may only shorten their
+        // end, never move the already-pinned start.
+        val catchUp = plan.reason.endsWith(":catch-up")
         // 2B bounded decline (TransitionPlanner): the 4 s DJ_FILTER length is
         // intentional — the 4-bar club minimum would stretch it to ~8 bars
         // and recreate the exposed overlap. Never resize a decline plan.
@@ -390,9 +397,33 @@ object DjMix {
         if (plan.transitionStyle != TransitionStyle.DJ_BLEND && plan.transitionStyle != TransitionStyle.DJ_FILTER) {
             return plan
         }
-        val beat = plan.beatSeconds.takeIf { it > 0 }
-            ?: analysis.beatInterval.takeIf { it > 0 }
-            ?: if (analysis.bpm > 0) 60.0 / analysis.bpm else return plan
+        val beat = plan.beatSeconds.takeIf { it.isFinite() && it > 0 }
+            ?: analysis.beatInterval.takeIf { it.isFinite() && it > 0 }
+            ?: analysis.bpm.takeIf { it.isFinite() && it > 0 }?.let { 60.0 / it }
+        if (plan.filterVariant == FilterTransitionVariant.BASS_HANDOFF &&
+            plan.transitionStyle == TransitionStyle.DJ_FILTER && !supportedBassBlend(analysis, nextAnalysis)
+        ) {
+            // This ride leaves both LPs open: bass HP + a shallow mid dip cannot
+            // separate two unaligned full arrangements for 4–8 bars. Keep the
+            // selected exit/cue, shrink the overlap, and never lengthen a rescue.
+            val cap = minOf(6.0, beat?.let { 2 * 4 * it } ?: 6.0)
+            val end = plan.transitionEnd
+            if (!end.isFinite() || end <= 0.0 || !plan.fadeSeconds.isFinite() || plan.fadeSeconds <= 0.0) return plan
+            val fade = minOf(plan.fadeSeconds, cap, end)
+            val start = if (catchUp) plan.transitionStart else end - fade
+            if (!start.isFinite() || start < 0.0) return plan
+            return plan.copy(
+                transitionStart = start,
+                transitionEnd = if (catchUp) start + fade else end,
+                fadeSeconds = fade,
+                handoffDuration = fade,
+                transitionBeats = if (plan.transitionBeats > 0 && beat != null) {
+                    minOf(plan.transitionBeats, kotlin.math.floor(fade / beat + 1e-9).toInt())
+                } else plan.transitionBeats,
+            )
+        }
+        if (catchUp) return plan
+        if (beat == null) return plan
         val blend = plan.transitionStyle == TransitionStyle.DJ_BLEND
         val defaultMinBars = if (blend) 8 else 4
         val defaultMinFade = defaultMinBars * 4 * beat
@@ -416,6 +447,18 @@ object DjMix {
         val fade = end - start
         if (fade + 0.05 < minFade && start <= 0.0) return plan
         return plan.copy(transitionStart = start, fadeSeconds = fade, handoffDuration = fade)
+    }
+
+    private fun supportedBassBlend(out: TrackAnalysis, inn: TrackAnalysis): Boolean {
+        if (out.beatConfidence.orZero() < MIN_DJ_CONFIDENCE || inn.beatConfidence.orZero() < MIN_DJ_CONFIDENCE ||
+            !out.bpm.isFinite() || !inn.bpm.isFinite() || out.bpm <= 0.0 || inn.bpm <= 0.0 ||
+            !stretchReachable(out.bpm, inn.bpm) ||
+            abs(incomingRateBetween(out.bpm, inn.bpm) - 1.0) > PhraseConfig.TEMPO_HARD_DELTA || FxPolicy.drifting(out, inn)
+        ) return false
+        if (!(exitKeyConfidence(out) >= 0.5) || !(entryKeyConfidence(inn) >= 0.5)) return false
+        val left = camelotCode(exitKeyForMix(out)) ?: return false
+        val right = camelotCode(entryKeyForMix(inn)) ?: return false
+        return camelotCompatible(left, right)
     }
 
     /** Past the stretch limit: echo (2/3) or a reverb wash (1/3). Echo stays the default. */

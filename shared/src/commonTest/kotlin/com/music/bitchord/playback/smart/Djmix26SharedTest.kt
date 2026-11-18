@@ -412,6 +412,9 @@ class Djmix26SharedTest {
         val choice = phraseChoice(MixTemplate.M1, releaseSec = 170.0).copy(tempoPrepBars = 16)
         val script = TransitionMoves.compile(choice, outBpm = 100.0, inBpm = 108.0)
         val clock = LoopMix.Clock(script.plan)
+        // Exactly 8% is supported. Without an epsilon, 1.08 - 1 > 0.08
+        // in binary floating point and this fixture silently tested a zero ramp.
+        assertEquals(64, clock.rampTo)
         assertEquals(clock.beatTimes[clock.rampTo], script.incomingHoldSec, 1e-9)
         assertEquals(clock.beatTimes[clock.rampTo], script.plan.incomingHoldSec, 1e-9)
         assertTrue(

@@ -282,6 +282,8 @@ object LoopMix {
         val acapella: Boolean = false,
         /** djmix25 P1.12: bass-swap width in beats (MixGain.faderTemplate table). */
         val faderSwapBeats: Double = 1.0,
+        /** Authored phrase LP lane, relative to the landing. Null keeps legacy/family filtering. */
+        val outLp: Lane? = null,
     ) {
         /** The tempo the ramp arrives at, in outgoing beats per minute. */
         val targetBpm: Double get() = targetBpmOverride ?: (inn.bpm / fold)
