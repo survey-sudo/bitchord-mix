@@ -2886,9 +2886,11 @@ class CrossfadeController(
                 incomingItem.let(analysisFor),
             )
             AutomixTelemetry.event("mix.plan", snapshotFields(transitionSnapshot) + mapOf("accepted" to true))
-            val evidence = TransitionEvidenceCache.recent(200).firstOrNull {
+            val evidence = TransitionEvidenceCache.recent(200).lastOrNull {
                 it.outId == transitionSnapshot?.outId && it.inId == transitionSnapshot?.inId &&
-                    it.style == transitionSnapshot?.style && it.reason == transitionSnapshot?.reason
+                    (it.style == transitionSnapshot?.style || it.reason == transitionSnapshot?.reason || it.style == transitionSnapshot?.alternativeKind || it.style == "decline")
+            } ?: TransitionEvidenceCache.recent(200).lastOrNull {
+                it.outId == transitionSnapshot?.outId && it.inId == transitionSnapshot?.inId
             }
             AutomixTelemetry.event(
                 "mix.dump",
