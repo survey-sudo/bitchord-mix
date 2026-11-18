@@ -67,7 +67,8 @@ class Djmix19RegressionTest {
         for (i in 0..40) {
             val plan = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$i")
             assertTrue(plan.djEffect != DjEffect.LOOP_ROLL, "id-$i picked LOOP_ROLL")
-            assertTrue(plan.djEffect in setOf(DjEffect.NONE, DjEffect.ECHO, DjEffect.REVERB), "unexpected gap effect ${plan.djEffect}")
+            assertEquals(DjEffect.NONE, plan.djEffect, "no vocal measurement")
+            assertEquals(0.0, plan.echoSeconds)
         }
     }
 

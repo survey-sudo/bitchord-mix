@@ -2,6 +2,8 @@ package com.music.bitchord.playback.smart
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertContentEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StructureEnrichmentConsistencyTest {
@@ -10,7 +12,7 @@ class StructureEnrichmentConsistencyTest {
         val section = PhraseSection(0, 4, SectionFn.INSTRUMENTAL, SectionRole.GROOVE, 0.4f, 7, 0, 0.5f, 5, 0f, 0f, 0f, 0.4f, true)
         val base = SongMap(
             trackKey = "enrich", durationSec = 16.0, bpm = 120.0, beatsPerBar = 4,
-            downbeats = DoubleArray(5) { it * 4.0 }, gridConfidence = 0.8f, tempoStable = true,
+            downbeats = DoubleArray(9) { it * 2.0 }, gridConfidence = 0.8f, tempoStable = true,
             phraseAnchor = 0, phraseLen = 8, sections = listOf(section), sungBars = BooleanArray(4),
             firstVocalBar = null, lastVocalBar = null, pickupBeats = 0f,
             startKind = StartKind.INTRO_INSTRUMENTAL, endingKind = EndingKind.UNKNOWN,
@@ -27,5 +29,9 @@ class StructureEnrichmentConsistencyTest {
         assertTrue(!enriched.sections.single().loopable)
         assertTrue(enriched.sections.single().vocal > 0.9f)
         assertTrue(enriched.isVocalMeasured(0))
+        assertContentEquals(base.downbeats, enriched.downbeats)
+        assertContentEquals(base.anchors, enriched.anchors)
+        assertEquals(base.gridMeasured, enriched.gridMeasured)
+        assertFalse(enriched.isVocalMeasured(3))
     }
 }

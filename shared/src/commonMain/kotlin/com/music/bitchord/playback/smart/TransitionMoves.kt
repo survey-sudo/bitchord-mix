@@ -2,6 +2,11 @@ package com.music.bitchord.playback.smart
 
 import kotlin.math.min
 
+/** The one-bar zero-overlap interval is outgoing prefill, not a dry blend. */
+internal fun incomingPhraseOffsetBars(entry: EntryCue, exitBars: Int): Int =
+    (entry.leadInBars - exitBars.coerceAtLeast(1)).coerceAtLeast(0)
+
+
 /**
  * One automation lane. Times are master beats relative to the landing L = 0.
  * Values are dB for gains and band shelves, Hz for filters, or 0..1 for sends.
@@ -134,52 +139,41 @@ object TransitionMoves {
         /** djmix25 P1.6: acapella-over-instrumental carrier. */
         acapella: Boolean = false,
     ): PhraseScript {
-        // djmix24 Bug A4: deterministic EDM buildup + pair-hash FX rotation.
-        // EDM dance pairs (110..150 BPM post-fold within 8%, low dual-vocal)
-        // ALWAYS get flanger + tightening roll (Bug A1 scalar carrier in
-        // Plan). Non-EDM eligible blends use deterministic pair-hash rotation
-        // FLANGER / CLEAN_SWAP / ECHO / REVERB — never flanging over
-        // dual-vocal overlap (vocalOverlapBeats >= 1.0). Tempo-gap templates
-        // (M6/M10/CUT/M11/RELAXED) never flange (echo/reverb own them).
+        // Preserve the already-validated crown plan, including its real effects.
+        choice.legacyLoop?.let { legacy ->
+            return sheet(choice, legacy, legacy.flanger, legacy.incomingHoldSec, 0.0, 0f)
+        }
         val eligibleTemplate = choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 ||
             choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 ||
             choice.template == MixTemplate.ROLLING || choice.template == MixTemplate.M2
         val notTempoGap = choice.template != MixTemplate.M6 &&
             choice.template != MixTemplate.M10 && choice.template != MixTemplate.CUT_ON_ONE &&
             choice.template != MixTemplate.M11 && choice.template != MixTemplate.RELAXED
-        val lowVocal = choice.vocalProduct < 0.18f && choice.vocalOverlapBeats < 1.0
-        val edmPair = isEdmDancePair(outBpm, inBpm)
+        val lowVocal = choice.vocalProduct < 0.18f &&
+            (choice.vocalClashEnergy?.let { it < 0.18 } ?: (choice.vocalOverlapBeats < 1.0))
         val measured = choice.vocalClashEnergy != null
         val actualBuildup = choice.exit.sectionFn == SectionFn.PRE_CHORUS ||
             choice.exit.sectionFn == SectionFn.BUILD || choice.entry.landingFn == SectionFn.BUILD ||
             choice.entry.landingFn == SectionFn.DROP
         val fx = FxPolicy.select(
             outgoingId, incomingId,
-            rhythmic = eligibleTemplate && notTempoGap,
+            rhythmic = eligibleTemplate && notTempoGap && choice.fxGridUsable,
             measured = measured,
             vocalClash = choice.vocalClashEnergy ?: if (choice.vocalOverlapBeats > 1.0) 1.0 else 0.0,
             speechLike = false,
             drifting = outBpm <= 1.0 || inBpm <= 1.0 || kotlin.math.abs((inBpm / alignedFold(outBpm, inBpm)) / outBpm - 1.0) > PhraseConfig.TEMPO_HARD_DELTA,
-            buildup = edmPair && lowVocal && actualBuildup,
-            cleanSpace = choice.template in setOf(MixTemplate.M6, MixTemplate.M10, MixTemplate.CUT_ON_ONE) || choice.keyClash,
+            buildup = lowVocal && actualBuildup,
+            cleanSpace = choice.echoGated && choice.exit.vocalRoomBars == 0 && choice.entry.leadInVocal < 0.2f &&
+                (choice.exit.sectionFn == SectionFn.OUTRO || choice.exit.sectionFn == SectionFn.FADE_OUT),
         )
-        val edmBuildup = fx == DjEffect.FLANGER && edmPair && lowVocal && actualBuildup && notTempoGap && eligibleTemplate
         // Non-EDM rotation: slot 0 -> FLANGER (colour), 1 -> CLEAN_SWAP,
         // 2 -> ECHO (echoGated path), 3 -> REVERB (wash). Anti-repeat is
         // inherent (hash of the pair, not time), so non-EDM queues stay
         // varied without ever flanging vocal clash.
         val rotationFlanger = fx == DjEffect.FLANGER && lowVocal && notTempoGap && eligibleTemplate
-        val rotationEcho = fx == DjEffect.ECHO && !edmBuildup
-        val rotationReverb = fx == DjEffect.REVERB && !edmBuildup
-        val wantFlanger = edmBuildup || rotationFlanger
-        val legacy = choice.legacyLoop
-        if (legacy != null) {
-            // Bug A1: legacy crown plans (LoopMix.plan) already carry the
-            // deterministic FX in Plan scalars. Merge so sheet() never
-            // drops a plan-flagged flanger/buildup.
-            val mergedFlanger = wantFlanger && !choice.keyClash
-            return sheet(choice, legacy, mergedFlanger, holdSec = 0.0, echoDelaySec = 0.0, echoFeedback = 0f)
-        }
+        val rotationEcho = fx == DjEffect.ECHO
+        val rotationReverb = fx == DjEffect.REVERB
+        val wantFlanger = rotationFlanger
         val outBeat = if (outBpm > 1.0) 60.0 / outBpm else 0.5
         val inBeat = if (inBpm > 1.0) 60.0 / inBpm else outBeat
         val bar = outBeat * 4.0
@@ -236,7 +230,7 @@ object TransitionMoves {
         // hard 4-bar cap, when a repeated phrase lets the outro replay.
         val requestedLoopBars = if (choice.exit.roomBars in 1..2) 2 else 4 + interpolationExtendBars.coerceAtLeast(0)
         val availableBars = (release / bar).toInt().coerceAtLeast(0)
-        val loopBars = minOf(requestedLoopBars, availableBars)
+        val loopBars = minOf(requestedLoopBars, availableBars, choice.exit.roomBars.coerceAtLeast(0))
         val looping = (choice.template == MixTemplate.M2 || needsExtension || interpolationExtendBars > 0) && loopBars > 0
         val loopLen = loopBars.toDouble() * bar
         val outPick = if (looping) {
@@ -259,7 +253,7 @@ object TransitionMoves {
         val fadeSecForEcho = total * bar
         val echoFeedbackForPlan = PhraseConfig.echoFeedbackFor(choice.template.name, fadeSecForEcho)
         val exitTail = PhraseConfig.exitTailSeconds(outBeat)
-        val inStartSec = choice.entry.startSec + (choice.entry.leadInBars - exit).coerceAtLeast(0) * inBar
+        val inStartSec = choice.entry.startSec + incomingPhraseOffsetBars(choice.entry, exit) * inBar
         val inPick = LoopMix.Pick(inStartSec, inStartSec, 4, inBeat, inBpm, 0.0, LoopMix.Check.MASK)
         val keyClash = choice.keyClash && !forceUnity
         // djmix24 Bug A1 scalar FX carrier: plan.flanger/buildupRoll/
@@ -268,9 +262,9 @@ object TransitionMoves {
         // (loopPlanFor / bridge paths). Slip-roll (Rung 4) reuses
         // buildupRoll; its 1->1/2->1/4 schedule is native-side.
         val planFlanger = wantFlanger && !echo && !keyClash && eligibleTemplate
-        val planRoll = (edmBuildup || fx == DjEffect.LOOP_ROLL) && !keyClash && lowVocal && notTempoGap &&
+        val planRoll = fx == DjEffect.LOOP_ROLL && !echo && !keyClash && lowVocal && notTempoGap &&
             (looping || choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 || choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 || choice.template == MixTemplate.ROLLING)
-        val planReverb = (edmBuildup || rotationReverb) && !echo && !keyClash
+        val planReverb = rotationReverb && !echo && !keyClash
         val planHpEnd = if (planRoll) LoopMix.BUILDUP_HP_END_HZ else if (planFlanger) 420f else 0f
         val basePlan = LoopMix.Plan(
             out = outPick,
@@ -313,7 +307,7 @@ object TransitionMoves {
             0.0
         }
         val plan = basePlan.copy(incomingHoldSec = hold)
-        return sheet(choice, plan, wantFlanger && !keyClash, hold, delaySec, echoFeedbackForPlan)
+        return sheet(choice, plan, plan.flanger, hold, delaySec, echoFeedbackForPlan)
     }
 
     /** Beats from t0 to the landing, for a compiled plan: the ramp, then the overlap. */

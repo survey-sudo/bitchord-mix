@@ -62,8 +62,8 @@ run_pair() {
     --out-prefix "$prefix" --clashE 0.18
   for wav in "$prefix"_off.wav "$prefix"_fixed015.wav "$prefix"_duckgain.wav; do
     echo "ffmpeg ebur128/astats $wav"
-    ffmpeg -nostdin -hide_banner -i "$wav" -af 'ebur128=peak=true,astats=metadata=1:reset=0' -f null - 2>&1 |
-      grep -E 'Integrated loudness|Peak:|RMS level dB|Peak level dB' || true
+    ffmpeg -nostdin -hide_banner -i "$wav" -af 'ebur128=peak=true,astats=metadata=1:reset=0' -f null - >"$wav.meters.log" 2>&1
+    grep -E 'Integrated loudness|Peak:|RMS level dB|Peak level dB' "$wav.meters.log"
     python3 "$ROOT/tools/automix_seam_metrics.py" "$wav" --reference "$prefix"_off.wav --boundary-sec 3.0
   done
 }

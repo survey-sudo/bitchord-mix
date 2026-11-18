@@ -405,7 +405,7 @@ class PhrasePlannerTest {
             start = StartKind.COLD_VOCAL,
         ).copy(vocalEnergy = FloatArray(32) { 0.9f })
         val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "rescue must produce a plan")
-        assertEquals(PhraseConfig.S_MIN, choice.score, 1e-9, "rescue carries S_MIN, got ${choice.score} via ${choice.template}")
+        assertEquals(MixTemplate.M6, choice.template, "strict selection may now accept zero-overlap echo")
         assertNotNull(choice.vocalClashEnergy, "rescue must populate vocalClashEnergy")
          assertEquals(0.0, choice.vocalOverlapBeats, "echo/cut rescue has no simultaneous dry vocal overlap")
     }
@@ -427,12 +427,12 @@ class PhrasePlannerTest {
             sungUntil = 18,
         ).copy(vocalEnergy = FloatArray(18) { 0.9f })
         val b = song(
-            "b", 120.0, 25,
-            listOf(section(9, 25, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 9, vocal = 0.9f)),
+            "b", 120.0, 48,
+            listOf(section(9, 48, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 9, vocal = 0.9f)),
             firstVocal = 9,
             sungFrom = 25,
             sungUntil = 25,
-        ).copy(vocalEnergy = FloatArray(25) { 0.9f })
+        ).copy(vocalEnergy = FloatArray(48) { 0.9f })
         val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "zero-lead-in HEAD must still produce a plan")
         assertEquals(EntryKind.HEAD, choice.entry.kind)
         assertEquals(9, choice.entry.startBar)

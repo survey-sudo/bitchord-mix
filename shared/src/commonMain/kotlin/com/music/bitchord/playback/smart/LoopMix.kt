@@ -534,12 +534,18 @@ object LoopMix {
         val fx = FxPolicy.select(
             out.trackId, inn.trackId, rhythmic = true,
             measured = (outPick.checkedBy == Check.MASK || outPick.checkedBy == Check.LYRICS_AND_MASK) &&
-                (inPick.checkedBy == Check.MASK || inPick.checkedBy == Check.LYRICS_AND_MASK),
+                (inPick.checkedBy == Check.MASK || inPick.checkedBy == Check.LYRICS_AND_MASK) &&
+                out.beatConfidence >= MIN_DJ_CONFIDENCE && inn.beatConfidence >= MIN_DJ_CONFIDENCE,
             vocalClash = if (dualVocal) 1.0 else 0.0, speechLike = false,
-            drifting = false, buildup = false, cleanSpace = false,
+            drifting = FxPolicy.drifting(out, inn),
+            buildup = buildupFits(TransitionStyle.DJ_BLEND, if (dualVocal) 1.0 else 0.0, false,
+                sectionAt(labelSections(out), outPick.start)?.kind,
+                sectionAt(labelSections(inn), inPick.start)?.kind, energyRise(out, outPick.start, outPick.end)),
+            cleanSpace = false,
         )
         val (fxFlanger, fxRoll, fxReverb, fxEcho) = when (fx) {
             DjEffect.FLANGER -> Quad(true, false, false, false)
+            DjEffect.LOOP_ROLL -> Quad(false, true, false, false)
             DjEffect.ECHO -> Quad(false, false, false, true)
             DjEffect.REVERB -> Quad(false, false, true, false)
             else -> Quad(false, false, false, false)
@@ -1273,11 +1279,17 @@ object LoopMix {
         val bars = clean.bars.coerceIn(2, 4)
         val rampBars = (bars - 2).coerceAtLeast(1)
         val exitBars = (bars - 1 - rampBars).coerceAtLeast(0)
+        val incomingVocal = FxPolicy.measuredVocal(inn, cueOf(inn, sungIn), cueOf(inn, sungIn) + bars * 4.0 * inBeat)
         val dropFx = FxPolicy.select(
             out.trackId, inn.trackId, rhythmic = true,
-            measured = clean.checkedBy == Check.MASK || clean.checkedBy == Check.LYRICS_AND_MASK,
-            vocalClash = if (clean.vocal >= 0.06) 1.0 else 0.0, speechLike = false,
-            drifting = false, buildup = false, cleanSpace = false,
+            measured = (clean.checkedBy == Check.MASK || clean.checkedBy == Check.LYRICS_AND_MASK) &&
+                incomingVocal != null && out.beatConfidence >= MIN_DJ_CONFIDENCE && inn.beatConfidence >= MIN_DJ_CONFIDENCE,
+            vocalClash = if (clean.vocal >= 0.06 || (incomingVocal ?: 1.0) >= VOCAL_ACTIVE_THRESHOLD) 1.0 else 0.0, speechLike = false,
+            drifting = FxPolicy.drifting(out, inn),
+            buildup = buildupFits(TransitionStyle.DJ_BLEND, clean.vocal, false,
+                sectionAt(labelSections(out), clean.start)?.kind,
+                sectionAt(labelSections(inn), cueOf(inn, sungIn))?.kind, energyRise(out, clean.start, clean.end)),
+            cleanSpace = false,
         )
         return Plan(
             out = Pick(clean.start, clean.end, clean.bars, outBeat, outBpm, clean.vocal, clean.checkedBy),
@@ -1350,11 +1362,16 @@ object LoopMix {
         // instrumental blends; rotation otherwise. Never flange dual-vocal or key-clash.
         val blendFx = if (bothSing || keyClash) Quad(false, false, false, false)
         else when (FxPolicy.select(
-            out.trackId, inn.trackId, rhythmic = true, measured = windowClean,
-            vocalClash = if (bothSing || keyClash) 1.0 else 0.0, speechLike = false, drifting = false,
-            buildup = false, cleanSpace = false,
+            out.trackId, inn.trackId, rhythmic = true,
+            measured = windowClean && out.beatConfidence >= MIN_DJ_CONFIDENCE && inn.beatConfidence >= MIN_DJ_CONFIDENCE,
+            vocalClash = if (bothSing || keyClash) 1.0 else 0.0, speechLike = false, drifting = FxPolicy.drifting(out, inn),
+            buildup = buildupFits(TransitionStyle.DJ_BLEND, 0.0, false,
+                sectionAt(labelSections(out), outStart)?.kind,
+                sectionAt(labelSections(inn), cueOf(inn, sungIn))?.kind, energyRise(out, outStart, outStart + need)),
+            cleanSpace = false,
         )) {
             DjEffect.FLANGER -> Quad(true, false, false, false)
+            DjEffect.LOOP_ROLL -> Quad(false, true, false, false)
             DjEffect.REVERB -> Quad(false, false, true, false)
             else -> Quad(false, false, false, false)
         }

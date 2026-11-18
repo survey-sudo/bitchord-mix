@@ -679,196 +679,105 @@ bool runOversizeRenderProbe() {
 }
 
 bool runEchoStopProbe() {
-  constexpr double stopAt = 2.0;
-  constexpr double releaseAt = 1.5;
-  constexpr int64_t total = 3 * kSampleRate;
-  Renderer renderer(kSampleRate);
-  renderer.setHighQuality(false);
-  renderer.setEcho(0, 0.18, 0.72f, 0.65f);
-  auto& d = renderer.deck(0);
-  d.left.resize(total); d.right.resize(total);
-  for (int64_t i = 0; i < total; ++i) {
-    const double t = double(i) / kSampleRate;
-    const float x = float(0.22 * std::sin(2.0 * kPi * 330.0 * t) +
-                          0.11 * std::sin(2.0 * kPi * 910.0 * t));
-    d.left[i] = x; d.right[i] = x * 0.9f;
-  }
-  d.knotTimes = {0.0, stopAt * kSampleRate};
-  d.knotPositions = {0.0, stopAt * kSampleRate};
-  d.stopAt = stopAt;
-  d.gain.times = {0.0, releaseAt, stopAt};
-  d.gain.values = {1.0f, 1.0f, 0.0f};
-  d.echoSend.times = {0.0, releaseAt - 0.18, releaseAt, stopAt};
-  d.echoSend.values = {1.0f, 1.0f, 0.0f, 0.0f};
-  renderer.prepare();
-  const int64_t first = renderer.firstFrame();
-  const int64_t end = int64_t(2.5 * kSampleRate);
-  std::vector<float> out(static_cast<size_t>(end - first) * 2, 0.f);
-  for (int64_t done = 0; done < end - first;) {
-    const int chunk = int(std::min<int64_t>(127, end - first - done));
-    renderer.render(first + done, out.data() + done * 2, chunk);
-    done += chunk;
-  }
-  auto rms = [&](double a, double b) {
-    const int64_t s = std::clamp<int64_t>(int64_t(std::llround(a * kSampleRate)), first, end);
-    const int64_t e = std::clamp<int64_t>(int64_t(std::llround(b * kSampleRate)), s, end);
-    double sum = 0.0;
-    for (int64_t f = s; f < e; ++f) {
-      const size_t p = size_t(f - first) * 2;
-      sum += double(out[p]) * out[p] + double(out[p + 1]) * out[p + 1];
-    }
-    return 20.0 * std::log10(std::max(1e-30, std::sqrt(sum / std::max<int64_t>(1, (e - s) * 2))));
+  // LoopMixSession.computeEchoOutEnvelopes: 120 BPM, swap=2, release=3.
+  // Send [0, swap-1.75*beat, swap, swap+.12] -> [0,0,.90,0].
+  // Dry [handover,0,swap,swap+.10,release,stop] -> [0,1,1,0,0,0].
+  // Reverb/IN are disabled to isolate Echo. In addition to the normal
+  // release+.05+8*beat+exitTail deadline, exercise an explicitly shortened
+  // finite deadline while stored wet is still substantial (not a plan claim).
+  constexpr double beat = .5, swap = 2.0, release = 3.0;
+  constexpr double sendClose = swap + .12;
+  struct Result {
+    double wetDb, lateDb, step, postPeak, beforeCancelDb, cancelPostPeak;
+    int stopOffset, cancelOffset;
+    bool finite, finished;
   };
-  auto step = [&](int64_t f) {
-    const size_t p = size_t(f - first) * 2;
-    const size_t q = p - 2;
-    return std::max(std::abs(double(out[p]) - out[q]), std::abs(double(out[p + 1]) - out[q + 1]));
-  };
-  const double storedDb = rms(releaseAt, releaseAt + 0.18);
-  const double finalDb = rms(stopAt - 0.005, stopAt);
-  const double drop = storedDb - finalDb;
-  const double boundary = step(int64_t(std::llround(stopAt * kSampleRate)));
-  const bool pass = storedDb > -60.0 && drop > 40.0 && boundary < 0.001 &&
-                    renderer.exitGateViolations() == 0;
-  std::printf("%s echo-stop-probe stored=%.3f dB final=%.3f dB drop=%.3f dB "
-              "boundaryStep=%.9f violations=%d\n", pass ? "ok" : "FAIL", storedDb,
-              finalDb, drop, boundary, renderer.exitGateViolations());
-
-  // Repeat with offsets that cross the retirement window at different callback boundaries.
-  bool offsetsOk = true;
-  for (const int block : {127, 1024, 4096}) {
+  auto renderCase = [&](double stop, int block, int shift, bool mute, bool abort) {
     Renderer r(kSampleRate);
-    r.setHighQuality(false); r.setEcho(0, 0.18, 0.72f, 0.65f);
-    auto& x = r.deck(0); x.left = d.left; x.right = d.right;
-    x.knotTimes = d.knotTimes; x.knotPositions = d.knotPositions; x.stopAt = d.stopAt;
-    x.gain = d.gain; x.echoSend = d.echoSend; r.prepare();
-    std::vector<float> b(2 * block, 0.f);
-    for (int64_t f = r.firstFrame(); f < end; f += block) r.render(f, b.data(), int(std::min<int64_t>(block, end - f)));
-    offsetsOk = offsetsOk && r.exitGateViolations() == 0;
-  }
-  std::printf("%s echo-stop interruption offsets 127/1024/4096\n", offsetsOk ? "ok" : "FAIL");
-  return pass && offsetsOk;
-}
-
-bool runLimiterOptInProbe() {
-  constexpr int kDelay = 72;  // round(0.0015 * 48000)
-  constexpr int kFrames = 32768;
-  auto configure = [](Renderer& r, bool delayed) {
     r.setHighQuality(false);
-    r.setDelayedTruePeakLimiter(delayed);
+    r.setEcho(0, beat * .75, .55f, mute ? 0.f : .55f);
     auto& d = r.deck(0);
-    d.left.resize(kFrames + 1024); d.right.resize(kFrames + 1024);
-    for (size_t i = 0; i < d.left.size(); ++i) {
-      const float x = float(0.98 * std::sin(2.0 * kPi * 997.0 * i / kSampleRate));
-      d.left[i] = x; d.right[i] = x;
-    }
-    d.knotTimes = {0.0, double(d.left.size())};
-    d.knotPositions = {0.0, double(d.left.size())};
-    d.preroll = 0.0;
-    d.runOn = true;
-  };
-  bool ok = true;
-  for (const int block : {127, 1024, 4096}) {
-    Renderer normal(kSampleRate), delayed(kSampleRate);
-    configure(normal, false); configure(delayed, true);
-    normal.prepare(); delayed.prepare();
-    const int64_t first = normal.firstFrame();
-    std::vector<float> a(kFrames * 2, 0.f), b(kFrames * 2, 0.f);
-    int64_t done = 0;
-    while (done < kFrames) {
-      const int n = std::min<int64_t>(block, kFrames - done);
-      normal.render(first + done, a.data() + done * 2, n);
-      delayed.render(first + done, b.data() + done * 2, n);
-      done += n;
-    }
-    double peak = 0.0, maxDifference = 0.0;
-    int firstNormal = -1, firstDelayed = -1;
-    for (int i = 0; i < kFrames; ++i) {
-      peak = std::max(peak, std::max(std::abs(double(b[2 * i])), std::abs(double(b[2 * i + 1]))));
-      maxDifference = std::max(maxDifference, std::abs(double(a[2 * i]) - b[2 * i]));
-      if (firstNormal < 0 && std::abs(a[2 * i]) > 1e-4) firstNormal = i;
-      if (firstDelayed < 0 && std::abs(b[2 * i]) > 1e-4) firstDelayed = i;
-    }
-    const bool pass = firstDelayed - firstNormal == kDelay && peak <= 0.89125 + 1e-4;
-    std::printf("%s delayed-limiter block=%d firstNormal=%d firstDelayed=%d delay=%d "
-                "peak=%.7f defaultDiff=%.7g\n", pass ? "ok" : "FAIL", block,
-                firstNormal, firstDelayed, firstDelayed - firstNormal, peak, maxDifference);
-    ok = ok && pass;
-  }
-  return ok;
-}
-
-bool runCadenceAudit() {
-  constexpr int64_t kFrames = 2 * kSampleRate;
-  bool ok = true;
-  double largestStep = 0.0;
-  double largestPartitionDifference = 0.0;
-  for (const int block : {127, 1024}) {
-    Renderer renderer(kSampleRate);
-    renderer.setHighQuality(false);
-    auto& d = renderer.deck(0);
-    d.left.resize(kFrames + 4096); d.right.resize(kFrames + 4096);
+    const int end = int(std::llround((stop + .2) * kSampleRate));
+    d.left.resize(end + kSampleRate); d.right.resize(d.left.size());
     for (size_t i = 0; i < d.left.size(); ++i) {
       const double t = double(i) / kSampleRate;
-      const float x = float(0.3 * std::sin(2.0 * kPi * (180.0 + 80.0 * t) * t));
-      d.left[i] = x; d.right[i] = x * 0.97f;
+      d.left[i] = float(.22 * std::sin(2*kPi*330*t) + .11 * std::sin(2*kPi*910*t));
+      d.right[i] = d.left[i] * .9f;
     }
-    d.knotTimes = {0.0, double(kFrames)};
-    d.knotPositions = {0.0, double(kFrames)};
-    d.highPassHz.times = {0.0, 0.25, 0.5, 0.75, 1.0, 1.25};
-    d.highPassHz.values = {120.f, 18000.f, 240.f, 16000.f, 300.f, 20000.f};
-    d.highPassHz.exponential = true;
-    renderer.prepare();
-    const int64_t first = renderer.firstFrame();
-    std::vector<float> out(static_cast<size_t>(kFrames) * 2, 0.f);
-    int64_t done = 0;
-    float previous = 0.f;
-    while (done < kFrames) {
-      const int n = int(std::min<int64_t>(block, kFrames - done));
-      renderer.render(first + done, out.data() + done * 2, n);
-      for (int i = 0; i < n; ++i) {
-        const float l = out[size_t(done + i) * 2];
-        ok = ok && std::isfinite(l);
-        if (done + i > 0) largestStep = std::max(largestStep, std::abs(double(l - previous)));
-        previous = l;
+    d.knotTimes = {0, stop * kSampleRate}; d.knotPositions = d.knotTimes;
+    d.stopAt = stop;
+    d.gain.times = {-.025, 0, swap, swap+.10, std::min(release, stop-.02), stop};
+    d.gain.values = {0, 1, 1, 0, 0, 0};
+    d.echoSend.times = {0, swap-1.75*beat, swap, sendClose};
+    d.echoSend.values = {0, 0, .90f, 0};
+    d.lowDb.times = {swap, swap+.10}; d.lowDb.values = {0, -24};
+    d.highPassHz.times = {0, swap-.1*beat, swap, swap+4*beat};
+    d.highPassHz.values = {20, 20, 120, 1600};
+    r.prepare();
+    const int64_t first = r.firstFrame();
+    std::vector<float> pcm(size_t(end-first)*2);
+    const int64_t cancelFrame = int64_t(2.4*kSampleRate);
+    bool cancelled = false, finite = true;
+    int64_t actualCancel = -1;
+    for (int64_t f = first; f < end;) {
+      if (abort && !cancelled && f >= cancelFrame) {
+        actualCancel = f;
+        d.fadeOutAt.store(d.heardPos, std::memory_order_relaxed);
+        cancelled = true;
       }
-      done += n;
+      const int n = int(std::min<int64_t>(f == first ? shift : block, end-f));
+      r.render(f, pcm.data()+2*(f-first), n);
+      f += n;
     }
-    std::printf("cadence-audit block=%d max_sample_step=%.9f control_cadence_frames=64\n",
-                block, largestStep);
+    for (float x : pcm) finite = finite && std::isfinite(x);
+    auto rms = [&](double a, double b) {
+      double sum = 0; int count = 0;
+      for (int64_t f = std::llround(a*kSampleRate); f < std::llround(b*kSampleRate); ++f) {
+        const size_t p = size_t(f-first)*2;
+        sum += double(pcm[p])*pcm[p]+double(pcm[p+1])*pcm[p+1]; count += 2;
+      }
+      return 10*std::log10(std::max(1e-60, sum/std::max(1,count)));
+    };
+    auto peak = [&](int64_t from) {
+      double v = 0;
+      for (int64_t f = from; f < end; ++f) for (int c=0;c<2;++c)
+        v = std::max(v, std::abs(double(pcm[size_t(f-first)*2+c])));
+      return v;
+    };
+    const int64_t stopFrame = std::llround(stop*kSampleRate);
+    auto stepAt = [&](int64_t f) {
+      double v = 0;
+      for (int c=0;c<2;++c) v = std::max(v, std::abs(double(pcm[size_t(f-first)*2+c])-
+                                                                  pcm[size_t(f-first-1)*2+c]));
+      return v;
+    };
+    const int64_t blockCut = first + shift + ((stopFrame-first-shift+block-1)/block)*block;
+    return Result{rms(2.14,2.24), rms(stop-.005,stop), std::max(stepAt(stopFrame),stepAt(blockCut)),
+                  peak(stopFrame), rms(2.26,2.36), abort ? peak(actualCancel+1200) : 0,
+                  int((stopFrame-first-shift)%block), int((cancelFrame-first-shift)%block),
+                  finite, d.finished};
+  };
+  bool ok = true;
+  for (double stop : {release+.05+8*beat+1.0, 2.7}) {
+    for (int block : {127,1024,4096}) for (int shift : {1,61}) {
+      const Result wet = renderCase(stop,block,shift,false,false);
+      const Result dry = renderCase(stop,block,shift,true,false);
+      const Result abort = renderCase(stop,block,shift,false,true);
+      // Keep the existing -60 dB, >40 dB, <.001 contracts and final 5ms
+      // window. Muted control must be silent where we measure stored wet.
+      const bool pass = wet.finite && dry.finite && abort.finite && wet.wetDb > -60 &&
+          wet.wetDb-wet.lateDb > 40 && wet.step < .001 && wet.postPeak < 1e-7 && wet.finished &&
+          dry.wetDb < -100 && abort.beforeCancelDb > -60 && abort.cancelPostPeak < 1e-7 && abort.finished;
+      std::printf("%s echo case=%s block=%d shift=%d stopOffset=%d cancelOffset=%d wet=%.3f "
+                  "dryControl=%.3f late5ms=%.3f drop=%.3f step=%.9g post=%.9g "
+                  "preCancel=%.3f postCancel=%.9g finite=%d finished=%d/%d\n",
+                  pass?"PASS":"FAIL", stop>3?"production":"short-deadline",block,shift,
+                  wet.stopOffset,abort.cancelOffset,wet.wetDb,dry.wetDb,wet.lateDb,wet.wetDb-wet.lateDb,
+                  wet.step,wet.postPeak,abort.beforeCancelDb,abort.cancelPostPeak,wet.finite,
+                  wet.finished,abort.finished);
+      ok = pass && ok;
+    }
   }
-  // The same automation is deliberately rendered with shifted callback
-  // boundaries; this records the observed partition sensitivity without
-  // adding latency to the active transport path.
-  Renderer a(kSampleRate), b(kSampleRate);
-  a.setHighQuality(false); b.setHighQuality(false);
-  for (Renderer* r : {&a, &b}) {
-    auto& d = r->deck(0);
-    d.left.assign(kFrames + 4096, 0.15f); d.right.assign(kFrames + 4096, 0.15f);
-    d.knotTimes = {0.0, double(kFrames)}; d.knotPositions = {0.0, double(kFrames)};
-    d.highPassHz.times = {0.0, 0.25, 0.5, 0.75, 1.0, 1.25};
-    d.highPassHz.values = {120.f, 18000.f, 240.f, 16000.f, 300.f, 20000.f};
-    d.highPassHz.exponential = true;
-    r->prepare();
-  }
-  std::vector<float> oa(size_t(kFrames) * 2, 0.f), ob(size_t(kFrames) * 2, 0.f);
-  const int64_t first = a.firstFrame();
-  for (int64_t done = 0; done < kFrames;) {
-    const int n = int(std::min<int64_t>(127, kFrames - done));
-    a.render(first + done, oa.data() + done * 2, n);
-    done += n;
-  }
-  for (int64_t done = 0; done < kFrames;) {
-    const int n = int(std::min<int64_t>(1024, kFrames - done));
-    b.render(first + done, ob.data() + done * 2, n);
-    done += n;
-  }
-  for (size_t i = 0; i < oa.size(); ++i) {
-    largestPartitionDifference = std::max(largestPartitionDifference,
-                                           std::abs(double(oa[i]) - ob[i]));
-  }
-  std::printf("cadence-audit shifted-partition max_difference=%.9g (no added transport latency)\n",
-              largestPartitionDifference);
   return ok;
 }
 
@@ -1108,8 +1017,6 @@ int runSelfTest() {
   ok = runHighpassProbe() && ok;
   ok = runOversizeRenderProbe() && ok;
   ok = runEchoStopProbe() && ok;
-  ok = runLimiterOptInProbe() && ok;
-  ok = runCadenceAudit() && ok;
 
   if (ok) {
     std::printf("ok selftest passed (filter/partition/effect probes, firstFrame=%lld)\n",
@@ -1669,13 +1576,6 @@ int runFileMode(const FileOpts& opt) {
 // arbitrarily longer monotonic loop stream; decode padding is not a repair.
 int runLoopDomainProbe() {
   bool ok = true;
-#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
-  // ASan's shadow-memory cost makes the full transport matrix unnecessarily
-  // long; retain one representative block/high-quality case per geometry.
-  constexpr bool kSanitized = true;
-#else
-  constexpr bool kSanitized = false;
-#endif
   auto check = [&](bool condition, const char* message) {
     if (!condition) { std::printf("FAIL loop-domain %s\n", message); ok = false; }
   };
@@ -1731,7 +1631,6 @@ int runLoopDomainProbe() {
   for(bool ramp : {false,true})
   for(int bars : {1,2,4}) for(double fold : {0.5,1.0,2.0})
   for(bool high : {false,true}) for(int block : {127,1024,4096}) {
-    if (kSanitized && (bars != 1 || fold != 1.0 || high || block != 1024)) continue;
     if(!ramp && (high || block!=1024)) continue;
     const double beat=.4775, start=3.875, region=start-1;
     const int beats=32, settle=int(8/fold);
@@ -1916,7 +1815,7 @@ int main(int argc, char** argv) {
   }
   if (wantLoopDomain) return runLoopDomainProbe();
   if (wantProbe) return runReverbStopProbe();
-  if (wantEchoProbe) return runEchoStopProbe();
+  if (wantEchoProbe) return runEchoStopProbe() ? 0 : 1;
   if (wantSelftest || argc == 1) return runSelfTest();
   printUsage(std::cerr, argv[0]);
   return 2;

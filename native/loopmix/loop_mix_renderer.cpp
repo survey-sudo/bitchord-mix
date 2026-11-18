@@ -20,9 +20,43 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kWetRetireFallbackSeconds = 1.0;
 constexpr double kNoRetire = 1e18;
 
+/** Start (mix seconds) for Echo's final positive-to-zero send release. */
+double echoWetRetireStart(const Envelope& sendEnv, const Envelope& gainEnv, double stopAt, bool runOn) {
+  if (runOn) return kNoRetire;
+  if (!(stopAt < 1e15) || !std::isfinite(stopAt)) return kNoRetire;
+  if (!sendEnv.empty()) {
+    const size_t n = std::min(sendEnv.times.size(), sendEnv.values.size());
+    size_t s = n;
+    for (size_t i = n; i-- > 0;) if (sendEnv.values[i] > 1e-6f) { s = i; break; }
+    if (s == n) return kNoRetire;
+    if (s + 1 < n && sendEnv.values[n - 1] < sendEnv.values[s]) {
+      bool valid = true;
+      for (size_t i = s; i + 1 < n; ++i) {
+        if (!std::isfinite(sendEnv.times[i]) || !std::isfinite(sendEnv.times[i + 1]) ||
+            !(sendEnv.times[i + 1] > sendEnv.times[i])) { valid = false; break; }
+      }
+      size_t p = s;
+      while (p + 1 < n && sendEnv.values[p + 1] == sendEnv.values[s]) ++p;
+      if (valid && std::isfinite(sendEnv.times[p]) && sendEnv.times[p] < stopAt) return sendEnv.times[p];
+    }
+  }
+  if (!gainEnv.empty()) {
+    const size_t n = std::min(gainEnv.times.size(), gainEnv.values.size());
+    for (size_t i = 0; i < n; ++i) {
+      if (gainEnv.values[i] > 1e-6f) continue;
+      bool sustained = true;
+      for (size_t j = i; j < n; ++j) if (gainEnv.values[j] > 1e-6f) { sustained = false; break; }
+      if (sustained && std::isfinite(gainEnv.times[i]) && gainEnv.times[i] < stopAt) return gainEnv.times[i];
+    }
+  }
+  const double start = stopAt - kWetRetireFallbackSeconds;
+  return start < 0.0 ? 0.0 : start;
+}
+
 /**
- * Start (mix seconds) of smooth stored-wet retirement for echo and reverb.
- * Signal: outWet(t) = wet(t) * w(t) * cancel(t), with
+ * Start (mix seconds) of the smooth reverb-output retirement. This is the
+ * baseline 60b9734 scan and intentionally remains independent of Echo.
+ * Signal: outReverb(t) = rev(t) * w(t) * cancel(t), with
  *   w(t) = 1                          t <= start
  *        = 0.5*(1+cos(pi*(t-start)/(stopAt-start)))  start < t < stopAt
  *        = 0                          t >= stopAt
@@ -50,11 +84,9 @@ double wetRetireStart(const Envelope& sendEnv, const Envelope& gainEnv, double s
   if (!sendEnv.empty()) {
     const size_t n = std::min(sendEnv.times.size(), sendEnv.values.size());
     if (n > 0) {
-      size_t s = n;
-      for (size_t i = n; i-- > 0;) {
-        if (sendEnv.values[i] > 1e-6f) { s = i; break; }
-      }
-      if (s < n) {
+      size_t s = n - 1;
+      while (s > 0 && sendEnv.values[s - 1] >= sendEnv.values[s]) --s;
+      if (sendEnv.values[s] > 1e-6f) {
         // Send-derived start only on an actual positive-to-lower final
         // release with valid (finite, strictly increasing) suffix times.
         // Constant/increasing positive suffixes (no strict fall) fall
@@ -594,7 +626,7 @@ void Renderer::setSvfQ(int index, float q) {
 
 void Renderer::prepare() {
   limitGain_ = 1.f;
-  // djmix24 1.5 ms lookahead ring (pre-allocated, worker thread).
+  // Preallocated sample-peak history ring; this is not a true-peak detector.
   {
     const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
     const int need = look + 64;
@@ -605,7 +637,6 @@ void Renderer::prepare() {
     std::fill(limitRingL_.begin(), limitRingL_.end(), 0.f);
     std::fill(limitRingR_.begin(), limitRingR_.end(), 0.f);
     limitRingPos_ = 0;
-    limitQueued_ = 0;
   }
   // djmix14: pre-allocate every render buffer here (worker thread). The audio
   // thread (render/renderDeck) must never allocate — see hard rule. PhraseIsolator
@@ -877,7 +908,7 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   const double fadeSamples = kFadeSeconds * sr;
   // Scheduled wet-output retirement (stopAt), from each effect's send release.
   // runOn decks get kNoRetire (see helper).
-  const double echoFadeStart = wetRetireStart(deck.echoSend, deck.gain, deck.stopAt, deck.runOn);
+  const double echoFadeStart = echoWetRetireStart(deck.echoSend, deck.gain, deck.stopAt, deck.runOn);
   const double revFadeStart = wetRetireStart(deck.reverbSend, deck.gain, deck.stopAt, deck.runOn);
   for (int at = 0; at < frames; at += kControlFrames) {
     const int count = std::min(kControlFrames, frames - at);
@@ -991,57 +1022,17 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
 }
 
 void Renderer::limit(int frames) {
-  // djmix24 1.5 ms lookahead -1.0 dBTP (0.891f) true-peak soft-knee
-  // limiter. Ring buffer pre-allocated in prepare(); fast attack, smooth
-  // release ~80 ms, zero allocations/locks. Prevents clipping when
-  // resonant SVF + jet flanger + echo/reverb + overlap sum together.
+  // Sample-peak limiter: scan up to 1.5 ms within this callback. It does not
+  // oversample or inspect future callbacks. Gain state carries across
+  // callbacks with an ~80 ms release.
   constexpr float kCeiling = 0.89125094f;
   constexpr float kKneeDb = 2.0f;  // soft-knee width (dB below ceiling)
-  constexpr float kKnee = 0.794f;  // -2 dBTP knee start
+  constexpr float kKnee = 0.794f;  // approximately -2 dBFS sample-peak knee start
   const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
   const float release = 1.f - std::exp(-1.f / (0.08f * float(sampleRate_)));
   const int ringSize = std::max(1, int(limitRingL_.size()));
-  if (delayedTruePeakLimiter_) {
-    // Opt-in path only: retain exactly [look] source frames before emitting
-    // them, then scan the four-times linear intersample peaks over the known
-    // lookahead window. The default transport path below remains unchanged.
-    for (int i = 0; i < frames; ++i) {
-      const int current = limitRingPos_;
-      limitRingL_[current] = mixLeft_[i];
-      limitRingR_[current] = mixRight_[i];
-      limitRingPos_ = (limitRingPos_ + 1) % ringSize;
-      if (limitQueued_ < look) {
-        ++limitQueued_;
-        mixLeft_[i] = mixRight_[i] = 0.f;
-        continue;
-      }
-      const int first = (limitRingPos_ + ringSize - look - 1) % ringSize;
-      float peak = 0.f;
-      float prevL = limitRingL_[first], prevR = limitRingR_[first];
-      peak = std::max(peak, std::max(std::abs(prevL), std::abs(prevR)));
-      for (int k = 1; k <= look; ++k) {
-        const int slot = (first + k) % ringSize;
-        const float nextL = limitRingL_[slot], nextR = limitRingR_[slot];
-        peak = std::max(peak, std::max(std::abs(prevL + (nextL - prevL) * 0.25f),
-                                       std::abs(prevR + (nextR - prevR) * 0.25f)));
-        peak = std::max(peak, std::max(std::abs(prevL + (nextL - prevL) * 0.5f),
-                                       std::abs(prevR + (nextR - prevR) * 0.5f)));
-        peak = std::max(peak, std::max(std::abs(prevL + (nextL - prevL) * 0.75f),
-                                       std::abs(prevR + (nextR - prevR) * 0.75f)));
-        peak = std::max(peak, std::max(std::abs(nextL), std::abs(nextR)));
-        prevL = nextL; prevR = nextR;
-      }
-      float target = peak > kCeiling ? kCeiling / peak : 1.f;
-      if (target < limitGain_) limitGain_ = target;
-      else limitGain_ += (target - limitGain_) * release;
-      mixLeft_[i] = limitRingL_[first] * limitGain_;
-      mixRight_[i] = limitRingR_[first] * limitGain_;
-    }
-    return;
-  }
-  // Ring holds the current block's lookahead window for cross-block
-  // continuity (pre-allocated above); peak is scanned within the block
-  // (1.5 ms * sr frames) so the splice does not move, zero allocations.
+  // Legacy ring records input but does not participate in peak detection.
+  // The scan is bounded by this callback; no transport delay is introduced.
   for (int i = 0; i < frames; ++i) {
     limitRingL_[(limitRingPos_) % ringSize] = mixLeft_[i];
     limitRingR_[(limitRingPos_) % ringSize] = mixRight_[i];

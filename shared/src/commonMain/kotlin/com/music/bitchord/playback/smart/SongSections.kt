@@ -1,5 +1,7 @@
 package com.music.bitchord.playback.smart
 
+import kotlin.text.CharCategory
+
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -318,7 +320,13 @@ fun vocalShare(analysis: TrackAnalysis, from: Double, until: Double): Double {
 
 fun normalizeLyric(text: String): String =
     text.lowercase()
-        .map { if (it.isLetterOrDigit() || it.isWhitespace()) it else ' ' }.joinToString("")
+        .map {
+            if (it.isLetterOrDigit() || it.isWhitespace() ||
+                it.category == CharCategory.NON_SPACING_MARK ||
+                it.category == CharCategory.COMBINING_SPACING_MARK ||
+                it.category == CharCategory.ENCLOSING_MARK
+            ) it else ' '
+        }.joinToString("")
         .replace(Regex("\\s+"), " ")
         .trim()
 

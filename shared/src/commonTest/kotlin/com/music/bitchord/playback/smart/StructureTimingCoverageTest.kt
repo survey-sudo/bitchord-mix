@@ -3,9 +3,56 @@ package com.music.bitchord.playback.smart
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class StructureTimingCoverageTest {
+    @Test
+    fun sparseHeadAndTailKeepTheirActualBarIndices() {
+        val observed = doubleArrayOf(0.25, 2.25, 4.25, 100.25, 102.25)
+        val grid = StructureAnalyzer.completeBarGrid(observed, 2.0, 104.25)
+        assertEquals(100.25, grid.times[50], 1e-9)
+        assertEquals(102.25, grid.times[51], 1e-9)
+        assertTrue(grid.times.toList().zipWithNext().all { (a, b) -> b > a && b - a <= 2.0 + 1e-9 })
+        assertTrue(grid.coverage[50])
+        assertFalse(grid.coverage[25])
+        assertFalse(grid.stable, "sparse evidence cannot establish whole-track stability")
+
+        val analysis = TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY, trackId = "sparse", duration = 104.25,
+            bpm = 120.0, beatInterval = 0.5, beatConfidence = 0.9,
+            downbeats = observed.toList(), quality = TrackAnalysis.QUALITY_FULL,
+            vocalWindows = listOf(
+                CurveWindow(0.25, 10.0, FloatArray(40)),
+                CurveWindow(100.25, 10.0, FloatArray(40) { 0.8f }),
+            ),
+        )
+        val map = SongMaps.fromAnalysis("sparse", analysis)!!
+        assertEquals(100.25, map.barTime(50), 1e-9)
+        assertTrue(map.sungBars[50])
+        assertEquals(0.0, map.vocalEnergyMeasuredAt(0))
+        assertNull(map.vocalEnergyMeasuredAt(25))
+        assertTrue(map.vocalEnergyMeasuredAt(50)!! > 0.7)
+        assertEquals(map, map.copy())
+        assertEquals(map.hashCode(), map.copy().hashCode())
+        val newCoverage = map.vocalCoverage.copyOf().also { it[25] = true }
+        assertNotEquals(map, map.copy(vocalCoverage = newCoverage))
+        assertNotEquals(map, map.copy(downbeats = map.downbeats.copyOf().also { it[0] += 0.1 }))
+    }
+
+    @Test
+    fun gridCompletionIsBoundedAndRejectsInvalidTimescale() {
+        val bounded = StructureAnalyzer.completeBarGrid(doubleArrayOf(0.25, 2.25, 1e12), 2.0, 1e12)
+        assertTrue(bounded.times.size <= 513)
+        assertTrue(bounded.times.all { it.isFinite() })
+        assertTrue(bounded.times.toList().zipWithNext().all { (a, b) -> b > a })
+        assertFailsWith<IllegalArgumentException> {
+            StructureAnalyzer.completeBarGrid(doubleArrayOf(0.0), Double.NaN, 20.0)
+        }
+    }
+
     @Test
     fun measuredPhaseAndMeterAreRetained() {
         val map = StructureAnalyzer.fromPcm(

@@ -69,18 +69,17 @@ object SongMaps {
     }
 
     fun fromAnalysis(trackKey: String, analysis: TrackAnalysis, partial: Boolean = false, beatsPerBar: Int = 4): SongMap? {
-        if (!analysis.isUsable || analysis.duration <= 1.0) return null
+        if (!analysis.isUsable || !analysis.duration.isFinite() || analysis.duration <= 1.0 ||
+            !analysis.bpm.isFinite()
+        ) return null
         val bpm = analysis.bpm.coerceIn(40.0, 220.0)
-        val beat = if (analysis.beatInterval > 0.05) analysis.beatInterval else 60.0 / bpm
+        val beat = if (analysis.beatInterval.isFinite() && analysis.beatInterval > 0.05) analysis.beatInterval else 60.0 / bpm
         val meter = beatsPerBar.coerceAtLeast(1)
         val bar = beat * meter
-        val bars = (analysis.duration / bar).toInt().coerceIn(4, 512)
-        val downbeats = if (analysis.downbeats.size >= 4) {
-            analysis.downbeats.filter { it.isFinite() && it >= 0.0 }.toDoubleArray()
-        } else {
-            DoubleArray(bars + 1) { it * bar }
-        }
-        val n = bars
+        val observed = analysis.downbeats.filter { it.isFinite() && it >= 0.0 }.toDoubleArray()
+        val grid = StructureAnalyzer.completeBarGrid(observed, bar, analysis.duration)
+        val downbeats = grid.times
+        val n = downbeats.count { it < analysis.duration }.coerceIn(1, 512)
         val sung = BooleanArray(n)
         val coverage = BooleanArray(n)
         val vocalEnergy = buildVocalBars(analysis, downbeats, bar, n, sung, coverage)
@@ -340,8 +339,9 @@ object SongMaps {
             bpm = bpm,
             beatsPerBar = meter,
             downbeats = downbeats,
-            gridConfidence = analysis.beatConfidence.toFloat().coerceIn(0f, 1f),
-            tempoStable = analysis.beatConfidence >= 0.45,
+            gridConfidence = analysis.beatConfidence.takeIf { it.isFinite() }?.toFloat()
+                ?.coerceIn(0f, if (observed.isEmpty()) 0.35f else 1f) ?: 0f,
+            tempoStable = analysis.beatConfidence >= 0.45 && grid.stable,
             phraseAnchor = 0,
             phraseLen = 8,
             sections = cleaned,
@@ -361,15 +361,14 @@ object SongMaps {
             contentEndSec = analysis.contentEndTime.takeIf { it > 1.0 } ?: analysis.duration,
             labelConfidence = 0.5f,
             structMs = 0,
-            partial = partial,
-            coarse = analysis.beatConfidence < PhraseConfig.GRID_COARSE,
+            partial = partial || grid.times.lastOrNull()?.let { it < analysis.duration } == true,
+            coarse = meter != 4 || analysis.beatConfidence < PhraseConfig.GRID_COARSE || observed.isEmpty(),
             activation = if (analysis.beatConfidence < 0.2 && analysis.bpm <= 0) PhraseConfig.ACTIVATION_FLOOR else 1f,
             speechLike = speech,
             vocalCoverage = coverage,
-            gridMeasured = analysis.downbeats.size >= 4 || analysis.headBeats != null || analysis.tailBeats != null,
-            gridCoverage = BooleanArray(downbeats.size) { it < analysis.downbeats.size },
-            provenance = if (analysis.vocalWindows.isNotEmpty() || analysis.vocalActivityMask.isNotEmpty())
-                "analysis:vocal-model" else "analysis:scalar",
+            gridMeasured = observed.isNotEmpty() && (analysis.headBeats != null || analysis.tailBeats != null),
+            gridCoverage = BooleanArray(n) { grid.coverage.getOrElse(it) { false } },
+            provenance = if (analysis.vocalWindows.isNotEmpty()) "analysis:vocal-model" else "analysis:scalar",
         )
     }
 
@@ -518,8 +517,12 @@ object SongMaps {
     }
 
     private fun barIndexAt(time: Double, downbeats: DoubleArray, bar: Double): Int {
+        if (!time.isFinite() || time < 0.0 || !bar.isFinite() || bar <= 0.0) return -1
         if (downbeats.isEmpty()) return (time / bar).toInt()
         if (time < downbeats.first()) return -1
+        if (time >= downbeats.last()) {
+            return downbeats.lastIndex + ((time - downbeats.last()) / bar).toInt()
+        }
         var lo = 0
         var hi = downbeats.size
         while (lo + 1 < hi) {

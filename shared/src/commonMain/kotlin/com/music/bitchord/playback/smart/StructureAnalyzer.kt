@@ -18,40 +18,60 @@ import kotlin.math.sqrt
  * the djmix6 plan.
  */
 object StructureAnalyzer {
-    private data class ReconciledGrid(val times: DoubleArray, val coverage: BooleanArray, val stable: Boolean)
+    internal data class GridTimeline(val times: DoubleArray, val coverage: BooleanArray, val stable: Boolean)
 
-    private fun reconcileBarGrid(measured: DoubleArray, barSec: Double, duration: Double): ReconciledGrid {
-        val source = measured.filter { it.isFinite() && it >= 0.0 }.distinct().sorted()
+    /** Dense bar indices, with observed boundaries distinguished from gap filling. */
+    internal fun completeBarGrid(measured: DoubleArray, barSec: Double, duration: Double): GridTimeline {
+        require(barSec.isFinite() && barSec > 0.05) { "invalid bar duration" }
+        require(duration.isFinite() && duration >= 0.0) { "invalid track duration" }
+        require(measured.size <= 4096) { "too many downbeats" }
+        val source = measured.filter { it.isFinite() && it >= 0.0 && it <= duration + barSec }.distinct().sorted()
+        val maxBoundaries = 513
         if (source.isEmpty()) {
-            val count = max(1, kotlin.math.ceil(duration / barSec.coerceAtLeast(0.01)).toInt())
-            return ReconciledGrid(DoubleArray(count) { it * barSec }, BooleanArray(count), false)
+            val count = (kotlin.math.ceil(duration / barSec).coerceAtMost(512.0).toInt() + 1).coerceAtLeast(1)
+            return GridTimeline(DoubleArray(count) { it * barSec }, BooleanArray(count), false)
         }
-        val step = if (source.size >= 2) (source[1] - source[0]).coerceAtLeast(0.01) else barSec
+        // A missing middle is not a very long bar and must not determine tempo.
+        val deltas = source.zipWithNext().map { (a, b) -> b - a }
+        val localSteps = deltas.filter { it in barSec * 0.5..barSec * 1.5 }.sorted()
+        val step = localSteps.getOrNull(localSteps.size / 2) ?: barSec
         val out = ArrayList<Double>()
         val covered = ArrayList<Boolean>()
-        var first = source.first()
-        while (first - step >= 0.0) {
-            first -= step
+        fun append(time: Double, observed: Boolean) {
+            if (out.size < maxBoundaries && time.isFinite() && time >= 0.0 &&
+                (out.isEmpty() || time > out.last())
+            ) {
+                out += time
+                covered += observed
+            }
         }
-        var t = first
-        while (t < source.first() - step * 0.2) {
-            out += t
-            covered += false
-            t += step
+        val preceding = kotlin.math.floor(source.first() / step)
+        val origin = source.first() - preceding * step
+        for (i in 0 until preceding.coerceAtMost(maxBoundaries.toDouble()).toInt()) {
+            append(origin + i * step, false)
         }
         for (value in source) {
-            out += value
-            covered += true
+            if (out.size >= maxBoundaries) break
+            if (out.isNotEmpty() && value <= out.last()) continue
+            if (out.isNotEmpty()) {
+                val previous = out.last()
+                val gap = value - previous
+                if (gap < step * 0.25) continue // duplicate detections cannot form a bar
+                val intervals = kotlin.math.round(gap / step).coerceIn(1.0, 1_000_000.0).toInt()
+                val missing = minOf(intervals - 1, maxBoundaries - out.size)
+                for (i in 1..missing) {
+                    append(previous + gap * i / intervals, false)
+                }
+            }
+            append(value, true)
         }
-        t = source.last() + step
-        while (t < duration) {
-            out += t
-            covered += false
-            t += step
+        // Include the next boundary to size the last (possibly partial) bar.
+        val tailStep = deltas.lastOrNull { it in barSec * 0.5..barSec * 1.5 } ?: step
+        while (out.size < maxBoundaries && out.last() < duration) {
+            append(out.last() + tailStep, false)
         }
-        // Keep a phase-preserving local interpolation for measured non-uniform grids.
-        val stable = source.zipWithNext().all { (a, b) -> abs((b - a) - step) <= step * 0.08 }
-        return ReconciledGrid(out.toDoubleArray(), covered.toBooleanArray(), stable)
+        val stable = deltas.isNotEmpty() && deltas.all { abs(it - step) <= step * 0.08 }
+        return GridTimeline(out.toDoubleArray(), covered.toBooleanArray(), stable)
     }
 
     class Timeout(message: String) : RuntimeException(message)
@@ -171,9 +191,15 @@ object StructureAnalyzer {
         val meter = beatsPerBar.coerceAtLeast(1)
         val barSec = beatSec * meter
         val suppliedDownbeats = downbeats != null && downbeats.isNotEmpty()
-        val grid = reconcileBarGrid(downbeats ?: DoubleArray(0), barSec, pcmDurationSec)
-        val starts = grid.times.filter { it < pcmDurationSec }.toDoubleArray().ifEmpty { doubleArrayOf(0.0) }
+        val grid = completeBarGrid(downbeats ?: DoubleArray(0), barSec, pcmDurationSec)
+        val filteredStarts = grid.times.filter { it < pcmDurationSec }
+        val starts: DoubleArray = if (filteredStarts.isEmpty()) {
+            doubleArrayOf(0.0)
+        } else {
+            filteredStarts.toDoubleArray()
+        }
         val bars = beatSync(frames, starts, barSec)
+        val startCount = starts.count()
         val measured = suppliedDownbeats && gridMeasured
         val confidenceCap = when {
             measured -> 1f
@@ -191,9 +217,10 @@ object StructureAnalyzer {
             trackKey, effectiveDuration, bpm, meter, starts, bars,
             mask, lyricPrior, gridConfidence = (gridConfidence ?: if (measured) 0.5f else 0.3f)
                 .coerceIn(0f, confidenceCap),
-            tempoStable = tempoStable ?: (suppliedDownbeats && grid.stable), activation = activation, speechLike = false, partial = effectivePartial,
+            tempoStable = tempoStable ?: (suppliedDownbeats && grid.stable), activation = activation, speechLike = false,
+            partial = effectivePartial || grid.times.lastOrNull()?.let { it < pcmDurationSec } == true,
             startedMs = startedMs, now = now,
-            gridMeasured = measured, gridCoverage = BooleanArray(starts.size) { suppliedDownbeats && grid.coverage.getOrElse(it) { false } },
+            gridMeasured = measured, gridCoverage = BooleanArray(startCount) { suppliedDownbeats && grid.coverage.getOrElse(it) { false } },
         ).copy(provenance = provenance)
         return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
             map.copy(contentEndSec = effectiveDuration)

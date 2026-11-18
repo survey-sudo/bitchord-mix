@@ -50,6 +50,10 @@ class LoopMixSession private constructor(
     val sampleRate: Int,
     /** Track second the incoming player becomes audible at (knot-exact). */
     val handoverTrack: Double = clock.elementTrackTime,
+    val scriptAttached: Boolean = false,
+    val rendererQuality: Boolean = true,
+    val scriptTemplate: String? = null,
+    val buildContext: BuildContext? = null,
 ) {
     /** Immutable identity and deadline for one deck build generation. */
     data class BuildContext(
@@ -929,7 +933,14 @@ class LoopMixSession private constructor(
             renderer.setHighQuality(highQuality)
             renderer.prepare()
             renderer.setFadeOut(LoopMixRenderer.IN, handoverTrackSec)
-            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec).also { it.planIncomingStart() }
+            return LoopMixSession(
+                effectivePlan, clock, outId, inId, renderer, sampleRate,
+                handoverTrack = handoverTrackSec,
+                scriptAttached = script != null,
+                rendererQuality = highQuality,
+                scriptTemplate = script?.choice?.template?.name,
+                buildContext = buildContext,
+            ).also { it.planIncomingStart() }
         }
 
         /**

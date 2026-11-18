@@ -41,9 +41,18 @@ class DjBlendGridConfidenceTest {
     @Test
     fun oneWeakGridCannotAuthorizeDjBlendInEitherDirection() {
         val strongOut = track("strong-out", 124.0, beatConfidence = 0.92)
-        val weakIn = track("weak-in", 124.0, beatConfidence = 0.25)
-        val weakOut = track("weak-out", 124.0, beatConfidence = 0.25)
+        val weakIn = track("weak-in", 124.0, beatConfidence = MIN_DJ_CONFIDENCE / 2)
+        val weakOut = track("weak-out", 124.0, beatConfidence = MIN_DJ_CONFIDENCE / 2)
         val strongIn = track("strong-in", 124.0, beatConfidence = 0.92)
+
+        // Exercise the OR-bug site directly, bypassing plain-crossfade/WSOLA
+        // early returns. The original OR authorizes both of these pairs.
+        for ((a, b) in listOf(strongOut to weakIn, weakOut to strongIn)) {
+            for (traits in listOf(null, PairTraits(a, b))) {
+                assertEquals(TransitionStyle.DJ_FILTER,
+                    mixPlan(a, b, 176.0, "content-end", b.duration, traits).transitionStyle)
+            }
+        }
 
         val outStrongPlan = planTransition(
             analysis = strongOut,
@@ -82,6 +91,8 @@ class DjBlendGridConfidenceTest {
     fun bothConfidentGridsAuthorizeDjBlend() {
         val out = track("out-ok", 124.0, beatConfidence = 0.92)
         val inn = track("in-ok", 124.5, beatConfidence = 0.90)
+        assertEquals(TransitionStyle.DJ_BLEND,
+            mixPlan(out, inn, 176.0, "content-end", inn.duration, PairTraits(out, inn)).transitionStyle)
         val plan = planTransition(
             analysis = out,
             nextAnalysis = inn,

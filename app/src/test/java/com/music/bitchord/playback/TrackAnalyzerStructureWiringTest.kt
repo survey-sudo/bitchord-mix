@@ -1,12 +1,10 @@
 package com.music.bitchord.playback
 
 import com.music.bitchord.playback.smart.CurveWindow
-import com.music.bitchord.playback.smart.SectionFn
 import com.music.bitchord.playback.smart.SongMapEnrichment
 import com.music.bitchord.playback.smart.SongMaps
 import com.music.bitchord.playback.smart.StructureAnalyzer
 import com.music.bitchord.playback.smart.TrackAnalysis
-import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -54,9 +52,14 @@ class TrackAnalyzerStructureWiringTest {
             vocalWindows = listOf(CurveWindow(0.0, 10.0, FloatArray(160) { 0.85f })),
         )
         val enriched = SongMapEnrichment.enrich(pass1, analysis)
-        assertTrue(enriched.gridMeasured)
+        // Vocal enrichment preserves the PCM grid provenance and timing; model
+        // downbeats do not promote a DSP grid to measured.
+        assertFalse(enriched.gridMeasured)
+        assertEquals(pass1.downbeats.toList(), enriched.downbeats.toList())
+        assertEquals(pass1.gridConfidence, enriched.gridConfidence, 1e-6f)
         assertTrue(enriched.isVocalMeasured(0))
-        assertTrue(enriched.sections.any { it.fn == SectionFn.VERSE || it.fn == SectionFn.CHORUS })
-        assertTrue(abs(enriched.downbeats.first() - 0.30) < 1e-4)
+        // The fixture is zero PCM, so the base section remains SILENCE. The
+        // measured model mask still invalidates an instrumental loop claim.
+        assertTrue(enriched.sections.none { it.loopable })
     }
 }

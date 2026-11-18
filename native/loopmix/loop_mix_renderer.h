@@ -275,8 +275,6 @@ class Renderer {
   void setReverb(int index, float roomSize, float damping, float wet);
   /** djmix24 Cytomic SVF Q. */
   void setSvfQ(int index, float q);
-  /** Optional cross-block true-peak limiter; disabled to preserve zero latency. */
-  void setDelayedTruePeakLimiter(bool enabled) { delayedTruePeakLimiter_ = enabled; }
 
   /** Call once both decks are filled in, before the first [render]. */
   void prepare();
@@ -310,11 +308,9 @@ class Renderer {
   std::atomic<int> exitGateViolations_{0};
   std::vector<float> inLeft_, inRight_, outLeft_, outRight_;
   std::vector<float> mixLeft_, mixRight_;
-  // djmix24 1.5 ms true-peak lookahead ring (pre-allocated in prepare).
+  // Legacy input history; limit() detects sample peaks within each callback.
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
-  int limitQueued_ = 0;
-  bool delayedTruePeakLimiter_ = false;
 };
 
 }  // namespace bitchord::loopmix

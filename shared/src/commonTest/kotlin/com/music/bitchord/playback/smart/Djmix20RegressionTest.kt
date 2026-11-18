@@ -259,7 +259,7 @@ class Djmix20RegressionTest {
     fun flangerFiresOnEligibleLowVocalBeatmixForRightPairHash() {
         val (outId, inId) = findIds(0)
         assertTrue(pairHash(outId, inId) % 4 == 0)
-        assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId, measured = true))
+        assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId, measured = true, buildup = true))
         val settings = effectSettings(DjEffect.FLANGER)
         assertTrue(settings.wet <= 0.42f, "wet=${settings.wet}")
         assertEquals(8f, settings.beats, 1e-6f)
@@ -273,7 +273,7 @@ class Djmix20RegressionTest {
         val out = track("a", 120.0, "C major", vocal = 0.05)
         val inn = track("b", 120.0, "C major", vocal = 0.05)
         val ann = DjMix.annotate(raw, out, inn, outgoingId = outId, incomingId = inId)
-        assertEquals(DjEffect.FLANGER, ann.djEffect, "must keep FLANGER; reason=${ann.reason}")
+        assertEquals(DjEffect.NONE, ann.djEffect, "flat arrangement is not a buildup")
         // Loop path: TransitionMoves M1 with same ids must set flanger.
         val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
         val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
@@ -285,8 +285,15 @@ class Djmix20RegressionTest {
             vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
             energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
         )
-        val script = TransitionMoves.compile(choice, 120.0, 120.0, outgoingId = outId, incomingId = inId)
+        val buildupChoice = choice.copy(vocalClashEnergy = 0.0, fxGridUsable = true,
+            exit = choice.exit.copy(sectionFn = SectionFn.BUILD))
+        val script = TransitionMoves.compile(buildupChoice, 120.0, 120.0, outgoingId = outId, incomingId = inId)
         assertTrue(script.flanger, "M1 low-vocal slot 0 must flange on loop path")
+        assertEquals(script.plan.flanger, script.flanger)
+        assertFalse(script.plan.buildupRoll, "selected flanger must not silently add a roll")
+        assertFalse(script.plan.reverbWash, "selected flanger must not silently add reverb")
+        assertFalse(TransitionMoves.compile(buildupChoice.copy(fxGridUsable = false), 120.0, 120.0,
+            outgoingId = outId, incomingId = inId).flanger)
     }
 
     @Test

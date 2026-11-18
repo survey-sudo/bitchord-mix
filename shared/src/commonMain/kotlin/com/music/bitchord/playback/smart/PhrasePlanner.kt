@@ -20,11 +20,11 @@ data class PhraseChoice(
     val swapBar: Double,
     /** Beats after L before A is fully gone. */
     val tailBeats: Double,
-    /** Extra loops of A's last phrase so a short outro covers B's lead-in. */
+    /** Reserved metadata; the rendered loop duration comes from the compiled plan. */
     val loopK: Int,
     /** Echo input is dry × send, so a send of 0 puts nothing into the delay. */
     val echoGated: Boolean,
-    /** Peak of the two vocal masks multiplied, over the overlap. Log only. */
+    /** Mean vocal-energy product over the overlap, with boolean fallback for unknown bars. */
     val vocalProduct: Float,
     /** Bars of tempo ramp on A before B is heard, under policy b. */
     val tempoPrepBars: Int,
@@ -56,6 +56,8 @@ data class PhraseChoice(
      * "not measured" and the renderer falls back to the legacy boolean gate.
      */
     val vocalClashEnergy: Double? = null,
+    /** Positive grid evidence for optional rhythmic FX; hand-built choices default clean. */
+    val fxGridUsable: Boolean = false,
 ) {
     /** Incoming deck rate at [beat] on the master clock, landing at 0. */
     fun incomingRate(beat: Double): Double = if (beat >= -PhraseConfig.B_UNITY_BARS_BEFORE_LANDING * 1.0) 1.0 else incomingRateBefore(beat)
@@ -164,6 +166,8 @@ object PhrasePlanner {
     ): PhraseChoice? {
         if (!PhraseConfig.PHRASE_PLANNER_ENABLED) return null
         if (out == null) return null
+        // The renderer's phrase clock is 4/4; leave other meters to the fallback.
+        if (out.beatsPerBar != 4 || (inn != null && inn.beatsPerBar != 4)) return null
         if (legacyLoop != null && legacyLoop.outLoops && legacyLoop.inLoops) {
             return loopCrown(legacyLoop, out, inn)
         }
@@ -282,7 +286,7 @@ object PhrasePlanner {
      * 4 bars, half-bar bass swap) for close tempos; M6 (Echo, 4 bars,
      * beat-synced echo-out + bass swap) for far tempos or clashes.
      */
-    private fun musicalRescue(
+    internal fun musicalRescue(
         out: SongMap,
         inn: SongMap,
         steps: Int?,
@@ -291,25 +295,22 @@ object PhrasePlanner {
         exits: List<ExitCue>,
         entries: List<EntryCue>,
     ): PhraseChoice? {
-        if (outBpm <= 0 || inBpm <= 0) return null
+        if (!outBpm.isFinite() || !inBpm.isFinite() || outBpm <= 1.0 || inBpm <= 1.0) return null
         if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
         val exit = exits.maxByOrNull { it.releaseSec } ?: return null
-        val entry = entries.firstOrNull() ?: return null
         val quiet = out.speechLike || inn.speechLike || out.startKind == StartKind.SPOKEN || inn.startKind == StartKind.SPOKEN ||
             out.activation < PhraseConfig.ACTIVATION_FLOOR || inn.activation < PhraseConfig.ACTIVATION_FLOOR
         if (quiet) return null
-        if (entry.startSec < 0.0 || entry.landingBar > inn.sungBars.size ||
-            (inn.durationSec > 0.0 && entry.startSec > inn.durationSec * MAX_INCOMING_SKIP_FRACTION) ||
-            (inn.durationSec > 0.0 && entry.startSec >= inn.durationSec - MIN_INCOMING_CLEARANCE_SECONDS)
+        if (exit.releaseBar !in 0..out.sungBars.size || exit.roomBars <= 0 ||
+            !exit.releaseSec.isFinite() || exit.releaseSec <= 0.0
         ) return null
-        if (exit.releaseBar !in 0..out.sungBars.size || entry.startBar !in 0..inn.sungBars.size ||
-            exit.roomBars <= 0 || entry.leadInBars < 0
-        ) return null
+        // Try valid entries instead of abandoning the pair when the first cue is unsafe.
+        for (entry in entries) {
         // Respect the musical tension veto: tension only resolves to a
         // release. A rescue must not route tension into ambient.
         val aRole = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))?.role ?: exit.role
         val bRole = inn.sectionAt(entry.landingBar)?.role ?: entry.landingRole
-        if (aRole == SectionRole.TENSION && bRole != SectionRole.RELEASE) return null
+        if (aRole == SectionRole.TENSION && bRole != SectionRole.RELEASE) continue
         // djmix14-review: coarse+coarse with extreme tempo is better left to
         // LoopMix.bridge / classic DJ_FILTER than a forced 4-bar rescue.
         if (out.coarse && inn.coarse && abs(foldedRatio(outBpm, inBpm) - 1.0) > 0.15) return null
@@ -319,13 +320,20 @@ object PhrasePlanner {
             entry.leadInVocal >= 0.2f
         val harmonicClash = (steps ?: 0) > 2
         val useEcho = delta > 0.08 || dualVocal || harmonicClash
-        val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
-        val rescueOverlap = overlapOf(template, exit, entry, outBpm, steps)
+        var template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
+        var rescueOverlap = if (useEcho) 0 else minOf(8, overlapOf(template, exit, entry, outBpm, steps))
+        val blendEnergy = vocalClashEnergy(out, inn, exit, entry, rescueOverlap)
+        val blendBeats = vocalClashBeats(out, inn, exit, entry, rescueOverlap)
+        if (!useEcho && (rescueOverlap > exit.roomBars ||
+                (blendEnergy?.let { it > CLASH_VETO_ENERGY } ?: (blendBeats > 1.0)))) {
+            template = MixTemplate.M6
+            rescueOverlap = 0
+        }
+        if (!incomingGeometrySafe(entry, inn, rescueOverlap, inBpm, outBpm)) continue
         val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
         val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
         val clashBeats = vocalClashBeats(out, inn, exit, entry, rescueOverlap)
         val clashEnergy = vocalClashEnergy(out, inn, exit, entry, rescueOverlap)
-        if (template != MixTemplate.M6 && clashEnergy != null && clashEnergy > CLASH_VETO_ENERGY) return null
         return PhraseChoice(
             template = template,
             rung = rungOf(template),
@@ -338,7 +346,7 @@ object PhrasePlanner {
             tailBeats = if (template == MixTemplate.M1) 1.0 else 0.0,
             loopK = 0,
             echoGated = template == MixTemplate.M6,
-            vocalProduct = 0f,
+            vocalProduct = vocalProduct(out, inn, exit, entry, rescueOverlap),
             tempoPrepBars = 0,
             echoDelayBeats = delayBeats,
             echoDelayName = delayName,
@@ -358,8 +366,28 @@ object PhrasePlanner {
             cost = 0.0,
             detail = "rescue-${template.name} ${rescueOverlap}bar",
             keyClash = harmonicClash && template == MixTemplate.M1,
+            fxGridUsable = fxGridsUsable(out, inn),
         )
+        }
+        return null
     }
+
+    internal fun incomingGeometrySafe(entry: EntryCue, inn: SongMap, overlap: Int, inBpm: Double, outBpm: Double = inBpm): Boolean {
+        if (!inBpm.isFinite() || inBpm <= 1.0 || !outBpm.isFinite() || outBpm <= 1.0 || entry.startBar < 0 || entry.leadInBars < 0 ||
+            entry.landingBar < entry.startBar || entry.landingBar > inn.sungBars.size ||
+            !entry.startSec.isFinite() || entry.startSec < 0.0
+        ) return false
+        val cue = entry.startSec + incomingPhraseOffsetBars(entry, overlap) * 240.0 / inBpm
+        val masterBpm = if (overlap == 0 || abs(foldedRatio(outBpm, inBpm) - 1.0) > PhraseConfig.TEMPO_HARD_DELTA) outBpm
+            else inBpm / alignedFold(outBpm, inBpm)
+        return inn.durationSec.isFinite() && inn.durationSec > 0.0 &&
+            cue <= latestIncomingCue(inn.durationSec) &&
+            cue + overlap.coerceAtLeast(1) * 240.0 / masterBpm <= inn.durationSec - MIN_INCOMING_CLEARANCE_SECONDS
+    }
+
+    private fun fxGridsUsable(out: SongMap, inn: SongMap): Boolean =
+        out.gridConfidence >= MIN_DJ_CONFIDENCE && inn.gridConfidence >= MIN_DJ_CONFIDENCE &&
+            out.tempoStable && inn.tempoStable && limitedTo(out, inn) == null
 
     private fun checkPlanTime(startedMs: Long, now: () -> Long) {
         if (startedMs <= 0L) return
@@ -455,6 +483,7 @@ object PhrasePlanner {
         outBpm: Double,
         inBpm: Double,
     ): String? {
+        if (!incomingGeometrySafe(entry, inn, overlapOf(template, exit, entry, outBpm, steps), inBpm, outBpm)) return "incoming bounds"
         if (template == MixTemplate.ENERGY_LIFT) {
             if (out.chorusCount < PhraseConfig.LIFT_MIN_CHORUSES) return "lift needs two choruses"
             val ballad = out.sections.filter { it.fn == SectionFn.CHORUS }.all { it.energyLevel <= PhraseConfig.LIFT_MIN_ENERGY }
@@ -588,14 +617,16 @@ object PhrasePlanner {
         var denominator = 0.0
         for (i in 0 until bars) {
             val a = exit.releaseBar - bars + i
-            val b = entry.startBar + i
+            val b = incomingOverlapBar(out, inn, entry, overlapBars, bars, i)
             // Weight by the outgoing section's own cross-track-comparable energy:
             // a collision on a loud bar is audible, the same presence over a
             // quiet bar is not. A map without section energy weighs every bar
             // the same, which degrades to an unweighted mean rather than to a
             // wrong answer.
             val w = (out.sectionAt(a)?.energy ?: 0.5f).toDouble().coerceIn(0.0, 1.0)
-            numerator += w * out.vocalEnergyAt(a) * inn.vocalEnergyAt(b)
+            val outEnergy = out.vocalEnergyMeasuredAt(a) ?: return null
+            val inEnergy = inn.vocalEnergyMeasuredAt(b) ?: return null
+            numerator += w * outEnergy * inEnergy
             denominator += w
         }
         if (denominator <= 0.0) return null
@@ -608,7 +639,7 @@ object PhrasePlanner {
         var beats = 0
         for (i in 0 until bars) {
             val a = exit.releaseBar - bars + i
-            val b = entry.startBar + i
+            val b = incomingOverlapBar(out, inn, entry, overlapBars, bars, i)
             if (out.sungBars.getOrElse(a) { false } && inn.sungBars.getOrElse(b) { false }) beats += out.beatsPerBar
         }
         return beats.toDouble()
@@ -744,16 +775,7 @@ object PhrasePlanner {
         }
         val loopK = 0
         val prep = tempoPrepBars(outBpm, inBpm, entry.leadInVocal > 0.2f || exit.vocalRoomBars > 0)
-        var productSum = 0.0
-        var productCount = 0
-        val bars = minOf(exit.roomBars, overlap, PhraseConfig.O_MAX_BARS)
-        for (i in 0 until bars) {
-            val a = out.vocalEnergyAt(exit.releaseBar - bars + i)
-            val b = inn.vocalEnergyAt(entry.startBar + i)
-            productSum += a * b
-            productCount++
-        }
-        val product = if (productCount > 0) productSum / productCount else 0.0
+        val product = vocalProduct(out, inn, exit, entry, overlap)
         return PhraseChoice(
             template = template,
             rung = rungOf(template),
@@ -765,7 +787,7 @@ object PhrasePlanner {
             tailBeats = tail,
             loopK = loopK,
             echoGated = template == MixTemplate.M6 || template == MixTemplate.ROLLING || template == MixTemplate.M5,
-            vocalProduct = product.toFloat(),
+            vocalProduct = product,
             tempoPrepBars = prep,
             echoDelayBeats = delay,
             echoDelayName = delayName,
@@ -785,7 +807,32 @@ object PhrasePlanner {
             detail = "${template.name} ${exit.kind}→${entry.kind} O=$overlap",
             keyClash = (steps ?: 0) > 2,
             vocalClashEnergy = clashEnergy,
+            fxGridUsable = fxGridsUsable(out, inn),
         )
+    }
+
+    // Native incoming playback is unity. At matched/folded tempo, each master
+    // bar advances fold incoming bars; sample the same cue offset as compile().
+    private fun incomingOverlapBar(out: SongMap, inn: SongMap, entry: EntryCue, overlap: Int, bars: Int, i: Int): Int {
+        val fold = alignedFold(out.bpm, inn.bpm)
+        val rate = if (abs(foldedRatio(out.bpm, inn.bpm) - 1.0) <= PhraseConfig.TEMPO_HARD_DELTA) fold
+            else if (out.bpm > 1.0) inn.bpm / out.bpm else 1.0
+        return entry.startBar + incomingPhraseOffsetBars(entry, overlap) +
+            kotlin.math.floor((overlap - bars + i) * rate).toInt()
+    }
+
+    internal fun vocalProduct(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlap: Int): Float {
+        val bars = minOf(exit.roomBars, overlap, PhraseConfig.O_MAX_BARS).coerceAtLeast(0)
+        if (bars == 0) return 0f
+        var sum = 0.0
+        for (i in 0 until bars) {
+            val aBar = exit.releaseBar - bars + i
+            val bBar = incomingOverlapBar(out, inn, entry, overlap, bars, i)
+            val a = out.vocalEnergyMeasuredAt(aBar) ?: if (out.sungBars.getOrElse(aBar) { false }) 1.0 else 0.0
+            val b = inn.vocalEnergyMeasuredAt(bBar) ?: if (inn.sungBars.getOrElse(bBar) { false }) 1.0 else 0.0
+            sum += a * b
+        }
+        return (sum / bars).toFloat()
     }
 
     private fun overlapOf(template: MixTemplate, exit: ExitCue, entry: EntryCue, bpm: Double, steps: Int? = null): Int {
@@ -796,7 +843,7 @@ object PhrasePlanner {
         } else {
             listOf(32, 16, 8, 4).firstOrNull { it <= natural } ?: natural.coerceAtMost(4)
         }
-        return when (template) {
+        val overlap = when (template) {
             MixTemplate.M7 -> if (clash) 8 else 16
             MixTemplate.M4 -> if (clash) entry.leadInBars.coerceIn(4, 8) else entry.leadInBars.coerceAtLeast(0)
             MixTemplate.M2 -> if (clash) entry.leadInBars.coerceIn(4, 8) else entry.leadInBars.coerceAtMost(16).coerceAtLeast(exit.roomBars)
@@ -804,6 +851,10 @@ object PhrasePlanner {
             MixTemplate.M9, MixTemplate.RELAXED -> if (clash) minOf(8, entry.leadInBars.coerceAtLeast(4)) else minOf(16, entry.leadInBars.coerceAtLeast(8))
             else -> snapped.coerceAtLeast(if (template == MixTemplate.M11) 0 else 4)
         }
+        // Compile caps non-looping content-end overlaps at eight bars. Apply
+        // it here first so cue selection, collision scoring and lanes agree.
+        val loops = template == MixTemplate.M2 || (exit.loopableRoom && exit.roomBars in 1 until overlap)
+        return if (exit.kind == ExitKind.CONTENT_END && !loops) minOf(overlap, 8) else overlap
     }
 
     private fun structScore(template: MixTemplate, exit: ExitCue, entry: EntryCue, out: SongMap? = null): Double {

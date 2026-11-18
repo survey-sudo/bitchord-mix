@@ -96,8 +96,9 @@ data class SongMap(
     val barSec: Double get() = if (bpm > 1.0) beatsPerBar.coerceAtLeast(1) * 60.0 / bpm else 0.0
 
     fun isVocalMeasured(bar: Int): Boolean = if (vocalCoverage.isEmpty()) {
-        bar in sungBars.indices && (vocalEnergy.isEmpty() || bar < vocalEnergy.size)
-    } else vocalCoverage.getOrElse(bar) { false }
+        bar in vocalEnergy.indices && vocalEnergy[bar].isFinite()
+    } else vocalCoverage.getOrElse(bar) { false } &&
+        vocalEnergy.getOrNull(bar)?.isFinite() == true
 
     fun isGridMeasured(bar: Int): Boolean = gridMeasured &&
         if (gridCoverage.isEmpty()) bar in downbeats.indices else gridCoverage.getOrElse(bar) { false }
@@ -112,11 +113,14 @@ data class SongMap(
     }
 
     /**
-     * Vocal energy heard in [bar], 0..1.
-     *
-     * Falls back to the boolean when the map was built without a measurement,
-     * so a hand-constructed map is unchanged. An out-of-range bar is silence.
+     * Measured model-scale vocal energy, or null for an uncovered bar.
      */
+    fun vocalEnergyMeasuredAt(bar: Int): Double? {
+        if (!isVocalMeasured(bar)) return null
+        if (vocalEnergy.isEmpty() || bar !in vocalEnergy.indices) return null
+        return vocalEnergy[bar].toDouble().coerceIn(0.0, 1.0)
+    }
+
     fun vocalEnergyAt(bar: Int): Double {
         if (bar < 0) return 0.0
         if (vocalEnergy.isNotEmpty()) {
@@ -155,13 +159,33 @@ data class SongMap(
         if (this === other) return true
         if (other !is SongMap) return false
         return trackKey == other.trackKey && schema == other.schema &&
-            durationSec == other.durationSec && partial == other.partial &&
+            durationSec == other.durationSec && bpm == other.bpm && beatsPerBar == other.beatsPerBar &&
+            gridConfidence == other.gridConfidence && tempoStable == other.tempoStable &&
+            phraseAnchor == other.phraseAnchor && phraseLen == other.phraseLen && partial == other.partial &&
             sections == other.sections && startKind == other.startKind &&
             endingKind == other.endingKind &&
-            sungBars.contentEquals(other.sungBars) && vocalEnergy.contentEquals(other.vocalEnergy)
+            firstVocalBar == other.firstVocalBar && lastVocalBar == other.lastVocalBar &&
+            pickupBeats == other.pickupBeats && contentEndSec == other.contentEndSec &&
+            labelConfidence == other.labelConfidence && coarse == other.coarse &&
+            activation == other.activation && speechLike == other.speechLike && chorusCount == other.chorusCount &&
+            downbeats.contentEquals(other.downbeats) && anchors.contentEquals(other.anchors) &&
+            sungBars.contentEquals(other.sungBars) && vocalEnergy.contentEquals(other.vocalEnergy) &&
+            vocalCoverage.contentEquals(other.vocalCoverage) && gridMeasured == other.gridMeasured &&
+            provenance == other.provenance && gridCoverage.contentEquals(other.gridCoverage)
     }
 
-    override fun hashCode(): Int =
-        ((trackKey.hashCode() * 31 + sections.hashCode()) * 31 + sungBars.contentHashCode()) * 31 +
-            vocalEnergy.contentHashCode()
+    override fun hashCode(): Int {
+        var result = listOf(
+            trackKey, schema, durationSec, bpm, beatsPerBar, gridConfidence, tempoStable,
+            phraseAnchor, phraseLen, partial, sections, startKind, endingKind, firstVocalBar,
+            lastVocalBar, pickupBeats, contentEndSec, labelConfidence, coarse, activation,
+            speechLike, chorusCount, gridMeasured, provenance,
+        ).hashCode()
+        result = result * 31 + downbeats.contentHashCode()
+        result = result * 31 + anchors.contentHashCode()
+        result = result * 31 + sungBars.contentHashCode()
+        result = result * 31 + vocalEnergy.contentHashCode()
+        result = result * 31 + vocalCoverage.contentHashCode()
+        return result * 31 + gridCoverage.contentHashCode()
+    }
 }

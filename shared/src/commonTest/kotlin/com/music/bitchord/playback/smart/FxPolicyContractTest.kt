@@ -30,6 +30,8 @@ class FxPolicyContractTest {
         assertEquals(DjEffect.NONE, FxPolicy.select(a0, b0, true, measured = true, 0.0, speechLike = true, drifting = false, buildup = true, cleanSpace = false))
         assertEquals(DjEffect.NONE, FxPolicy.select(a0, b0, true, measured = true, vocalClash = 0.25, speechLike = false, drifting = false, buildup = true, cleanSpace = false))
         assertEquals(DjEffect.NONE, blendColour(0.0, a0, b0))
+        assertEquals(DjEffect.NONE, FxPolicy.select(a0, b0, true, true, 0.0, false, false, false, false))
+        assertEquals(DjEffect.NONE, FxPolicy.select(a0, b0, true, true, 0.0, false, true, true, false))
     }
 
     @Test

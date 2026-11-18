@@ -1383,7 +1383,7 @@ private const val MAX_REROUTE_CANDIDATES = 3
  * once per tick and shared by every exit [planTransition] tries, so the
  * whole-curve passes here are never repeated per candidate.
  */
-private class PairTraits(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis) {
+internal class PairTraits(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis) {
     private val globalOut = analysis.bpm.orZero()
     private val globalIn = nextAnalysis.bpm.orZero()
 
@@ -2098,7 +2098,7 @@ private fun planTransitionInner(
  * tempi agree, a filter ride when they don't. Timing only; the caller
  * decides whether it has started.
  */
-private fun mixPlan(
+internal fun mixPlan(
     analysis: TrackAnalysis,
     nextAnalysis: TrackAnalysis,
     mixAnchor: Double,

@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.assertNull
 
 class PhraseRescueInvariantTest {
     private fun map(
@@ -55,6 +56,29 @@ class PhraseRescueInvariantTest {
         val c2 = PhrasePlanner.select(lowAct, b, 0, 120.0, 120.0)
         assertTrue(c1 == null || c1.template in setOf(MixTemplate.RELAXED, MixTemplate.M11))
         assertTrue(c2 == null || c2.template in setOf(MixTemplate.RELAXED, MixTemplate.M11))
+        assertNull(PhrasePlanner.select(b.copy(beatsPerBar = 3), b, 0, 120.0, 120.0))
+    }
+
+    @Test
+    fun measuredClashRescuesToEchoButSoftVerseStillBlends() {
+        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 24, 48.0, 8, 0, 0,
+            SectionFn.OUTRO, SectionRole.GROOVE, .5f, 5, false, 0, 0)
+        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 4, SectionFn.INTRO, SectionRole.GROOVE,
+            4, 0f, false, .5f, 5, 0, 0f)
+        // Boolean masks deliberately disagree with measured energy: the measured
+        // signal must prevent a loud collision without vetoing a soft verse.
+        val loudOut = map("a").copy(vocalEnergy = FloatArray(24) { .9f })
+        val loudIn = map("b").copy(vocalEnergy = FloatArray(24) { .9f })
+        val echo = assertNotNull(PhrasePlanner.musicalRescue(loudOut, loudIn, 0, 120.0, 120.0,
+            listOf(exit), listOf(entry)))
+        assertEquals(MixTemplate.M6, echo.template)
+        assertEquals(0, echo.overlapBars)
+        val soft = assertNotNull(PhrasePlanner.musicalRescue(
+            loudOut.copy(vocalEnergy = FloatArray(24) { .3f }),
+            loudIn.copy(vocalEnergy = FloatArray(24) { .3f }), 0, 120.0, 120.0,
+            listOf(exit), listOf(entry)))
+        assertEquals(MixTemplate.M1, soft.template)
+        assertEquals(.09f, soft.vocalProduct, 1e-5f)
     }
 
     @Test
@@ -85,10 +109,16 @@ class PhraseRescueInvariantTest {
             "in-multi",
             sections = listOf(PhraseSection(0, 24, SectionFn.CHORUS, SectionRole.RELEASE, 0.9f, 0, 0, 0.8f, 8, 0f, 0f, 0f, 0.5f, false)),
         )
-        val choice = PhrasePlanner.select(out, inn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
-        if (choice != null) {
-            assertTrue(choice.entry.startSec <= inn.durationSec * 0.25 + 1e-6)
-            assertTrue(choice.exit.releaseSec >= out.durationSec * 0.68 - 1e-6)
-        }
+        val latest = ExitCue(ExitKind.CONTENT_END, 24, 48.0, 8, 0, 0,
+            SectionFn.OUTRO, SectionRole.GROOVE, .5f, 5, false, 0, 0)
+        val valid = EntryCue(EntryKind.HEAD, 0, 0.0, 4, SectionFn.INTRO, SectionRole.GROOVE,
+            4, 0f, false, .5f, 5, 0, 0f)
+        val choice = assertNotNull(PhrasePlanner.musicalRescue(out, inn, 4, 120.0, 120.0,
+            listOf(latest, latest.copy(releaseBar = 16, releaseSec = 32.0)),
+            listOf(valid.copy(startSec = 20.0), valid)))
+        assertEquals(48.0, choice.exit.releaseSec)
+        assertEquals(valid, choice.entry)
+        assertEquals(MixTemplate.M6, choice.template)
+        assertEquals(0, choice.overlapBars)
     }
 }

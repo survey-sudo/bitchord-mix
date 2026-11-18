@@ -92,11 +92,16 @@ class DjMixTest {
 
     @Test
     fun tempoGapUsesCleanEffectOnlyWhenMeasuredAndDefaultsCleanOtherwise() {
-        val reverbPair = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
+        val out = track(100.0).copy(vocalActivityMask = List(90) { 0.05 })
+        val inn = track(140.0).copy(vocalActivityMask = List(90) { 0.05 })
+        val unmeasured = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
+        assertEquals(DjEffect.NONE, unmeasured.djEffect)
+        assertEquals(0.0, unmeasured.echoSeconds)
+        val reverbPair = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "b")
         assertEquals(DjEffect.REVERB, reverbPair.djEffect)
         assertEquals(0.0, reverbPair.echoSeconds)
         val echoId = (0 until 64).first { FxPolicy.fxSlot("a", "id-$it") == 2 }
-        val echoed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$echoId")
+        val echoed = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "id-$echoId")
         assertEquals(DjEffect.ECHO, echoed.djEffect)
         assertTrue(echoed.echoSeconds > 0.2)
         val cleanPair = FxPolicy.select("a", "b", false, true, 0.0, false, false, false, true)
@@ -163,7 +168,8 @@ class DjMixTest {
     @Test
     fun anInstrumentalBlendCanFlangeAndTwoSingersDoNotGetThatFlanger() {
         val id = (0 until 24).first { pairHash("out", "fx-$it") % 4 == 0 }
-        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id", measured = true))
+        assertEquals(DjEffect.FLANGER, blendColour(0.0, "out", "fx-$id", measured = true, buildup = true))
+        assertEquals(DjEffect.NONE, blendColour(0.0, "out", "fx-$id", measured = true))
         assertEquals(DjEffect.NONE, blendColour(0.0, "out", "fx-$id"))
         assertEquals(DjEffect.NONE, blendColour(0.5, "out", "fx-$id", measured = true))
     }

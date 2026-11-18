@@ -211,15 +211,20 @@ object CuePoints {
                 val steps = kotlin.math.round((sec - origin) / barSec)
                 (origin + steps * barSec).coerceIn(minSec, maxSec)
             }
-            val rawBar = kotlin.math.round(snappedSec / barSec).toInt().coerceAtLeast(1)
+            val rawBar = if (map.downbeats.isNotEmpty() && snappedSec <= map.downbeats.last()) {
+                map.downbeats.indices.minByOrNull { kotlin.math.abs(map.downbeats[it] - snappedSec) } ?: 0
+            } else {
+                val origin = map.downbeats.lastOrNull() ?: 0.0
+                map.downbeats.lastIndex.coerceAtLeast(0) + kotlin.math.round((snappedSec - origin) / barSec).toInt()
+            }.coerceAtLeast(1)
             val localAnchor = map.anchors.lastOrNull { it <= rawBar } ?: map.phraseAnchor
             val delta = rawBar - localAnchor
             val rem = ((delta % 4) + 4) % 4
             var alignedBar = if (rem <= 2) rawBar - rem else rawBar + (4 - rem)
-            var alignedSec = map.barTime(alignedBar).coerceAtMost(maxSec)
+            var alignedSec = map.barTime(alignedBar)
             if (alignedSec > maxSec) {
                 alignedBar = (alignedBar - 4).coerceAtLeast(localAnchor)
-                alignedSec = map.barTime(alignedBar).coerceAtMost(maxSec)
+                alignedSec = map.barTime(alignedBar)
             }
             if (alignedSec < minSec - 1e-6 && alignedBar + 4 >= 0) {
                 val nextBar = alignedBar + 4
@@ -229,7 +234,7 @@ object CuePoints {
                     alignedSec = nextSec
                 }
             }
-            return alignedBar to alignedSec.coerceIn(0.0, maxSec)
+            return alignedBar to alignedSec
         }
 
         val targets = ArrayList<Pair<ExitKind, Double>>()

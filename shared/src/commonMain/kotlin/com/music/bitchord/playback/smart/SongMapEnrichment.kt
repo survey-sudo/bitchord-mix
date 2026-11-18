@@ -13,9 +13,8 @@ import kotlin.math.abs
  * never reaches scoring, vetoes, or the stem-duck decision.
  *
  * Coverage: Pass 2 `vocalWindows` only tiles head ~45s + tail ~60s per
- * `TrackAnalyzer.kt:1432-1433`, so uncovered middle bars read `0f`. That is
- * safe because D1/D2 read exit-tail and entry-head bars, which are exactly
- * the covered regions; the middle is never the overlap.
+ * `TrackAnalyzer.kt`. Uncovered middle bars remain explicitly unmeasured and
+ * must not be treated as measured silence by planner consumers.
  */
 object SongMapEnrichment {
 
@@ -32,30 +31,25 @@ object SongMapEnrichment {
      */
     fun enrich(base: SongMap, analysis: TrackAnalysis): SongMap {
         if (analysis.quality != TrackAnalysis.QUALITY_FULL || analysis.vocalWindows.isEmpty()) return base
-        if (analysis.bpm <= 0.0 || base.bpm <= 0.0 || abs(base.bpm - analysis.bpm) / analysis.bpm > 0.02) return base
+        if (!analysis.bpm.isFinite() || !base.bpm.isFinite() || analysis.bpm <= 0.0 || base.bpm <= 0.0 ||
+            abs(base.bpm - analysis.bpm) / analysis.bpm > 0.02
+        ) return base
         val n = base.sungBars.size
         if (n <= 0) return base
 
-        val modelBeats = (analysis.headBeats?.downbeats.orEmpty() + analysis.tailBeats?.downbeats.orEmpty())
-            .filter { it.isFinite() && it >= 0.0 }.distinct().sorted()
-        val reconciledDownbeats = if (modelBeats.size >= 2) {
-            DoubleArray(base.downbeats.size) { b ->
-                val original = base.barTime(b)
-                modelBeats.minByOrNull { abs(it - original) }
-                    ?.takeIf { abs(it - original) <= base.barSec * 0.75 } ?: original
-            }
-        } else base.downbeats
-        val barStarts = DoubleArray(n + 1) { b ->
-            if (b < reconciledDownbeats.size) reconciledDownbeats[b]
-            else (reconciledDownbeats.lastOrNull() ?: 0.0) +
-                (b - reconciledDownbeats.size + 1) * base.barSec
-        }
+        // The structure classifier and vocal windows were computed on the base
+        // timeline. Do not retime those bars to sparse head/tail model beats
+        // without re-aggregating every feature; preserve phase and provenance.
+        val barStarts = DoubleArray(n + 1) { base.barTime(it) }
         val seen = BooleanArray(n)
         val sungFromWin = BooleanArray(n)
         val energyAccum = DoubleArray(n)
+        val energyCounts = IntArray(n)
 
         for (window in analysis.vocalWindows) {
-            if (window.values.isEmpty() || window.frameRate <= 0.0) continue
+            if (window.values.isEmpty() || !window.frameRate.isFinite() || window.frameRate <= 0.0 ||
+                !window.startTime.isFinite()
+            ) continue
             for (b in 0 until n) {
                 val t0 = barStarts[b]
                 val t1 = barStarts[b + 1]
@@ -67,6 +61,7 @@ object SongMapEnrichment {
                     val t = window.startTime + i / window.frameRate
                     if (t < t0 || t >= t1) continue
                     val v = window.values[i]
+                    if (!v.isFinite()) continue
                     sum += v.toDouble()
                     count++
                     if (v > SongMaps.VOCAL_BAR_GATE) above++
@@ -74,7 +69,8 @@ object SongMapEnrichment {
                 }
                 if (count == 0) continue
                 val mean = sum / count
-                energyAccum[b] = if (seen[b]) (energyAccum[b] + mean) / 2.0 else mean
+                energyAccum[b] += sum
+                energyCounts[b] += count
                 seen[b] = true
                 if (peak > SongMaps.VOCAL_BAR_GATE && (mean > 0.08 || above >= 2 || peak >= 0.35f)) {
                     sungFromWin[b] = true
@@ -86,7 +82,7 @@ object SongMapEnrichment {
 
         val outSung = BooleanArray(n) { b -> if (seen[b]) sungFromWin[b] else base.sungBars[b] }
         val outEnergy = FloatArray(n) { b ->
-            if (seen[b]) energyAccum[b].toFloat().coerceIn(0f, 1f)
+            if (seen[b]) (energyAccum[b] / energyCounts[b]).toFloat().coerceIn(0f, 1f)
             else if (b < base.vocalEnergy.size) base.vocalEnergy[b] else 0f
         }
 
@@ -116,18 +112,16 @@ object SongMapEnrichment {
                     else -> sec.role
                 },
                 vocal = vocal,
-                loopable = sec.loopable && vocal < 0.2f,
-                conf = if (vocal >= 0.3f) maxOf(sec.conf, 0.45f) else sec.conf,
+                loopable = sec.loopable && vocal < 0.2f && (cStart until cEnd).all {
+                    seen[it] || base.isVocalMeasured(it)
+                },
+                conf = sec.conf,
             )
         }
 
-        val vocalSections = newSections.filter { it.vocal >= 0.4f }
-        val repeatedGroups = vocalSections.groupingBy { it.group }.eachCount().filterValues { it >= 2 }.keys
-        val recomputedSections = newSections.map { sec ->
-            if (sec.vocal >= 0.4f && sec.group in repeatedGroups && sec.fn == SectionFn.VERSE) {
-                sec.copy(fn = SectionFn.CHORUS, role = SectionRole.RELEASE, loopable = false, conf = maxOf(sec.conf, 0.5f))
-            } else sec
-        }
+        // Occupancy invalidates an instrumental claim; it cannot establish a
+        // chorus, new phrase anchors or additional boundary confidence.
+        val recomputedSections = newSections
 
         val first = outSung.indexOfFirst { it }.let { if (it < 0) null else it }
         val last = outSung.indexOfLast { it }.let { if (it < 0) null else it }
@@ -145,10 +139,8 @@ object SongMapEnrichment {
             tailVocal >= 0.3f -> EndingKind.OUTRO_VOCAL
             else -> base.endingKind
         }
-        val anchors = (base.anchors.toList() + recomputedSections.filter { it.vocal >= 0.3f }.map { it.startBar })
-            .distinct().sorted().toIntArray()
-        val confidence = if (recomputedSections.isEmpty()) base.labelConfidence else
-            recomputedSections.map { it.conf }.average().toFloat().coerceIn(0f, 1f)
+        val anchors = base.anchors
+        val confidence = base.labelConfidence
         return base.copy(
             sungBars = outSung,
             vocalEnergy = outEnergy,
@@ -161,14 +153,16 @@ object SongMapEnrichment {
             chorusCount = recomputedSections.count { it.fn == SectionFn.CHORUS },
             labelConfidence = confidence,
             anchors = anchors,
-            downbeats = if (modelBeats.size >= 2) reconciledDownbeats else base.downbeats,
-            gridConfidence = if (modelBeats.size >= 2) maxOf(base.gridConfidence, analysis.beatConfidence.toFloat()) else base.gridConfidence,
-            tempoStable = if (modelBeats.size >= 2) base.tempoStable && analysis.beatConfidence >= 0.45 else base.tempoStable,
-            gridMeasured = base.gridMeasured || modelBeats.size >= 2,
-            vocalCoverage = if (base.vocalCoverage.isEmpty()) {
-                BooleanArray(n) { seen[it] }
-            } else base.vocalCoverage.copyOf().also { for (b in seen.indices) if (seen[b] && b < it.size) it[b] = true },
-            provenance = if (base.provenance.isBlank()) "enriched:vocal-model" else base.provenance + "+vocal-model",
+            downbeats = base.downbeats,
+            gridConfidence = base.gridConfidence,
+            tempoStable = base.tempoStable,
+            gridMeasured = base.gridMeasured,
+            vocalCoverage = BooleanArray(n) { seen[it] || base.isVocalMeasured(it) },
+            provenance = when {
+                base.provenance.isBlank() -> "enriched:vocal-model"
+                base.provenance.endsWith("+vocal-model") -> base.provenance
+                else -> base.provenance + "+vocal-model"
+            },
         )
     }
 }

@@ -49,6 +49,12 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
 
 /** Deadline-aware serialization gate for model inference and deterministic JVM tests. */
 internal class TransitionModelGate(private val now: () -> Long = { SystemClock.elapsedRealtime() }) {
@@ -90,13 +96,6 @@ internal object TransitionBudgetContext {
 
     fun current(): Pair<Long, () -> Boolean>? = local.get()?.let { it.deadlineMs to it.shouldAbort }
 }
-import kotlin.math.abs
-import kotlin.math.ceil
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
-import java.util.Locale
-
 /**
  * Produces [TrackAnalysis] for tracks that are about to be mixed, and hands it
  * to [TransitionPlanner].

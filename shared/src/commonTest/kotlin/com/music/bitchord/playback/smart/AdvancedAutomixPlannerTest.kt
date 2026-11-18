@@ -135,8 +135,8 @@ class AdvancedAutomixPlannerTest {
             assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
             assertEquals(FilterTransitionVariant.ECHO_RIDE, plan.filterVariant)
             // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
-            val effect = when (pairHash(current.trackId, next.trackId) % 3) {
-                2 -> DjEffect.REVERB
+            val effect = when (FxPolicy.fxSlot(current.trackId, next.trackId)) {
+                3 -> DjEffect.REVERB
                 else -> DjEffect.ECHO
             }
             assertEquals(effect, plan.djEffect)
