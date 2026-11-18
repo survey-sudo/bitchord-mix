@@ -23,7 +23,7 @@ class AutomixFireAttributionTest {
             assertJoin(plan, dump, fire)
             assertEquals("null", fire["spliceTargetMs"].toString())
             assertEquals("null", fire["rendererFirstFrame"].toString())
-            assertEquals("false", fire["tookOverAtFire"].toString())
+            assertEquals("null", fire["tookOverAtFire"].toString())
         }
     }
 
