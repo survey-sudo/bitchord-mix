@@ -512,12 +512,14 @@ class Djmix26SharedTest {
     }
 
     @Test
-    fun nativeBridgeYieldsOnlyUnder8sWhilePreservingCrownContract() {
+    fun nativeBridgeYieldsOnlyUnder8500msWhilePreservingCrownContract() {
         val loopStartMs = 180_000L
-        // Native bridge stays alive while >= 8s remains to decode.
-        assertFalse(LoopMix.shouldYieldColdLoop(loopStartMs, 172_000L, fastReady = false, building = false, blendArmLeadMs = 25_000L, nextStreamReady = false, isNativeBridge = true))
+        // One strict floor, shared with prime eligibility and LOOP_ARMING.
+        assertFalse(LoopMix.shouldYieldColdLoop(loopStartMs, 171_500L, fastReady = false, building = false, blendArmLeadMs = 25_000L, nextStreamReady = false, isNativeBridge = true))
         assertFalse(LoopMix.shouldYieldColdLoop(loopStartMs, 165_000L, fastReady = false, building = true, blendArmLeadMs = 25_000L, nextStreamReady = true, isNativeBridge = true))
-        assertTrue(LoopMix.shouldYieldColdLoop(loopStartMs, 172_001L, fastReady = false, building = true, blendArmLeadMs = 25_000L, nextStreamReady = true, isNativeBridge = true))
+        assertTrue(LoopMix.shouldYieldColdLoop(loopStartMs, 171_501L, fastReady = false, building = true, blendArmLeadMs = 25_000L, nextStreamReady = true, isNativeBridge = true))
+        assertTrue(LoopMix.shouldYieldColdLoop(loopStartMs, 171_600L, fastReady = false, building = false, blendArmLeadMs = 25_000L, nextStreamReady = false, isNativeBridge = true))
+        assertFalse(LoopMix.shouldYieldColdLoop(loopStartMs, 179_999L, fastReady = true, building = true, blendArmLeadMs = 25_000L, nextStreamReady = false, isNativeBridge = true))
     }
 
     // ---- Task 2B (main) beat-aligned helpers: adapters use bk analysis() ----

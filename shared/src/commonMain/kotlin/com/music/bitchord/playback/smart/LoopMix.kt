@@ -419,6 +419,9 @@ object LoopMix {
      * riding it to dry EOF starved classic begin() on Never Let Go ->
      * S.A.D.
      */
+    /** One shared strict cold floor for native prime, IDLE and LOOP_ARMING soft yields. */
+    const val NATIVE_COLD_FLOOR_MS = 8_500L
+
     fun shouldYieldColdLoop(
         loopStartMs: Long,
         currentPositionMs: Long,
@@ -433,8 +436,8 @@ object LoopMix {
         val remainingMs = loopStartMs - currentPositionMs
         if (isNativeBridge) {
             // Keep a valid nativeBridge (Beat blend / Drop / Echo) alive
-            // while >= 8 s remains to decode a native transition window.
-            return remainingMs < 8_000L
+            // while >= 8.5 s remains to decode a native transition window.
+            return remainingMs < NATIVE_COLD_FLOOR_MS
         }
         if (building) {
             // djmix17: an active build may run during the outer prime
