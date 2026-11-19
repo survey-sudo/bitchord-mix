@@ -75,6 +75,10 @@ object LoopMix {
     const val MIN_RAMP_BARS = 2
     const val MAX_RAMP_BARS = 24
 
+    /** Existing native loop_mix_renderer.cpp advancing-rate processing limits; not musical preferences. */
+    const val CROWN_MIN_EXECUTION_RATE: Double = 0.75
+    const val CROWN_MAX_EXECUTION_RATE: Double = 1.35
+
     /** Share of sung mask frames a loop may still have (a breath), and the longest sung run it may hold. */
     const val MAX_SUNG_SHARE = 0.03
     const val MAX_SUNG_RUN_SEC = 0.2
@@ -287,6 +291,93 @@ object LoopMix {
         val targetBpm: Double get() = targetBpmOverride ?: (inn.bpm / fold)
     }
 
+    /** Nullable summaries are always finite; refusals are stable codes suitable for existing telemetry. */
+    data class CrownQualification(
+        val accepted: Boolean,
+        val refusal: String?,
+        val outMinRate: Double? = null,
+        val outMaxRate: Double? = null,
+        val inMinRate: Double? = null,
+        val inMaxRate: Double? = null,
+        val requiredRampBars: Int? = null,
+    )
+
+    /**
+     * Execution feasibility of a genuine two-sided crown, not a whole-track musical verdict.
+     * Local lyrics/mask/loudness remain the search's responsibility; actual emitted knot rates
+     * remain the session's responsibility. This does not qualify or change lower-rung bridges.
+     */
+    fun qualifyCrown(plan: Plan): CrownQualification {
+        fun refused(code: String) = CrownQualification(accepted = false, refusal = code)
+        if (!plan.outLoops || !plan.inLoops) return refused("not-crown")
+
+        // Only floating-point arithmetic precision (relative 1e-9), never another musical margin.
+        val precision = 1e-9
+        fun same(a: Double, b: Double): Boolean = a.isFinite() && b.isFinite() &&
+            abs(a - b) <= precision * maxOf(abs(a), abs(b))
+        fun validPick(pick: Pick): Boolean {
+            if (!pick.loopStart.isFinite() || pick.loopStart < 0.0 || !pick.loopEnd.isFinite() ||
+                pick.loopEnd <= pick.loopStart || pick.bars !in LOOP_LENGTHS ||
+                !pick.beatSec.isFinite() || pick.beatSec <= 0.0 || !pick.bpm.isFinite() || pick.bpm <= 0.0
+            ) return false
+            val length = pick.loopEnd - pick.loopStart
+            return length.isFinite() && same(length, pick.beatSec * pick.beats) &&
+                same(pick.bpm * pick.beatSec, 60.0)
+        }
+        if (!validPick(plan.out)) return refused("invalid-out-pick")
+        if (!validPick(plan.inn)) return refused("invalid-in-pick")
+        if (plan.fold != 0.5 && plan.fold != 1.0 && plan.fold != 2.0) return refused("unsupported-fold")
+
+        val target = plan.inn.bpm / plan.fold
+        val q = target / plan.out.bpm
+        val inverse = 1.0 / q
+        if (!target.isFinite() || target <= 0.0 || !q.isFinite() || q <= 0.0 ||
+            !inverse.isFinite() || inverse <= 0.0
+        ) return refused("invalid-rates")
+        val rawRampBars = ceil(abs(target - plan.out.bpm) / MAX_BPM_PER_BAR)
+        // Retain the existing minimum, but do not hide a requirement beyond the maximum by clamping.
+        val requiredRampBars = rawRampBars.takeIf { it.isFinite() && it <= Int.MAX_VALUE.toDouble() }
+            ?.toInt()?.coerceAtLeast(MIN_RAMP_BARS)
+        val summary = CrownQualification(
+            accepted = false,
+            refusal = null,
+            outMinRate = minOf(1.0, q),
+            outMaxRate = maxOf(1.0, q),
+            inMinRate = minOf(1.0, inverse),
+            inMaxRate = maxOf(1.0, inverse),
+            requiredRampBars = requiredRampBars,
+        )
+        fun inExecutionBounds(rate: Double): Boolean =
+            rate >= CROWN_MIN_EXECUTION_RATE - precision && rate <= CROWN_MAX_EXECUTION_RATE + precision
+        if (!inExecutionBounds(q) || !inExecutionBounds(inverse)) return summary.copy(refusal = "execution-rate")
+        if (requiredRampBars == null || requiredRampBars > MAX_RAMP_BARS) return summary.copy(refusal = "ramp-budget")
+
+        if (plan.enterBars != ENTER_BARS || plan.rampBars !in MIN_RAMP_BARS..MAX_RAMP_BARS ||
+            plan.rampBars < requiredRampBars || plan.exitBars < EXIT_BARS || plan.nativeIncoming ||
+            !plan.incomingHoldSec.isFinite() || plan.incomingHoldSec < 0.0 ||
+            !plan.faderSwapBeats.isFinite() || plan.faderSwapBeats <= 0.0 || !same(plan.targetBpm, target)
+        ) return summary.copy(refusal = "invalid-clock")
+
+        // Existing whole-IN-loop release rounding also bounds Clock allocation before constructing it.
+        val inLoopOutBars = plan.inn.bars / plan.fold
+        val expectedTotalBars = (ceil((plan.enterBars + plan.rampBars + EXIT_BARS) / inLoopOutBars) * inLoopOutBars).roundToInt()
+        if (plan.totalBars != expectedTotalBars || plan.exitBars != plan.totalBars - plan.enterBars - plan.rampBars) {
+            return summary.copy(refusal = "invalid-release")
+        }
+        val clock = Clock(plan)
+        if (clock.beatTimes.any { !it.isFinite() } ||
+            (1 until clock.beatTimes.size).any { clock.beatTimes[it] <= clock.beatTimes[it - 1] } ||
+            !same(clock.tempo(0), plan.out.bpm) || !same(clock.tempo(clock.beats - 1), target)
+        ) return summary.copy(refusal = "invalid-clock")
+        val releaseLoops = (clock.inReleasePosition - plan.inn.loopStart) / (plan.inn.loopEnd - plan.inn.loopStart)
+        val releaseRate = (clock.tempo(clock.beats - 1) / plan.inn.bpm) * plan.fold
+        if (!clock.outPositionAt(clock.beats).isFinite() || !clock.inPositionAt(clock.beats).isFinite() ||
+            !releaseLoops.isFinite() || releaseLoops < 1.0 || !same(releaseLoops, kotlin.math.round(releaseLoops)) ||
+            !same(releaseRate, 1.0)
+        ) return summary.copy(refusal = "invalid-release")
+        return summary.copy(accepted = true)
+    }
+
     // ---- Choosing the loops ----------------------------------------------------------------
 
     /**
@@ -314,8 +405,7 @@ object LoopMix {
         why: StringBuilder? = null,
         playableOutDurationSec: Double = outDuration,
     ): Plan? {
-        // djmix20 decline-to-mix (Apple parity): unmixable pairs never loop.
-        if (shouldDeclineToMix(out, inn)) return null.also { why?.append("decline to mix") }
+        // A locally clean executable crown outranks coarse whole-track preferences; bridges do not.
         val effectiveOutDuration = if (playableOutDurationSec > 1.0) minOf(outDuration, playableOutDurationSec) else outDuration
         return mixPlan(
             out, effectiveOutDuration, inn, inDuration,
@@ -559,7 +649,7 @@ object LoopMix {
         // geometry ([loopsBetween]/[firstClean]) is untouched.
         val outAnchors = trackedAnchors(out.tailBeats, outPick.start, outPick.end, outPick.bars)
         val inAnchors = trackedAnchors(inn.headBeats, inPick.start, inPick.end, inPick.bars)
-        return Plan(
+        val candidate = Plan(
             out = pick(outPick, outBeat, outBpm, outAnchors),
             inn = pick(inPick, inBeat, inBpm, inAnchors),
             fold = fold,
@@ -573,6 +663,9 @@ object LoopMix {
             reverbWash = fxReverb,
             hpSweepEndHz = if (fxRoll) BUILDUP_HP_END_HZ else 0f,
         )
+        val qualification = qualifyCrown(candidate)
+        if (!qualification.accepted) return null.also { why?.append("crown: ")?.append(qualification.refusal) }
+        return candidate
     }
 
     private data class Quad(val a: Boolean, val b: Boolean, val c: Boolean, val d: Boolean)

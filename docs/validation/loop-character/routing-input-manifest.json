@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "purpose": "fixed synthetic route witnesses for unmodified-vc83 versus candidate comparison",
+  "recordingIdentity": "unknown; deterministic generated fixtures are not user recordings",
+  "analysisRevision": "synthetic manifest inputs; no stored catalog analysis revision",
+  "mapResolution": "disabled/absent in test inputs",
+  "common": {
+    "sampleRate": 48000,
+    "outDurationSec": 200.0,
+    "inDurationSec": 180.0,
+    "localBeatSec": 0.5,
+    "downbeatPhaseSec": 0.5,
+    "localGridConfidence": 0.9,
+    "levelRms": 0.3,
+    "lyricSpans": [],
+    "maskFrameRate": 10.0,
+    "maskFramesPerTrack": 2000,
+    "maskSungValue": 0.9,
+    "maskCleanValue": 0.05,
+    "levelWindowRmsEachFrame": 0.3,
+    "playheadMs": 10000,
+    "queueState": "uncommitted synthetic next-item transition",
+    "outputCapability": "planner-only harness; no LoopMixPort supplied",
+    "pcm": "native-only run generates deterministic 220/330/440/660/880Hz stereo sine regions on demand; no source recording",
+    "warmScenario": "both synthetic decode windows return complete physical PCM",
+    "coldScenario": "planner yields before renderer; no fake session or sink takeover",
+    "effectRotation": "fixed pair IDs; effects recorded separately from route technique"
+  },
+  "opportunities": [
+    {
+      "id": "clean-control",
+      "globalOutBpm": 120.0,
+      "globalInBpm": 120.0,
+      "outVocalProbability": 0.0,
+      "inVocalProbability": 0.0,
+      "outLocalGridBpm": 120.0,
+      "inLocalGridBpm": 120.0,
+      "outCleanMaskIntervalsSec": [[190.0, 198.5]],
+      "inCleanMaskIntervalsSec": [[0.0, 8.5]],
+      "literalLoopGeometrySec": {"out": [190.5, 198.5], "in": [0.5, 8.5]},
+      "expectedInvariant": "candidate crown with two loop flags, fold1; plan-only selected route"
+    },
+    {
+      "id": "whole-track-metadata-conflict",
+      "globalOutBpm": 120.0,
+      "globalInBpm": 132.0,
+      "outVocalProbability": 0.9,
+      "inVocalProbability": 0.9,
+      "outLocalGridBpm": 120.0,
+      "inLocalGridBpm": 120.0,
+      "outCleanMaskIntervalsSec": [[190.0, 198.5]],
+      "inCleanMaskIntervalsSec": [[0.0, 8.5]],
+      "literalLoopGeometrySec": {"out": [190.5, 198.5], "in": [0.5, 8.5]},
+      "expectedComparison": "baseline crown absent; candidate selected crown if executable qualification holds; global decline remains true"
+    },
+    {
+      "id": "local-sung-veto",
+      "globalOutBpm": 120.0,
+      "globalInBpm": 120.0,
+      "outVocalProbability": 0.0,
+      "inVocalProbability": 0.0,
+      "outLocalGridBpm": 120.0,
+      "inLocalGridBpm": 120.0,
+      "outCleanMaskIntervalsSec": [],
+      "inCleanMaskIntervalsSec": [[0.0, 10.5]],
+      "outLyricSpanSec": [[188.0, 200.0]],
+      "expectedInvariant": "no two-sided crown"
+    },
+    {
+      "id": "insufficient-mask-coverage",
+      "globalOutBpm": 120.0,
+      "globalInBpm": 120.0,
+      "outVocalProbability": 0.0,
+      "inVocalProbability": 0.0,
+      "outVocalWindow": null,
+      "inVocalWindow": null,
+      "expectedInvariant": "no two-sided crown; missing local evidence is not instrumental proof"
+    },
+    {
+      "id": "quiet-loop-corridors",
+      "globalOutBpm": 120.0,
+      "globalInBpm": 120.0,
+      "outVocalProbability": 0.0,
+      "inVocalProbability": 0.0,
+      "outLevelRmsInCandidate": 0.0,
+      "inLevelRmsInCandidate": 0.0,
+      "expectedInvariant": "no two-sided crown from silent windows"
+    },
+    {
+      "id": "wide-tempo-120-to-134-fold1",
+      "outLocalGridBpm": 120.0,
+      "inLocalGridBpm": 134.0,
+      "fold": 1.0,
+      "outCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "inCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "expectedInvariant": "existing executable wide-ramp witness retained"
+    },
+    {
+      "id": "wide-tempo-111-to-169-fold2",
+      "outLocalGridBpm": 111.0,
+      "inLocalGridBpm": 169.0,
+      "fold": 2.0,
+      "outCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "inCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "expectedInvariant": "existing fold2 witness retained within reciprocal execution bounds"
+    },
+    {
+      "id": "wide-tempo-170-to-80-fold-half",
+      "outLocalGridBpm": 170.0,
+      "inLocalGridBpm": 80.0,
+      "fold": 0.5,
+      "outCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "inCleanMaskIntervalsSec": "full measured clean fixture windows",
+      "expectedInvariant": "existing fold0.5 witness retained within reciprocal execution bounds"
+    },
+    {
+      "id": "genuine-native-bridge-control",
+      "routeSource": "existing unmodified LoopMix.bridge path with global decline input",
+      "requestedGeometry": "must have outLoops=false or inLoops=false as emitted by bridge",
+      "expectedInvariant": "never classified as crown merely because native route is chosen"
+    }
+  ],
+  "observableLimits": {
+    "plannerCandidate": "observed by shared pure planner APIs",
+    "controllerAccepted": "unknown in shared replay; controller test harness does not exercise native first-ticker route",
+    "prepared": "real JNI session only in dedicated isolated native suite; otherwise unknown",
+    "rendererOutput": "real renderer output only in dedicated isolated host-JNI test",
+    "controllerTakeover": "unknown; sink controller lifecycle is not driven by the JVM replay",
+    "delegateBufferAcceptance": "unknown",
+    "listeningAcceptance": "unknown"
+  }
+}

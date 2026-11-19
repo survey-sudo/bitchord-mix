@@ -359,8 +359,9 @@ private fun itemText(track: TransitionTrackInfo?): String =
  * dual-vocal high: both vocalProbability >=0.62). Compatible pairs never
  * decline: Beautiful 99.93->104.5 (same key, delta ~4.6%) and folded pairs
  * Drip 78.89->UP 162.01 (fold 2, delta ~2.6%) both return false.
- * Public so LoopMix and CrossfadeController can skip beatmix/loop rungs
- * for the same pairs.
+ * Public so lower-rung bridge/classic routing can share this preference.
+ * A locally clean, executable two-sided LoopMix crown is qualified separately;
+ * this whole-track predicate does not establish crown execution infeasibility.
  */
 fun shouldDeclineToMix(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Boolean {
     val outBpm = analysis.bpm.orZero()

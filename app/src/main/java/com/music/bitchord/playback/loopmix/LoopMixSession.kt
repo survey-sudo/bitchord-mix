@@ -49,7 +49,22 @@ class LoopMixSession private constructor(
     val sampleRate: Int,
     /** Track second the incoming player becomes audible at (knot-exact). */
     val handoverTrack: Double = clock.elementTrackTime,
+    /** Actual native deck configuration; unknown only for manually constructed sessions. */
+    val configuredOutLoops: Boolean? = null,
+    val configuredInLoops: Boolean? = null,
 ) {
+    /** Preserve the prior manual-session constructor; actual geometry is unknown for this path. */
+    private constructor(
+        plan: LoopMix.Plan,
+        clock: LoopMix.Clock,
+        outId: String,
+        inId: String,
+        renderer: LoopMixRenderer,
+        sampleRate: Int,
+        handoverTrack: Double,
+    ) : this(plan, clock, outId, inId, renderer, sampleRate, handoverTrack,
+        configuredOutLoops = null, configuredInLoops = null)
+
     /** Track microseconds of the outgoing loop start: where the sink splices. */
     val takeoverUs: Long = (plan.out.loopStart * 1_000_000).roundToLong()
 
@@ -238,10 +253,20 @@ class LoopMixSession private constructor(
             inAnalysis: TrackAnalysis? = null,
             sungOut: List<LoopMix.Span>? = null,
             sungIn: List<LoopMix.Span>? = null,
+            onRefusal: ((String) -> Unit)? = null,
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
-            if (!LoopMixRenderer.available || sampleRate <= 0) return null
+            fun refuse(reason: String): LoopMixSession? {
+                onRefusal?.invoke(reason)
+                return null
+            }
+            if (sampleRate <= 0) return refuse("invalid_sample_rate")
+            val crown = plan.outLoops && plan.inLoops
+            // Preserve the early capability gate for non-crown routes. Crowns
+            // qualify first, even without JNI, so a geometry refusal is not
+            // misattributed to renderer capability (and never reaches decode).
+            if (!crown && !LoopMixRenderer.available) return refuse("renderer_unavailable")
             // djmix18: the script hold is the truth for the handover: pass it into the
             // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
             // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
@@ -250,6 +275,10 @@ class LoopMixSession private constructor(
             val effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec) {
                 plan.copy(incomingHoldSec = effectiveHoldSec)
             } else plan
+            if (crown) {
+                val nominal = LoopMix.qualifyCrown(effectivePlan)
+                if (!nominal.accepted) return refuse("crown_nominal_${nominal.refusal ?: "invalid"}")
+            }
             val clock = LoopMix.Clock(effectivePlan)
             // Nominal bounds shared with fast-ready checks. Actual tracked
             // knots below may extend the physical decode request before build.
@@ -269,6 +298,11 @@ class LoopMixSession private constructor(
             val outHasTailKnot = !effectivePlan.outLoops && outStopMixSec > clock.releaseAt + 1e-6
             val knots = buildDeckKnots(effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
                 outHasTailKnot, outStopMixSec, tailRateEarly)
+            if (crown) {
+                val actual = qualifyCrownKnots(effectivePlan, clock, sampleRate, knots)
+                if (!actual.accepted) return refuse(requireNotNull(actual.refusal))
+                if (!LoopMixRenderer.available) return refuse("renderer_unavailable")
+            }
             val incomingGeometry = incomingGeometry(effectivePlan, clock, knots)
             val actualInTo = maxOf(bounds.inTo, incomingGeometry.handoverTrack + inTail,
                 incomingGeometry.requiredEnd)
@@ -289,17 +323,17 @@ class LoopMixSession private constructor(
             } catch (e: Exception) {
                 decode(LoopMix.Side.OUT, bounds.outFrom, actualOutTo) to decode(LoopMix.Side.IN, bounds.inFrom, actualInTo)
             }
-            var outRegion = outDecoded ?: return null
-            var inRegion = inDecoded ?: return null
+            var outRegion = outDecoded ?: return refuse("decode_out_unavailable")
+            var inRegion = inDecoded ?: return refuse("decode_in_unavailable")
             if (outRegion.start > plan.out.loopStart || inRegion.start > plan.inn.loopStart) {
                 Log.w(TAG, "a region starts after its loop: out ${outRegion.start}, in ${inRegion.start}")
-                return null
+                return refuse("pcm_starts_after_loop")
             }
             if (!coversOutgoingStartAndLoop(outRegion, sampleRate, effectivePlan) ||
                 !coversPhysical(inRegion, sampleRate, effectivePlan.inn.loopStart, incomingGeometry.requiredEnd)
             ) {
                 Log.i(TAG, "loop-domain rejected: incomplete physical PCM out=${outRegion.left.size}/${outRegion.right.size} in=${inRegion.left.size}/${inRegion.right.size} requiredOut=$requiredOutEnd requiredIn=${incomingGeometry.requiredEnd}")
-                return null
+                return refuse("pcm_incomplete_physical_coverage")
             }
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
@@ -489,7 +523,7 @@ class LoopMixSession private constructor(
                 }
             }
             val renderer = LoopMixRenderer(sampleRate)
-            if (!renderer.isValid) return null
+            if (!renderer.isValid) return refuse("renderer_build_failed")
             val sr = sampleRate.toDouble()
             fun samplesOf(region: LoopRegion, trackSeconds: Double) = (trackSeconds - region.start) * sr
 
@@ -873,7 +907,9 @@ class LoopMixSession private constructor(
             renderer.setHighQuality(highQuality)
             renderer.prepare()
             renderer.setFadeOut(LoopMixRenderer.IN, handoverTrackSec)
-            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec).also { it.planIncomingStart() }
+            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec,
+                configuredOutLoops = effectivePlan.outLoops, configuredInLoops = incomingGeometry.loops,
+            ).also { it.planIncomingStart() }
         }
 
         /**
@@ -924,6 +960,76 @@ class LoopMixSession private constructor(
             val inFrames: DoubleArray,
             val inPositionsSec: DoubleArray,
         )
+
+        internal data class CrownKnotQualification(
+            val accepted: Boolean,
+            val refusal: String? = null,
+            val outMinRate: Double? = null,
+            val outMaxRate: Double? = null,
+            val inMinRate: Double? = null,
+            val inMaxRate: Double? = null,
+        )
+
+        /**
+         * Qualify the actual buildDeckKnots output, in unwrapped track seconds,
+         * before PCM/JNI. This deliberately does not repair or clamp a knot.
+         * Native prepare() finds the first position > 0.5 sample from p0 and
+         * stays silent up to the preceding knot (renderer.cpp:673-689, 778-785).
+         * Only a declared IN hold at p0 may use that initial activation contract;
+         * after the first advance, neither deck may park or move backwards.
+         */
+        internal fun qualifyCrownKnots(
+            plan: LoopMix.Plan,
+            clock: LoopMix.Clock,
+            sampleRate: Int,
+            knots: DeckKnots,
+        ): CrownKnotQualification {
+            if (!plan.outLoops || !plan.inLoops) return CrownKnotQualification(true)
+            if (sampleRate <= 0 || !clock.incomingHoldSec.isFinite() || clock.incomingHoldSec < 0.0) {
+                return CrownKnotQualification(false, "crown_actual_geometry")
+            }
+            data class DeckResult(val refusal: String?, val minRate: Double?, val maxRate: Double?)
+            fun deck(frames: DoubleArray, positions: DoubleArray, start: Double,
+                expectedSize: Int, side: String, initialHoldSec: Double): DeckResult {
+                var low: Double? = null
+                var high: Double? = null
+                fun result(reason: String?) = DeckResult(reason?.let { "crown_actual_${side}_$it" }, low, high)
+                if (frames.size != expectedSize || frames.size != positions.size || frames.size < 2 ||
+                    !start.isFinite() || start < 0.0 || frames.first() != 0.0 || positions.first() != start ||
+                    frames.any { !it.isFinite() || it < 0.0 } ||
+                    positions.any { !it.isFinite() || it < start }
+                ) return result("geometry")
+                var active = false
+                for (i in 1 until frames.size) {
+                    val outputAdvance = frames[i] - frames[i - 1]
+                    val sourceAdvance = positions[i] - positions[i - 1]
+                    if (!outputAdvance.isFinite() || outputAdvance <= 0.0 || !sourceAdvance.isFinite()) {
+                        return result("geometry")
+                    }
+                    if (sourceAdvance == 0.0 && !active && initialHoldSec > 1e-9 &&
+                        positions[i] == start && frames[i] / sampleRate <= initialHoldSec
+                    ) continue
+                    if (sourceAdvance <= 0.0) return result("nonadvancing")
+                    active = true
+                    val rate = sampleRate.toDouble() * sourceAdvance / outputAdvance
+                    if (!rate.isFinite()) return result("geometry")
+                    low = low?.let { minOf(it, rate) } ?: rate
+                    high = high?.let { maxOf(it, rate) } ?: rate
+                    // Round-off at an exact endpoint is not a new rate envelope.
+                    if (rate < LoopMix.CROWN_MIN_EXECUTION_RATE - 1e-9 ||
+                        rate > LoopMix.CROWN_MAX_EXECUTION_RATE + 1e-9
+                    ) return result("rate")
+                }
+                return result(if (active) null else "nonadvancing")
+            }
+            val out = deck(knots.outFrames, knots.outPositionsSec, plan.out.loopStart,
+                clock.beats + 1, "out", 0.0)
+            val inn = deck(knots.inFrames, knots.inPositionsSec, plan.inn.loopStart,
+                clock.beats + clock.settleBeats + 1, "in", clock.incomingHoldSec)
+            val reason = out.refusal ?: inn.refusal
+            return CrownKnotQualification(reason == null, reason,
+                out.minRate, out.maxRate, inn.minRate, inn.maxRate)
+        }
 
         internal class VocalMidCarve(
             val apply: Boolean,

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "behaviorReference": "djmix9 source reconstruction",
+  "originalApkBehaviorVerified": false,
+  "namedPairIdentityVerified": false,
+  "currentBaseCommit": "170328bed4b78eaa68e7fce739ba8b121e4aa38c",
+  "historicalCommit": "dc78e0d449d7bdf51e821f8e8c1de223bff8bf5a",
+  "historicalBlobs": [
+    {
+      "path": "shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt",
+      "gitBlob": "a5d166d55e136af318b3d05c68f34bbf25823c98",
+      "sha256": "9efb391142eef9a0cd14a86d0ce4ab5ff192108de1bfff9a182dba5b91f89c42",
+      "inspectedLines": [203, 220, 278, 331]
+    },
+    {
+      "path": "shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/LoopMixTest.kt",
+      "gitBlob": "b4237de7a819b71d3be17c38247eb501e8e3b1f1",
+      "sha256": "791bd7851f4722d8da247f23e9b8707ead4b36e94c85a5f390fc23a6b6d90a8f"
+    }
+  ],
+  "fixtureTestPath": "shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/LoopEligibilityRecoveryTest.kt",
+  "fixedLocalGeometry": {
+    "outDurationSec": 200.0,
+    "inDurationSec": 180.0,
+    "outLocalBpm": 120.0,
+    "inLocalBpm": 120.0,
+    "beatDurationSec": 0.5,
+    "downbeatPhaseSec": 0.5,
+    "outLoopStartSec": 190.5,
+    "outLoopEndSec": 198.5,
+    "inLoopStartSec": 0.5,
+    "inLoopEndSec": 8.5,
+    "outLoopBars": 4,
+    "inLoopBars": 4,
+    "fold": 1.0,
+    "outLoops": true,
+    "inLoops": true
+  },
+  "metadataConflictWitness": {
+    "outGlobalBpm": 120.0,
+    "inGlobalBpm": 132.0,
+    "outVocalProbability": 0.9,
+    "inVocalProbability": 0.9,
+    "localEvidenceUnchanged": true,
+    "expectedCoarseDecline": true
+  },
+  "expectationBasis": "Literal fixture geometry independently derived from fixed local bars and reviewed source; not an oracle call to the current planner",
+  "runtimeEvidenceStatus": "not yet executed"
+}

@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "claim": "Whole-track metadata blocks an otherwise identical locally clean crown on unmodified vc83",
+  "result": "expected-regression-reproduced",
+  "productionBaseCommit": "170328bed4b78eaa68e7fce739ba8b121e4aa38c",
+  "sourceArchiveSha256": "72c2d360cc30148cc102392412780c6d322540de3db97e7d8120b2b6487e9eec",
+  "frozenTestSha256": "278bb895415a888d714d700de7f288a1c279aca95970f0092b35b6e992406d3d",
+  "frozenProvenanceSha256": "eb3703f9c8310cf646ceca86d7c69ef0ec6d32c98ade8c2e000ffe073d9bffe3",
+  "executor": "cue isolated snapshot",
+  "remoteEvidenceRoot": "/workspace/diagnostics/automix-loop-character-20261119/base-red-F437t13z",
+  "durableJobId": "loop-base-red-mwmxqoiw-d0c6",
+  "command": "./gradlew :shared:jvmTest --tests '*LoopEligibilityRecoveryTest' --offline -Pbitchord.bundleWear=false --max-workers=2 --no-daemon --stacktrace",
+  "environmentSetup": "source /etc/profile.d/android-dev.sh",
+  "gradleExit": 1,
+  "productionAndTestCompilationSucceeded": true,
+  "counts": {
+    "tests": 2,
+    "failures": 1,
+    "errors": 0,
+    "skipped": 0
+  },
+  "control": {
+    "test": "cleanMeasuredLocalLoopsProduceFourBarCrown[jvm]",
+    "result": "passed"
+  },
+  "regression": {
+    "test": "wholeTrackDeclineStillAllowsIdenticalCleanLocalOneTimesCrown[jvm]",
+    "result": "failed-as-expected",
+    "message": "Locally clean measured material must yield a crown even when whole-track metadata declines",
+    "decisiveFrame": "LoopEligibilityRecoveryTest.assertCleanCrown(LoopEligibilityRecoveryTest.kt:86)",
+    "testCallFrame": "LoopEligibilityRecoveryTest.wholeTrackDeclineStillAllowsIdenticalCleanLocalOneTimesCrown(LoopEligibilityRecoveryTest.kt:69)"
+  },
+  "retainedArtifacts": [
+    {
+      "path": "baseline-vc83/command.txt",
+      "sha256": "c81b0b1b56b3952c91de31da2fd53e35df7fb1e6ec35346ef58ea48e77d7f9b2"
+    },
+    {
+      "path": "baseline-vc83/gradle.log",
+      "sha256": "d48a2f236429a38d5fc35ef13a83d4d080ee9b552c9c96b3521a12b640ab7864"
+    },
+    {
+      "path": "baseline-vc83/exit-code.txt",
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    {
+      "path": "baseline-vc83/environment.log",
+      "sha256": "f5f4eede0923404ed6cc1ed6be4991b2481f2401b89c803a6a7252013d6beb25"
+    },
+    {
+      "path": "baseline-vc83/TEST-com.music.bitchord.playback.smart.LoopEligibilityRecoveryTest.xml",
+      "sha256": "77f3a76e16574a1373297844ceaa84c839b434e487da8aae0e7cacc4dd3de0e7"
+    }
+  ],
+  "limitations": [
+    "Synthetic local-evidence fixture, not the identified Adrenaline to Bloody Paradise recordings",
+    "Shared planner test only; no session or controller execution in this baseline gate",
+    "Current queue technique distribution and musical listening acceptance remain unmeasured"
+  ]
+}

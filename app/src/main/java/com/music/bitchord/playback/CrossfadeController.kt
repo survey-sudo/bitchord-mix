@@ -386,6 +386,26 @@ internal fun shouldSkipStemAtLaunch(
     armWhenReady: Boolean,
 ): Boolean = shouldSkipStemNearSplice(remainingToSpliceMs, deadlineMs, nowMs) || (analysisBusy && armWhenReady)
 
+/** One terminal classification shared by normal classic and native completion paths. */
+internal fun automixTerminalOutcome(
+    isTerminal: Boolean,
+    executed: Boolean,
+    handedOff: Boolean,
+    reason: String,
+): String = when {
+    !isTerminal -> "unknown"
+    executed && handedOff && reason in setOf(
+        "finish",
+        "loop-complete",
+        "planned",
+        "planned-fade-done",
+        "loop-handover-drift-recovery",
+        "loop-handover-unstarted-recovery",
+    ) -> "completed"
+    reason.contains("scrub") || reason.contains("seek") || reason == "interrupted" -> "cancelled"
+    else -> "unknown"
+}
+
 /**
  * D3b: phrase planner (M6) must never hijack a declined pair in [nativeBridge];
  * declined pairs flow into [LoopMix.bridge] (TransitionAlternatives / Echo).
@@ -1363,6 +1383,12 @@ class CrossfadeController(
      * CANCEL and EMERGENCY_TAIL scrub paths.
      */
     private fun resetPlansForScrub() {
+        if (phase == Phase.IDLE && opportunity != null && !terminalRecorded) {
+            mixEvent("mix.plan.rejected", mapOf("stage" to "terminal", "outcome" to "cancelled",
+                "terminal" to true, "refusalCode" to "scrub-cancelled", "reason" to "scrub"))
+            terminalRecorded = true
+            opportunity = null
+        }
         scrubEpoch++
         countdownStabilizer.reset()
         scrubSettledAtMs = nowMs() + SCRUB_SETTLE_MS
@@ -1431,6 +1457,12 @@ class CrossfadeController(
         if (audible) {
             AutomixTelemetry.event("mix.freeze.queueEdit", mapOf("why" to why, "phase" to phase.name))
             return
+        }
+        if (phase == Phase.IDLE && opportunity != null && !terminalRecorded) {
+            mixEvent("mix.plan.rejected", mapOf("stage" to "terminal", "outcome" to "cancelled",
+                "terminal" to true, "refusalCode" to "queue-edit", "reason" to why))
+            terminalRecorded = true
+            opportunity = null
         }
         discardPrime()
         loopPlanned = null
@@ -1952,6 +1984,7 @@ class CrossfadeController(
         val nextIndex = player.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
+        ensureOpportunity(currentItem.mediaId, nextItem.mediaId)
         // Even a manual catalogue match is still video-origin. AutoMix's
         // analysis and cueing are deliberately never applied to either side
         // of a transition involving a video row.
@@ -2070,7 +2103,7 @@ class CrossfadeController(
         if (rejKey != lastRejectedLogKey) {
             lastRejectedLogKey = rejKey
         if (plan.reason.contains("fallback") || plan.reason.contains("plain") || plan.reason.contains("unmixable") || plan.reason.contains("decline")) {
-            AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "classic-fallback", "reason" to plan.reason,
+            mixEvent("mix.plan.rejected", mapOf("stage" to "candidate", "technique" to "classic", "rung" to "classic-fallback", "reason" to plan.reason,
                 "qualityA" to currentAnalysis.quality, "qualityB" to nextAnalysis.quality,
                 "statusA" to currentAnalysis.status, "statusB" to nextAnalysis.status,
                 "bpmA" to currentAnalysis.bpm, "bpmB" to nextAnalysis.bpm,
@@ -2078,9 +2111,10 @@ class CrossfadeController(
         }
         } else if (!plan.blocked && verdict != lastEmittedPlanVerdict) {
             lastEmittedPlanVerdict = verdict
-            AutomixTelemetry.event(
+            mixEvent(
                 "mix.plan",
                 mapOf(
+                    "stage" to "candidate", "technique" to "classic",
                     "template" to "classic", "locked" to false, "slides" to 0,
                     "bpmA" to currentAnalysis.bpm, "bpmB" to nextAnalysis.bpm,
                     "statusA" to currentAnalysis.status, "statusB" to nextAnalysis.status,
@@ -2143,18 +2177,20 @@ class CrossfadeController(
             committedBeforeLoop.family == CountdownStabilizer.Family.CLASSIC &&
             committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
 
-        // djmix25 R2: decline-to-mix skips the crown loop/drop/blend but
-        // still tries the bridge Echo rung (tempo_jump_plan doctrine). The
-        // classic EQUAL_POWER phrase-length decline (TransitionPlanner)
-        // is the fallback only when that echo is null. Scalars only.
-        val declineToMix = shouldDeclineToMix(currentAnalysis, nextAnalysis)
         val prevLoopPlanned = loopPlanned
         val prevLoopPlanKey = loopPlanKey
         val prevLoopScript = loopScript
         var loop: LoopMix.Plan? = null
         var planLoop: LoopMix.Plan? = null
+        val lockedBridge = committedBeforeLoop != null &&
+            (committedBeforeLoop.locked || committedBeforeLoop.shown) &&
+            committedBeforeLoop.family == CountdownStabilizer.Family.NATIVE_BRIDGE &&
+            committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
         if (!suppressingLoop && !lockedClassic) {
-            planLoop = loopPlanFor(
+            planLoop = if (lockedBridge) {
+                loopRefusal = loopRefusalFor(player, currentItem, nextItem, analysisState, currentAnalysis, nextAnalysis)
+                null
+            } else loopPlanFor(
                 player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration, analysisState,
             )
             val staleCommittedLoop = planLoop == null &&
@@ -2174,9 +2210,19 @@ class CrossfadeController(
             committedBeforeLoop.family != CountdownStabilizer.Family.CLASSIC &&
             committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
         ) {
-            val hardRefusal = loopRefusal in HARD_LOOP_REFUSALS
+            val previousRefusal = prevLoopPlanned?.let {
+                retainedPlanRefusal(it, currentAnalysis, nextAnalysis,
+                    lyricSpans[currentItem.mediaId]?.spans, lyricSpans[nextItem.mediaId]?.spans)
+                    ?: retainedBoundsRefusal(it, player.duration, nextDuration)
+            }
+            val hardRefusal = loopRefusal in HARD_LOOP_REFUSALS || previousRefusal != null
+            if (previousRefusal != null) {
+                countdownStabilizer.onRungFailed(pairKey, scrubEpoch, committedBeforeLoop.family)
+            }
             val prevMatchesCommitted = prevLoopPlanned != null &&
                 prevLoopPlanKey?.startsWith("$pairKey|") == true &&
+                nativeFamily(prevLoopPlanned) == committedBeforeLoop.family &&
+                previousRefusal == null &&
                 (prevLoopPlanned.out.loopStart * 1000).roundToLong() == committedBeforeLoop.targetStartMs
             if (loop == null && !hardRefusal && !suppressingBridge && prevMatchesCommitted &&
                 committedBeforeLoop.targetStartMs > player.currentPosition
@@ -2187,13 +2233,15 @@ class CrossfadeController(
                 loop = prevLoopPlanned
                 loopRefusal = null
             } else if (loop == null && hardRefusal) {
+                if (previousRefusal != null) noteLoopVerdict(pairKey, null, previousRefusal)
                 countdownStabilizer.onRungFailed(
                     pairKey, scrubEpoch, committedBeforeLoop.family,
                     suppressBridgeToo = (loopRefusal != "sung veto"),
                 )
             } else if (loop != null) {
                 val candStartMs = (loop.out.loopStart * 1000).roundToLong()
-                if (kotlin.math.abs(candStartMs - committedBeforeLoop.targetStartMs) > CountdownStabilizer.MAX_DRIFT_MS &&
+                if ((nativeFamily(loop) != committedBeforeLoop.family ||
+                    kotlin.math.abs(candStartMs - committedBeforeLoop.targetStartMs) > CountdownStabilizer.MAX_DRIFT_MS) &&
                     prevMatchesCommitted
                 ) {
                     loopPlanned = prevLoopPlanned
@@ -2234,7 +2282,7 @@ class CrossfadeController(
             val remainingMsEarly = loopStartMsTmp - player.currentPosition
             val nextReadyTmp = nextStreamReady(nextItem)
             val primeLeadMsTmp = adaptivePrimeLeadMs(nextReadyTmp, blendArmLeadMs)
-            val isBridge = planLoop == null
+            val isBridge = !isCrown(loop)
             val hardColdAbortMs = if (isBridge) 8_000L else if (!nextReadyTmp) 14_000L else 10_000L
             if (!fastReadyTmp && !buildingTmp) {
                 if (remainingMsEarly >= hardColdAbortMs && remainingMsEarly <= primeLeadMsTmp) {
@@ -2276,7 +2324,8 @@ class CrossfadeController(
                     val fbKey = "cold-loop-headroom-using-classic|${loop.out.loopStart}"
                     if (fbKey != lastFallbackLogKey) {
                         lastFallbackLogKey = fbKey
-                        AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to "cold-loop-headroom-using-classic", "phase" to phase.name))
+                        routeRefusal("mix.loop.fallback", "cold-loop-headroom-using-classic", "accepted", "native-bridge", "classic",
+                            coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis))
                     }
                     countdownStabilizer.onRungFailed(
                         pairKey, scrubEpoch,
@@ -2300,9 +2349,9 @@ class CrossfadeController(
                 val fbKey = "insufficient-cold-lead-using-classic|${loop.out.loopStart}"
                 if (fbKey != lastFallbackLogKey) {
                     lastFallbackLogKey = fbKey
-                    AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to "insufficient-cold-lead-using-classic", "phase" to phase.name))
+                    // Destination is recorded after the bridge rescue resolves below.
                 }
-                val yieldedWasCrown = planLoop != null
+                val yieldedWasCrown = isCrown(loop)
                 loop = if (yieldedWasCrown) {
                     nativeBridge(player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration)
                 } else null
@@ -2319,6 +2368,9 @@ class CrossfadeController(
                     }
                 }
                 if (loop == null) {
+                    routeRefusal("mix.loop.fallback", "insufficient-cold-lead-using-classic", "accepted",
+                        if (yieldedWasCrown) "crown-loop" else "native-bridge", "classic",
+                        coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis))
                     countdownStabilizer.onRungFailed(
                         pairKey, scrubEpoch,
                         if (yieldedWasCrown) CountdownStabilizer.Family.LOOP else CountdownStabilizer.Family.NATIVE_BRIDGE,
@@ -2331,6 +2383,8 @@ class CrossfadeController(
                     loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
                     discardPrime()
                 } else {
+                    routeRefusal("mix.loop.fallback", "insufficient-cold-lead-using-classic", "accepted", "crown-loop", "native-bridge",
+                        coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis))
                     countdownStabilizer.onRungFailed(
                         pairKey, scrubEpoch, CountdownStabilizer.Family.LOOP, suppressBridgeToo = false,
                     )
@@ -2339,11 +2393,7 @@ class CrossfadeController(
         }
         if (loop != null) {
             val loopStartMs = (loop.out.loopStart * 1000).roundToLong()
-            val loopFamily = if (planLoop != null) {
-                CountdownStabilizer.Family.LOOP
-            } else {
-                CountdownStabilizer.Family.NATIVE_BRIDGE
-            }
+            val loopFamily = nativeFamily(loop)
             countdownStabilizer.consider(
                 CountdownStabilizer.Candidate(
                     pairKey = pairKey,
@@ -2357,6 +2407,7 @@ class CrossfadeController(
                 player.currentPosition,
             )
             lastSmartPlan = plan
+            acceptRoute(loop, nativeRouteFields(loop, coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis)))
             lastPlanStartedAtMs = nowMs()
             lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
             publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
@@ -2461,6 +2512,7 @@ class CrossfadeController(
             allowCommit = allowClassicCommit,
         )
         lastSmartPlan = plan
+        if (!plan.blocked && allowClassicCommit) acceptRoute(plan, classicRouteFields(plan))
         lastPlanStartedAtMs = nowMs()
         lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
         publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
@@ -2765,6 +2817,7 @@ class CrossfadeController(
         val nextIndex = out.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET || nextIndex >= out.mediaItemCount) return armDeath("no-next-index")
         plannedNextId = out.getMediaItemAt(nextIndex).mediaId
+        out.currentMediaItem?.let { ensureOpportunity(it.mediaId, requireNotNull(plannedNextId)) }
         // The last blend's stretch, if it is somehow still easing off: this
         // player is about to be the outgoing side of a new one.
         endEase(clickless = false)
@@ -2864,6 +2917,10 @@ class CrossfadeController(
         }
 
         phase = Phase.ARMING
+        acceptRoute(plan ?: "standard-classic", classicRouteFields(plan))
+        if (into.playbackState == Player.STATE_READY && into.currentMediaItem?.mediaId == opportunity?.inId) {
+            preparedRoute(classicRouteFields(plan))
+        }
         return true
     }
 
@@ -2982,6 +3039,7 @@ class CrossfadeController(
         val now = nowMs()
         val expired = now > armDeadline
         val ready = into.playbackState == Player.STATE_READY
+        if (ready && into.currentMediaItem?.mediaId == opportunity?.inId) preparedRoute(classicRouteFields(planInFlight))
 
         // A standby that never got the incoming track ready has nothing to fade
         // up. Give up and let the queue move on plainly rather than fading into
@@ -3054,9 +3112,10 @@ class CrossfadeController(
     private fun cancelArming(reason: String) {
         if (phase != Phase.ARMING) return
         lastCompleteReason = reason
-        AutomixTelemetry.event(
+        mixEvent(
             "mix.arm.death",
             mapOf(
+                "stage" to "prepared", "technique" to "classic", "refusalCode" to refusalCode(reason),
                 "reason" to reason,
                 "phase" to phase.name,
                 "msSincePlan" to (nowMs() - lastPlanStartedAtMs),
@@ -3088,10 +3147,12 @@ class CrossfadeController(
         fadeStartedAt = nowMs()
         // djmix13: record firing accuracy at the moment the blend starts.
         // djmix14: cueErrorMs was seconds-minus-ms (5000-5=4995). Convert first.
-        val targetCueMs = ((lastSmartPlan?.incomingCueTime ?: 0.0) * 1000.0).roundToLong()
-        AutomixTelemetry.event(
+        val targetCueMs = ((planInFlight?.incomingCueTime ?: 0.0) * 1000.0).roundToLong()
+        executedRoute = classicRouteFields(planInFlight)
+        mixEvent(
             "mix.fire",
-            mapOf(
+            requireNotNull(executedRoute) + mapOf(
+                "stage" to "executed", "executionMarker" to "classic-fade-fired",
                 "mode" to "classic",
                 "plannedStartMs" to lastSmartPlanStartMs,
                 "actualStartMs" to out.currentPosition,
@@ -4064,6 +4125,138 @@ class CrossfadeController(
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
+    /** One opportunity survives revisions, retries and native -> classic cleanup. */
+    private data class Opportunity(val attemptId: String, val outId: String, val inId: String, val scrubEpoch: Long)
+    private val opportunityRunId = java.util.UUID.randomUUID().toString()
+    private var opportunitySequence = 0L
+    private var opportunity: Opportunity? = null
+    private var planRevision = 0
+    private var revisionRoute: Any? = null
+    private var executedRoute: Map<String, Any?>? = null
+    private var terminalRecorded = false
+    private var routingFallback = false
+    private data class NativeBinding(
+        val context: Opportunity,
+        val revision: Int,
+        val generation: Int,
+        val coarseDecline: Boolean?,
+    )
+    private var nativeBinding: NativeBinding? = null
+    private val routingEvidenceKeys = mutableSetOf<String>()
+
+    private fun ensureOpportunity(outId: String, inId: String): Opportunity {
+        opportunity?.let { current ->
+            if (current.outId == outId && current.inId == inId && current.scrubEpoch == scrubEpoch && !terminalRecorded) return current
+        }
+        // A pair changed without a measured terminal event: do not invent success.
+        opportunity = Opportunity("$opportunityRunId:${++opportunitySequence}", outId, inId, scrubEpoch)
+        planRevision = 0
+        revisionRoute = null
+        executedRoute = null
+        nativeBinding = null
+        terminalRecorded = false
+        routingEvidenceKeys.clear()
+        return opportunity!!
+    }
+
+    private fun opportunityFields(context: Opportunity?): Map<String, Any?> = mapOf(
+        "attemptId" to context?.attemptId,
+        "outId" to context?.outId, "inId" to context?.inId,
+        "scrubEpoch" to context?.scrubEpoch,
+        "outRenditionRevision" to "unknown", "inRenditionRevision" to "unknown",
+        "outAnalysisRevision" to "unknown", "inAnalysisRevision" to "unknown",
+    )
+
+    private fun mixEvent(name: String, fields: Map<String, Any?>, context: Opportunity? = opportunity) {
+        AutomixTelemetry.event(name, opportunityFields(context) + mapOf("planRevision" to planRevision) + fields)
+    }
+
+    private fun nativeRouteFields(
+        plan: LoopMix.Plan,
+        outLoops: Boolean? = null,
+        inLoops: Boolean? = null,
+        actualConfiguration: Boolean = false,
+        coarseDecline: Boolean? = null,
+    ): Map<String, Any?> {
+        val configurationKnown = actualConfiguration || outLoops != null || inLoops != null
+        // Telemetry may be assembled on the playback ticker. Keep its planned
+        // endpoint summaries scalar-only; the full shared qualifier allocates
+        // a clock and is run at admission, not again for every route event.
+        val targetRate = plan.targetBpm / plan.out.bpm
+        val reciprocalRate = 1.0 / targetRate
+        val ratesFinite = plan.outLoops && plan.inLoops && targetRate.isFinite() && targetRate > 0.0 &&
+            reciprocalRate.isFinite() && reciprocalRate > 0.0
+        val isConfiguredCrown = if (configurationKnown) outLoops == true && inLoops == true
+            else plan.outLoops && plan.inLoops
+        val technique = when {
+            configurationKnown && (outLoops == null || inLoops == null) -> "unknown-native"
+            configurationKnown && outLoops == true && inLoops == true -> "crown-loop"
+            configurationKnown -> "native-bridge"
+            plan.outLoops && plan.inLoops -> "crown-loop" // requested candidate only
+            else -> "native-bridge"
+        }
+        return mapOf(
+            "technique" to technique,
+            "rung" to plan.rung,
+            "requestedOutLoops" to plan.outLoops, "requestedInLoops" to plan.inLoops,
+            "configuredOutLoops" to outLoops, "configuredInLoops" to inLoops,
+            "outLoopStart" to plan.out.loopStart, "outLoopEnd" to plan.out.loopEnd,
+            "inLoopStart" to plan.inn.loopStart, "inLoopEnd" to plan.inn.loopEnd,
+            "fold" to plan.fold, "rampBars" to plan.rampBars,
+            "echoTail" to plan.echoTail, "carve" to plan.carve, "clash" to plan.clash,
+            "coarseDecline" to coarseDecline,
+            "coarseOverride" to (coarseDecline == true && isConfiguredCrown),
+            "outGridSource" to if (plan.out.anchorBeats != null) "tracked" else "constant-grid",
+            "inGridSource" to if (plan.inn.anchorBeats != null) "tracked" else "constant-grid",
+            "plannedOutMinRate" to if (ratesFinite) minOf(1.0, targetRate) else null,
+            "plannedOutMaxRate" to if (ratesFinite) maxOf(1.0, targetRate) else null,
+            "plannedInMinRate" to if (ratesFinite) minOf(1.0, reciprocalRate) else null,
+            "plannedInMaxRate" to if (ratesFinite) maxOf(1.0, reciprocalRate) else null,
+        )
+    }
+
+    private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
+        "technique" to "classic", "transitionStyle" to plan?.transitionStyle?.name,
+        "filterVariant" to plan?.filterVariant?.name, "djEffect" to plan?.djEffect?.name,
+    )
+
+    private fun acceptRoute(plan: Any, fields: Map<String, Any?>) {
+        reviseRoute(plan)
+        val key = "accepted|${fields["technique"]}|$planRevision"
+        if (routingEvidenceKeys.add(key)) mixEvent("mix.plan", fields + mapOf("stage" to "accepted"))
+    }
+
+    private fun reviseRoute(plan: Any): Int {
+        if (revisionRoute != plan) {
+            revisionRoute = plan
+            planRevision++
+        }
+        return planRevision
+    }
+
+    private fun preparedRoute(fields: Map<String, Any?>, context: Opportunity? = opportunity, revision: Int = planRevision, generation: Int? = null) {
+        if (context != opportunity || terminalRecorded) return
+        val key = "prepared|${fields["technique"]}|$revision|$generation"
+        if (routingEvidenceKeys.add(key)) mixEvent("mix.plan", fields + mapOf(
+            "stage" to "prepared", "planRevision" to revision, "buildGeneration" to generation,
+        ), context)
+    }
+
+    private fun refusalCode(reason: String): String = reason
+        .replace(Regex("\\s+\\d+ ms over$"), " deadline-over")
+        .replace(Regex(" early-abort \\(\\d+ ms left\\)$"), " early-abort")
+
+    private fun routeRefusal(name: String, reason: String, stage: String, technique: String, destination: String? = null,
+        context: Opportunity? = opportunity, revision: Int = planRevision, generation: Int? = null,
+        coarseDecline: Boolean? = null) {
+        if (context != opportunity || terminalRecorded) return
+        val code = refusalCode(reason)
+        if (!routingEvidenceKeys.add("refusal|$stage|$technique|$code")) return
+        mixEvent(name, mapOf("stage" to stage, "technique" to technique, "reason" to reason,
+            "refusalCode" to code, "fallbackTo" to destination, "phase" to phase.name,
+            "planRevision" to revision, "buildGeneration" to generation,
+            "coarseDecline" to coarseDecline), context)
+    }
     private val deckTiming = DeckTiming(nowMs)
     @Volatile private var deckSide: String = "outgoing"
 
@@ -4194,8 +4387,9 @@ class CrossfadeController(
         state: SmartAnalysis,
     ): LoopMix.Plan? {
         val pair = "${current.mediaId}->${next.mediaId}"
+        val coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis)
         loopRefusalFor(player, current, next, state, currentAnalysis, nextAnalysis)?.let { why ->
-            noteLoopVerdict(pair, null, why)
+            noteLoopVerdict(pair, null, why, coarseDecline)
             return null
         }
         askLyrics(current, durationMs)
@@ -4205,9 +4399,23 @@ class CrossfadeController(
         // span list is a fetch that found no synced lines.
         val outLyrics = lyricSpans[current.mediaId]
         val inLyrics = lyricSpans[next.mediaId]
-        val sticky = loopPlanned?.takeIf { loopPlanKey?.startsWith("$pair|") == true }
+        val cached = loopPlanned?.takeIf { loopPlanKey?.startsWith("$pair|") == true }
+        // The shared cache also holds native bridges. Only a two-sided loop is
+        // crown evidence; do not KEEP a bridge here or erase its phrase script.
+        val sticky = cached?.takeIf(::isCrown)
+        val armed = phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING
+        sticky?.let { retained ->
+            retainedPlanRefusal(retained, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)?.let { reason ->
+                dropRefusedLoop(pair, armed && !handedOff, reason, coarseDecline)
+                return null
+            }
+            retainedBoundsRefusal(retained, player.duration, nextDurationMs)?.let { reason ->
+                dropRefusedLoop(pair, armed && !handedOff, reason, coarseDecline)
+                return null
+            }
+        }
         if (sticky == null && (lyricsPending(current.mediaId, currentAnalysis) || lyricsPending(next.mediaId, nextAnalysis))) {
-            noteLoopVerdict(pair, null, "waiting on lyrics")
+            noteLoopVerdict(pair, null, "waiting on lyrics", coarseDecline)
             return null
         }
         // djmix14: a sticky plan whose loopStart the playhead already crossed
@@ -4219,13 +4427,12 @@ class CrossfadeController(
                 player.currentPosition,
             )
         ) {
-            noteLoopVerdict(pair, null, "stale loop start passed")
+            noteLoopVerdict(pair, null, "stale loop start passed", coarseDecline)
             loopPlanned = null
             loopScript = null
             loopPlanKey = null
             return null
         }
-        val armed = phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING
         val seekPast = sticky != null && player.currentPosition > sticky.out.loopStart * 1000 + 1_500
         val why = StringBuilder()
         // djmix18 (Bug 3): clamp to the live playable stream so rendition mismatches
@@ -4247,14 +4454,17 @@ class CrossfadeController(
             playableOutDurationSec = playableOutSec,
         )
         val stickyVeto = sticky != null && LoopMix.vetoes(sticky, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)
-        val replacement = candidate?.takeIf { !LoopMix.vetoes(it, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans) }
+        val candidateRefusal = candidate?.let {
+            retainedPlanRefusal(it, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)
+        }
+        val replacement = candidate?.takeIf { isCrown(it) && candidateRefusal == null }
         when (LoopMix.holdLoop(armed, sticky != null, replacement != null, pairChanged = false, seekPast, sungVeto = stickyVeto)) {
             LoopMix.Hold.KEEP -> {
                 // Lyrics or a mask can arrive after the plan was stored. KEEP is
                 // not a free pass: the same check runs again here, and a veto
                 // drops the loop so the next rung can take the pair.
                 if (sticky != null && LoopMix.vetoes(sticky, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)) {
-                    dropVetoedLoop(pair, armed)
+                dropVetoedLoop(pair, armed, coarseDecline)
                     return null
                 }
                 loopRefusal = null
@@ -4266,14 +4476,16 @@ class CrossfadeController(
             }
             LoopMix.Hold.CLEAR -> {
                 if (stickyVeto) {
-                    dropVetoedLoop(pair, armed && !handedOff)
+                    dropVetoedLoop(pair, armed && !handedOff, coarseDecline)
                     return null
                 }
-                val reason = if (why.isEmpty()) "no later bar" else why.toString()
-                noteLoopVerdict(pair, null, reason)
-                loopPlanned = null
-        loopScript = null
-                loopPlanKey = null
+                val reason = candidateRefusal ?: if (why.isEmpty()) "no later bar" else why.toString()
+                noteLoopVerdict(pair, null, reason, coarseDecline)
+                if (cached == null || isCrown(cached)) {
+                    loopPlanned = null
+                    loopScript = null
+                    loopPlanKey = null
+                }
                 return null
             }
         }
@@ -4285,18 +4497,22 @@ class CrossfadeController(
             val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
             val lead = fastLeadSec(base, current, next, sampleRate)
             if (base.out.loopStart < posSec + lead) {
-                noteLoopVerdict(pair, null, "loop too near playhead")
+                noteLoopVerdict(pair, null, "loop too near playhead", coarseDecline)
                 return null
             }
         }
         val crowned = crownLoop(base, current, next, currentAnalysis, nextAnalysis)
         val plan = stamp(crowned, currentAnalysis, nextAnalysis)
+        retainedPlanRefusal(plan, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)?.let { reason ->
+            noteLoopVerdict(pair, null, reason, coarseDecline)
+            return null
+        }
         loopPlanKey = "$pair|${plan.out.loopStart}"
         loopPlanned = plan
         loopScript = null
         phraseDetail = null
         loopRefusal = null
-        noteLoopVerdict(pair, plan, null)
+        noteLoopVerdict(pair, plan, null, coarseDecline)
         return plan
     }
 
@@ -4304,16 +4520,48 @@ class CrossfadeController(
      * Forgets a loop the lyrics or the vocal mask no longer allow. When it was
      * already arming, the decks come down so this tick can start the next rung.
      */
-    private fun dropVetoedLoop(pair: String, disarm: Boolean) {
+    private fun dropVetoedLoop(pair: String, disarm: Boolean, coarseDecline: Boolean? = null) {
+        dropRefusedLoop(pair, disarm, "sung veto", coarseDecline)
+    }
+
+    private fun dropRefusedLoop(pair: String, disarm: Boolean, reason: String, coarseDecline: Boolean? = null) {
         loopPlanned = null
         loopScript = null
         loopPlanKey = null
         if (disarm) {
-            loopFallBack("sung veto")
-            loopRefusal = null
+            loopFallBack(reason)
+            loopRefusal = reason
         } else {
-            noteLoopVerdict(pair, null, "sung veto")
+            noteLoopVerdict(pair, null, reason, coarseDecline)
         }
+    }
+
+    private fun isCrown(plan: LoopMix.Plan): Boolean = plan.outLoops && plan.inLoops
+
+    private fun nativeFamily(plan: LoopMix.Plan): CountdownStabilizer.Family =
+        if (isCrown(plan)) CountdownStabilizer.Family.LOOP else CountdownStabilizer.Family.NATIVE_BRIDGE
+
+    private fun retainedBoundsRefusal(plan: LoopMix.Plan, outDurationMs: Long, inDurationMs: Long): String? = when {
+        outDurationMs > 1_000L && plan.out.loopEnd * 1000 > outDurationMs -> "outgoing loop beyond playable duration"
+        inDurationMs > 1_000L && plan.inn.loopEnd * 1000 > inDurationMs -> "incoming loop beyond playable duration"
+        else -> null
+    }
+
+    /** The same immutable geometry admission is used for NEW, KEEP and restoration. */
+    private fun retainedPlanRefusal(
+        plan: LoopMix.Plan,
+        out: TrackAnalysis,
+        inn: TrackAnalysis,
+        sungOut: List<LoopMix.Span>?,
+        sungIn: List<LoopMix.Span>?,
+    ): String? {
+        // Local contradictory evidence is authoritative even on an armed crown.
+        if (LoopMix.vetoes(plan, out, inn, sungOut, sungIn)) return "sung veto"
+        if (isCrown(plan)) {
+            val qualification = LoopMix.qualifyCrown(plan)
+            if (!qualification.accepted) return qualification.refusal ?: "crown qualification refused"
+        }
+        return null
     }
 
     /** True for 1.5 s after lyrics were asked, and only when no vocal mask can decide instead. */
@@ -4348,6 +4596,7 @@ class CrossfadeController(
         durationMs: Long,
         nextDurationMs: Long,
     ): LoopMix.Plan? {
+        val coarseDecline = shouldDeclineToMix(currentAnalysis, nextAnalysis)
         when (loopRefusal) {
             "no renderer",
             "playback speed is not 1x",
@@ -4375,11 +4624,31 @@ class CrossfadeController(
                 loopPlanKey = null
             }
         }
+        val committed = countdownStabilizer.committedFor(pair, scrubEpoch)
+        loopPlanned?.takeIf { cached ->
+            !isCrown(cached) && loopPlanKey?.startsWith("$pair|") == true &&
+                committed?.family == CountdownStabilizer.Family.NATIVE_BRIDGE &&
+                (committed.locked || committed.shown) &&
+                retainedPlanRefusal(cached, currentAnalysis, nextAnalysis,
+                    lyricSpans[current.mediaId]?.spans, lyricSpans[next.mediaId]?.spans) == null &&
+                retainedBoundsRefusal(cached, player.duration, nextDurationMs) == null
+        }?.let { cached ->
+            loopRefusal = null
+            return cached
+        }
         if (shouldRunPhrasePlannerForBridge(currentAnalysis, nextAnalysis)) {
             phrasePlanFor(player, current, next, currentAnalysis, nextAnalysis, durationMs)?.let { candidate ->
                 val phrase = candidate.plan
                 val phraseScript = candidate.script
                 val stamped = stamp(phrase, currentAnalysis, nextAnalysis)
+                if (isCrown(stamped) && committed?.family == CountdownStabilizer.Family.NATIVE_BRIDGE &&
+                    (committed.locked || committed.shown)) return@let
+                val phraseRefusal = retainedPlanRefusal(stamped, currentAnalysis, nextAnalysis,
+                    lyricSpans[current.mediaId]?.spans, lyricSpans[next.mediaId]?.spans)
+                if (phraseRefusal != null) {
+                    noteLoopVerdict(pair, null, phraseRefusal, coarseDecline)
+                    return@let
+                }
                 val alreadyPlanned = loopPlanned?.let {
                     loopPlanKey?.startsWith("$pair|") == true && abs(it.out.loopStart - stamped.out.loopStart) < 0.05
                 } == true
@@ -4390,7 +4659,7 @@ class CrossfadeController(
                     if (stamped.out.loopStart < posSec + lead) {
                         // Rejected: neither loopScript nor phraseDetail is
                         // committed, so the UI never shows this candidate.
-                        noteLoopVerdict(pair, null, "bridge too near")
+                        noteLoopVerdict(pair, null, "bridge too near", coarseDecline)
                         return@let
                     }
                 }
@@ -4399,7 +4668,7 @@ class CrossfadeController(
                 loopScript = phraseScript
                 commitPhrase(candidate)
                 loopRefusal = null
-                noteLoopVerdict(pair, stamped, null)
+                noteLoopVerdict(pair, stamped, null, coarseDecline)
                 return stamped
             }
         }
@@ -4422,7 +4691,7 @@ class CrossfadeController(
             val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
             val lead = fastLeadSec(stamped, current, next, sampleRate)
             if (stamped.out.loopStart < posSec + lead) {
-                noteLoopVerdict(pair, null, "bridge too near")
+                noteLoopVerdict(pair, null, "bridge too near", coarseDecline)
                 return null
             }
         }
@@ -4431,7 +4700,7 @@ class CrossfadeController(
         loopScript = null
         phraseDetail = null
         loopRefusal = null
-        noteLoopVerdict(pair, stamped, null)
+        noteLoopVerdict(pair, stamped, null, coarseDecline)
         return stamped
     }
 
@@ -4582,7 +4851,7 @@ class CrossfadeController(
         val choice = candidate.script.choice
         val out = candidate.out
         val inn = candidate.inn
-        AutomixTelemetry.event("mix.plan", mapOf("template" to choice.template, "locked" to candidate.locked, "slides" to candidate.slides, "bpmA" to out.bpm, "bpmB" to inn.bpm, "statusA" to out.status, "statusB" to inn.status, "qualityA" to out.quality, "qualityB" to inn.quality, "exitTailSec" to candidate.script.plan.exitTailSeconds,
+        mixEvent("mix.plan", nativeRouteFields(candidate.plan, coarseDecline = shouldDeclineToMix(out, inn)) + mapOf("stage" to "candidate", "template" to choice.template, "locked" to candidate.locked, "slides" to candidate.slides, "bpmA" to out.bpm, "bpmB" to inn.bpm, "statusA" to out.status, "statusB" to inn.status, "qualityA" to out.quality, "qualityB" to inn.quality, "exitTailSec" to candidate.script.plan.exitTailSeconds,
             // djmix25 P2.13 telemetry completeness.
             "reason" to "phrase-${choice.template.name}",
             "rung" to choice.rung,
@@ -4634,8 +4903,18 @@ class CrossfadeController(
         return plan.copy(clash = clash, carve = carve, keys = keys)
     }
 
-    private fun noteLoopVerdict(pair: String, plan: LoopMix.Plan?, refusal: String?) {
+    private fun noteLoopVerdict(pair: String, plan: LoopMix.Plan?, refusal: String?, coarseDecline: Boolean? = null) {
         loopRefusal = refusal
+        if (refusal != null) routeRefusal("mix.plan.rejected", refusal, "candidate",
+            if (refusal.startsWith("bridge")) "native-bridge" else "crown-loop",
+            context = opportunity, coarseDecline = coarseDecline)
+        if (plan != null) {
+            val revision = reviseRoute(plan)
+            val fields = nativeRouteFields(plan, coarseDecline = coarseDecline)
+            if (routingEvidenceKeys.add("candidate|${fields["technique"]}|$revision")) {
+                mixEvent("mix.plan", fields + mapOf("stage" to "candidate"))
+            }
+        }
         val verdict = "$pair: " + (plan?.let { "loop mix at ${"%.2f".format(Locale.ROOT, it.out.loopStart)}s · ${describeLoop(it)}" } ?: "no loop mix ($refusal)")
         if (verdict == lastLoopVerdict) return
         lastLoopVerdict = verdict
@@ -4707,10 +4986,7 @@ class CrossfadeController(
         val key = "$reason|${phase.name}"
         if (key != lastArmDeathKey) {
             lastArmDeathKey = key
-            AutomixTelemetry.event(
-                "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
-            )
+            routeRefusal("mix.arm.death", reason, "accepted", "classic")
         }
         return false
     }
@@ -4736,7 +5012,8 @@ class CrossfadeController(
             val key = "beginLoop:$reason|$pairKey"
             if (key != lastFallbackLogKey) {
                 lastFallbackLogKey = key
-                AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
+                routeRefusal("mix.loop.fallback", reason, "accepted", nativeRouteFields(plan)["technique"] as String, "classic",
+                    coarseDecline = loopOutAnalysis?.let { out -> loopInAnalysis?.let { inn -> shouldDeclineToMix(out, inn) } })
             }
             loopSuppressedPair = pairKey
             loopSuppressedUntil = nowMs() + LOOP_SUPPRESSION_MS
@@ -4805,7 +5082,22 @@ class CrossfadeController(
         val inLevel = (loudnessGain(inItem.mediaId) / loudnessGain(outItem.mediaId))
             .takeIf { it.isFinite() && it > 0f } ?: 1f
         val highQuality = AppSettings.automixPerformanceMode.value != AutomixPerformanceMode.EFFICIENT
-        val script = loopScript
+        val buildPair = "${outItem.mediaId}->${inItem.mediaId}"
+        val script = loopScript?.takeIf {
+            (loopPlanKey?.startsWith("$buildPair|") == true && loopPlanned == plan) || loopTarget == plan
+        }
+        val context = ensureOpportunity(outItem.mediaId, inItem.mediaId)
+        val revision = reviseRoute(plan)
+        val capturedPlan = plan.copy(out = plan.out.copy(anchorBeats = plan.out.anchorBeats?.toList()),
+            inn = plan.inn.copy(anchorBeats = plan.inn.anchorBeats?.toList()))
+        // Freeze the correct pair BEFORE suspension. CurveWindow owns mutable
+        // arrays; a data-class copy alone would still share another pass's mask.
+        val rememberedPair = loopOutItem?.mediaId == outItem.mediaId && loopInItem?.mediaId == inItem.mediaId
+        val capturedOutAnalysis = snapshotLoopAnalysis(if (rememberedPair) loopOutAnalysis ?: analysisFor(outItem) else analysisFor(outItem))
+        val capturedInAnalysis = snapshotLoopAnalysis(if (rememberedPair) loopInAnalysis ?: analysisFor(inItem) else analysisFor(inItem))
+        val capturedSungOut = lyricSpans[outItem.mediaId]?.spans?.toList()
+        val capturedSungIn = lyricSpans[inItem.mediaId]?.spans?.toList()
+        val capturedCoarseDecline = shouldDeclineToMix(capturedOutAnalysis, capturedInAnalysis)
         val spliceRemainingAtLaunch = (plan.out.loopStart * 1000).roundToLong() - out.currentPosition
         val skipStemAtLaunch = shouldSkipStemAtLaunch(
             spliceRemainingAtLaunch,
@@ -4854,7 +5146,7 @@ class CrossfadeController(
                             }
                         }
                     }
-                    LoopMixSession.build(plan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = loopOutAnalysis, inAnalysis = loopInAnalysis, sungOut = loopSungOut, sungIn = loopSungIn, decode = { side, from, to ->
+                    LoopMixSession.build(capturedPlan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = capturedOutAnalysis, inAnalysis = capturedInAnalysis, sungOut = capturedSungOut, sungIn = capturedSungIn, onRefusal = { reason -> buildFailure = reason }, decode = { side, from, to ->
                         // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
                         val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
                         deckSide = sideName
@@ -4866,7 +5158,7 @@ class CrossfadeController(
                     })
                 }.onFailure {
                     Log.w(TAG, "loop build failed", it)
-                    buildFailure = "${deckSide.ifEmpty { "deck" }} error:${it.javaClass.simpleName}"
+                    buildFailure = "session error:${it.javaClass.simpleName}"
                 }.getOrNull()
             }
             if (generation != buildGeneration) {
@@ -4878,9 +5170,17 @@ class CrossfadeController(
                 session?.close()
                 return@launch
             }
+            if (context != opportunity || terminalRecorded) {
+                session?.close()
+                return@launch
+            }
             val steps = deckTiming.snapshot(nowMs())
                 .joinToString { "${it.step} ${it.endedMs - it.startedMs}ms" }
             if (session == null) {
+                routeRefusal("mix.plan.rejected", buildFailure ?: "session build-null", "prepared",
+                    nativeRouteFields(plan, coarseDecline = capturedCoarseDecline)["technique"] as String,
+                    context = context, revision = revision, generation = generation,
+                    coarseDecline = capturedCoarseDecline)
                 Log.w(TAG, "loop build produced no decks ($steps)")
                 primeRetryAt = nowMs() + LOOP_PRIME_RETRY_MS
                 // djmix16: a null build while already LOOP_ARMING yields
@@ -4917,6 +5217,7 @@ class CrossfadeController(
                         shiftLoopOrFallback(out)
                     } else {
                         primedKey = null
+                        nativeBinding = NativeBinding(context, revision, generation, capturedCoarseDecline)
                         armLoop(session, out, into, nextIndex, outPort, inPort)
                     }
                 }
@@ -4936,10 +5237,16 @@ class CrossfadeController(
                         shiftLoopOrFallback(out)
                     } else {
                         primedKey = null
+                        nativeBinding = NativeBinding(context, revision, generation, capturedCoarseDecline)
                         armLoop(session, out, into, nextIndex, outPort, inPort)
                     }
                 }
-                phase == Phase.IDLE -> primedSession = session
+                phase == Phase.IDLE -> {
+                    primedSession = session
+                    nativeBinding = NativeBinding(context, revision, generation, capturedCoarseDecline)
+                    preparedRoute(nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
+                        actualConfiguration = true, coarseDecline = capturedCoarseDecline), context, revision, generation)
+                }
                 else -> session.close()
             }
         }
@@ -4966,6 +5273,24 @@ class CrossfadeController(
         loopInDurationMs = nextDurationMs
     }
 
+    private fun snapshotLoopAnalysis(analysis: TrackAnalysis): TrackAnalysis {
+        fun windows(values: List<com.music.bitchord.playback.smart.CurveWindow>) = values.map {
+            com.music.bitchord.playback.smart.CurveWindow(it.startTime, it.frameRate, it.values.copyOf())
+        }
+        fun beats(value: com.music.bitchord.playback.smart.BeatSide?) = value?.copy(
+            beats = value.beats.toList(), downbeats = value.downbeats.toList(),
+        )
+        return analysis.copy(
+            downbeats = analysis.downbeats.toList(), phraseBoundaries = analysis.phraseBoundaries.toList(),
+            mixInCandidates = analysis.mixInCandidates.toList(), mixOutCandidates = analysis.mixOutCandidates.toList(),
+            energyCurve = analysis.energyCurve.toList(), lowEnergyCurve = analysis.lowEnergyCurve.toList(),
+            vocalActivityMask = analysis.vocalActivityMask.toList(),
+            headBeats = beats(analysis.headBeats), tailBeats = beats(analysis.tailBeats),
+            vocalWindows = windows(analysis.vocalWindows), levelWindows = windows(analysis.levelWindows),
+            instrumentalWindows = windows(analysis.instrumentalWindows),
+        )
+    }
+
     private fun primeKey(plan: LoopMix.Plan, outItem: MediaItem, inItem: MediaItem, sampleRate: Int) =
         "${plan.rung}|${outItem.mediaId}->${inItem.mediaId}|${plan.out.loopStart}|${plan.out.loopEnd}|${plan.out.bars}|" +
             "${plan.inn.loopStart}|${plan.inn.loopEnd}|${plan.inn.bars}|$sampleRate"
@@ -4976,6 +5301,7 @@ class CrossfadeController(
     }
 
     private fun discardPrime() {
+        buildGeneration++
         primeJob?.cancel()
         primeJob = null
         loopBuildJob = null
@@ -5067,6 +5393,12 @@ class CrossfadeController(
         val deadline = deckTiming.deadlineMs
         val notLate = deadline != DeckBudget.NO_DEADLINE_MS && deadline > 0L && now <= deadline
         val reason = if (notLate) "shift-bar-null" else lateDeckReason()
+        candidate?.let {
+            retainedPlanRefusal(it, outAnalysis, inAnalysis, loopSungOut, loopSungIn)?.let { refusal ->
+                loopFallBack(refusal)
+                return
+            }
+        }
         if (candidate == null) {
             Log.d(TAG, "loop has no later bar ($why)")
             loopFallBack(reason)
@@ -5131,6 +5463,16 @@ class CrossfadeController(
         outPort: LoopMixPort,
         inPort: LoopMixPort,
     ) {
+        val outItem = loopOutItem
+        val inItem = loopInItem
+        if (outItem != null && inItem != null) {
+            retainedPlanRefusal(session.plan, analysisFor(outItem), analysisFor(inItem),
+                lyricSpans[outItem.mediaId]?.spans, lyricSpans[inItem.mediaId]?.spans)?.let { refusal ->
+                session.close()
+                loopFallBack(refusal)
+                return
+            }
+        }
         val items = (0 until out.mediaItemCount).map { out.getMediaItemAt(it) }
         queuedItemCount = items.size
         into.skipSilenceEnabled = false
@@ -5162,6 +5504,11 @@ class CrossfadeController(
         into.prepare()
         session.attach(outPort, inPort)
         loopSession = session
+        nativeBinding?.let { binding ->
+            preparedRoute(nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
+                actualConfiguration = true, coarseDecline = nativeBinding?.coarseDecline),
+                binding.context, binding.revision, binding.generation)
+        }
         loopIncomingStarted = false
         deferredHandoffLogged = false
         lastLoopPositionMs = -1L
@@ -5176,6 +5523,7 @@ class CrossfadeController(
 
     /** Waits for the outgoing sink to splice over to the renderer. */
     private fun driveLoopArming() {
+        if (rejectLiveCrown()) return
         val out = outgoing ?: return loopBail("no outgoing player")
         if (!out.playWhenReady) {
             // djmix22: same proof as driveLoopMix (pre-takeover pause watch).
@@ -5264,9 +5612,15 @@ class CrossfadeController(
             phase = Phase.LOOP_RUNNING
             AppSettings.smartTransitionWindow.value = null
             AppSettings.smartMixInProgress.value = true
-            AutomixTelemetry.event(
+            val binding = nativeBinding
+            executedRoute = nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
+                actualConfiguration = true, coarseDecline = binding?.coarseDecline)
+            mixEvent(
                 "mix.fire",
-                mapOf(
+                requireNotNull(executedRoute) + mapOf(
+                    "stage" to "executed", "executionMarker" to "native-takeover-observed",
+                    "executionScope" to "takeover-only-not-delegate-buffer-or-listening-proof",
+                    "planRevision" to binding?.revision, "buildGeneration" to binding?.generation,
                     "mode" to "loop",
                     "plannedStartMs" to loopTargetStartMs,
                     "actualStartMs" to out.currentPosition,
@@ -5274,7 +5628,7 @@ class CrossfadeController(
                     "prerollSec" to 1.0,
                     "spliceTargetMs" to loopTargetStartMs,
                     "trackIndex" to outgoingItemIndex,
-                ),
+                ), binding?.context ?: opportunity,
             )
             scope.launch(Dispatchers.Default) {
                 session.outPort?.spliceLag()?.let { (lag, score) ->
@@ -5303,6 +5657,7 @@ class CrossfadeController(
 
     /** The mix is running: starts the incoming player, aligns it, hands the session over, and ends. */
     private fun driveLoopMix() {
+        if (rejectLiveCrown()) return
         val session = loopSession ?: return finish()
         val out = outgoing ?: return loopBail("no outgoing player")
         val into = incoming ?: return loopBail("no incoming player")
@@ -5369,6 +5724,18 @@ class CrossfadeController(
         publishLoopBeat(session, m, now)
         announceLoopPosition()
         if (m >= session.clock.elementAt + LOOP_END_MARGIN_SECONDS) finishLoop()
+    }
+
+    /** No callback work: contradictory local evidence is checked on the ticker. */
+    private fun rejectLiveCrown(): Boolean {
+        val plan = loopSession?.plan ?: loopTarget ?: return false
+        if (!isCrown(plan)) return false
+        val outItem = loopOutItem ?: return false
+        val inItem = loopInItem ?: return false
+        val reason = retainedPlanRefusal(plan, analysisFor(outItem), analysisFor(inItem),
+            lyricSpans[outItem.mediaId]?.spans, lyricSpans[inItem.mediaId]?.spans) ?: return false
+        if (loopSession?.outPort?.tookOver == true) loopBail(reason, settle = false) else loopFallBack(reason)
+        return true
     }
 
     /**
@@ -5700,14 +6067,17 @@ class CrossfadeController(
     /** The loop mix isn't happening after all: the pair takes the planner's blend instead. */
     private fun loopFallBack(reason: String) {
         // djmix13: count every arm death so regressions are visible.
-        AutomixTelemetry.event(
-            "mix.arm.death",
-            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
-        )
+        val failedPlan = loopSession?.plan ?: loopTarget ?: loopPlanned
+        val failedTechnique = failedPlan?.let { nativeRouteFields(it)["technique"] as String } ?: "unknown-native"
+        routeRefusal("mix.arm.death", reason, "prepared", failedTechnique, "classic",
+            coarseDecline = nativeBinding?.coarseDecline
+                ?: loopOutAnalysis?.let { out -> loopInAnalysis?.let { inn -> shouldDeclineToMix(out, inn) } })
         val fbKey = "$reason|${phase.name}"
         if (fbKey != lastFallbackLogKey) {
             lastFallbackLogKey = fbKey
-            AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
+            routeRefusal("mix.loop.fallback", reason, "prepared", failedTechnique, "classic",
+                coarseDecline = nativeBinding?.coarseDecline
+                    ?: loopOutAnalysis?.let { out -> loopInAnalysis?.let { inn -> shouldDeclineToMix(out, inn) } })
         }
         Log.d(TAG, "loop mix falls back to a blend: $reason")
         val pairKey = loopOutItem?.let { o -> loopInItem?.let { i -> "${o.mediaId}->${i.mediaId}" } }
@@ -5727,7 +6097,15 @@ class CrossfadeController(
         pinnedCatchUpKey = null
         pinnedCatchUpPlan = null
         loopRefusal = reason
-        loopBail(reason, settle = false)
+        // Internal pre-takeover teardown is not the opportunity's terminal:
+        // classic fallback and decode retries keep the original pair identity.
+        val previousFallback = routingFallback
+        routingFallback = true
+        try {
+            loopBail(reason, settle = false)
+        } finally {
+            routingFallback = previousFallback
+        }
         // djmix26: immediately re-anchor & adopt/arm classic on the same tick
         // so the countdown & smartTransitionWindow never flash late or vanish.
         if (phase == Phase.IDLE && !inFallbackReplan) {
@@ -6162,6 +6540,10 @@ class CrossfadeController(
         // is deliberately kept non-null through finish() by finishLoop() and
         // loopBail() for exactly this capture.
         val endPhase = phase.name
+        val completionContext = opportunity
+        val completionRevision = planRevision
+        val completionRoute = executedRoute ?: mapOf("technique" to "unknown")
+        val completionGeneration = nativeBinding?.generation
         val didHandoff = handedOff
         val loopPlan = loopSession?.plan
         val outBpm = RetireGuard.loopOutBpm(outgoingAnalysis.bpm, loopPlan?.out?.bpm ?: 0.0)
@@ -6225,6 +6607,22 @@ class CrossfadeController(
         if (phase != Phase.TAIL) disarmTailLoopSession()
         discardPrime()
         val wasTransitioning = phase != Phase.IDLE
+        val isTerminal = wasTransitioning && !routingFallback && !terminalRecorded
+        val completionOutcome = automixTerminalOutcome(
+            isTerminal = isTerminal,
+            executed = executedRoute != null,
+            handedOff = didHandoff,
+            reason = completeReason,
+        )
+        if (isTerminal) terminalRecorded = true
+        val completionFields = completionRoute + mapOf(
+            "stage" to if (isTerminal) "terminal" else "fallback",
+            "terminal" to isTerminal, "outcome" to completionOutcome,
+            "planRevision" to completionRevision, "buildGeneration" to completionGeneration,
+            "phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm,
+            "tailMs" to tailMs, "reason" to completeReason,
+            "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs,
+        )
         if (phase != Phase.IDLE) {
             Log.d(TAG, "finish from $phase")
             // Stamped under this guard rather than beside the assignment at the
@@ -6340,11 +6738,8 @@ class CrossfadeController(
         incomingAnalysis = TrackAnalysis()
         phase = Phase.IDLE
         if (wasTransitioning) {
-            AutomixTelemetry.event(
-                "mix.complete",
-                mapOf("phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm, "tailMs" to tailMs, "reason" to completeReason,
-                    "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs),
-            )
+            mixEvent("mix.complete", completionFields, completionContext)
+            if (isTerminal) opportunity = null
             handoverExpectedMs = 0L
             handoverHeardMs = -1L
             handoverTargetMs = 0L
