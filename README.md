@@ -39,8 +39,6 @@
 
 <div align="center">
 
-<img src="Banner.png" alt="BitChord banner" width="100%" />
-
 <h1><a id="features"></a>Features</h1>
 
 <table>
@@ -160,14 +158,6 @@ Grab the latest signed APK from this fork's [Releases](https://github.com/survey
 We welcome contributions to BitChord! Please review our [Contributing Guide](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md) before submitting a Pull Request.
 
 [**Contributing Guide**](CONTRIBUTING.md) · [**Code of Conduct**](CODE_OF_CONDUCT.md) · [**Maintainers**](MAINTAINERS.md) · [**Additional Docs**](ADDITIONAL.md)
-
-### Thanks to all contributors ❤
-
-<a href="https://github.com/kushagrasinghx/BitChord/graphs/contributors">
-  <img src="https://raw.githubusercontent.com/kushagrasinghx/BitChord/contributors/contributors.svg" />
-</a>
-
-</div>
 
 ---
 
