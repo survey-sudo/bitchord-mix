@@ -1285,7 +1285,11 @@ class CrossfadeController(
                 // harmless and shouldn't cost the listener the blend.
                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> bail()
                 Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> bail()
-                Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> ranOutBeforeHandoff()
+                Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> {
+                    expireIdleOpportunity("natural-auto-advance")
+                    ranOutBeforeHandoff()
+                }
+                Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> expireIdleOpportunity("natural-repeat")
             }
         }
 
@@ -4156,7 +4160,36 @@ class CrossfadeController(
         nativeBinding = null
         terminalRecorded = false
         routingEvidenceKeys.clear()
+        resetOpportunityEventKeys()
         return opportunity!!
+    }
+
+    /** Natural queue occurrences can share IDs; expire telemetry only, never audio/planning state. */
+    private fun expireIdleOpportunity(reason: String) {
+        if (phase != Phase.IDLE) return
+        val context = opportunity ?: return
+        if (!terminalRecorded) {
+            mixEvent("mix.plan.rejected", mapOf("stage" to "terminal", "outcome" to "unknown",
+                "terminal" to true, "refusalCode" to "media-occurrence-ended", "reason" to reason), context)
+        }
+        terminalRecorded = true
+        opportunity = null
+        planRevision = 0
+        revisionRoute = null
+        executedRoute = null
+        nativeBinding = null
+        routingEvidenceKeys.clear()
+        resetOpportunityEventKeys()
+    }
+
+    /** Outer event guards must not hide the same verdict on a later opportunity. */
+    private fun resetOpportunityEventKeys() {
+        lastRejectedLogKey = null
+        lastEmittedPlanVerdict = null
+        lastArmDeathKey = null
+        lastFallbackLogKey = null
+        phraseLogKey = null
+        lastPhraseNullKey = null
     }
 
     private fun opportunityFields(context: Opportunity?): Map<String, Any?> = mapOf(
@@ -4206,14 +4239,22 @@ class CrossfadeController(
             "echoTail" to plan.echoTail, "carve" to plan.carve, "clash" to plan.clash,
             "coarseDecline" to coarseDecline,
             "coarseOverride" to (coarseDecline == true && isConfiguredCrown),
-            "outGridSource" to if (plan.out.anchorBeats != null) "tracked" else "constant-grid",
-            "inGridSource" to if (plan.inn.anchorBeats != null) "tracked" else "constant-grid",
+            "plannedOutGridSource" to if (plan.out.anchorBeats != null) "tracked" else "constant-grid",
+            "plannedInGridSource" to if (plan.inn.anchorBeats != null) "tracked" else "constant-grid",
+            "outGridSource" to "unknown", "inGridSource" to "unknown",
             "plannedOutMinRate" to if (ratesFinite) minOf(1.0, targetRate) else null,
             "plannedOutMaxRate" to if (ratesFinite) maxOf(1.0, targetRate) else null,
             "plannedInMinRate" to if (ratesFinite) minOf(1.0, reciprocalRate) else null,
             "plannedInMaxRate" to if (ratesFinite) maxOf(1.0, reciprocalRate) else null,
         )
     }
+
+    private fun nativeSessionRouteFields(session: LoopMixSession, coarseDecline: Boolean? = null): Map<String, Any?> =
+        nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
+            actualConfiguration = true, coarseDecline = coarseDecline) + mapOf(
+            "outGridSource" to session.outGridSource.telemetryValue,
+            "inGridSource" to session.inGridSource.telemetryValue,
+        )
 
     private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
         "technique" to "classic", "transitionStyle" to plan?.transitionStyle?.name,
@@ -5244,8 +5285,7 @@ class CrossfadeController(
                 phase == Phase.IDLE -> {
                     primedSession = session
                     nativeBinding = NativeBinding(context, revision, generation, capturedCoarseDecline)
-                    preparedRoute(nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
-                        actualConfiguration = true, coarseDecline = capturedCoarseDecline), context, revision, generation)
+                    preparedRoute(nativeSessionRouteFields(session, capturedCoarseDecline), context, revision, generation)
                 }
                 else -> session.close()
             }
@@ -5505,8 +5545,7 @@ class CrossfadeController(
         session.attach(outPort, inPort)
         loopSession = session
         nativeBinding?.let { binding ->
-            preparedRoute(nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
-                actualConfiguration = true, coarseDecline = nativeBinding?.coarseDecline),
+            preparedRoute(nativeSessionRouteFields(session, binding.coarseDecline),
                 binding.context, binding.revision, binding.generation)
         }
         loopIncomingStarted = false
@@ -5613,8 +5652,7 @@ class CrossfadeController(
             AppSettings.smartTransitionWindow.value = null
             AppSettings.smartMixInProgress.value = true
             val binding = nativeBinding
-            executedRoute = nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
-                actualConfiguration = true, coarseDecline = binding?.coarseDecline)
+            executedRoute = nativeSessionRouteFields(session, binding?.coarseDecline)
             mixEvent(
                 "mix.fire",
                 requireNotNull(executedRoute) + mapOf(

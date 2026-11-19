@@ -1,6 +1,8 @@
 package com.music.bitchord.playback.loopmix
 
+import com.music.bitchord.playback.smart.BeatSide
 import com.music.bitchord.playback.smart.LoopMix
+import com.music.bitchord.playback.smart.TrackAnalysis
 import org.junit.Assert.*
 import org.junit.Assume
 import org.junit.Before
@@ -28,11 +30,12 @@ class LoopCrownNativeSessionTest {
         assertTrue("Required libbitchord_loopmix.so did not load", LoopMixRenderer.available)
     }
 
-    private fun build(p: LoopMix.Plan): LoopMixSession {
+    private fun build(p: LoopMix.Plan, outAnalysis: TrackAnalysis? = null, inAnalysis: TrackAnalysis? = null): LoopMixSession {
         val refusals = mutableListOf<String>()
         val decoded = AtomicInteger()
         val session = LoopMixSession.build(p, "generated-out", "generated-in",
             LoopCrownFixtures.SAMPLE_RATE, 1f, highQuality = false,
+            outAnalysis = outAnalysis, inAnalysis = inAnalysis,
             onRefusal = { refusals += it },
         ) { side, from, to ->
             decoded.incrementAndGet()
@@ -76,6 +79,8 @@ class LoopCrownNativeSessionTest {
             try {
                 assertEquals(true, session.configuredOutLoops)
                 assertEquals(true, session.configuredInLoops)
+                assertEquals(LoopMixSession.GridSource.CLOCK, session.outGridSource)
+                assertEquals(LoopMixSession.GridSource.CLOCK, session.inGridSource)
                 val c = session.clock
                 val sr = LoopCrownFixtures.SAMPLE_RATE
                 val k = LoopCrownFixtures.knots(p, c)
@@ -170,6 +175,8 @@ class LoopCrownNativeSessionTest {
             assertTrue(p.inLoops)
             assertEquals(false, session.configuredOutLoops)
             assertEquals(false, session.configuredInLoops)
+            assertEquals(LoopMixSession.GridSource.CLOCK, session.outGridSource)
+            assertEquals(LoopMixSession.GridSource.NATIVE_CLOCK, session.inGridSource)
             val block = FloatArray(512 * 2)
             var frame = session.renderer.firstFrame()
             var energy = 0.0
@@ -189,6 +196,46 @@ class LoopCrownNativeSessionTest {
             session.close()
             session.close()
             assertFalse(session.renderer.isValid)
+        }
+    }
+
+    @Test(timeout = 60_000) fun actualSessionGridMetadataComesFromBuiltKnotsRatherThanPlannerAnchors() {
+        val base = LoopCrownFixtures.plan()
+        val inBeats = (0..base.inn.beats).map { base.inn.loopStart + it * base.inn.beatSec }
+        val p = base.copy(inn = base.inn.copy(anchorBeats = inBeats))
+        val outAnalysis = LoopCrownFixtures.irregularOut(p)
+        val inAnalysis = TrackAnalysis(headBeats = BeatSide(
+            inBeats, emptyList(), p.inn.bpm, .9))
+        val session = build(p, outAnalysis, inAnalysis)
+        try {
+            assertNull(session.plan.out.anchorBeats)
+            assertNotNull(session.plan.inn.anchorBeats)
+            assertEquals(true, session.configuredOutLoops)
+            assertEquals(true, session.configuredInLoops)
+            assertEquals(LoopMixSession.GridSource.TRACKED, session.outGridSource)
+            assertEquals(LoopMixSession.GridSource.CLOCK, session.inGridSource)
+            val knots = LoopCrownFixtures.knots(p, session.clock, outAnalysis, inAnalysis)
+            assertEquals(knots.outGridSource, session.outGridSource)
+            assertEquals(knots.inGridSource, session.inGridSource)
+            assertEquals(LoopMixSession.incomingGeometry(p, session.clock, knots).handoverTrack,
+                session.handoverTrack, 1e-9)
+        } finally {
+            session.close()
+            assertFalse(session.renderer.isValid)
+        }
+        val bridge = base.copy(outLoops = false, inLoops = false, rung = "Beat blend")
+        val c = LoopMix.Clock(bridge)
+        val observed = (0..(c.beats + c.settleBeats)).map { bridge.inn.loopStart + it * bridge.inn.beatSec * 1.01 }
+        val tracked = TrackAnalysis(headBeats = BeatSide(observed, emptyList(), bridge.inn.bpm, .9))
+        val straightSession = build(bridge, tracked, tracked)
+        try {
+            assertEquals(false, straightSession.configuredOutLoops)
+            assertEquals(false, straightSession.configuredInLoops)
+            assertEquals(LoopMixSession.GridSource.TRACKED, straightSession.outGridSource)
+            assertEquals(LoopMixSession.GridSource.TRACKED, straightSession.inGridSource)
+        } finally {
+            straightSession.close()
+            assertFalse(straightSession.renderer.isValid)
         }
     }
 

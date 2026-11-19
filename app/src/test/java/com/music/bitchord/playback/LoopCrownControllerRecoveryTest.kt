@@ -7,6 +7,8 @@ import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.ExoPlayer
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.playback.loopmix.LoopMixRenderer
+import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.CurveWindow
 import com.music.bitchord.playback.smart.LoopMix
@@ -112,9 +114,49 @@ class LoopCrownControllerRecoveryTest {
         assertEquals(true, overridden["coarseDecline"])
         assertEquals(true, overridden["coarseOverride"])
         assertEquals(1.0, overridden["plannedOutMinRate"])
-        assertEquals("constant-grid", overridden["outGridSource"])
+        assertEquals("constant-grid", overridden["plannedOutGridSource"])
+        assertEquals("unknown", overridden["outGridSource"])
+        assertEquals("unknown", overridden["inGridSource"])
+        val anchored = plan.copy(out = plan.out.copy(anchorBeats = listOf(160.0, 160.5)),
+            inn = plan.inn.copy(anchorBeats = listOf(8.0, 8.5)))
+        val requested = r.nativeFields(anchored)
+        assertEquals("tracked", requested["plannedOutGridSource"])
+        assertEquals("tracked", requested["plannedInGridSource"])
+        assertEquals("unknown", requested["outGridSource"])
+        assertEquals("unknown", requested["inGridSource"])
         assertEquals(false, r.nativeFields(plan, false, false, actual = true, coarseDecline = true)["coarseOverride"])
         assertEquals("Echo", bridge.rung)
+    }
+
+    @Test
+    fun priorSevenArgumentManualSessionKeepsActualGridAndConfigurationUnknown() = withRig { r ->
+        val plan = crown()
+        val clock = LoopMix.Clock(plan)
+        // Exercise the existing manual-session constructor without attaching
+        // ports, fabricating takeover or treating this readout as JNI proof.
+        val renderer = LoopMixRenderer(48_000, object : LoopMixRenderer.Readout {
+            override fun firstFrame() = 0L
+            override fun heard(index: Int) = 0.0
+            override fun exitGateViolations() = 0
+        })
+        val session = LoopMixSession::class.java.getDeclaredConstructor(
+            LoopMix.Plan::class.java, LoopMix.Clock::class.java, String::class.java, String::class.java,
+            LoopMixRenderer::class.java, Int::class.javaPrimitiveType, Double::class.javaPrimitiveType,
+        ).apply { isAccessible = true }.newInstance(plan, clock, "A", "B", renderer, 48_000, clock.elementTrackTime)
+        try {
+            assertNull(session.configuredOutLoops)
+            assertNull(session.configuredInLoops)
+            assertEquals(LoopMixSession.GridSource.UNKNOWN, session.outGridSource)
+            assertEquals(LoopMixSession.GridSource.UNKNOWN, session.inGridSource)
+            val fields = r.call("nativeSessionRouteFields", session, null) as Map<*, *>
+            assertEquals("unknown-native", fields["technique"])
+            assertEquals("unknown", fields["outGridSource"])
+            assertEquals("unknown", fields["inGridSource"])
+            assertEquals("constant-grid", fields["plannedOutGridSource"])
+            assertEquals("constant-grid", fields["plannedInGridSource"])
+        } finally {
+            session.close()
+        }
     }
 
     @Test
@@ -199,8 +241,112 @@ class LoopCrownControllerRecoveryTest {
         assertTrue(lines.single().contains("\"refusalCode\":\"incoming decode deadline-over\""))
     }
 
-    private class Rig(val dir: File) : AutoCloseable {
-        val out = Deck(listOf("A", "B").map { MediaItem.Builder().setMediaId(it).build() })
+    @Test
+    fun identicalCandidateArmAndFallbackEventsReemitOnTheNextOpportunity() = withRig { r ->
+        fun emit(): List<String> {
+            // Exercise the real classic candidate/rejection guards, including
+            // the second-tick candidate branch, rather than only routingEvidenceKeys.
+            repeat(3) { r.call("considerSmartTransition", 200_000L, true) }
+            repeat(2) { r.call("armDeath", "same-refusal") }
+            repeat(2) { r.call("beginLoop", r.out.player, crown(), r.out.player.currentMediaItem,
+                r.out.player.getMediaItemAt(r.out.player.nextMediaItemIndex), 200_000L, 200_000L) }
+            assertEquals("IDLE", r.get("phase").toString())
+            val context = r.get("opportunity")
+            assertSame(context, r.call("ensureOpportunity", r.out.player.currentMediaItem?.mediaId,
+                r.out.player.getMediaItemAt(r.out.player.nextMediaItemIndex).mediaId))
+            val attempt = eventField(r.events().last { it.contains("\"ev\":\"mix.arm.death\"") }, "attemptId")
+            return r.events().filter { eventField(it, "attemptId") == attempt && !it.contains("\"terminal\":true") }
+        }
+        fun assertEvents(events: List<String>) {
+            assertEquals(1, events.count { it.contains("\"ev\":\"mix.plan\"") &&
+                it.contains("\"stage\":\"candidate\"") && it.contains("\"technique\":\"classic\"") })
+            assertEquals(1, events.count { it.contains("\"ev\":\"mix.plan.rejected\"") &&
+                it.contains("\"stage\":\"candidate\"") && it.contains("\"technique\":\"classic\"") })
+            assertEquals(1, events.count { it.contains("\"ev\":\"mix.arm.death\"") })
+            assertEquals(1, events.count { it.contains("\"ev\":\"mix.loop.fallback\"") &&
+                it.contains("\"reason\":\"no-out-port\"") })
+        }
+        val first = emit()
+        assertEvents(first)
+        // A changed pair reaches ensureOpportunity directly, without relying
+        // on the separate natural-occurrence expiration to reset outer guards.
+        r.out.player.setMediaItems(listOf("C", "D").map { MediaItem.Builder().setMediaId(it).build() }, 0, 10_000L)
+        r.out.player.prepare()
+        val second = emit()
+        assertEvents(second)
+        assertNotEquals(eventField(first.first(), "attemptId"), eventField(second.first(), "attemptId"))
+        for (name in listOf("mix.plan", "mix.plan.rejected", "mix.arm.death", "mix.loop.fallback")) {
+            val a = first.single { eventField(it, "ev") == name &&
+                (name != "mix.plan.rejected" || it.contains("\"technique\":\"classic\"")) }
+            val b = second.single { eventField(it, "ev") == name &&
+                (name != "mix.plan.rejected" || it.contains("\"technique\":\"classic\"")) }
+            assertEquals(eventField(a, "reason"), eventField(b, "reason"))
+        }
+    }
+
+    @Test
+    fun duplicateIdAutoAdvanceAndRepeatExpireOnlyIdleOccurrenceEvidence() = withRig(listOf("A", "A", "A")) { r ->
+        r.controller.start()
+        var previous = r.call("ensureOpportunity", "A", "A")
+        val phraseLock = r.get("phraseLock")
+        val countdown = r.get("countdownStabilizer")
+        val plan = crown()
+        r.set("loopPlanned", plan)
+        r.set("shownCountdownKey", "unchanged-countdown")
+        r.set("primedKey", "unchanged-build")
+        r.set("primeRetryAt", 12_345L)
+        val epoch = r.get("scrubEpoch")
+        val generation = r.get("buildGeneration")
+        for ((i, reason) in listOf(Player.MEDIA_ITEM_TRANSITION_REASON_AUTO,
+            Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT).withIndex()) {
+            r.out.advance(reason)
+            assertEquals(1, r.out.player.currentMediaItemIndex)
+            assertEquals("A", r.out.player.currentMediaItem?.mediaId)
+            assertNull(r.get("opportunity"))
+            r.out.notifyTransition(reason) // no new opportunity: no duplicate terminal
+            assertEquals(i + 1, r.events().count { it.contains("\"terminal\":true") })
+            val current = r.call("ensureOpportunity", "A", "A")
+            assertNotEquals(previous, current)
+            r.call("preparedRoute", r.nativeFields(plan, true, true), previous, 1, generation)
+            assertFalse(r.events().any { it.contains("\"stage\":\"prepared\"") })
+            previous = current
+            assertEquals(epoch, r.get("scrubEpoch"))
+            assertEquals(generation, r.get("buildGeneration"))
+            assertSame(plan, r.get("loopPlanned"))
+            assertSame(phraseLock, r.get("phraseLock"))
+            assertSame(countdown, r.get("countdownStabilizer"))
+            assertEquals("unchanged-countdown", r.get("shownCountdownKey"))
+            assertEquals("unchanged-build", r.get("primedKey"))
+            assertEquals(12_345L, r.get("primeRetryAt"))
+        }
+        val terminals = r.events().filter { it.contains("\"terminal\":true") }
+        assertTrue(terminals.all { it.contains("\"outcome\":\"unknown\"") &&
+            it.contains("\"refusalCode\":\"media-occurrence-ended\"") })
+        assertEquals(listOf("natural-auto-advance", "natural-repeat"), terminals.map { eventField(it, "reason") })
+        assertEquals(2, terminals.map { eventField(it, "attemptId") }.distinct().size)
+        assertFalse(r.events().any { it.contains("\"stage\":\"executed\"") })
+    }
+
+    @Test
+    fun naturalOccurrenceTerminalUsesOriginalPairAndRepeatKeepsActiveClassicAttempt() = withRig(listOf("A", "B", "C")) { r ->
+        r.controller.start()
+        r.call("ensureOpportunity", "A", "B")
+        r.out.advance(Player.MEDIA_ITEM_TRANSITION_REASON_AUTO)
+        val terminal = r.events().single { it.contains("\"terminal\":true") }
+        assertEquals("A", eventField(terminal, "outId"))
+        assertEquals("B", eventField(terminal, "inId"))
+        assertEquals("B", r.out.player.currentMediaItem?.mediaId)
+        r.beginClassic()
+        val active = r.get("opportunity")
+        assertEquals("ARMING", r.get("phase").toString())
+        r.out.advance(Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)
+        assertSame(active, r.get("opportunity"))
+        assertEquals("ARMING", r.get("phase").toString())
+        assertEquals(1, r.events().count { it.contains("\"terminal\":true") })
+    }
+
+    private class Rig(val dir: File, ids: List<String>) : AutoCloseable {
+        val out = Deck(ids.map { MediaItem.Builder().setMediaId(it).build() })
         private val into = Deck(emptyList())
         private val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher())
         val controller = CrossfadeController(scope = scope, active = { out.player }, standby = { into.player },
@@ -230,6 +376,7 @@ class LoopCrownControllerRecoveryTest {
     /** Real queue/prepare state changes; no native port or fabricated takeover. */
     private class Deck(initial: List<MediaItem>) {
         private val items = initial.toMutableList()
+        private val listeners = mutableSetOf<Player.Listener>()
         private var index = if (items.isEmpty()) C.INDEX_UNSET else 0
         private var state = if (items.isEmpty()) Player.STATE_IDLE else Player.STATE_READY
         private var volume = 0f
@@ -239,6 +386,8 @@ class LoopCrownControllerRecoveryTest {
             when (method.name) {
                 "equals" -> proxy === args?.get(0)
                 "hashCode" -> System.identityHashCode(proxy)
+                "addListener" -> { listeners.add(args!![0] as Player.Listener); null }
+                "removeListener" -> { listeners.remove(args!![0] as Player.Listener); null }
                 "getCurrentMediaItem" -> items.getOrNull(index)
                 "getCurrentMediaItemIndex", "getCurrentPeriodIndex" -> index
                 "getMediaItemCount" -> items.size
@@ -275,9 +424,24 @@ class LoopCrownControllerRecoveryTest {
                 }
             }
         } as ExoPlayer
+
+        fun advance(reason: Int) {
+            require(reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO || reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                check(index + 1 in items.indices)
+                index++
+            }
+            position = 10_000L
+            notifyTransition(reason)
+        }
+
+        fun notifyTransition(reason: Int) {
+            check(listeners.isNotEmpty()) { "The controller must register its actual Player.Listener" }
+            listeners.toList().forEach { it.onMediaItemTransition(items.getOrNull(index), reason) }
+        }
     }
 
-    private fun withRig(test: (Rig) -> Unit) {
+    private fun withRig(ids: List<String> = listOf("A", "B"), test: (Rig) -> Unit) {
         val telemetryDir = AutomixTelemetry::class.java.getDeclaredField("dir").apply { isAccessible = true }
         val savedDir = telemetryDir.get(AutomixTelemetry)
         val savedSmart = AppSettings.smartFadeEnabled.value
@@ -296,7 +460,7 @@ class LoopCrownControllerRecoveryTest {
             AppSettings.smartFadeEnabled.value = false
             AppSettings.playbackSpeed.value = 1f
             AppSettings.crossfadeSeconds.value = 4
-            Rig(dir).use(test)
+            Rig(dir, ids).use(test)
         } finally {
             telemetryDir.set(AutomixTelemetry, savedDir)
             AppSettings.smartFadeEnabled.value = savedSmart
@@ -312,6 +476,9 @@ class LoopCrownControllerRecoveryTest {
         val saved = flow.value
         return { flow.value = saved }
     }
+
+    private fun eventField(event: String, key: String): String? = Regex("\"$key\":\"([^\"]*)\"")
+        .find(event)?.groupValues?.get(1)
 
     companion object {
         private fun crown(): LoopMix.Plan = LoopMix.Plan(

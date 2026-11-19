@@ -8,11 +8,14 @@ Implementation contract for the user-approved isolated branch
 The independent regression is frozen. The isolated cue baseline reproduced the
 intended vc83 admission failure: two tests, one failure, zero errors/skips; the
 clean control passed and only the whole-track-metadata crown assertion failed.
-The bounded production slice is implemented and the final ordinary integrated
-shared/app gate is green on the frozen v10 snapshot. The host renderer probes and
-host-JNI session proof are recorded separately; controller/sink takeover and
-musical listening remain unproven. Evidence summary and retained raw reports are
-listed in `validation/loop-character/candidate-final-v10/`.
+The initial recovery is committed as `689285f`. The complete independent audit
+found three attribution issues; their bounded follow-up repair is independently
+reviewed and validated. Current results: shared 536 tests, app 1,446 tests with
+five skips, and a separate four-test required-JNI session run; no failures/errors.
+See `validation/loop-character/FULL_DIFF_REVIEW.md` and
+`validation/loop-character/attribution-followup-result.json` for the final repair
+identity and evidence. Android controller/sink takeover and musical listening
+remain unproven.
 
 This is not the historical vc49 work order in `/home/hfzhkn/opus5.5.md`.
 The user subsequently authorized committing this isolated branch. Merges, APK
@@ -146,7 +149,7 @@ automatic route rejection.
 | Accepted mechanics retained | Parent integration executor | Ordinary shared/app/UI checks and existing native selftest, reverb-stop and 63-pair loop-domain modes |
 | Routing change explained | Fixed-input replay owner | Before/after candidate/accepted/prepared/executed outcomes and refusal chains, not arbitrary loop-frequency targets |
 
-## Frozen candidate results
+## Initial recovery candidate results (v10)
 
 The bounded controller attribution addendum records coarse-decline/local-reason
 and grid-source candidate fields plus immutable decline context through prepared
@@ -190,8 +193,9 @@ preparation, controller takeover, delegate acceptance, and listening as
 unobserved; it does not quantify the user's catalog or Echo/Filter prevalence.
 
 The v10 ordinary integrated run and dedicated host-JNI session run both passed.
-Terminal-outcome classification also has a focused regression test. No
-production/test source changed after the v10 integrated invocation.
+Terminal-outcome classification also has a focused regression test. These
+results identify the initial recovery snapshot. The separately frozen audit
+follow-up has newer regression totals and source hashes in its own receipt.
 
 Baseline command, in an isolated cue snapshot after sourcing the provisioned
 Android environment:

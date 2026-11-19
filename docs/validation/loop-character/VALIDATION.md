@@ -1,4 +1,4 @@
-# Loop recovery validation record
+# Initial loop recovery validation record
 
 Base source: `170328bed4b78eaa68e7fce739ba8b121e4aa38c`.
 Branch: `automix/loop-character-20261119`.
@@ -10,10 +10,12 @@ The uncommitted v10 snapshot was tested on cue in
 Its source archive SHA-256 is
 `86ade61bf9c6a24d14eab6cc3712c5761fe8e1e4179e82c169ac36b3917e860a`.
 
-All production and test files in this commit match that tested snapshot.
-Documentation subsequently records validation and the user's commit authorization.
+All production and test files in initial commit `689285f` match that tested
+snapshot. Later attribution repairs have their own source identity, independent
+review closure and validation in `FULL_DIFF_REVIEW.md` and
+`attribution-followup-result.json`.
 
-## Results
+## Initial results
 
 | Check | Result |
 |---|---|
@@ -59,10 +61,11 @@ Earlier frozen baseline details and fixture/history provenance are committed
 alongside this record. The initial provenance JSON's runtime status describes
 the freeze point; the executed baseline result is in `baseline-result.json`.
 
-The independent full-diff audit is still running at commit time. A completed
-partial review identified the native `loop-complete` terminal classification
-defect; v10 fixes it and includes regression coverage. The focused review of
-that fix reported no issue. Do not describe this as a completed full audit.
+At the initial commit, the independent full-diff audit was still running. It
+subsequently completed, identified three attribution issues, and independently
+reviewed their repair to closure. See `FULL_DIFF_REVIEW.md` for findings and
+follow-up validation. The earlier partial review's native `loop-complete`
+terminal classification fix is already included in v10 with regression coverage.
 
 ## Limits
 

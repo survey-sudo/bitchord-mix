@@ -3,10 +3,11 @@
 ## Ownership and limits
 
 The parent owned remote cue execution and interpretation. Child writers performed
-scoped static checks; the snapshot worker owns immutable local packaging. The
-final candidate pass is complete on frozen v10; no production/test edits were
-made after the final integrated run. The earlier vc83 baseline-red evidence
-remains valid for its frozen inputs.
+scoped static checks; the snapshot worker owns immutable local packaging. Initial
+v10 validation and the later attribution-only audit repair are both complete on
+separately identified snapshots. The earlier vc83 baseline-red evidence remains
+valid for its frozen inputs. Current follow-up commands, hashes and totals are
+in `attribution-followup-result.json`; review closure is in `FULL_DIFF_REVIEW.md`.
 
 The user authorized a commit after validation. No source/toolchain/dependency
 downloads, APK tasks, merges or device operations. An offline cache or missing
@@ -105,7 +106,7 @@ acceptance, sink takeover, delegate-buffer acceptance or listening. Such stages
 remain unknown when not exercised. Keep stage reaches and one terminal outcome
 per replay scenario separate; synthetic corpus counts are not queue prevalence.
 
-## Final ordinary integrated pass
+## Initial ordinary integrated pass
 
 After focused/native evidence was green, one ordinary integrated invocation was
 run on the final v10 source digest with native JVM options unset. The v10 integrated
@@ -121,3 +122,12 @@ Its exact command, environment, exit, raw log and XML reports are retained under
 root. Parsed totals are shared 536/0/0/0 and app 1437/0/0/4
 (tests/failures/errors/skips). No release or named-pair listening claim follows
 from these checks.
+
+## Reviewed attribution follow-up
+
+The repair of the three independent review findings passed 33 focused tests,
+four dedicated required-JNI tests, and a final ordinary shared/app invocation:
+shared 536/0/0/0; app 1446/0/0/5. Each invocation retained its own reports before
+the next Gradle command ran. All phase result hashes and copied XML totals were
+verified before committing the follow-up. Native probe evidence is reused only
+for renderer/JNI sources unchanged by the metadata repair.

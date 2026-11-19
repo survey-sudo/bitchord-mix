@@ -1,0 +1,185 @@
+{
+  "schema": 1,
+  "baseCommit": "689285faea7d1e015e74d833ea3feb0ff10a60c6",
+  "sourceArchiveSha256": "84c123b3fe00d36bc2c0c6d4ab9430b8c2aae4f5f9945a39ffe574714a0a36cb",
+  "sourceManifestSha256": "dca8a2c372adbf663dabf14eaa4aec10c42f7d42dc1ee5d3fe2cf9bb407a5f1c",
+  "followupDiffSha256": "728085bf293d57e88f52b9214e4ed3168b497388ba02922192186c1ab4a06de8",
+  "changedFiles": {
+    "app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt": "6ded7949d55d67c153429fc4892a44902e1c325d1ddc0966dd73e4597826b5ff",
+    "app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt": "260571631b4193c8c4f33df1f0228f1c8061fffc6c7f74febca5b832ea3c2e7f",
+    "app/src/test/java/com/music/bitchord/playback/LoopCrownControllerRecoveryTest.kt": "3ed4a07bb45b472c8d7673447c196157c07dd074569868611bc89203e5fed348",
+    "app/src/test/java/com/music/bitchord/playback/loopmix/LoopCrownKnotQualificationTest.kt": "2edb7648c8970c2da9cc38bfc59dd1c09cd2dee69b5003295c4a4a4d1eadf293",
+    "app/src/test/java/com/music/bitchord/playback/loopmix/LoopCrownNativeSessionTest.kt": "b429373418fdcbcdf9532c795ca4ff6cd07ffff175209d8de162f79284196f60"
+  },
+  "independentReview": {
+    "model": "xingchiapi/gpt-6.1-sol#max",
+    "fullInitialAudit": "completed",
+    "followupDiffLines": 647,
+    "findingsClosed": 3,
+    "additionalFindings": 0
+  },
+  "cueEvidenceRoot": "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3",
+  "phases": {
+    "focused": {
+      "exit": 0,
+      "reports": {
+        "app": {
+          "reports": 3,
+          "tests": 33,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        }
+      },
+      "commands": [
+        {
+          "label": "ordinary-focused",
+          "command": "ordinary-focused.command.json",
+          "log": "ordinary-focused.log",
+          "exit": 0,
+          "elapsedSeconds": 194.104,
+          "invocation": {
+            "cwd": "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/src",
+            "argv": [
+              "./gradlew",
+              ":app:testProdDebugUnitTest",
+              "--tests",
+              "*LoopCrownControllerRecoveryTest",
+              "--tests",
+              "*LoopCrownKnotQualificationTest",
+              "--tests",
+              "*LoopSourceGeometryTest",
+              "--offline",
+              "-Pbitchord.bundleWear=false",
+              "--max-workers=2",
+              "--no-daemon",
+              "--stacktrace"
+            ],
+            "JAVA_TOOL_OPTIONS": null
+          },
+          "logSha256": "8217ad2a440a502ddd9fd31cb7820b9cbe79d59a2baf2dcd63a481fb033a32ce"
+        }
+      ],
+      "resultSha256": "b3ab6a188d00034b143793430cb40114606b05742b39a6bc04a87fb60b2e6979"
+    },
+    "native": {
+      "exit": 0,
+      "reports": {
+        "app": {
+          "reports": 1,
+          "tests": 4,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        }
+      },
+      "commands": [
+        {
+          "label": "jni-build",
+          "command": "jni-build.command.json",
+          "log": "jni-build.log",
+          "exit": 0,
+          "elapsedSeconds": 5.29,
+          "invocation": {
+            "cwd": "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/src",
+            "argv": [
+              "g++",
+              "-std=c++17",
+              "-O2",
+              "-fPIC",
+              "-shared",
+              "-I",
+              "native",
+              "-I",
+              "native/third_party",
+              "-I/usr/lib/jvm/java-21-openjdk-amd64/include",
+              "-I/usr/lib/jvm/java-21-openjdk-amd64/include/linux",
+              "native/loopmix/loop_mix_renderer.cpp",
+              "app/src/main/cpp/jni/loopmix_jni.cpp",
+              "-o",
+              "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/native/hostnative/libbitchord_loopmix.so"
+            ],
+            "JAVA_TOOL_OPTIONS": null
+          },
+          "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "label": "required-native",
+          "command": "required-native.command.json",
+          "log": "required-native.log",
+          "exit": 0,
+          "elapsedSeconds": 299.462,
+          "invocation": {
+            "cwd": "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/src",
+            "argv": [
+              "./gradlew",
+              ":app:testProdDebugUnitTest",
+              "--tests",
+              "*LoopCrownNativeSessionTest",
+              "--offline",
+              "-Pbitchord.bundleWear=false",
+              "--max-workers=2",
+              "--no-daemon",
+              "--stacktrace",
+              "--rerun-tasks"
+            ],
+            "JAVA_TOOL_OPTIONS": "-Dbitchord.loopmix.hostNativeRequired=true -Djava.library.path=/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/native/hostnative"
+          },
+          "logSha256": "15977a7c543b766d50afcc2fafff5dd87abf35f5aaa78fded932dbe52860dd98"
+        }
+      ],
+      "resultSha256": "297ae1b397e7b7cd81e3b1655edeaef11aa5fb85591b6eb7994a30500c21d0e7",
+      "librarySha256": "dd37b224197c9c810ebd05fdd97d78e01fc2cee56f470c4899ff413b808c3ce9"
+    },
+    "integrated": {
+      "exit": 0,
+      "reports": {
+        "shared": {
+          "reports": 66,
+          "tests": 536,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "app": {
+          "reports": 138,
+          "tests": 1446,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 5
+        }
+      },
+      "commands": [
+        {
+          "label": "ordinary-integrated",
+          "command": "ordinary-integrated.command.json",
+          "log": "ordinary-integrated.log",
+          "exit": 0,
+          "elapsedSeconds": 95.495,
+          "invocation": {
+            "cwd": "/workspace/diagnostics/automix-loop-character-20261119/attribution-84c123b3/src",
+            "argv": [
+              "./gradlew",
+              ":shared:jvmTest",
+              ":app:testProdDebugUnitTest",
+              "--offline",
+              "-Pbitchord.bundleWear=false",
+              "--max-workers=2",
+              "--no-daemon",
+              "--stacktrace"
+            ],
+            "JAVA_TOOL_OPTIONS": null
+          },
+          "logSha256": "eee88485baf31cfbb11640a952bcb206a40174f1bb1eb5ab3f18b65971e06255"
+        }
+      ],
+      "resultSha256": "00b5a23875028f857c23acfdb882a3a3c1037a8174bf2a4ab3b4add8e93cca19"
+    }
+  },
+  "unchangedNativeProbeEvidence": "Original selftest, reverb-stop and 63-case loop-domain results retained for unchanged renderer/JNI sources; this follow-up changes attribution only.",
+  "limitations": [
+    "Android sink/controller takeover, delegate-buffer acceptance and listening remain unobserved",
+    "Synthetic replay is not catalog-wide route prevalence",
+    "No named-recording identity mapping, APK, phone operation, model change or NPU activation"
+  ]
+}

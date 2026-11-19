@@ -52,7 +52,15 @@ class LoopMixSession private constructor(
     /** Actual native deck configuration; unknown only for manually constructed sessions. */
     val configuredOutLoops: Boolean? = null,
     val configuredInLoops: Boolean? = null,
+    /** Source of the emitted knots, independent of planner anchor evidence. */
+    val outGridSource: GridSource = GridSource.UNKNOWN,
+    val inGridSource: GridSource = GridSource.UNKNOWN,
 ) {
+    /** Bounded attribution; holds/tail/settle retain their existing clock geometry. */
+    enum class GridSource(val telemetryValue: String) {
+        UNKNOWN("unknown"), TRACKED("tracked"), CLOCK("clock"), NATIVE_CLOCK("native-clock"),
+    }
+
     /** Preserve the prior manual-session constructor; actual geometry is unknown for this path. */
     private constructor(
         plan: LoopMix.Plan,
@@ -909,6 +917,7 @@ class LoopMixSession private constructor(
             renderer.setFadeOut(LoopMixRenderer.IN, handoverTrackSec)
             return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec,
                 configuredOutLoops = effectivePlan.outLoops, configuredInLoops = incomingGeometry.loops,
+                outGridSource = knots.outGridSource, inGridSource = knots.inGridSource,
             ).also { it.planIncomingStart() }
         }
 
@@ -959,6 +968,8 @@ class LoopMixSession private constructor(
             val outPositionsSec: DoubleArray,
             val inFrames: DoubleArray,
             val inPositionsSec: DoubleArray,
+            val outGridSource: GridSource = GridSource.UNKNOWN,
+            val inGridSource: GridSource = GridSource.UNKNOWN,
         )
 
         internal data class CrownKnotQualification(
@@ -1172,11 +1183,15 @@ class LoopMixSession private constructor(
             }
 
             val inFrames = DoubleArray(totalInBeats + 1) { clock.beatTimes[it] * sr }
+            var inGridSource = GridSource.CLOCK
             val inPositionsSec = DoubleArray(totalInBeats + 1) { k ->
                 val mixSec = clock.beatTimes[k]
                 when {
                     clock.incomingHoldSec > 1e-9 -> clock.inUnwrappedTimeAt(mixSec)
-                    plan.nativeIncoming -> plan.inn.loopStart + mixSec
+                    plan.nativeIncoming -> {
+                        inGridSource = GridSource.NATIVE_CLOCK
+                        plan.inn.loopStart + mixSec
+                    }
                     k <= beats -> clock.inPositionAt(k)
                     else -> clock.inPositionAt(beats) + (mixSec - clock.releaseAt)
                 }
@@ -1194,6 +1209,7 @@ class LoopMixSession private constructor(
                     trackedBeatsInWindow(inSideBeats, plan.inn.loopStart, expectedInCount, plan.inn.beatSec)
                 } else null
                 if (inTracked != null) {
+                    inGridSource = GridSource.TRACKED
                     for (k in 0..holdIdx.coerceAtMost(totalInBeats)) {
                         inPositionsSec[k] = plan.inn.loopStart
                     }
@@ -1228,7 +1244,9 @@ class LoopMixSession private constructor(
                 }
             }
 
-            return DeckKnots(outFrames, outPositionsSec, inFrames, inPositionsSec)
+            return DeckKnots(outFrames, outPositionsSec, inFrames, inPositionsSec,
+                outGridSource = if (outLoopTracked != null || outStraightTracked != null) GridSource.TRACKED else GridSource.CLOCK,
+                inGridSource = inGridSource)
         }
 
         internal fun computeVocalMidCarve(
