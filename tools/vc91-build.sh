@@ -16,7 +16,7 @@ EXPECTED_CODE=91
 EXPECTED_NAME="2.2.3-djmix49"
 SDK="${ANDROID_HOME:-/home/boxes/android-sdk}"
 AAPT2="$SDK/build-tools/36.0.0/aapt2"
-SIGNED="app/build/outputs/apk/prod/release/app-prod-release.apk"
+SIGNED="app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk"
 
 if [ "${1:-}" = "--audit" ]; then
   APK="${2:-$SIGNED}"
