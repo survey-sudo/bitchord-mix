@@ -24,6 +24,9 @@ import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionMoves
 import com.music.bitchord.playback.smart.TransitionTrackInfo
 import com.music.bitchord.playback.smart.planTransition
+import com.music.bitchord.playback.smart.nativeTiming
+import com.music.bitchord.playback.loopmix.LoopRegion
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -279,41 +282,85 @@ class Djmix26AppTest {
     }
 
     @Test
-    fun echoOutEnvelopesPreChargeBeforeCutFastDryCutAndZeroExitGateViolations() {
-        val out = track("out-100", 100.0, duration = 200.0).copy(key = "C major", keyConfidence = 0.9)
-        val inn = track("in-135", 135.0, duration = 200.0).copy(key = "Eb major", keyConfidence = 0.9)
+    fun echoOutHonorsTheSelectedCutAndPreservesTheColdIncomingAttack() {
+        val out = track("out-100", 100.0, duration = 200.0).copy(key = "C major", keyConfidence = 0.9,
+            vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(4000)))).withMeasuredEchoTestEvidence()
+        val inn = track("in-135", 135.0, duration = 200.0).copy(key = "Eb major", keyConfidence = 0.9,
+            vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(4000)))).withMeasuredEchoTestEvidence()
         val plan = LoopMix.bridge(out, out.duration, inn, inn.duration, earliestOutSec = 150.0)!!
         assertEquals("Echo", plan.rung)
         val clock = LoopMix.Clock(plan)
         val outStopAtSec = clock.releaseAt + 0.05 + plan.out.beatSec * 8 + plan.exitTailSeconds
         val env = LoopMixSession.computeEchoOutEnvelopes(plan, clock, outStopAtSec)
+        val h = requireNotNull(plan.handoff)
+        assertEquals(h.outDryFallStart.mixSec, env.swapAtSec, 1e-9)
 
         assertTrue(env.feedback in 0.50f..0.58f)
-        // Echo & reverb pre-charge BEFORE swapAtSec, then close after swapAtSec.
-        assertTrue(env.echoSendTimes.first() == 0.0 && env.echoSendValues.first() == 0f)
-        assertTrue(env.echoSendValues.any { it >= 0.8f })
-        assertEquals(0f, env.echoSendValues.last(), 1e-6f)
-        assertTrue(env.reverbSendValues.any { it in 0.25f..0.32f })
-        assertEquals(0f, env.reverbSendValues.last(), 1e-6f)
+        val sendTimes = doubleArrayOf(0.0, h.outCaptureStart.mixSec,
+            h.outDryFallStart.mixSec, h.outSendClose.mixSec)
+        assertArrayEquals(sendTimes, env.echoSendTimes, 1e-9)
+        assertArrayEquals(sendTimes, env.reverbSendTimes, 1e-9)
+        assertArrayEquals(floatArrayOf(0f, 0f, 0.90f, 0f), env.echoSendValues, 0f)
+        assertArrayEquals(floatArrayOf(0f, 0f, 0.28f, 0f), env.reverbSendValues, 0f)
 
-        // Dry cut: 1f up to swapAtSec, 0f within 80..120ms, 0f at stopAt -> exitGateViolations == 0.
-        val swapIdx = env.outGainTimes.indexOfFirst { kotlin.math.abs(it - env.swapAtSec) < 1e-6 }
-        assertTrue(swapIdx >= 1)
-        assertEquals(1f, env.outGainValues[swapIdx], 1e-6f)
-        val cutDur = env.outGainTimes[swapIdx + 1] - env.outGainTimes[swapIdx]
-        assertTrue("dry cut must be 80..120ms, got ${cutDur * 1000}ms", cutDur in 0.08..0.12)
-        assertEquals(0f, env.outGainValues[swapIdx + 1], 1e-6f)
-        assertEquals(0f, env.outGainValues.last(), 1e-6f)
-        assertTrue("stopAt gain is 0.0f so exitGateViolations == 0", env.outGainTimes.last() >= outStopAtSec - 1e-6)
-
-        // Song B enters cleanly at swapAtSec over 0.5..1 beat with 300Hz->20kHz LPF opening.
-        assertEquals(0.0, env.inGainTimes.first(), 1e-6)
-        assertEquals(0f, env.inGainValues.first(), 1e-6f)
-        assertEquals(300f, env.inLpValues.first(), 1e-3f)
-        assertEquals(20000f, env.inLpValues.last(), 1e-3f)
-        // Outgoing HPF sweeps 120 Hz -> 1600 Hz over the 3-4 beat tail.
+        val outStart = env.outGainTimes.indexOfFirst { kotlin.math.abs(it - h.outDryFallStart.mixSec) < 1e-9 }
+        val outEnd = env.outGainTimes.indexOfLast { kotlin.math.abs(it - h.outDryEnd.mixSec) < 1e-9 }
+        assertTrue(outStart >= 1 && outEnd > outStart)
+        assertEquals(1f, env.outGainValues[outStart], 0f)
+        assertTrue(env.outGainValues.drop(outEnd).all { it == 0f })
+        assertEquals(outStopAtSec, env.outGainTimes.last(), 1e-9)
+        val fadeTimes = env.outGainTimes.copyOfRange(outStart, outEnd + 1)
+        val fadeGains = env.outGainValues.copyOfRange(outStart, outEnd + 1)
+        assertArrayEquals(fadeTimes, env.outLowTimes, 0.0)
+        assertTrue(fadeGains.asList().zipWithNext().all { (a, b) -> a >= b })
+        assertEquals(0f, env.outLowValues.first(), 0f)
+        assertEquals(LoopMix.BASS_CUT_DB.toFloat(), env.outLowValues.last(), 0f)
+        assertTrue(env.outLowValues.asList().zipWithNext().all { (a, b) -> a >= b })
+        val firstIncoming = env.inGainValues.indexOfFirst { it == 1f }
+        assertEquals(h.inAudibleStart.mixSec, env.inGainTimes[firstIncoming], 1e-9)
+        assertTrue(env.inGainValues.take(firstIncoming).all { it == 0f })
+        assertTrue(env.inLpValues.all { it == 20000f })
         assertTrue(120f in env.outHpValues.toList())
         assertEquals(1600f, env.outHpValues.last(), 1e-3f)
+
+        // Contract envelopes never adapt a protected cut to a short decoder result.
+        val pcmEnd = h.outDryEnd.mixSec - 0.10
+        val short = LoopMixSession.computeEchoOutEnvelopes(plan, clock, outStopAtSec, pcmEnd)
+        assertArrayEquals(env.outGainTimes, short.outGainTimes, 0.0)
+        assertArrayEquals(env.outGainValues, short.outGainValues, 0f)
+        assertArrayEquals(env.inGainTimes, short.inGainTimes, 0.0)
+        assertArrayEquals(env.inGainValues, short.inGainValues, 0f)
+        assertArrayEquals(env.echoSendTimes, short.echoSendTimes, 0.0)
+        assertArrayEquals(env.reverbSendTimes, short.reverbSendTimes, 0.0)
+    }
+
+    @Test
+    fun contractedKnotsKeepExactSourceEventsDespiteTrackedGridDriftAndRefuseShortPcm() {
+        val h = requireNotNull(nativeTiming(100.0, 100.8, 102.0, 102.4,
+            0.5, 0.5, 1.4, 3.3, 0.0, 3.0))
+        val plan = LoopMix.Plan(out = pick2B(100.0).copy(beatSec = 0.6, bpm = 100.0),
+            inn = pick2B(0.5), fold = 1.0, enterBars = 1, rampBars = 0, exitBars = 1,
+            totalBars = 2, outLoops = false, inLoops = false, nativeIncoming = true,
+            echoTail = true, rung = "Echo", targetBpmOverride = 100.0,
+            incomingHoldSec = h.inHoldMixSec, handoff = h)
+        val clock = LoopMix.Clock(plan)
+        val drift = TrackAnalysis(tailBeats = BeatSide(List(40) { 100.0 + it * 0.624 }, emptyList(), 96.15, 0.9))
+        val knots = LoopMixSession.buildDeckKnots(plan, clock, 48000, drift, null, true, 8.0, 1.0)
+        assertEquals(null, LoopMixSession.qualifyHandoffKnots(plan, clock, 48000, knots))
+        assertEquals(maxOf(h.outDryEnd.mixSec, h.inFullLevelMixSec), clock.handoffAt, 1e-9)
+        assertTrue("Adoption must not wait for a later musical landing", clock.handoffAt < h.inLanding.mixSec)
+        assertEquals(h.outDryEnd.sourceSec, LoopMixSession.knotSourceAt(knots.outFrames,
+            knots.outPositionsSec, h.outDryEnd.mixSec, 48000)!!, 1e-9)
+        assertEquals(h.inLanding.sourceSec, LoopMixSession.knotSourceAt(knots.inFrames,
+            knots.inPositionsSec, h.inLanding.mixSec, 48000)!!, 1e-9)
+        fun region(start: Double, end: Double) = LoopRegion(FloatArray(((end - start) * 48000).roundToLong().toInt()),
+            FloatArray(((end - start) * 48000).roundToLong().toInt()), start)
+        val incoming = region(0.0, 20.0)
+        assertFalse(LoopMixSession.coversHandoffPcm(plan, 48000, knots, region(99.0, 102.3), incoming))
+        assertTrue(LoopMixSession.coversHandoffPcm(plan, 48000, knots, region(99.0, 102.5), incoming))
+        val bad = LoopMixSession.Companion.DeckKnots(knots.outFrames, knots.outPositionsSec.map { it + 0.04 }.toDoubleArray(),
+            knots.inFrames, knots.inPositionsSec)
+        assertEquals("handoff_out_knot_mapping", LoopMixSession.qualifyHandoffKnots(plan, clock, 48000, bad))
     }
 
     @Test

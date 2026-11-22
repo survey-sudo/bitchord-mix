@@ -72,11 +72,11 @@ class Djmix20RegressionTest {
         assertTrue(shouldDeclineToMix(out, inn), "unmixable must decline")
         assertNotNull(declineToMixDetail(out, inn))
         val p = plan(out, inn)
-        assertEquals(TransitionStyle.DJ_FILTER, p.transitionStyle, "reason=${p.reason}")
-        assertTrue(p.fadeSeconds in 3.5..4.5, "fade=${p.fadeSeconds}")
+        assertEquals(TransitionStyle.NATURAL, p.transitionStyle, "reason=${p.reason}")
+        assertEquals(0.0, p.fadeSeconds)
         assertTrue(p.reason.contains("decline-to-mix"))
-        assertEquals(inn.audibleStartTime!!, p.incomingCueTime, 1e-6, "cue at audible start")
-        assertTrue(p.transitionEnd <= out.contentEndTime + 1e-6, "ends at content_end")
+        assertEquals(0.0, p.incomingCueTime, "natural advance preserves the intro")
+        assertEquals(out.duration, p.transitionEnd, "plays to physical EOF")
     }
 
     @Test
@@ -210,6 +210,8 @@ class Djmix20RegressionTest {
         val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
         val choice = PhraseChoice(
             template = MixTemplate.M6, rung = "Echo", score = 0.9, exit = exit, entry = entry,
+            handoff = requireNotNull(nativeTiming(168.0, 168.0, 169.625, 170.0,
+                0.0, 0.0, 16.0, 18.0, 0.0, 5.05)),
             overlapBars = 0, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = true,
             vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
             swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
@@ -222,7 +224,10 @@ class Djmix20RegressionTest {
         assertTrue(script.outGain.beats.last() >= script.outGain.beats.first(), "lane must extend")
         // At least 2 beats of dissolve past the last content knot.
         val tailBeats = script.plan.exitTailSeconds / 0.5
-        assertTrue(script.outGain.beats.last() >= 2.0, "mute beat=${script.outGain.beats.last()} tailBeats=$tailBeats")
+        val h = assertNotNull(script.handoff)
+        val tailEndMixSec = h.inLanding.mixSec + script.outGain.beats.last() * script.plan.out.beatSec
+        assertTrue(tailEndMixSec >= h.outDryEnd.mixSec + tailBeats * script.plan.out.beatSec - 1e-9,
+            "OUT silent tail must extend two beats after its own dry seam, not B's later landing")
     }
 
     @Test
@@ -326,13 +331,15 @@ class Djmix20RegressionTest {
         val out = track("a", 120.0, "C major", vocal = 0.02)
         val inn = track("b", 140.0, "C major", vocal = 0.02)
         val ann = DjMix.annotate(gap, out, inn, outgoingId = outId, incomingId = inId)
-        assertTrue(ann.djEffect == DjEffect.ECHO || ann.djEffect == DjEffect.REVERB, "echo gap got ${ann.djEffect}")
+        assertEquals(DjEffect.NONE, ann.djEffect, "uncertified classic Echo cannot be replaced by a wash")
         assertTrue(ann.djEffect != DjEffect.FLANGER)
         // M6 (Echo template) on loop path must never flange even with flanger ids.
         val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
         val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
         val echoChoice = PhraseChoice(
             template = MixTemplate.M6, rung = "Echo", score = 0.9, exit = exit, entry = entry,
+            handoff = requireNotNull(nativeTiming(168.0, 168.0, 169.625, 170.0,
+                0.0, 0.0, 8 * 240.0 / 140.0, 2.0 + 8 * 240.0 / 140.0, 0.0, 5.05)),
             overlapBars = 0, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = true,
             vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
             swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",

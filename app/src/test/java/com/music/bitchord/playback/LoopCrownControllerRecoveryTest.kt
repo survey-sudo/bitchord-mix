@@ -7,6 +7,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.exoplayer.ExoPlayer
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.playback.loopmix.LoopMixPort
 import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.CountdownStabilizer
@@ -180,6 +181,77 @@ class LoopCrownControllerRecoveryTest {
     }
 
     @Test
+    fun loopBailEvidenceSurvivesSameOpportunityClassicFallbackAndClearsOnNewOpportunity() = withRig { r ->
+        val opportunity = requireNotNull(r.call("ensureOpportunity", "A", "B"))
+        val attemptId = opportunity.javaClass.getDeclaredField("attemptId").apply { isAccessible = true }
+            .get(opportunity) as String
+        val loopRunning = CrossfadeController::class.java.getDeclaredField("phase").let { field ->
+            field.isAccessible = true
+            field.type.enumConstants.single { it.toString() == "LOOP_RUNNING" }
+        }
+        r.set("phase", loopRunning)
+        r.set("outgoing", r.out.player)
+        r.set("executedRoute", mapOf("technique" to "native-bridge"))
+        r.set("planRevision", 9)
+        r.setNativeBinding(opportunity, revision = 7, generation = 42, coarseDecline = true)
+        r.set("capturedTakeoverSpliceBufferStatus", LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED)
+        r.set("capturedLoopTookOver", true)
+
+        // This is the production native->classic fallback path. Its internal
+        // loopBail cleanup is nonterminal for the still-current opportunity.
+        r.call("loopFallBack", "paused")
+        assertEquals("IDLE", r.get("phase").toString())
+        assertSame(opportunity, r.get("opportunity"))
+        assertEquals("paused", r.get("initiatingExitReason"))
+        val fallbackComplete = r.events().single {
+            it.contains("\"ev\":\"mix.complete\"") && it.contains("\"terminal\":false")
+        }
+        // Emit the native attempt snapshot before clearing it for classic.
+        assertTrue(fallbackComplete, fallbackComplete.contains("\"initiatingExitReason\":\"paused\""))
+        assertTrue(fallbackComplete,
+            fallbackComplete.contains("\"takeoverSpliceBufferDelegateStatus\":\"UNRESOLVED\""))
+        assertTrue(fallbackComplete, fallbackComplete.contains("\"planRevision\":7"))
+        assertTrue(fallbackComplete, fallbackComplete.contains("\"buildGeneration\":42"))
+        assertNull(r.get("capturedTakeoverSpliceBufferStatus"))
+        assertNull(r.get("capturedLoopTookOver"))
+        assertNull(r.get("nativeBinding"))
+
+        r.beginClassic()
+        assertSame(opportunity, r.get("opportunity"))
+        assertEquals("paused", r.get("initiatingExitReason"))
+        assertNull("a new classic route must not inherit the old native arm status",
+            r.get("capturedTakeoverSpliceBufferStatus"))
+        assertNull(r.get("capturedLoopTookOver"))
+        r.out.position = 196_000L
+        r.call("driveArming")
+        assertEquals("FADING", r.get("phase").toString())
+        val fired = r.events().single { it.contains("\"ev\":\"mix.fire\"") }
+        assertTrue(fired, fired.contains("\"attemptId\":\"$attemptId\""))
+        assertTrue(fired, fired.contains("\"technique\":\"classic\""))
+
+        r.call("finish")
+        val terminal = r.events().single { it.contains("\"ev\":\"mix.complete\"") && it.contains("\"terminal\":true") }
+        assertTrue(terminal, terminal.contains("\"attemptId\":\"$attemptId\""))
+        assertTrue(terminal, terminal.contains("\"initiatingExitReason\":\"paused\""))
+        assertTrue(terminal, terminal.contains("\"takeoverSpliceBufferDelegateStatus\":null"))
+        assertTrue(terminal, terminal.contains("\"tookOver\":null"))
+        assertTrue(terminal, terminal.contains("\"buildGeneration\":null"))
+        assertTrue(terminal, terminal.contains("\"technique\":\"classic\""))
+        assertNull(r.get("initiatingExitReason"))
+        assertNull(r.get("capturedTakeoverSpliceBufferStatus"))
+        assertNull(r.get("capturedLoopTookOver"))
+
+        // A new Opportunity drops evidence independently of terminal cleanup.
+        r.set("initiatingExitReason", "stale")
+        r.set("capturedTakeoverSpliceBufferStatus", LoopMixPort.TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED)
+        r.set("capturedLoopTookOver", true)
+        r.call("ensureOpportunity", "C", "D")
+        assertNull(r.get("initiatingExitReason"))
+        assertNull(r.get("capturedTakeoverSpliceBufferStatus"))
+        assertNull(r.get("capturedLoopTookOver"))
+    }
+
+    @Test
     fun acceptedPreparedAndExecutedClassicUseEffectiveInFlightRoute() = withRig { r ->
         val effective = TransitionPlan(transitionStart = 196.0, transitionEnd = 200.0,
             fadeSeconds = 4.0, transitionStyle = TransitionStyle.EQUAL_POWER)
@@ -277,8 +349,10 @@ class LoopCrownControllerRecoveryTest {
         assertNotEquals(eventField(first.first(), "attemptId"), eventField(second.first(), "attemptId"))
         for (name in listOf("mix.plan", "mix.plan.rejected", "mix.arm.death", "mix.loop.fallback")) {
             val a = first.single { eventField(it, "ev") == name &&
+                (name != "mix.plan" || (it.contains("\"stage\":\"candidate\"") && it.contains("\"technique\":\"classic\""))) &&
                 (name != "mix.plan.rejected" || it.contains("\"technique\":\"classic\"")) }
             val b = second.single { eventField(it, "ev") == name &&
+                (name != "mix.plan" || (it.contains("\"stage\":\"candidate\"") && it.contains("\"technique\":\"classic\""))) &&
                 (name != "mix.plan.rejected" || it.contains("\"technique\":\"classic\"")) }
             assertEquals(eventField(a, "reason"), eventField(b, "reason"))
         }
@@ -355,6 +429,11 @@ class LoopCrownControllerRecoveryTest {
         fun get(name: String): Any? = field(name).get(controller)
         fun set(name: String, value: Any?) = field(name).set(controller, value)
         private fun field(name: String) = CrossfadeController::class.java.getDeclaredField(name).apply { isAccessible = true }
+        fun setNativeBinding(context: Any, revision: Int, generation: Int, coarseDecline: Boolean?) {
+            val bindingClass = CrossfadeController::class.java.declaredClasses.single { it.simpleName == "NativeBinding" }
+            val constructor = bindingClass.declaredConstructors.single().apply { isAccessible = true }
+            set("nativeBinding", constructor.newInstance(context, revision, generation, coarseDecline))
+        }
         fun call(name: String, vararg args: Any?): Any? = CrossfadeController::class.java.declaredMethods
             .single { it.name == name && it.parameterCount == args.size }
             .apply { isAccessible = true }.invoke(controller, *args)

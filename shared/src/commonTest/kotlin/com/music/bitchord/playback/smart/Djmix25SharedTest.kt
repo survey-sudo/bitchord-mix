@@ -263,19 +263,37 @@ class Djmix25SharedTest {
         assertFalse(TransitionMoves.shouldAcapella(weak, inn))
     }
 
-    // ---- decline now routes to echo (bridge) ----
+    // ---- decline keeps a measured Echo or an explicit natural-end bridge ----
 
     @Test
-    fun bridgeGivesDeclinedPairsAnEchoRung() {
+    fun bridgeKeepsUnmeasuredDeclinedPairsNaturalAndMeasuredEchoAvailable() {
         val out = analysis(100.0, duration = 200.0, key = "C major", keyConfidence = 0.9, vocalProbability = 0.3)
         // Fill grids: constantGrid needs beatConfidence + bpm; downbeats set.
         val inn = analysis(130.0, duration = 200.0, key = "Eb major", keyConfidence = 0.9, vocalProbability = 0.3)
-        // Far tempo + key clash -> declined, but bridge must still echo.
+        // Far tempo + key clash cannot certify an unmeasured effect capture.
         assertTrue(shouldDeclineToMix(out, inn))
         val plan = LoopMix.bridge(out, out.duration, inn, inn.duration, 0.0)
-        assertNotNull(plan, "declined pair must still get bridge echo")
-        assertEquals("Echo", plan!!.rung)
-        assertTrue(plan.echoTail)
+        assertNotNull(plan, "declined pair must retain a deliberate native handoff")
+        assertEquals("Natural handoff", plan!!.rung)
+        assertFalse(plan.echoTail)
+        assertFalse(plan.reverbWash)
+        val h = assertNotNull(plan.handoff)
+        assertEquals(out.duration, h.outDryEnd.sourceSec)
+        assertEquals(h.outDryEnd, h.outDryFallStart)
+        assertEquals(LoopMix.cueOf(inn), h.inCueSourceSec)
+        assertEquals(HandoffStatus.UNKNOWN, qualifyMusicalHandoff(h, out, inn, null, null).status)
+
+        // The same coarse decline permits an actually measured pulse and phrase cut.
+        val measuredOut = out.copy(phraseBoundaries = listOf(198.0),
+            vocalWindows = listOf(CurveWindow(0.0, 20.0,
+            FloatArray(4000) { if (it / 20.0 < 196.0) 0.8f else 0f }))).withMeasuredEchoEvidence()
+        val measuredIn = inn.copy(vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(4000) { 0.8f }))).withMeasuredEchoEvidence()
+        val echo = assertNotNull(LoopMix.bridge(measuredOut, out.duration, measuredIn, inn.duration, 0.0))
+        assertEquals("Echo", echo.rung)
+        assertTrue(echo.echoTail)
+        assertTrue(echo.reverbWash)
+        assertEquals(HandoffStatus.QUALIFIED,
+            qualifyMusicalHandoff(assertNotNull(echo.handoff), measuredOut, measuredIn, null, null).status)
     }
     // ---- vc67 P2 MixWeightTuner (deleted in the automix overhaul) ----
     // The tuner was global +/-0.05 scalars with no production caller and no

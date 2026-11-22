@@ -56,6 +56,8 @@ data class PhraseChoice(
      * "not measured" and the renderer falls back to the legacy boolean gate.
      */
     val vocalClashEnergy: Double? = null,
+    /** Selected on the source grids before M6 is admitted or scored. */
+    val handoff: MusicalHandoff? = null,
 ) {
     /** Incoming deck rate at [beat] on the master clock, landing at 0. */
     fun incomingRate(beat: Double): Double = if (beat >= -PhraseConfig.B_UNITY_BARS_BEFORE_LANDING * 1.0) 1.0 else incomingRateBefore(beat)
@@ -142,9 +144,9 @@ object PhrasePlanner {
                 choice = next
                 return next
             }
-            val echo = held.copy(template = MixTemplate.M6, rung = "Echo", score = held.score * 0.9)
-            choice = echo
-            return echo
+            // A template copy has no source-grid or vocal admission for Echo.
+            // Keep the admitted choice until a newly planned handoff is available.
+            return held
         }
     }
 
@@ -246,12 +248,16 @@ object PhrasePlanner {
                         ratioSkip++
                         continue
                     }
-                    val veto = veto(template, exit, entry, out, inn, steps, outBpm, inBpm)
+                    val handoff = if (template == MixTemplate.M6) {
+                        scriptedEchoHandoff(exit, entry, out, inn, outBpm, inBpm, outAnalysis, inAnalysis)
+                    } else null
+                    val veto = if (template == MixTemplate.M6 && handoff == null) "echo handoff" else
+                        veto(template, exit, entry, out, inn, steps, outBpm, inBpm, handoff)
                     if (veto != null) {
                         vetoCounts[veto] = (vetoCounts[veto] ?: 0) + 1
                         continue
                     }
-                    val choice = score(template, exit, entry, out, inn, steps, outBpm, inBpm)
+                    val choice = score(template, exit, entry, out, inn, steps, outBpm, inBpm, handoff)
                     if (best == null || choice.score > best.score + 1e-6) best = choice
                 }
             }
@@ -259,13 +265,9 @@ object PhrasePlanner {
         if (best == null || best.score < PhraseConfig.S_MIN) {
             lastVetoSummary = "no-choose tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}" +
                 if (best != null) " lowScore=${"%.3f".format(best.score)}" else ""
-            // djmix14 musical fallback rung: strict templates all vetoed, but
-            // both grids are usable (BPM + downbeats). Synthesize a clean
-            // 4-bar rescue at the latest outro exit + head entry instead of
-            // handing the pair back empty-handed. Beat blend (M1) when the
-            // post-fold delta is <=8% and no dual-vocal clash; Echo (M6)
-            // otherwise (tempo lurch or vocal/harmonic clash).
-            val rescue = musicalRescue(out, inn, steps, outBpm, inBpm, exits, entries)
+            // A soft score miss may still leave a useful admitted candidate.
+            // Rescue must not resurrect a hard-vetoed or uncovered geometry.
+            val rescue = musicalRescue(out, inn, steps, outBpm, inBpm, exits, entries, outAnalysis, inAnalysis)
             if (rescue != null) {
                 lastVetoSummary = "rescue ${rescue.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
                 return rescue
@@ -276,13 +278,8 @@ object PhrasePlanner {
         return best
     }
 
-    /**
-     * Clean 4-bar musical rescue when every strict template vetoed.
-     * Requires usable BPM + downbeats on both sides. M1 (Beat blend,
-     * 4 bars, half-bar bass swap) for close tempos; M6 (Echo, 4 bars,
-     * beat-synced echo-out + bass swap) for far tempos or clashes.
-     */
-    private fun musicalRescue(
+    /** Rescue relaxes the soft score threshold, never strict admission. */
+    internal fun musicalRescue(
         out: SongMap,
         inn: SongMap,
         steps: Int?,
@@ -290,71 +287,41 @@ object PhrasePlanner {
         inBpm: Double,
         exits: List<ExitCue>,
         entries: List<EntryCue>,
+        outAnalysis: TrackAnalysis?,
+        inAnalysis: TrackAnalysis?,
     ): PhraseChoice? {
-        if (outBpm <= 0 || inBpm <= 0) return null
+        if (outBpm <= 1 || inBpm <= 1 || limitedTo(out, inn) != null) return null
         if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
-        val exit = exits.filter { it.roomBars >= 1 }.maxByOrNull { it.releaseSec }
-            ?: exits.lastOrNull() ?: return null
-        val entry = entries.firstOrNull() ?: return null
-        // Respect the musical tension veto: tension only resolves to a
-        // release. A rescue must not route tension into ambient.
-        val aRole = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))?.role ?: exit.role
-        val bRole = inn.sectionAt(entry.landingBar)?.role ?: entry.landingRole
-        if (aRole == SectionRole.TENSION && bRole != SectionRole.RELEASE) return null
-        // djmix14-review: coarse+coarse with extreme tempo is better left to
-        // LoopMix.bridge / classic DJ_FILTER than a forced 4-bar rescue.
         if (out.coarse && inn.coarse && abs(foldedRatio(outBpm, inBpm) - 1.0) > 0.15) return null
-        val ratio = foldedRatio(outBpm, inBpm)
-        val delta = abs(ratio - 1.0)
-        val dualVocal = (out.sungBars.any { it } && inn.sungBars.any { it }) &&
-            entry.leadInVocal >= 0.2f
-        val harmonicClash = (steps ?: 0) > 2
-        val useEcho = delta > 0.08 || dualVocal
-        val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
-        val steadyGrids = out.downbeats.size >= 8 && inn.downbeats.size >= 8
-        val rescueOverlap = when {
-            template != MixTemplate.M1 -> 4
-            harmonicClash -> if (steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8) 8 else 4
-            steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8 -> 8
-            else -> 4
+        var best: PhraseChoice? = null
+        for (exit in exits.sortedByDescending { it.releaseSec }) for (entry in entries) {
+            for (template in listOf(MixTemplate.M1, MixTemplate.M6)) {
+                val handoff = if (template == MixTemplate.M6) {
+                    scriptedEchoHandoff(exit, entry, out, inn, outBpm, inBpm, outAnalysis, inAnalysis)
+                        ?: continue
+                } else null
+                if (handoff != null && qualifyMusicalHandoff(handoff, outAnalysis, inAnalysis, null, null)
+                        .status != HandoffStatus.QUALIFIED) continue
+                // Unknown tail coverage cannot turn a synthesized eight-bar
+                // room into an admitted rescue. Use only covered source bars.
+                val overlap = overlapOf(template, exit, entry, outBpm, steps)
+                val aStart = if (handoff != null) exit.releaseBar - 1 else exit.releaseBar - overlap
+                val bEnd = if (handoff != null) entry.landingBar + 1 else entry.startBar + overlap
+                if (!coveredBars(out, aStart, exit.releaseBar) || !coveredBars(inn, entry.startBar, bEnd)) continue
+                if (template == MixTemplate.M1 && (overlap <= 0 || overlap > exit.roomBars || overlap > entry.leadInBars)) continue
+                if (veto(template, exit, entry, out, inn, steps, outBpm, inBpm, handoff) != null) continue
+                val candidate = score(template, exit, entry, out, inn, steps, outBpm, inBpm, handoff)
+                    .let { it.copy(detail = "rescue-${template.name} ${it.detail}") }
+                val compiled = TransitionMoves.compile(candidate, outBpm, inBpm)
+                val clock = LoopMix.Clock(compiled.plan)
+                if (clock.elementAt > PhraseConfig.O_MAX_SEC + 1e-6 ||
+                    abs(compiled.plan.inn.loopStart - entry.startSec) > 1e-6) continue
+                // Only the soft ranking threshold is relaxed. Keep the real
+                // score and all strict structural, vocal and rate vetoes.
+                if (best == null || candidate.score > best.score) best = candidate
+            }
         }
-        val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
-        val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
-        val clashBeats = vocalClashBeats(out, inn, exit, entry, rescueOverlap)
-        val clashEnergy = vocalClashEnergy(out, inn, exit, entry, rescueOverlap)
-        return PhraseChoice(
-            template = template,
-            rung = rungOf(template),
-            score = PhraseConfig.S_MIN,
-            exit = exit,
-            entry = entry,
-            overlapBars = rescueOverlap,
-            // Match score(): M1/M3 swap at -overlap/2, all others at 0.0.
-            swapBar = if (template == MixTemplate.M1) -rescueOverlap / 2.0 else 0.0,
-            tailBeats = if (template == MixTemplate.M1) 1.0 else 0.0,
-            loopK = 0,
-            echoGated = template == MixTemplate.M6,
-            vocalProduct = 0f,
-            tempoPrepBars = 0,
-            echoDelayBeats = delayBeats,
-            echoDelayName = delayName,
-            swapRampMs = rampMs,
-            swapRampName = rampName,
-            tempoPolicy = if (PhraseConfig.TEMPO_POLICY == "b") "TEMPO_POLICY=b" else "TEMPO_POLICY=a",
-            vocalOverlapBeats = clashBeats,
-            vocalClashEnergy = clashEnergy,
-            energyDelta = 0f,
-            struct = 0.6,
-            vocalScore = 0.6,
-            phraseScore = 0.6,
-            energyScore = 0.6,
-            lengthScore = 0.6,
-            keyScore = 0.6,
-            tempoScore = 0.6,
-            cost = 0.0,
-            detail = "rescue-${template.name} ${rescueOverlap}bar",
-            keyClash = harmonicClash && template == MixTemplate.M1,
-        )
+        return best
     }
 
     private fun checkPlanTime(startedMs: Long, now: () -> Long) {
@@ -450,6 +417,7 @@ object PhrasePlanner {
         steps: Int?,
         outBpm: Double,
         inBpm: Double,
+        handoff: MusicalHandoff? = null,
     ): String? {
         if (template == MixTemplate.ENERGY_LIFT) {
             if (out.chorusCount < PhraseConfig.LIFT_MIN_CHORUSES) return "lift needs two choruses"
@@ -484,8 +452,9 @@ object PhrasePlanner {
             // colliding and it does not. That inversion is the whole reason the
             // weighted measure exists, so the veto has to honour it.
             val overlap = overlapOf(template, exit, entry, outBpm, steps)
-            val clash = vocalClashBeats(out, inn, exit, entry, overlap)
-            val clashEnergy = vocalClashEnergy(out, inn, exit, entry, overlap)
+            val actual = handoff?.let { echoCollision(out, inn, it, 60.0 / outBpm) }
+            val clash = actual?.beats ?: vocalClashBeats(out, inn, exit, entry, overlap)
+            val clashEnergy = if (actual != null) actual.energy else vocalClashEnergy(out, inn, exit, entry, overlap)
             // Peak-aware: mean alone dilutes a single loud bar (0.81/8=0.101).
             // Restore the beat-count floor unless the measured energy is
             // clearly soft (<0.05); unmeasured pairs stay on the count.
@@ -618,6 +587,116 @@ object PhrasePlanner {
         return (inBpm / alignedFold(outBpm, inBpm)) / outBpm
     }
 
+    private fun coveredBars(map: SongMap, from: Int, until: Int): Boolean =
+        from >= 0 && until > from && until <= map.sungBars.size &&
+            until < map.downbeats.size &&
+            (map.vocalEnergy.isEmpty() || until <= map.vocalEnergy.size)
+
+    /**
+     * Preserve the selected cue. A lead-in normally runs after A's dry seam;
+     * only a cue that actually starts the declared pickup may precede it.
+     * The incoming landing comes from B's own grid, including tracked drift.
+     */
+    internal fun scriptedEchoHandoff(
+        exit: ExitCue,
+        entry: EntryCue,
+        out: SongMap,
+        inn: SongMap,
+        outBpm: Double,
+        inBpm: Double,
+        outAnalysis: TrackAnalysis? = null,
+        inAnalysis: TrackAnalysis? = null,
+    ): MusicalHandoff? {
+        if (!outBpm.isFinite() || !inBpm.isFinite() || outBpm <= 1 || inBpm <= 1) return null
+        val outBeat = 60.0 / outBpm
+        val inBeat = 60.0 / inBpm
+        val cut = exit.releaseSec
+        val start = out.barTime((exit.releaseBar - 1).coerceAtLeast(0))
+        val cue = entry.startSec
+        val landing = inn.barTime(entry.landingBar)
+        if (listOf(start, cut, cue, landing).any { !it.isFinite() || it < 0.0 } ||
+            cut <= start || cut > out.durationSec + 1e-6 || landing < cue || landing >= inn.durationSec) return null
+        val dryEndMix = cut - start
+        val fallMix = (dryEndMix - 0.75 * outBeat).coerceAtLeast(0.0)
+        fun timing(hold: Double): MusicalHandoff = MusicalHandoff(
+            outCaptureStart = HandoffPoint(start, 0.0),
+            outSendClose = HandoffPoint(cut, dryEndMix),
+            outDryFallStart = HandoffPoint(start + fallMix, fallMix),
+            outDryEnd = HandoffPoint(cut, dryEndMix),
+            inCueSourceSec = cue,
+            inHoldMixSec = hold,
+            inAudibleStart = HandoffPoint(cue, hold),
+            inFullLevelMixSec = hold,
+            inLanding = HandoffPoint(landing, hold + landing - cue),
+            wetRetireMixSec = maxOf(dryEndMix, hold + landing - cue) +
+                0.05 + outBeat * 8 + PhraseConfig.exitTailSeconds(outBeat),
+        )
+        // Bar flags are not word-level lyric certainty. Pass the actual local
+        // analyses; missing masks stay UNKNOWN. Bar collision is checked below.
+        fun qualification(h: MusicalHandoff) = qualifyMusicalHandoff(h, outAnalysis, inAnalysis, null, null)
+        var handoff = timing(dryEndMix)
+        val pickupDuration = landing - cue
+        val pickupBudget = entry.pickupBeats.coerceAtLeast(0f) * inBeat
+        val explicitPickup = inn.startKind == StartKind.VOCAL_PICKUP && pickupBudget > 0.0 &&
+            pickupDuration > 0.0 && pickupDuration <= pickupBudget + 1e-6 &&
+            abs(cue - (landing - pickupBudget).coerceAtLeast(0.0)) <= 1e-6
+        if (explicitPickup && pickupDuration < dryEndMix) {
+            val early = timing(dryEndMix - pickupDuration)
+            // Unknown mask coverage cannot authorize an overlap, even if the
+            // SongMap's bar labels look clean.
+            val collision = echoCollision(out, inn, early, outBeat)
+            if (qualification(early).status == HandoffStatus.QUALIFIED &&
+                collision.beats <= 1.0 && (collision.energy ?: 1.0) <= CLASH_VETO_ENERGY) handoff = early
+        }
+        // The app refuses an ornamental Echo without measured capture/cut
+        // coverage. Enforce the same gate before scoring or displaying M6.
+        if (qualification(handoff).status != HandoffStatus.QUALIFIED ||
+            EchoAdmission.musicalRefusal(handoff, outAnalysis, inAnalysis) != null) return null
+        val reservation = TransitionMoves.echoReservationBars(handoff, outBeat) * 4 * outBeat
+        val handback = LoopMix.SETTLE_BARS * 4 * outBeat
+        if (reservation + handback > PhraseConfig.O_MAX_SEC + 1e-6) return null
+        return handoff
+    }
+
+    private data class EchoCollision(val beats: Double, val energy: Double?, val peak: Float)
+
+    /** Integrate the actually audible unity-rate overlap on both source grids. */
+    private fun echoCollision(out: SongMap, inn: SongMap, h: MusicalHandoff, outBeat: Double): EchoCollision {
+        val from = h.inAudibleStart.mixSec
+        val to = h.outDryEnd.mixSec
+        if (to <= from) return EchoCollision(0.0,
+            if (out.vocalEnergy.isNotEmpty() && inn.vocalEnergy.isNotEmpty()) 0.0 else null, 0f)
+        val outOrigin = h.outCaptureStart.sourceSec - h.outCaptureStart.mixSec
+        val inOrigin = h.inCueSourceSec - h.inHoldMixSec
+        val boundaries = (listOf(from, to) + out.downbeats.map { it - outOrigin } +
+            inn.downbeats.map { it - inOrigin }).filter { it in from..to }.distinct().sorted()
+        var clashSec = 0.0
+        var energy = 0.0
+        var peak = 0f
+        var measured = out.vocalEnergy.isNotEmpty() && inn.vocalEnergy.isNotEmpty()
+        for (i in 0 until boundaries.lastIndex) {
+            val duration = boundaries[i + 1] - boundaries[i]
+            val mid = (boundaries[i + 1] + boundaries[i]) * 0.5
+            val a = out.downbeats.indexOfLast { it <= outOrigin + mid }
+            val inSource = inOrigin + mid
+            val b = inn.downbeats.indexOfLast { it <= inSource }.let {
+                if (it < 0 && inn.pickupBeats > 0f && inSource >= 0.0 &&
+                    inSource >= inn.barTime(0) - inn.pickupBeats * (60.0 / inn.bpm)) 0 else it
+            }
+            if (a !in out.sungBars.indices || b !in inn.sungBars.indices) {
+                measured = false
+                clashSec += duration // unmeasured overlap is never clean room
+                continue
+            }
+            if (a !in out.vocalEnergy.indices || b !in inn.vocalEnergy.indices) measured = false
+            val product = out.vocalEnergyAt(a) * inn.vocalEnergyAt(b)
+            energy += duration * product
+            peak = maxOf(peak, product.toFloat())
+            if (out.sungBars[a] && inn.sungBars[b]) clashSec += duration
+        }
+        return EchoCollision(clashSec / outBeat, if (measured) energy / (to - from) else null, peak)
+    }
+
     private fun score(
         template: MixTemplate,
         exit: ExitCue,
@@ -627,16 +706,18 @@ object PhrasePlanner {
         steps: Int?,
         outBpm: Double,
         inBpm: Double,
+        handoff: MusicalHandoff? = null,
     ): PhraseChoice {
         val overlap = overlapOf(template, exit, entry, outBpm, steps)
         val struct = structScore(template, exit, entry, out)
-        val clashBeats = vocalClashBeats(out, inn, exit, entry, overlap)
+        val actual = handoff?.let { echoCollision(out, inn, it, 60.0 / outBpm) }
+        val clashBeats = actual?.beats ?: vocalClashBeats(out, inn, exit, entry, overlap)
         // Energy-weighted collision where it was measured, and the old beat
         // count normalised onto the same 0..1 axis where it was not. The two are
         // not the same measurement, so each keeps its own meaning: the weighted
         // one is what the listener hears, the fallback is a conservative proxy
         // that reads a straddled threshold as a real collision.
-        val clashEnergy = vocalClashEnergy(out, inn, exit, entry, overlap)
+        val clashEnergy = if (actual != null) actual.energy else vocalClashEnergy(out, inn, exit, entry, overlap)
         val clash = clashEnergy ?: (clashBeats / 4.0).coerceIn(0.0, 1.0)
         val vocalScore = if (carve(template)) 0.8 else 1.0 - clash
         val phrase = phraseScore(out, inn, exit.releaseBar, entry.landingBar)
@@ -728,7 +809,8 @@ object PhrasePlanner {
         val bonuses = (seamBonus + buildupBonus + alignBonus + kindBonus).coerceAtMost(0.08)
         val total = 0.18 * struct + 0.30 * vocalScore + 0.12 * phrase + 0.14 * energy +
             0.08 * length + 0.08 * key + 0.10 * tempo - cost + bonuses
-        val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
+        val (delayName, delay) = PhraseConfig.echoDelayBeats(
+            if (template == MixTemplate.M6) outBpm else inBpm, template == MixTemplate.ROLLING)
         val (rampName, ramp) = PhraseConfig.swapRampMs(template.name)
         val swap = when (template) {
             MixTemplate.M1, MixTemplate.M3 -> -overlap / 2.0
@@ -761,7 +843,7 @@ object PhrasePlanner {
             tailBeats = tail,
             loopK = loopK,
             echoGated = template == MixTemplate.M6 || template == MixTemplate.ROLLING || template == MixTemplate.M5,
-            vocalProduct = product,
+            vocalProduct = actual?.peak ?: product,
             tempoPrepBars = prep,
             echoDelayBeats = delay,
             echoDelayName = delayName,
@@ -781,6 +863,7 @@ object PhrasePlanner {
             detail = "${template.name} ${exit.kind}→${entry.kind} O=$overlap",
             keyClash = (steps ?: 0) > 2,
             vocalClashEnergy = clashEnergy,
+            handoff = handoff,
         )
     }
 

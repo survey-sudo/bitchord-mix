@@ -13,6 +13,7 @@ import com.music.bitchord.playback.smart.PhraseChoice
 import com.music.bitchord.playback.smart.PhrasePlanner
 import com.music.bitchord.playback.smart.SectionFn
 import com.music.bitchord.playback.smart.SectionRole
+import com.music.bitchord.playback.smart.nativeTiming
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -31,6 +32,8 @@ class Djmix20AppTest {
         val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
         return PhraseChoice(
             template = template, rung = PhrasePlanner.rungOf(template), score = 0.9,
+            handoff = if (template == MixTemplate.M6) requireNotNull(nativeTiming(
+                168.0, 168.0, 169.625, 170.0, 0.0, 0.0, 16.0, 18.0, 0.0, 5.05)) else null,
             exit = exit, entry = entry, overlapBars = overlapBars,
             swapBar = -overlapBars / 2.0, tailBeats = 1.0, loopK = 0,
             echoGated = template == MixTemplate.M6, vocalProduct = 0f, tempoPrepBars = 0,

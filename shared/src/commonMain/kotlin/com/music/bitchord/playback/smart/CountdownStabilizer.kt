@@ -49,12 +49,14 @@ class CountdownStabilizer {
     private var suppressedPairKey: String? = null
     private var suppressedEpoch: Long = -1L
     private val suppressedFamilies: MutableSet<Family> = mutableSetOf()
+    private var failedCommittedNative: Boolean = false
 
     fun reset() {
         current = null
         suppressedPairKey = null
         suppressedEpoch = -1L
         suppressedFamilies.clear()
+        failedCommittedNative = false
     }
 
     fun committedFor(pairKey: String, scrubEpoch: Long): Committed? =
@@ -62,6 +64,13 @@ class CountdownStabilizer {
 
     fun isFamilySuppressed(pairKey: String, scrubEpoch: Long, family: Family): Boolean =
         suppressedPairKey == pairKey && suppressedEpoch == scrubEpoch && family in suppressedFamilies
+
+    /** A rejected candidate alone must not authorize an automatic crossfade. */
+    fun hasFailedCommittedNative(pairKey: String, scrubEpoch: Long): Boolean =
+        suppressedPairKey == pairKey && suppressedEpoch == scrubEpoch && failedCommittedNative
+
+    /** New queue occurrence, possibly with identical IDs; leave countdown/audio state alone. */
+    fun clearFailedNativeRecovery() { failedCommittedNative = false }
 
     fun markShown(pairKey: String, scrubEpoch: Long) {
         val c = committedFor(pairKey, scrubEpoch) ?: return
@@ -86,6 +95,7 @@ class CountdownStabilizer {
             suppressedPairKey = pairKey
             suppressedEpoch = scrubEpoch
             suppressedFamilies.clear()
+            failedCommittedNative = false
         }
         suppressedFamilies.add(family)
         if (suppressBridgeToo) {
@@ -93,6 +103,8 @@ class CountdownStabilizer {
             suppressedFamilies.add(Family.NATIVE_BRIDGE)
         }
         val c = committedFor(pairKey, scrubEpoch)
+        if (c != null && c.family != Family.CLASSIC && c.family in suppressedFamilies &&
+            (c.shown || c.locked)) failedCommittedNative = true
         if (c != null && c.family in suppressedFamilies) {
             current = null
         }
@@ -104,6 +116,7 @@ class CountdownStabilizer {
             suppressedPairKey = candidate.pairKey
             suppressedEpoch = candidate.scrubEpoch
             suppressedFamilies.clear()
+            failedCommittedNative = false
         }
         if (candidate.family in suppressedFamilies) {
             return committedFor(candidate.pairKey, candidate.scrubEpoch)
@@ -211,6 +224,9 @@ class CountdownStabilizer {
         durationSec: Double,
         allowCommit: Boolean = true,
     ): TransitionPlan {
+        // A dry queue advance must never be resurrected or stretched into a
+        // previously cached classic fade merely because its marker is hidden.
+        if (fresh.transitionStyle == TransitionStyle.NATURAL) return fresh
         if (fresh.blocked || !fresh.markerVisible) {
             val existing = committedFor(pairKey, scrubEpoch)
             if (existing != null && existing.family == Family.CLASSIC &&

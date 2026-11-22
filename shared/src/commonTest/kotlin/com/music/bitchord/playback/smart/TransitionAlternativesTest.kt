@@ -144,15 +144,15 @@ class TransitionAlternativesTest {
     }
 
     @Test
-    fun curveLessDeclineKeepsBoundedFade() {
+    fun curveLessDeclineDefaultsToNaturalAdvance() {
         // No low-band curves anywhere: no family may answer.
         val bareOut = build("o", 120.0, "C major").copy(lowEnergyCurve = emptyList())
         val bareIn = build("i", 94.0, "F major", vocalProbability = 0.9).copy(lowEnergyCurve = emptyList())
         val c = TransitionAlternatives.select(bareOut, bareIn, 196.0, 200.0, 10.0, 0.5)
         assertNull(c, "no curves, no alternatives")
         val plan = plan(bareOut, bareIn)
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle, "reason=" + plan.reason)
-        assertEquals(4.0, plan.fadeSeconds, 1e-9)
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle, "reason=" + plan.reason)
+        assertEquals(0.0, plan.fadeSeconds, 1e-9)
     }
 
     @Test
@@ -273,7 +273,7 @@ class TransitionAlternativesTest {
     }
 
     @Test
-    fun curveLessNoClashDeclineKeepsBoundedCarve() {
+    fun curveLessNoClashDeclineDoesNotForceACarve() {
         // (d) no clash, no curves: no family can physically run, so the
         // bounded decline plays — now the DECLINE carve, still at native
         // tempo (rate 1.0) with the separated envelopes.
@@ -283,12 +283,11 @@ class TransitionAlternativesTest {
         val bareOutCut = bareOut.copy(lowEnergyCurve = emptyList())
         assertTrue(shouldDeclineToMix(bareOutCut, bareIn), "dual-vocal gap must decline")
         val plan = plan(bareOutCut, bareIn)
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle, "reason=" + plan.reason)
-        assertEquals(FilterTransitionVariant.DECLINE, plan.filterVariant)
-        assertEquals(4.0, plan.fadeSeconds, 1e-9)
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle, "reason=" + plan.reason)
+        assertEquals(0.0, plan.fadeSeconds, 1e-9)
         assertEquals(1.0, plan.incomingPlaybackRate, 1e-9)
-        assertTrue(plan.bassSwap, "the carve performs the one-kick handoff")
-        assertEquals("decline", TransitionEvidenceCache.recent(1)[0].style)
+        assertFalse(plan.bassSwap, "natural advance does not edit the bass")
+        assertEquals(0.0, plan.echoSeconds)
         TransitionEvidenceCache.clear()
     }
 

@@ -27,6 +27,8 @@ import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.LoopMix
+import com.music.bitchord.playback.smart.LocalBlendAdmission
+import com.music.bitchord.playback.smart.LyricCue
 import com.music.bitchord.playback.smart.shouldDeclineToMix
 import com.music.bitchord.playback.smart.PhraseConfig
 import com.music.bitchord.playback.smart.PhraseMaps
@@ -48,6 +50,7 @@ import com.music.bitchord.playback.smart.TransitionAlternatives
 import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
 import com.music.bitchord.playback.smart.TransitionEvidenceCache
+import com.music.bitchord.playback.smart.localBlendFitsDeckSpeedCap
 import com.music.bitchord.playback.smart.VocalDepthFilter
 import com.music.bitchord.playback.smart.TransitionTrackInfo
 import com.music.bitchord.playback.smart.BUILDUP_RISE
@@ -162,7 +165,8 @@ internal fun safeDeckSpeed(raw: Float, beatmatched: Boolean = true): Float {
  * [safeDeckSpeed] applied to a mix [rate] (1.0 = no stretch) before [deckSpeed] stacks it with
  * the listener speed. [rate] may arrive as `NaN` (unknown BPM ratio): that is `1.0f`, never
  * a stretch. Every `setPlaybackSpeed` that carries a beatmatch rate goes through here so the
- * `[0.92f, 1.08f]` ceiling cannot be bypassed.
+ * `[0.92f, 1.08f]` ceiling applies to ordinary unqualified requests. A locally
+ * admitted classic blend uses its separately checked physical rate in incomingBaseSpeed.
  */
 internal fun safeRateForDeck(rate: Double, beatmatched: Boolean = true): Double =
     safeDeckSpeed(rate.toFloat(), beatmatched).toDouble()
@@ -174,6 +178,32 @@ internal fun safeRateForDeck(rate: Double, beatmatched: Boolean = true): Double 
  */
 internal fun deckSpeedSafe(user: Float, rate: Double, beatmatched: Boolean = true): Float =
     deckSpeed(user, safeRateForDeck(rate, beatmatched))
+
+/**
+ * Applies a locally admitted physical stretch before the existing composite
+ * player-speed cap. Invalid rates cannot bypass the ordinary deck-speed guard.
+ */
+internal fun deckSpeedForAdmittedBlend(user: Float, admittedRate: Double): Float {
+    val base = if (user.isFinite() && user in 0.25f..3f) user else 1f
+    val rate = if (admittedRate.isFinite() &&
+        admittedRate in com.music.bitchord.playback.smart.MIN_INCOMING_RATE..
+            com.music.bitchord.playback.smart.MAX_INCOMING_RATE
+    ) admittedRate.toFloat() else 1f
+    return (base * rate).coerceIn(0.25f, 3f)
+}
+
+/** Called only after the genuine crown attempt. A displayed native countdown keeps its family. */
+internal fun nativePlanAfterCrown(
+    crown: LoopMix.Plan?,
+    classic: TransitionPlan,
+    out: TrackAnalysis,
+    inn: TrackAnalysis,
+    committedNative: Boolean,
+    lyricsOut: List<LyricCue> = emptyList(),
+    lyricsIn: List<LyricCue> = emptyList(),
+    bridge: () -> LoopMix.Plan?,
+): LoopMix.Plan? = crown ?: if (!committedNative &&
+    LocalBlendAdmission.isQualified(classic, out, inn, lyricsOut, lyricsIn)) null else bridge()
 
 /**
  * Cold-loop yield headroom (djmix18, Bug&nbsp;4): once both tracks are analysed, a `LoopMix.plan`
@@ -713,6 +743,8 @@ class CrossfadeController(
      * smarter timing, not a beatmatch.
      */
     private var incomingPlaybackRate: Double = 1.0
+    /** This exact classic plan passed local admission; its physical rate is not the global taste cap. */
+    private var localBlendInFlight = false
 
     /**
      * Advanced Automix: the speed-up the outgoing track is brought up to before
@@ -839,7 +871,9 @@ class CrossfadeController(
          */
         val echoAt = onBar(FILTER_ECHO_AT)
         val echoFrom = if (grid > 0) echoAt - 1.0 / grid else echoAt
-        val echoKill = if (grid > 0) ECHO_KILL_BEATS / grid else 0.0
+        // Short overlaps can have fewer than four beats after the echo cue.
+        // Close the dry path by progress 1 even when the wet fader runs longer.
+        val echoKill = if (grid > 0) minOf(ECHO_KILL_BEATS / grid, 1.0 - echoAt) else 0.0
 
         /**
          * How much of the DJ fader curve a blend keeps: all of it for two tracks
@@ -946,6 +980,11 @@ class CrossfadeController(
     private var loopSuppressedUntil = 0L
     /** djmix14: reason for the next mix.complete (planned-fade-done, loop-complete, ...). */
     private var lastCompleteReason: String? = null
+    /** First observed loop bail cause; independent of the terminal/tail completion reason. */
+    private var initiatingExitReason: String? = null
+    /** Port observations captured before cleanup disarms or releases the loop session. */
+    private var capturedTakeoverSpliceBufferStatus: LoopMixPort.TakeoverSpliceBufferStatus? = null
+    private var capturedLoopTookOver: Boolean? = null
     /** djmix22 (vc64): last playWhenReady-change reason seen on the session player,
      * logged on mix.pause.detected so a focus-loss pause is provable from telemetry. */
     @Volatile private var lastPlayWhenReadyChangeReason: Int = 0
@@ -2038,7 +2077,10 @@ class CrossfadeController(
 
         askLyrics(currentItem, duration)
         askLyrics(nextItem, nextDuration)
-        var plan = planTransition(
+        val outLyricCues = lyricSpans[currentItem.mediaId]?.cues.orEmpty().toList()
+        val inLyricCues = lyricSpans[nextItem.mediaId]?.cues.orEmpty().toList()
+        fun recoveryRequired(): Boolean = countdownStabilizer.hasFailedCommittedNative(pairKey, scrubEpoch)
+        fun classicPlanFor(recovery: Boolean): TransitionPlan = planTransition(
             analysis = currentAnalysis,
             nextAnalysis = nextAnalysis,
             currentTrack = currentItem.toTransitionInfo(duration),
@@ -2048,10 +2090,13 @@ class CrossfadeController(
             fadeSeconds = fallbackSeconds,
             mode = CrossfadeMode.SMART,
             advanced = advanced,
-            lyricsOut = lyricSpans[currentItem.mediaId]?.cues.orEmpty(),
-            lyricsIn = lyricSpans[nextItem.mediaId]?.cues.orEmpty(),
+            lyricsOut = outLyricCues,
+            lyricsIn = inLyricCues,
             mixWindow = true,
+            listenerSpeed = AppSettings.playbackSpeed.value.toDouble(),
+            allowRecoveryCrossfade = recovery,
         )
+        var plan = classicPlanFor(recoveryRequired())
         // djmix16 pin: ANY :catch-up plan for (pair, scrubEpoch) is pinned
         // ONCE and reused on every subsequent tick — never recomputed as
         // playbackTime + lead (moving carrot: transitionStart 187.5 ->
@@ -2130,8 +2175,11 @@ class CrossfadeController(
                     "reason" to plan.reason,
                     "rung" to plan.transitionStyle.name,
                     "transitionStyle" to plan.transitionStyle.name,
-                    "decline" to shouldDeclineToMix(currentAnalysis, nextAnalysis),
-                    "declineToMix" to shouldDeclineToMix(currentAnalysis, nextAnalysis),
+                    "decline" to plan.reason.contains("decline-to-mix"),
+                    "declineToMix" to plan.reason.contains("decline-to-mix"),
+                    "coarseDecline" to shouldDeclineToMix(currentAnalysis, nextAnalysis),
+                    "coarseOverride" to (shouldDeclineToMix(currentAnalysis, nextAnalysis) &&
+                        LocalBlendAdmission.MARKER in plan.policyReasons),
                     "camelotLeft" to (camelotCode(com.music.bitchord.playback.smart.exitKeyForMix(currentAnalysis)) ?: ""),
                     "camelotRight" to (camelotCode(com.music.bitchord.playback.smart.entryKeyForMix(nextAnalysis)) ?: ""),
                     "fxSlot" to com.music.bitchord.playback.smart.TransitionMoves.fxSlot(currentItem.mediaId, nextItem.mediaId),
@@ -2176,7 +2224,7 @@ class CrossfadeController(
             loopSuppressedPair = null
         }
         val committedBeforeLoop = countdownStabilizer.committedFor(pairKey, scrubEpoch)
-        val lockedClassic = committedBeforeLoop != null &&
+        val lockedClassic = plan.transitionStyle != TransitionStyle.NATURAL && committedBeforeLoop != null &&
             (committedBeforeLoop.locked || committedBeforeLoop.shown) &&
             committedBeforeLoop.family == CountdownStabilizer.Family.CLASSIC &&
             committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
@@ -2200,12 +2248,22 @@ class CrossfadeController(
             val staleCommittedLoop = planLoop == null &&
                 loopRefusal == "stale loop start passed" &&
                 committedBeforeLoop != null
-            loop = planLoop ?: if (!suppressingBridge && !staleCommittedLoop) {
-                nativeBridge(
+            val committedNative = committedBeforeLoop != null &&
+                (committedBeforeLoop.locked || committedBeforeLoop.shown) &&
+                committedBeforeLoop.family != CountdownStabilizer.Family.CLASSIC &&
+                committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
+            loop = nativePlanAfterCrown(planLoop, plan, currentAnalysis, nextAnalysis, committedNative,
+                outLyricCues, inLyricCues) {
+                if (!suppressingBridge && !staleCommittedLoop) nativeBridge(
                     player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
-                )
-            } else {
-                null
+                ) else null
+            }
+            if (loop == null && !committedNative && LocalBlendAdmission.isQualified(plan, currentAnalysis, nextAnalysis,
+                    outLyricCues, inLyricCues)) {
+                // The shared cache can still contain an uncommitted Echo. Do not publish it over classic.
+                loopPlanned = null
+                loopPlanKey = null
+                loopScript = null
             }
         }
         // djmix26: anti-oscillation & HEAD -> FULL stability for Loop/Bridge.
@@ -2356,7 +2414,8 @@ class CrossfadeController(
                     // Destination is recorded after the bridge rescue resolves below.
                 }
                 val yieldedWasCrown = isCrown(loop)
-                loop = if (yieldedWasCrown) {
+                loop = if (yieldedWasCrown && !LocalBlendAdmission.isQualified(plan, currentAnalysis, nextAnalysis,
+                        outLyricCues, inLyricCues)) {
                     nativeBridge(player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration)
                 } else null
                 if (loop != null) {
@@ -2468,6 +2527,33 @@ class CrossfadeController(
         }
         if (phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING) return
         discardPrime()
+        // A native arm can fail during this very tick. Admit its bounded
+        // recovery immediately instead of waiting behind a stale natural plan.
+        if (plan.transitionStyle == TransitionStyle.NATURAL && recoveryRequired()) {
+            plan = classicPlanFor(true)
+        }
+
+        if (plan.transitionStyle == TransitionStyle.NATURAL) {
+            // Leave both songs intact. No standby fade, countdown commitment,
+            // seek, rate change, or pause-at-EOF: the existing queue owns advance.
+            releaseHold()
+            holdWanted = false
+            plannedTransition = null
+            pinnedCatchUpPlan = null
+            pinnedCatchUpKey = null
+            lastSmartPlan = plan
+            lastSmartPlanStartMs = duration
+            acceptRoute(plan, classicRouteFields(plan) + mapOf(
+                "technique" to "natural", "rung" to "Natural handoff",
+                "executionScope" to "normal-queue-advance-no-overlap",
+            ))
+            AppSettings.smartTransitionWindow.value = null
+            AppSettings.smartMixInProgress.value = false
+            AppSettings.smartMixPreview.value = null
+            AppSettings.smartMixBlend.value = null
+            clearMixView()
+            return
+        }
 
         // Gated on *both* tracks being measured, not on the plan alone. Until
         // then the planner is still sizing the overlap from a fallback that
@@ -2820,6 +2906,16 @@ class CrossfadeController(
         if (out === into) return armDeath("same-player")
         val nextIndex = out.nextMediaItemIndex
         if (nextIndex == C.INDEX_UNSET || nextIndex >= out.mediaItemCount) return armDeath("no-next-index")
+        val localBlend = plan?.takeIf { LocalBlendAdmission.MARKER in it.policyReasons }
+        if (localBlend != null && (!LocalBlendAdmission.isQualified(localBlend,
+                out.currentMediaItem?.let(analysisFor) ?: TrackAnalysis(), analysisFor(out.getMediaItemAt(nextIndex)),
+                out.currentMediaItem?.let { lyricSpans[it.mediaId]?.cues }.orEmpty().toList(),
+                lyricSpans[out.getMediaItemAt(nextIndex).mediaId]?.cues.orEmpty().toList()) ||
+                !localBlendFitsDeckSpeedCap(AppSettings.playbackSpeed.value.toDouble(), playbackRate) ||
+                abs(playbackRate - localBlend.incomingPlaybackRate) > 0.0001 || outgoingRate != 1.0 ||
+                abs(cueTimeMs / 1000.0 - localBlend.incomingCueTime) > 0.002 ||
+                abs(endMs / 1000.0 - localBlend.transitionEnd) > 0.002 ||
+                abs(fade / 1000.0 - localBlend.fadeSeconds) > 0.002)) return armDeath("local-blend-admission-lost")
         plannedNextId = out.getMediaItemAt(nextIndex).mediaId
         out.currentMediaItem?.let { ensureOpportunity(it.mediaId, requireNotNull(plannedNextId)) }
         // The last blend's stretch, if it is somehow still easing off: this
@@ -2833,7 +2929,9 @@ class CrossfadeController(
         fadeEndMs = endMs
         smartFadeActive = smart
         incomingCueTimeMs = cueTimeMs.coerceAtLeast(0L)
-        incomingPlaybackRate = com.music.bitchord.playback.smart.audibleTempoRate(playbackRate)
+        localBlendInFlight = localBlend != null
+        incomingPlaybackRate = if (localBlendInFlight) playbackRate
+            else com.music.bitchord.playback.smart.audibleTempoRate(playbackRate)
         outgoingPlaybackRate = com.music.bitchord.playback.smart.audibleTempoRate(outgoingRate)
         rampSteps = if (beatMs > 0L) rampStepsFor(outgoingRate) else 0
         rampStepMs = beatMs
@@ -2879,8 +2977,9 @@ class CrossfadeController(
         // Stacks on top of the listener's speed control rather than replacing
         // it, so a beatmatched transition and "play everything at 1.25x" don't
         // fight each other. Undone in [finish].
-        // djmix18: beatmatch rate clamped to [0.92f, 1.08f] via safeDeckSpeed.
-        into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate))
+        // Ordinary requests retain safeDeckSpeed; a locally admitted blend preserves
+        // its checked physical rate, set once while this incoming deck is silent.
+        into.setPlaybackSpeed(incomingBaseSpeed())
         buildupSpeed = into.playbackParameters.speed
         // Tempo only. The old pitch corrector turned a small transpose into a
         // time factor of about a thousand, which is the 999x runaway.
@@ -3035,6 +3134,10 @@ class CrossfadeController(
         val out = outgoing ?: return cancelArming("missing-outgoing-player")
         val into = incoming ?: return cancelArming("missing-incoming-player")
         if (!stillWorthFading()) return cancelArming("mix-disabled-or-no-next")
+        val armedPlan = planInFlight
+        if (armedPlan != null && LocalBlendAdmission.MARKER in armedPlan.policyReasons &&
+            !localBlendFitsDeckSpeedCap(AppSettings.playbackSpeed.value.toDouble(), incomingPlaybackRate)
+        ) return cancelArming("local-blend-listener-speed-cap")
         // Paused while armed: the transition is no longer imminent, and holding
         // a prepared decoder open against a stopped player is worse than arming
         // again when playback resumes.
@@ -3144,6 +3247,9 @@ class CrossfadeController(
     private fun startFade() {
         val out = outgoing ?: return cancelArming("missing-outgoing-at-fade")
         val into = incoming ?: return cancelArming("missing-incoming-at-fade")
+        if (localBlendInFlight &&
+            !localBlendFitsDeckSpeedCap(AppSettings.playbackSpeed.value.toDouble(), incomingPlaybackRate)
+        ) return cancelArming("local-blend-listener-speed-cap")
 
         armOutgoingPreFiltered = false
         into.volume = 0f
@@ -3227,8 +3333,12 @@ class CrossfadeController(
             softSpeedJob = null
             nudgeUntil = 0L
             lockCount = 0
-            // Beatmatched=false: listener speed only, never the mix stretch across the solo.
-            into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, 1.0, beatmatched = false))
+            // A locally admitted blend keeps its measured source mapping through
+            // the remaining overlap. finish() releases it once; a midpoint reset
+            // would invalidate that admission and de-sync the grids halfway through.
+            if (!localBlendInFlight) {
+                into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, 1.0, beatmatched = false))
+            }
             tracks.incomingTempo(1f)
         }
         // AutoPlay may have appended to the queue since the standby was loaded
@@ -3371,20 +3481,26 @@ class CrossfadeController(
         // 4% stretch finished the blend 4% early and left the incoming drop
         // landing after it rather than on its end.
         val wallSpan = if (render.advanced) span * mediaRatio.toFloat() else span.toFloat()
-        val incomingProgress = (elapsed / wallSpan).coerceIn(0f, 1f)
+        val incomingHeard = elapsed / wallSpan
+        val incomingProgress = incomingHeard.coerceIn(0f, 1f)
         // Duration/decoder timing can put the real file end ahead of the
         // analysed anchor. In that case the outgoing deck must still reach
         // zero before its final sample instead of remaining loud and appearing
         // to stop. Normally this is zero and incoming timing remains authority.
-        val outRemaining = out.duration.takeIf { it != C.TIME_UNSET && it > 0L }
-            ?.minus(out.currentPosition)
+        val outDuration = out.duration.takeIf { it != C.TIME_UNSET && it > 0L }
+        val outPosition = out.currentPosition
+        val outRemaining = outDuration?.minus(outPosition)
         // Measured from where the fade actually started, over the overlap we
         // still have. Using the planned span against a file that was already
         // about to end put progress near 1 on the first tick and cut A off.
-        val traveled = (out.currentPosition - fadeOutOriginMs).coerceAtLeast(0L)
+        val traveled = (outPosition - fadeOutOriginMs).coerceAtLeast(0L)
         val budget = fadeOutBudgetMs.coerceAtLeast(1L)
         val outgoingProgress = (traveled.toFloat() / budget.toFloat()).coerceIn(0f, 1f)
         val progress = maxOf(incomingProgress, outgoingProgress)
+        val echoTailEnd = render.echoAt + render.echoTailMs / wallSpan
+        val echoFileLeft = if (render.echo) outDuration?.minus(fadeOutOriginMs) else null
+        val echoBudget = minOf(budget, echoFileLeft ?: budget).coerceAtLeast(1L)
+        val echoHeard = if (render.echo) maxOf(incomingHeard, traveled.toFloat() / echoBudget) else progress
 
         // Before the handoff the session is still the outgoing player, so a
         // failure on the incoming one would otherwise go unheard: its position
@@ -3421,10 +3537,19 @@ class CrossfadeController(
         // ahead of that. So those are aimed at the blend as it will be when the
         // audio they touch is played, each side by its own lead.
         val incomingAt = ((elapsed + tracks.incomingLeadMs()) / wallSpan).coerceIn(0f, 1f)
-        val outgoingAt = (progress + tracks.outgoingLeadMs() / span.toFloat()).coerceIn(0f, 1f)
+        val outgoingAt = (echoHeard + tracks.outgoingLeadMs() / span.toFloat()).coerceIn(0f, 1f)
 
         val rise = mixRise(progress)
-        val fall = mixFall(progress)
+        val fall = if (render.echo) {
+            val fileEnd = echoFileLeft?.let { it.toDouble() / echoBudget } ?: Double.POSITIVE_INFINITY
+            val fadeEnd = minOf(maxOf(1.0, echoTailEnd), fileEnd.coerceAtLeast(1.0))
+            // The player fader carries both dry and wet. Keep it moving through
+            // the existing tail, ending at the decoder EOF if that arrives first.
+            if (echoHeard >= fadeEnd) 0f
+            else MixGain.fall(((echoHeard - render.echoAt) / (fadeEnd - render.echoAt)).toFloat()).coerceAtLeast(0f)
+        } else {
+            mixFall(progress)
+        }
         player.volume = rise
         out.volume = if (ranOn(out)) 0f else fall
         onBlendHeadroom(
@@ -3459,7 +3584,7 @@ class CrossfadeController(
         // An echo out rings past the end of the blend, carried by the outgoing
         // player's own silenced audio, so that player is kept until its tail
         // has been heard out.
-        val tailDone = !render.echo || elapsed / wallSpan >= render.echoAt + render.echoTailMs / wallSpan
+        val tailDone = !render.echo || incomingHeard >= echoTailEnd
         // vc77: progress is the max of the two sides, so it can reach 1 while
         // the incoming sink is still mid-blend and would strand its filter.
         // Unless the outgoing file is about to EOF (where waiting would cut
@@ -3471,8 +3596,7 @@ class CrossfadeController(
             (progress >= 1f && tailDone && (incomingReady || outAboutToEof))
         // vc77 hang bound: progress==1 blocked by incomingReady while the
         // incoming player sits in STATE_BUFFERING and the outgoing file is
-        // not near EOF. The outgoing fader is already 0 here, so the blend
-        // is inaudibly silent either way; after FADING_STALL_BAIL_MS of
+        // not near EOF. After FADING_STALL_BAIL_MS of
         // continuous buffering, force-bail through the existing
         // abnormal-exit path (survivor kept, its filters reopened only by
         // finish() once the retiree is silent — Seam A). A pause parks in
@@ -3581,6 +3705,7 @@ class CrossfadeController(
 
     private fun disarmTailLoopSession() {
         val s = tailLoopSession ?: return
+        captureLoopExitObservation(s)
         tailLoopSession = null
         s.outPort?.disarm()
         s.inPort?.disarm()
@@ -4153,10 +4278,14 @@ class CrossfadeController(
             if (current.outId == outId && current.inId == inId && current.scrubEpoch == scrubEpoch && !terminalRecorded) return current
         }
         // A pair changed without a measured terminal event: do not invent success.
+        countdownStabilizer.clearFailedNativeRecovery()
         opportunity = Opportunity("$opportunityRunId:${++opportunitySequence}", outId, inId, scrubEpoch)
         planRevision = 0
         revisionRoute = null
         executedRoute = null
+        initiatingExitReason = null
+        capturedTakeoverSpliceBufferStatus = null
+        capturedLoopTookOver = null
         nativeBinding = null
         terminalRecorded = false
         routingEvidenceKeys.clear()
@@ -4259,6 +4388,8 @@ class CrossfadeController(
     private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
         "technique" to "classic", "transitionStyle" to plan?.transitionStyle?.name,
         "filterVariant" to plan?.filterVariant?.name, "djEffect" to plan?.djEffect?.name,
+        "localBlendAdmission" to (plan?.policyReasons?.contains(LocalBlendAdmission.MARKER) == true),
+        "plannedIncomingRate" to plan?.incomingPlaybackRate,
     )
 
     private fun acceptRoute(plan: Any, fields: Map<String, Any?>) {
@@ -4598,6 +4729,12 @@ class CrossfadeController(
     ): String? {
         // Local contradictory evidence is authoritative even on an armed crown.
         if (LoopMix.vetoes(plan, out, inn, sungOut, sungIn)) return "sung veto"
+        if (plan.echoTail) {
+            plan.handoff?.let { handoff ->
+                com.music.bitchord.playback.smart.EchoAdmission.musicalRefusal(handoff, out, inn)
+                    ?.let { return it }
+            }
+        }
         if (isCrown(plan)) {
             val qualification = LoopMix.qualifyCrown(plan)
             if (!qualification.accepted) return qualification.refusal ?: "crown qualification refused"
@@ -5503,6 +5640,12 @@ class CrossfadeController(
         outPort: LoopMixPort,
         inPort: LoopMixPort,
     ) {
+        // This is a new native execution attempt. Clear attempt evidence here,
+        // never in begin(), which may be the classic fallback for the same
+        // opportunity after this attempt's cleanup.
+        initiatingExitReason = null
+        capturedTakeoverSpliceBufferStatus = null
+        capturedLoopTookOver = null
         val outItem = loopOutItem
         val inItem = loopInItem
         if (outItem != null && inItem != null) {
@@ -5871,6 +6014,7 @@ class CrossfadeController(
     /** The mix played out: the incoming player is the song, the outgoing one is retired. */
     private fun finishLoop() {
         val session = loopSession ?: return finish()
+        captureLoopExitObservation(session)
         val out = outgoing
         val into = incoming
         val wasIncomingStarted = loopIncomingStarted
@@ -5993,6 +6137,7 @@ class CrossfadeController(
         // disarm. Only when the renderer provably finished — genuine audible
         // audio still takes the guard below.
         outgoing?.volume = 0f
+        captureLoopExitObservation(session)
         session.outPort?.disarm()
         session.inPort?.disarm()
         loopSession = null
@@ -6035,9 +6180,11 @@ class CrossfadeController(
         deferDisarm: Boolean = false,
     ) {
         lastCompleteReason = reason
+        if (initiatingExitReason == null) initiatingExitReason = reason
         loopCleanupContendedSession = null
         loopCleanupContendedSinceNanos = 0L
         val session = loopSession
+        if (session != null) captureLoopExitObservation(session)
         // djmix15: loop BPMs live in the plan, not in the (blank) analyses.
         // Record them so finish() reports real tempos even after a
         // RetireGuard tail re-enters finish() post-null. No mute here:
@@ -6102,6 +6249,13 @@ class CrossfadeController(
         }
     }
 
+    /** Snapshot ticker-visible port evidence before its generation is disarmed. */
+    private fun captureLoopExitObservation(session: LoopMixSession) {
+        val port = session.outPort ?: return
+        capturedLoopTookOver = port.tookOver
+        capturedTakeoverSpliceBufferStatus = port.takeoverSpliceBufferStatus
+    }
+
     /** The loop mix isn't happening after all: the pair takes the planner's blend instead. */
     private fun loopFallBack(reason: String) {
         // djmix13: count every arm death so regressions are visible.
@@ -6142,7 +6296,10 @@ class CrossfadeController(
         try {
             loopBail(reason, settle = false)
         } finally {
-            routingFallback = previousFallback
+            // A retire guard can suspend this cleanup in TAIL. Keep its
+            // nonterminal classification through that tail's eventual
+            // mix.complete rather than reverting when loopBail returns.
+            if (phase != Phase.TAIL) routingFallback = previousFallback
         }
         // djmix26: immediately re-anchor & adopt/arm classic on the same tick
         // so the countdown & smartTransitionWindow never flash late or vanish.
@@ -6338,7 +6495,8 @@ class CrossfadeController(
             val outBpm = analysisFor(item).bpm
             val inBpm = next.let { analysisFor(it).bpm }
             val bridge = if (outBpm > 0 && inBpm > 0) "${outBpm.roundToInt()}→${inBpm.roundToInt()}" else ""
-            val rate = com.music.bitchord.playback.smart.audibleTempoRate(plan.incomingPlaybackRate)
+            val rate = if (LocalBlendAdmission.MARKER in plan.policyReasons) plan.incomingPlaybackRate
+                else com.music.bitchord.playback.smart.audibleTempoRate(plan.incomingPlaybackRate)
             val tempo = when {
                 plan.buildup -> "build"
                 bridge.isNotBlank() -> bridge
@@ -6422,6 +6580,7 @@ class CrossfadeController(
             TransitionStyle.BEATLESS_BRIDGE -> "bridge"
             TransitionStyle.EQUAL_POWER -> "crossfade"
             TransitionStyle.GAPLESS -> "gapless"
+            TransitionStyle.NATURAL -> "natural handoff"
             else -> "mix"
         }
     }
@@ -6571,6 +6730,7 @@ class CrossfadeController(
     private fun leavingOnBail(): ExoPlayer? = if (handedOff) outgoing else incoming
 
     private fun finish() {
+        (loopSession ?: tailLoopSession)?.let(::captureLoopExitObservation)
         // djmix14: capture the real completion values BEFORE clearing.
         // djmix15: loop mixes store BPMs in loopSession.plan, not
         // outgoingAnalysis/incomingAnalysis (which stay blank 0.0). Fall
@@ -6579,10 +6739,21 @@ class CrossfadeController(
         // loopBail() for exactly this capture.
         val endPhase = phase.name
         val completionContext = opportunity
-        val completionRevision = planRevision
         val completionRoute = executedRoute ?: mapOf("technique" to "unknown")
-        val completionGeneration = nativeBinding?.generation
+        val completionBinding = nativeBinding.takeUnless { completionRoute["technique"] == "classic" }
+        val completionRevision = completionBinding?.revision ?: planRevision
+        val completionGeneration = completionBinding?.generation
         val didHandoff = handedOff
+        val loopOutPort = loopSession?.outPort
+        val didTakeOver = loopOutPort?.tookOver ?: capturedLoopTookOver
+        val takeoverSpliceBufferStatus = if (loopOutPort != null) {
+            loopOutPort.takeoverSpliceBufferStatus
+        } else {
+            capturedTakeoverSpliceBufferStatus
+        }
+        val retiringPlayer = if (didHandoff) outgoing else incoming
+        val retiringPlayerPlayWhenReady = retiringPlayer?.playWhenReady
+        val retiringPlayerPlaybackState = retiringPlayer?.playbackState
         val loopPlan = loopSession?.plan
         val outBpm = RetireGuard.loopOutBpm(outgoingAnalysis.bpm, loopPlan?.out?.bpm ?: 0.0)
         val inBpm = RetireGuard.loopInBpm(incomingAnalysis.bpm, loopPlan?.inn?.bpm ?: 0.0)
@@ -6636,7 +6807,15 @@ class CrossfadeController(
                 }
                 AutomixTelemetry.event(
                     "mix.exit.guard",
-                    mapOf("site" to "finish", "phase" to phase.name, "gainDb" to RetireGuard.gainDb(vol)),
+                    opportunityFields(completionContext) + mapOf("planRevision" to completionRevision) +
+                        (executedRoute ?: mapOf("technique" to "unknown")) + mapOf(
+                            "site" to "finish", "phase" to phase.name, "gainDb" to RetireGuard.gainDb(vol),
+                            "initiatingExitReason" to initiatingExitReason,
+                            "takeoverSpliceBufferDelegateStatus" to takeoverSpliceBufferStatus?.name,
+                            "handedOff" to didHandoff, "tookOver" to didTakeOver,
+                            "retiringPlayerPlayWhenReady" to retiringPlayerPlayWhenReady,
+                            "retiringPlayerPlaybackState" to retiringPlayerPlaybackState,
+                        ),
                 )
                 beginTailOrFinish(spare!!, "emergency-retire-guard", "finish:" + phase.name)
                 return
@@ -6660,6 +6839,11 @@ class CrossfadeController(
             "phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm,
             "tailMs" to tailMs, "reason" to completeReason,
             "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs,
+            "initiatingExitReason" to initiatingExitReason,
+            "takeoverSpliceBufferDelegateStatus" to takeoverSpliceBufferStatus?.name,
+            "handedOff" to didHandoff, "tookOver" to didTakeOver,
+            "retiringPlayerPlayWhenReady" to retiringPlayerPlayWhenReady,
+            "retiringPlayerPlaybackState" to retiringPlayerPlaybackState,
         )
         if (phase != Phase.IDLE) {
             Log.d(TAG, "finish from $phase")
@@ -6774,10 +6958,20 @@ class CrossfadeController(
         rampSteps = 0
         outgoingAnalysis = TrackAnalysis()
         incomingAnalysis = TrackAnalysis()
+        localBlendInFlight = false
         phase = Phase.IDLE
         if (wasTransitioning) {
             mixEvent("mix.complete", completionFields, completionContext)
-            if (isTerminal) opportunity = null
+            if (isTerminal) {
+                opportunity = null
+                initiatingExitReason = null
+            }
+            capturedTakeoverSpliceBufferStatus = null
+            capturedLoopTookOver = null
+            if (routingFallback) {
+                nativeBinding = null
+                routingFallback = false
+            }
             handoverExpectedMs = 0L
             handoverHeardMs = -1L
             handoverTargetMs = 0L
@@ -6974,7 +7168,7 @@ class CrossfadeController(
             // GAPLESS is an album being played through, where any filtering would
             // be an edit the record didn't ask for — so it stays open whatever
             // the material does.
-            TransitionStyle.GAPLESS -> filters.open()
+            TransitionStyle.GAPLESS, TransitionStyle.NATURAL -> filters.open()
             // EQUAL_POWER used to be defined the same way: the bottom tier,
             // reached because the evidence was too weak to justify anything more
             // opinionated, therefore don't touch the spectrum.
@@ -7385,7 +7579,7 @@ class CrossfadeController(
      * 0:00, fading equal-power — which is indistinguishable from what the app
      * did before Automix existed and would be a lie to advertise.
      */
-    private fun isRealMix(): Boolean = smartFadeActive && (
+    private fun isRealMix(): Boolean = smartFadeActive && render.style != TransitionStyle.NATURAL && (
         render.style == TransitionStyle.DJ_BLEND ||
             render.style == TransitionStyle.DJ_FILTER ||
             incomingCueTimeMs > 0L ||
@@ -7441,17 +7635,6 @@ class CrossfadeController(
             return TransitionAlternatives.declineOutGainAt(progress.toDouble()).toFloat()
         }
         if (!render.advanced) return fallGain(progress)
-        // djmix25 R3: the fader used to stay at 1.0 for the whole echo-out
-        // (dry faded in the chain, master volume never falling, gain=1.0
-        // telemetry). It now holds 1f until the echo beat, then cos-falls
-        // over the echo tail window, so out.volume eases 1 -> 0.
-        if (render.echo) {
-            val at = render.echoAt.toFloat().coerceIn(0f, 1f)
-            if (progress <= at) return 1f
-            val span = (1f - at).coerceAtLeast(1e-4f)
-            val w = ((progress - at) / span).coerceIn(0f, 1f)
-            return MixGain.fall(w)
-        }
         val styled = when (render.style) {
             TransitionStyle.DJ_BLEND -> {
                 if (!render.bassSwap) {
@@ -7547,7 +7730,10 @@ class CrossfadeController(
         nudgeUntil = now + (abs(median) / (base * abs(factor - 1f)) * 1000).roundToLong().coerceIn(1L, MAX_NUDGE_MS)
     }
 
-    private fun incomingBaseSpeed(): Float = deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate)
+    private fun incomingBaseSpeed(): Float {
+        if (!localBlendInFlight) return deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate)
+        return deckSpeedForAdmittedBlend(AppSettings.playbackSpeed.value, incomingPlaybackRate)
+    }
 
     /**
      * The buildup. Speed and pitch rise together by [BUILDUP_RISE] across the
@@ -7557,7 +7743,7 @@ class CrossfadeController(
      */
     private fun rideBuildup(progress: Float) {
         val into = incoming ?: return
-        if (!render.buildup || handedOff) return
+        if (!render.buildup || handedOff || localBlendInFlight) return
         val lift = BUILDUP_RISE * progress.toDouble() * progress.toDouble()
         // djmix18: clamp the beatmatch rate to [0.92f, 1.08f] before the buildup lift so the
         // tempo lift can never push a deck past the hard ceiling. deckPlayedRate re-clamps

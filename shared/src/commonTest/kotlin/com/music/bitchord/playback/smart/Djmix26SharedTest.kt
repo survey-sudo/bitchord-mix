@@ -51,6 +51,15 @@ class Djmix26SharedTest {
         )
     }
 
+    /** This fixture explicitly measures a quiet/instrumental vocal mask end to end. */
+    private fun fullyMeasuredQuiet(analysis: TrackAnalysis): TrackAnalysis = analysis.copy(
+        vocalWindows = listOf(CurveWindow(
+            startTime = 0.0,
+            frameRate = 20.0,
+            values = FloatArray((analysis.duration * 20.0).toInt()) { 0.02f },
+        )),
+    )
+
     private fun phraseChoice(template: MixTemplate, releaseSec: Double): PhraseChoice {
         val exit = ExitCue(
             kind = ExitKind.OUTRO_PHRASE,
@@ -425,8 +434,10 @@ class Djmix26SharedTest {
 
     @Test
     fun echoPlanProducesDownbeatCutWithPreChargedHoldAndNativeIncoming() {
-        val out = analysis("out-100", 100.0, duration = 200.0).copy(key = "C major", keyConfidence = 0.9)
-        val inn = analysis("in-130", 130.0, duration = 200.0).copy(key = "Eb major", keyConfidence = 0.9, audibleStartTime = 0.1)
+        val out = analysis("out-100", 100.0, duration = 200.0).copy(key = "C major", keyConfidence = 0.9,
+            vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(4000) { if (it / 20.0 < 190.0) 0.8f else 0f }))).withMeasuredEchoEvidence()
+        val inn = analysis("in-130", 130.0, duration = 200.0).copy(key = "Eb major", keyConfidence = 0.9,
+            audibleStartTime = 0.1, vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(4000) { 0.8f }))).withMeasuredEchoEvidence()
         assertTrue(shouldDeclineToMix(out, inn))
         val plan = LoopMix.bridge(out, out.duration, inn, inn.duration, earliestOutSec = 150.0)
         assertNotNull(plan)
@@ -436,8 +447,11 @@ class Djmix26SharedTest {
         assertFalse(plan.buildupRoll)
         assertTrue(plan.nativeIncoming)
         assertEquals(plan.out.beatSec * 4.0, plan.incomingHoldSec, 1e-6)
-        assertTrue(out.downbeats.any { abs(it - plan.out.loopStart) < 1e-6 })
-        assertEquals(inn.downbeats.first(), plan.inn.loopStart, 1e-6)
+        val h = assertNotNull(plan.handoff)
+        assertTrue(out.downbeats.any { abs(it - h.outDryEnd.sourceSec) < 1e-6 })
+        assertEquals(0.1, plan.inn.loopStart, 1e-6)
+        assertEquals(h.inAudibleStart.mixSec, h.inFullLevelMixSec, 1e-9)
+        assertEquals(HandoffStatus.QUALIFIED, qualifyMusicalHandoff(h, out, inn, null, null).status)
     }
 
     @Test
@@ -458,6 +472,7 @@ class Djmix26SharedTest {
             duration = 200.0,
             mode = CrossfadeMode.SMART,
             advanced = true,
+            allowRecoveryCrossfade = true, // last-resort failed-native recovery, never the default choice
         )
         assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
         assertTrue(plan.fadeSeconds in 3.5..4.5, "sculpted fallback must be 3.5..4.5s, got ${plan.fadeSeconds}")
@@ -475,12 +490,15 @@ class Djmix26SharedTest {
 
     @Test
     fun keyClashBeatmatchedPairRoutesToFiltered4To8BarBassSwapBlend() {
-        val out = analysis("out-124", 124.0, duration = 200.0).copy(
+        val rawOut = analysis("out-124", 124.0, duration = 200.0).copy(
             key = "C major", keyConfidence = 0.9, vocalProbability = 0.2,
         )
-        val inn = analysis("in-126", 126.0, duration = 200.0).copy(
+        // Keep the synthetic content-end cue on its own measured four-bar
+        // grid boundary; an off-phrase endpoint must not be rescued by policy.
+        val out = fullyMeasuredQuiet(rawOut).copy(contentEndTime = rawOut.downbeats[100])
+        val inn = fullyMeasuredQuiet(analysis("in-126", 126.0, duration = 200.0).copy(
             key = "F# major", keyConfidence = 0.9, vocalProbability = 0.2,
-        )
+        ))
         assertFalse(shouldDeclineToMix(out, inn))
         val steps = regionalCamelotSteps(out, inn)
         assertNotNull(steps)
@@ -501,7 +519,8 @@ class Djmix26SharedTest {
         // 2. PhrasePlanner + TransitionMoves
         val outMap = SongMaps.fromAnalysis("out-124", out)
         val inMap = SongMaps.fromAnalysis("in-126", inn)
-        val choice = PhrasePlanner.select(outMap, inMap, steps, 124.0, 126.0)
+        val choice = PhrasePlanner.select(outMap, inMap, steps, 124.0, 126.0,
+            outAnalysis = out, inAnalysis = inn)
         assertNotNull(choice)
         assertTrue(choice!!.overlapBars in 4..8, "key-clash phrase overlap must be 4-8 bars, got ${choice.overlapBars}")
         val script = TransitionMoves.compile(choice, 124.0, 126.0, outgoingId = "out-124", incomingId = "in-126")
@@ -763,6 +782,7 @@ class Djmix26SharedTest {
             currentTrack = TransitionTrackInfo(out.trackId, 200_000L),
             nextTrack = TransitionTrackInfo(inn.trackId, 200_000L),
             currentTime = 10.0, duration = 200.0, mode = CrossfadeMode.SMART,
+            allowRecoveryCrossfade = true, // bounded recovery still honors its four-second cap
         )
         assertEquals(TransitionStyle.DJ_FILTER, p.transitionStyle, "reason=${p.reason}")
         assertTrue(p.fadeSeconds in 3.5..4.5, "fade=${p.fadeSeconds}")

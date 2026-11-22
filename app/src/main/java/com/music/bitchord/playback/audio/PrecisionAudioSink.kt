@@ -166,6 +166,10 @@ class PrecisionAudioSink(
     /** Incoming: a block has been processed since it was armed. */
     private var loopInStarted = false
 
+    /** Whether outputByteBuffer is the still-pending takeover splice buffer. */
+    private var pendingTakeoverSpliceBuffer = false
+    private var pendingTakeoverSpliceGeneration = -1
+
     /** End of the previous incoming block, for the gap counter. Unset after a flush. */
     private var lastIncomingEndUs = C.TIME_UNSET
 
@@ -347,7 +351,7 @@ class PrecisionAudioSink(
 
         // 1. Drain pending output from previous cycle if delegate had backpressure
         if (outputByteBuffer.hasRemaining()) {
-            val consumed = delegate.handleBuffer(
+            val consumed = handleOutputBuffer(
                 outputByteBuffer,
                 pendingPresentationTimeUs,
                 pendingAccessUnitCount,
@@ -465,9 +469,11 @@ class PrecisionAudioSink(
                 loopGenerating = true
                 loopNextUs = blockTimeUs + Util.sampleCountToDurationUs(decodedFrames.toLong(), configuredSampleRate)
                 loop.tookOver = true
+                pendingTakeoverSpliceBuffer = true
+                pendingTakeoverSpliceGeneration = loopGeneration
             }
 
-            val consumed = delegate.handleBuffer(
+            val consumed = handleOutputBuffer(
                 outputByteBuffer,
                 pendingPresentationTimeUs,
                 blockAccessUnits,
@@ -494,6 +500,52 @@ class PrecisionAudioSink(
             return presentationTimeUs
         }
         return presentationTimeUs + Util.sampleCountToDurationUs(frames, configuredSampleRate)
+    }
+
+    /** Tracks only the exact splice buffer; full consumption is not presentation or audibility. */
+    private fun handleOutputBuffer(
+        buffer: ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        val isTakeoverSplice = pendingTakeoverSpliceBuffer && buffer === outputByteBuffer
+        if (isTakeoverSplice) {
+            loop.publishTakeoverSpliceBufferStatus(
+                pendingTakeoverSpliceGeneration,
+                LoopMixPort.TakeoverSpliceBufferStatus.OFFERED_TO_DELEGATE,
+            )
+        }
+        val accepted = try {
+            delegate.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        } catch (failure: Throwable) {
+            if (isTakeoverSplice) {
+                loop.publishTakeoverSpliceBufferStatus(
+                    pendingTakeoverSpliceGeneration,
+                    LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED,
+                )
+                // The delegate may have drained before throwing. Do not let
+                // reuse of this ByteBuffer upgrade that unresolved observation.
+                if (!buffer.hasRemaining()) {
+                    pendingTakeoverSpliceBuffer = false
+                    pendingTakeoverSpliceGeneration = -1
+                }
+            }
+            throw failure
+        }
+        if (isTakeoverSplice) {
+            val remains = buffer.hasRemaining()
+            val status = if (accepted && !remains) {
+                LoopMixPort.TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED
+            } else {
+                LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED
+            }
+            loop.publishTakeoverSpliceBufferStatus(pendingTakeoverSpliceGeneration, status)
+            if (!remains) {
+                pendingTakeoverSpliceBuffer = false
+                pendingTakeoverSpliceGeneration = -1
+            }
+        }
+        return accepted
     }
 
     /**
@@ -551,6 +603,8 @@ class PrecisionAudioSink(
         loopGenerating = false
         loopRendering = false
         loopInStarted = false
+        pendingTakeoverSpliceBuffer = false
+        pendingTakeoverSpliceGeneration = -1
         lastIncomingEndUs = C.TIME_UNSET
         port.tookOver = false
         port.interrupted = false
@@ -607,7 +661,7 @@ class PrecisionAudioSink(
      */
     private fun generateLoop(arm: LoopMixPort.OutArm, outEncoding: PcmEncoding): Boolean {
         if (outputByteBuffer.hasRemaining()) {
-            val consumed = delegate.handleBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
+            val consumed = handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
             if (!consumed || outputByteBuffer.hasRemaining()) return false
         }
         repeat(MAX_GENERATED_BLOCKS) {
@@ -631,7 +685,7 @@ class PrecisionAudioSink(
             processedEndUs = loopNextUs
             pendingPresentationTimeUs = if (blockUs != C.TIME_UNSET) blockUs + delegateOffsetUs else blockUs
             pendingAccessUnitCount = 0
-            val consumed = delegate.handleBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
+            val consumed = handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
             if (!consumed || outputByteBuffer.hasRemaining()) return false
         }
         return false
@@ -672,7 +726,7 @@ class PrecisionAudioSink(
     /** [frames] of silence, timed as the next frames on the delegate's clock. */
     private fun writeSilence(frames: Int, trackBlockUs: Long, outEncoding: PcmEncoding): Boolean {
         if (outputByteBuffer.hasRemaining()) {
-            val consumed = delegate.handleBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
+            val consumed = handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
             if (!consumed || outputByteBuffer.hasRemaining()) return false
         }
         audioBlock.reset(frames)
@@ -685,7 +739,7 @@ class PrecisionAudioSink(
         pendingPresentationTimeUs = blockUs
         pendingAccessUnitCount = 0
         // Accepted or not, the frames are the delegate's now (a partial write drains next call).
-        delegate.handleBuffer(outputByteBuffer, blockUs, 0)
+        handleOutputBuffer(outputByteBuffer, blockUs, 0)
         return true
     }
 
@@ -766,6 +820,14 @@ class PrecisionAudioSink(
      */
     private fun loopInterrupted() {
         val port = loop
+        if (pendingTakeoverSpliceBuffer) {
+            port.publishTakeoverSpliceBufferStatus(
+                pendingTakeoverSpliceGeneration,
+                LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED,
+            )
+            pendingTakeoverSpliceBuffer = false
+            pendingTakeoverSpliceGeneration = -1
+        }
         port.invalidatePosition()
         if ((port.outArm != null && loopRendering) || (port.inArm != null && loopInStarted)) {
             port.interrupted = true
@@ -782,7 +844,7 @@ class PrecisionAudioSink(
 
     override fun playToEndOfStream() {
         if (isPrecisionActive && outputByteBuffer.hasRemaining()) {
-            delegate.handleBuffer(outputByteBuffer, pendingPresentationTimeUs, pendingAccessUnitCount)
+            handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, pendingAccessUnitCount)
         }
         delegate.playToEndOfStream()
     }

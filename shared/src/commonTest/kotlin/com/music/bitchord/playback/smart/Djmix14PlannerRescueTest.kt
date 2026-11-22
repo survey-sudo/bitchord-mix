@@ -58,6 +58,9 @@ class Djmix14PlannerRescueTest {
             keyConfidence = 0.8,
             contentEndTime = 175.0,
             energyCurve = listOf(EnergySample(0.0, 0.5), EnergySample(175.0, 0.4)),
+            // This synthetic full fixture is measured instrumental material;
+            // grids and FULL quality alone do not certify vocal coverage.
+            vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(3_602) { 0.02f })),
             quality = TrackAnalysis.QUALITY_FULL,
         )
     }
@@ -85,19 +88,21 @@ class Djmix14PlannerRescueTest {
         assertTrue(late.transitionStyle == TransitionStyle.DJ_BLEND || late.transitionStyle == TransitionStyle.DJ_FILTER, "style=${late.transitionStyle}")
     }
 
-    @Test fun musicalFallbackNeverEmptyHanded() {
+    @Test fun measuredMusicalFallbackPreservesUsableCandidate() {
         // Close tempos (<=8%): beat blend (M1). Far tempos (>8%): echo (M6).
-        // Usable grids guarantee a non-null rescue even under veto pressure.
+        // Complete quiet local evidence makes these positive controls eligible.
         val outClose = SongMaps.fromAnalysis("out", fullAnalysis(100.0, "out"))
         val inClose = SongMaps.fromAnalysis("inn", fullAnalysis(104.0, "inn"))
         assertNotNull(outClose)
         assertNotNull(inClose)
-        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0)
+        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0,
+            outAnalysis = fullAnalysis(100.0, "out"), inAnalysis = fullAnalysis(104.0, "inn"))
         assertNotNull(closeChoice, "close pair must choose (strict or rescue)")
         // Far tempos: 100 vs 140 (40% folded delta).
         val outFar = SongMaps.fromAnalysis("out2", fullAnalysis(100.0, "out2"))
         val inFar = SongMaps.fromAnalysis("inn2", fullAnalysis(140.0, "inn2"))
-        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0)
+        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0,
+            outAnalysis = fullAnalysis(100.0, "out2"), inAnalysis = fullAnalysis(140.0, "inn2"))
         assertNotNull(farChoice, "far pair must choose, never null")
         // Far must favour echo over a tempo lurch; assert template is a
         // short/echo family, never a long blend.
@@ -105,6 +110,19 @@ class Djmix14PlannerRescueTest {
         // Close must not be a forced echo when strict would blend; either
         // M1 (blend) via strict or rescue, never an echo-only signal.
         assertTrue(closeChoice.template == MixTemplate.M1 || closeChoice.template == MixTemplate.M6 || closeChoice.template == MixTemplate.RELAXED, "close=${closeChoice.template}")
+    }
+
+    @Test fun usableGridsCannotForceSMinForAnUnmeasuredEchoRescue() {
+        val outAnalysis = fullAnalysis(100.0, "out").copy(vocalWindows = emptyList())
+        val inAnalysis = fullAnalysis(140.0, "inn").copy(vocalWindows = emptyList())
+        val out = assertNotNull(SongMaps.fromAnalysis("out", outAnalysis))
+        val inn = assertNotNull(SongMaps.fromAnalysis("inn", inAnalysis))
+        assertNull(PhrasePlanner.musicalRescue(out, inn, 0, 100.0, 140.0,
+            CuePoints.exits(out), CuePoints.entries(inn), outAnalysis, inAnalysis))
+        val selected = PhrasePlanner.select(out, inn, 0, 100.0, 140.0,
+            outAnalysis = outAnalysis, inAnalysis = inAnalysis)
+        assertTrue(selected == null || selected.template != MixTemplate.M6,
+            "Unmeasured M6 must be rejected during selection, before native preparation")
     }
 
     @Test fun cueErrorMsMillisecondMath() {
@@ -125,14 +143,16 @@ class Djmix14PlannerRescueTest {
         val outClose = SongMaps.fromAnalysis("out", fullAnalysis(100.0, "out"))
         val inClose = SongMaps.fromAnalysis("inn", fullAnalysis(104.0, "inn"))
         assertNotNull(outClose); assertNotNull(inClose)
-        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0)
+        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0,
+            outAnalysis = fullAnalysis(100.0, "out"), inAnalysis = fullAnalysis(104.0, "inn"))
         assertNotNull(closeChoice)
         // Manually exercise both rescue templates (M1/M6) through compile so
         // the lane contract is checked even when strict wins the close pair.
         val outFar = SongMaps.fromAnalysis("out2", fullAnalysis(100.0, "out2"))
         val inFar = SongMaps.fromAnalysis("inn2", fullAnalysis(140.0, "inn2"))
         assertNotNull(outFar); assertNotNull(inFar)
-        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0)
+        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0,
+            outAnalysis = fullAnalysis(100.0, "out2"), inAnalysis = fullAnalysis(140.0, "inn2"))
         assertNotNull(farChoice)
         for (choice in listOf(closeChoice, farChoice)) {
             val script = TransitionMoves.compile(choice, 100.0, if (choice === farChoice) 140.0 else 104.0)

@@ -39,7 +39,9 @@ class PhraseScript(
     val flanger: Boolean,
     val bTrimDb: Float,
     val phaseMs: Double,
-)
+) {
+    val handoff: MusicalHandoff? get() = plan.handoff
+}
 
 /**
  * Compiles a [PhraseChoice] into a plan and the lanes of its score sheet.
@@ -170,6 +172,7 @@ object TransitionMoves {
             val mergedFlanger = wantFlanger || legacy.flanger
             return sheet(choice, legacy, mergedFlanger, holdSec = 0.0, echoDelaySec = 0.0, echoFeedback = 0f)
         }
+        if (choice.template == MixTemplate.M6) return compileEcho(choice, outBpm, inBpm)
         val outBeat = if (outBpm > 1.0) 60.0 / outBpm else 0.5
         val inBeat = if (inBpm > 1.0) 60.0 / inBpm else outBeat
         val bar = outBeat * 4.0
@@ -305,7 +308,36 @@ object TransitionMoves {
     /** Beats from t0 to the landing, for a compiled plan: the ramp, then the overlap. */
     fun landingBeat(script: PhraseScript): Double {
         val plan = script.plan
+        script.handoff?.let { return it.inLanding.mixSec / plan.out.beatSec }
         return (plan.rampBars + plan.exitBars).coerceAtLeast(1) * 4.0
+    }
+
+    /** Reserve the real landing and wet retirement before the normal handback. */
+    internal fun echoReservationBars(handoff: MusicalHandoff, outBeat: Double): Int =
+        kotlin.math.ceil((maxOf(handoff.inLanding.mixSec, handoff.wetRetireMixSec) - 1e-9) /
+            (4.0 * outBeat)).toInt().coerceAtLeast(1)
+
+    private fun compileEcho(choice: PhraseChoice, outBpm: Double, inBpm: Double): PhraseScript {
+        val h = requireNotNull(choice.handoff) { "M6 requires a handoff selected on both source grids" }
+        val outBeat = 60.0 / outBpm
+        val inBeat = 60.0 / inBpm
+        val total = echoReservationBars(h, outBeat)
+        require((total + LoopMix.SETTLE_BARS) * 4 * outBeat <= PhraseConfig.O_MAX_SEC + 1e-6) {
+            "M6 landing and handback exceed the execution budget"
+        }
+        val plan = LoopMix.Plan(
+            out = LoopMix.Pick(h.outCaptureStart.sourceSec - h.outCaptureStart.mixSec,
+                h.outCaptureStart.sourceSec - h.outCaptureStart.mixSec, 4, outBeat, outBpm, 0.0, LoopMix.Check.MASK),
+            inn = LoopMix.Pick(h.inCueSourceSec, h.inCueSourceSec, 4, inBeat, inBpm, 0.0, LoopMix.Check.MASK),
+            fold = 1.0, enterBars = 0, rampBars = 0, exitBars = total, totalBars = total,
+            outLoops = false, inLoops = false, nativeIncoming = true, echoTail = true,
+            rung = choice.rung, targetBpmOverride = outBpm,
+            incomingHoldSec = h.inHoldMixSec, exitTailSeconds = PhraseConfig.exitTailSeconds(outBeat),
+            handoff = h,
+        )
+        val delay = PhraseConfig.echoDelayBeats(outBpm, rolling = false).second * outBeat
+        return sheet(choice, plan, false, h.inHoldMixSec, delay,
+            PhraseConfig.echoFeedbackFor(choice.template.name, h.outDryEnd.mixSec))
     }
 
     private fun sheet(
@@ -353,9 +385,18 @@ object TransitionMoves {
                 outHp = lane(0.0, 150f, 2.0, 300f, 4.0, 400f, exponential = true),
                 echoSend = lane(0.0, 0f),
             )
-            MixTemplate.M6 -> lanes(
-                outGain = lane(-4.0, 0f, -1.0, 0f, 0.0, mute, shape = "ep"),
-                inGain = lane(-choice.entry.pickupBeats.toDouble(), 0f, 0.0, 0f),
+            MixTemplate.M6 -> {
+                val h = requireNotNull(plan.handoff)
+                // Only M6 uses its explicit landing. Other templates keep their
+                // original lane origin. At unity, seconds map linearly to beats.
+                fun beat(mixSec: Double) = (mixSec - h.inLanding.mixSec) / plan.out.beatSec
+                val activation = beat(h.inHoldMixSec)
+                lanes(
+                outGain = lane(beat(0.0), 0f, beat(h.outDryFallStart.mixSec), 0f,
+                    beat(h.outDryEnd.mixSec), mute, shape = "ep"),
+                // Native envelopes hold their first value before the first knot.
+                // Keep a real silent prefix, then open fully at the protected cue.
+                inGain = lane(beat(0.0), mute, activation - 1e-6, mute, activation, 0f),
                 outLow = lane(0.0, 0f),
                 inLow = lane(0.0, 0f),
                 outMid = lane(0.0, 0f),
@@ -363,8 +404,12 @@ object TransitionMoves {
                 outHigh = lane(0.0, 0f),
                 inHigh = lane(0.0, 0f),
                 outHp = lane(0.0, 20f),
-                echoSend = lane(-4.0, 0f, -3.5, 0f, -2.0, PhraseConfig.ECHO_SEND_PEAK, 0.0, PhraseConfig.ECHO_SEND_PEAK, 0.25, 0f, shape = "cos"),
-            )
+                echoSend = lane(beat(h.outCaptureStart.mixSec), 0f,
+                    beat((h.outCaptureStart.mixSec + h.outDryFallStart.mixSec) * 0.5), PhraseConfig.ECHO_SEND_PEAK,
+                    beat(h.outSendClose.mixSec) - 1e-6, PhraseConfig.ECHO_SEND_PEAK,
+                    beat(h.outSendClose.mixSec), 0f, shape = "cos"),
+                )
+            }
             MixTemplate.M10, MixTemplate.CUT_ON_ONE -> lanes(
                 outGain = lane(-4.0, 0f, -1.0, 0f, 0.0, mute, shape = "ep"),
                 inGain = lane(-1.0, mute, 0.0, 0f, shape = "ep"),
@@ -558,7 +603,8 @@ object TransitionMoves {
     ): String {
         val c = script.choice
         val barB = if (bpmB > 1.0) 4.0 * 60.0 / bpmB else 0.0
-        val landingB = c.entry.startSec + (c.entry.landingBar - c.entry.startBar) * barB
+        val landingB = script.handoff?.inLanding?.sourceSec
+            ?: (c.entry.startSec + (c.entry.landingBar - c.entry.startBar) * barB)
         return buildString {
             append("{\"template\":\"${c.template.name}\",\"rung\":\"${c.rung}\"")
             append(",\"score\":${fmt(c.score)}")

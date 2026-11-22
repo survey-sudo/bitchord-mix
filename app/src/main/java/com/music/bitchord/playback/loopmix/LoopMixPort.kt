@@ -27,6 +27,17 @@ import java.util.concurrent.atomic.AtomicLong
  */
 class LoopMixPort {
 
+    /**
+     * Delegate-side state for the one output buffer that crosses the outgoing
+     * song into the renderer. This says nothing about AudioTrack presentation
+     * or audibility.
+     */
+    enum class TakeoverSpliceBufferStatus {
+        OFFERED_TO_DELEGATE,
+        DELEGATE_FULLY_CONSUMED,
+        UNRESOLVED,
+    }
+
     class OutArm(
         val renderer: LoopMixRenderer,
         /** Track microseconds of the loop start: mix frame 0. */
@@ -51,10 +62,27 @@ class LoopMixPort {
     @Volatile var generation: Int = 0
         private set
 
+    /** Generation-tagged so a late audio-thread observation cannot revive an old arm. */
+    private val takeoverSpliceBufferState = AtomicLong()
+
+    /** Null until this generation's takeover splice buffer has been observed. */
+    val takeoverSpliceBufferStatus: TakeoverSpliceBufferStatus?
+        get() {
+            val state = takeoverSpliceBufferState.get()
+            if ((state ushr 32).toInt() != generation) return null
+            return when (state.toInt()) {
+                STATUS_OFFERED -> TakeoverSpliceBufferStatus.OFFERED_TO_DELEGATE
+                STATUS_CONSUMED -> TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED
+                STATUS_UNRESOLVED -> TakeoverSpliceBufferStatus.UNRESOLVED
+                else -> null
+            }
+        }
+
     fun armOutgoing(arm: OutArm) {
         inArm = null
         outArm = arm
         generation++
+        resetTakeoverSpliceBufferStatus()
         invalidatePosition()
     }
 
@@ -63,6 +91,7 @@ class LoopMixPort {
         inArm = arm
         pendingShift.set(0)
         generation++
+        resetTakeoverSpliceBufferStatus()
         invalidatePosition()
     }
 
@@ -71,7 +100,26 @@ class LoopMixPort {
         inArm = null
         pendingShift.set(0)
         generation++
+        resetTakeoverSpliceBufferStatus()
         invalidatePosition()
+    }
+
+    /** Audio-thread publication; lock-free and ignored once its arm is stale. */
+    fun publishTakeoverSpliceBufferStatus(
+        armGeneration: Int,
+        status: TakeoverSpliceBufferStatus,
+    ) {
+        if (generation != armGeneration) return
+        val encoded = encodeTakeoverSpliceBufferStatus(armGeneration, status)
+        while (true) {
+            val current = takeoverSpliceBufferState.get()
+            if ((current ushr 32).toInt() != armGeneration || generation != armGeneration) return
+            if (takeoverSpliceBufferState.compareAndSet(current, encoded)) return
+        }
+    }
+
+    private fun resetTakeoverSpliceBufferStatus() {
+        takeoverSpliceBufferState.set(encodeTakeoverSpliceBufferStatus(generation, null))
     }
 
     // ---- What the sink publishes ---------------------------------------------------------
@@ -218,6 +266,23 @@ class LoopMixPort {
     }
 
     companion object {
+        private const val STATUS_OFFERED = 1
+        private const val STATUS_CONSUMED = 2
+        private const val STATUS_UNRESOLVED = 3
+
+        private fun encodeTakeoverSpliceBufferStatus(
+            generation: Int,
+            status: TakeoverSpliceBufferStatus?,
+        ): Long {
+            val code = when (status) {
+                TakeoverSpliceBufferStatus.OFFERED_TO_DELEGATE -> STATUS_OFFERED
+                TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED -> STATUS_CONSUMED
+                TakeoverSpliceBufferStatus.UNRESOLVED -> STATUS_UNRESOLVED
+                null -> 0
+            }
+            return (generation.toLong() shl 32) or (code.toLong() and 0xffff_ffffL)
+        }
+
         // Media3's documented ~280 ms polling interval plus 120 ms scheduling
         // margin. Still rejects stalled observations instead of advancing forever.
         const val POSITION_FRESHNESS_NANOS = 400_000_000L

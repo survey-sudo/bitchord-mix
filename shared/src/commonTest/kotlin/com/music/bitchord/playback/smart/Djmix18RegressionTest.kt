@@ -59,6 +59,8 @@ class Djmix18RegressionTest {
         overlapBars: Int = 8,
         prepBars: Int = 0,
         releaseSec: Double = 170.0,
+        outBpm: Double = 120.0,
+        inBpm: Double = 120.0,
     ) = PhraseChoice(
         template = template,
         rung = PhrasePlanner.rungOf(template),
@@ -87,6 +89,14 @@ class Djmix18RegressionTest {
         keyScore = 0.9,
         tempoScore = 0.9,
         cost = 0.0,
+        // Explicit unity-rate fixture: B's full cue starts at A's dry seam.
+        handoff = if (template == MixTemplate.M6) requireNotNull(nativeTiming(
+            releaseSec - 240.0 / outBpm, releaseSec - 240.0 / outBpm,
+            releaseSec - 0.75 * 60.0 / outBpm, releaseSec,
+            0.0, 0.0, overlapBars * 240.0 / inBpm,
+            240.0 / outBpm + overlapBars * 240.0 / inBpm, 0.0,
+            8 * 60.0 / outBpm + PhraseConfig.exitTailSeconds(60.0 / outBpm) + 0.05,
+        )) else null,
     )
 
     private fun evalLane(lane: Lane, beat: Double): Float {
@@ -106,12 +116,12 @@ class Djmix18RegressionTest {
     @Test
     fun nonBeatmatchedTemplatesKeepNaturalOutgoingTempoAndM1FoldsTwoToOne() {
         for (template in listOf(MixTemplate.M6, MixTemplate.M10, MixTemplate.CUT_ON_ONE)) {
-            val s1 = TransitionMoves.compile(choiceFor(template, overlapBars = 0), outBpm = 104.5, inBpm = 66.5)
+            val s1 = TransitionMoves.compile(choiceFor(template, overlapBars = 0, outBpm = 104.5, inBpm = 66.5), outBpm = 104.5, inBpm = 66.5)
             assertEquals(104.5, s1.plan.targetBpm, 1e-6, "$template must keep outBpm 104.5")
             assertEquals(1.0, s1.plan.fold, 1e-6, "$template fold must be 1.0")
             assertEquals(0, s1.plan.rampBars, "$template must not ramp tempo")
 
-            val s2 = TransitionMoves.compile(choiceFor(template, overlapBars = 0), outBpm = 66.5, inBpm = 128.0)
+            val s2 = TransitionMoves.compile(choiceFor(template, overlapBars = 0, outBpm = 66.5, inBpm = 128.0), outBpm = 66.5, inBpm = 128.0)
             assertEquals(66.5, s2.plan.targetBpm, 1e-6, "$template must keep outBpm 66.5")
             assertEquals(1.0, s2.plan.fold, 1e-6)
             assertEquals(0, s2.plan.rampBars)
@@ -218,7 +228,9 @@ class Djmix18RegressionTest {
             durationSec = 180.0,
             sections = listOf(
                 PhraseSection(0, 16, SectionFn.INTRO, SectionRole.GROOVE, 0.8f, 0, 0, 0.4f, 4, 0f, 0f, 0f, 0.3f, false),
-                PhraseSection(16, 90, SectionFn.VERSE, SectionRole.NARRATIVE, 0.8f, 1, 0, 0.7f, 7, 0f, 0f, 0.8f, 0.4f, false),
+                // A one-level rise over the outgoing outro is eligible; a
+                // larger synthetic jump would veto every aligned alternative.
+                PhraseSection(16, 90, SectionFn.VERSE, SectionRole.NARRATIVE, 0.8f, 1, 0, 0.7f, 6, 0f, 0f, 0.8f, 0.4f, false),
             ),
             sungBars = BooleanArray(90) { it >= 16 },
             firstVocalBar = 16,
@@ -227,11 +239,43 @@ class Djmix18RegressionTest {
             chorusCount = 0,
         )
         val fullExits = CuePoints.exits(fullMap)
+        assertTrue(fullExits.isNotEmpty(), "full map must still offer exits after the chorus")
         for (exit in fullExits) {
             assertTrue(exit.releaseSec >= 170.0 - 1e-6, "vocal song exit ${exit.releaseSec}s cut vocals before 170s")
         }
-        val selected = assertNotNull(PhrasePlanner.select(fullMap, innMap, 0, 120.0, 120.0))
-        assertTrue(selected.exit.releaseSec >= 170.0 - 1e-6, "selected exit ${selected.exit.releaseSec}s must not cut before 170s")
+        // M6's qualified handoff still exceeds O_MAX with wet retirement and
+        // settle. The modest level-3 to level-6 rise leaves a non-Echo aligned
+        // outro move eligible, so this fixture can test both the late exit and
+        // the planner's safe fallback without changing production policy.
+        val selected = assertNotNull(PhrasePlanner.select(
+            fullMap, innMap, 0, 120.0, 120.0,
+            outAnalysis = fullCoverageAnalysis(fullMap),
+            inAnalysis = fullCoverageAnalysis(innMap),
+        ), "An eligible non-Echo late move must remain available: ${PhrasePlanner.lastVetoSummary}")
+        assertTrue(selected.template == MixTemplate.ROLLING || selected.template == MixTemplate.M11,
+            "The over-budget M6 handoff must not be selected: ${selected.template}")
+        assertTrue(selected.exit.releaseSec >= 170.0 - 1e-6,
+            "selected exit ${selected.exit.releaseSec}s must not cut before 170s")
+    }
+
+    /** Full-window synthetic vocal evidence aligned with the hand-built SongMap. */
+    private fun fullCoverageAnalysis(map: SongMap): TrackAnalysis {
+        val frameRate = 20.0
+        val frames = (map.durationSec * frameRate).toInt()
+        val vocals = FloatArray(frames) { frame ->
+            val sourceSec = frame / frameRate
+            val bar = map.downbeats.indexOfLast { it <= sourceSec }
+            if (map.sungBars.getOrElse(bar) { false }) 0.8f else 0.02f
+        }
+        return TrackAnalysis(
+            status = TrackAnalysis.STATUS_READY,
+            duration = map.durationSec,
+            bpm = map.bpm,
+            beatInterval = 60.0 / map.bpm,
+            downbeats = map.downbeats.toList(),
+            contentEndTime = map.contentEndSec,
+            vocalWindows = listOf(CurveWindow(0.0, frameRate, vocals)),
+        )
     }
 
     // ---- 4. Graceful RELAXED / VOCAL_OVER_OUTRO & pre-filled M6 echo ----
@@ -249,7 +293,7 @@ class Djmix18RegressionTest {
             assertEquals(TransitionMoves.MUTE_DB, script.outGain.values.last(), 1e-6f)
         }
 
-        val m6 = TransitionMoves.compile(choiceFor(MixTemplate.M6, overlapBars = 0), outBpm = 104.5, inBpm = 66.5)
+        val m6 = TransitionMoves.compile(choiceFor(MixTemplate.M6, overlapBars = 0, outBpm = 104.5, inBpm = 66.5), outBpm = 104.5, inBpm = 66.5)
         val sendTwoBeatsBefore = evalLane(m6.echoSend, -2.0)
         assertTrue(sendTwoBeatsBefore > 0.1f, "M6 echoSend at -2.0 beats must be > 0, got $sendTwoBeatsBefore")
         assertTrue(evalLane(m6.outGain, -2.0) > -1.0f, "M6 dry outGain must still be audible while pre-filling echo at -2.0 beats")

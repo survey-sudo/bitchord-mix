@@ -180,6 +180,7 @@ object DjMix {
         outgoingId: String = "",
         incomingId: String = "",
     ): TransitionPlan {
+        if (plan.transitionStyle == TransitionStyle.NATURAL) return plan.copy(mixSummary = "natural handoff")
         if (plan.blocked || plan.transitionStyle == TransitionStyle.GAPLESS) {
             return if (plan.transitionStyle == TransitionStyle.GAPLESS) {
                 plan.copy(mixSummary = "gapless")
@@ -242,12 +243,20 @@ object DjMix {
         if (build && next.djEffect != DjEffect.LOOP_ROLL && next.djEffect != DjEffect.REVERB) {
             next = next.copy(djEffect = DjEffect.FLANGER)
         }
-        return next.copy(
+        val qualified = LocalBlendAdmission.MARKER in next.policyReasons
+        // Dedicated Echo handoffs own cut/landing/retirement admission. Remove
+        // an uncertified classic throw at the end, so it is not replaced by a
+        // newly selected roll/flanger simply because its effect slot is empty.
+        val cleared = qualified || next.djEffect == DjEffect.ECHO || next.echoSeconds > 0.0 ||
+            (next.filterVariant == FilterTransitionVariant.ECHO_RIDE && next.djEffect == DjEffect.REVERB)
+        val admitted = if (cleared) next.copy(djEffect = DjEffect.NONE, echoSeconds = 0.0) else next
+        return admitted.copy(
             vocalHandoff = handoff,
-            buildup = build,
+            buildup = if (qualified) false else build,
             outSection = outAt?.name?.lowercase() ?: "",
             inSection = inAt?.name?.lowercase() ?: "",
-            mixSummary = summary(next, analysis, nextAnalysis, outAt, inAt, handoff, extend, build),
+            mixSummary = summary(admitted,
+                analysis, nextAnalysis, outAt, inAt, handoff, extend, if (qualified) false else build),
         )
     }
 
@@ -270,6 +279,8 @@ object DjMix {
         // would move transitionEnd/fade/cue off the anchor. Metadata helpers
         // (vocalHandoff, phraseExtend, colour, tempoGap, summary) still run.
         if (plan.reason.endsWith(":catch-up")) return plan
+        // This exact geometry already passed local coverage/collision admission.
+        if (LocalBlendAdmission.MARKER in plan.policyReasons) return plan
         var end = plan.transitionEnd
         var start = plan.transitionStart
         var cue = plan.incomingCueTime
@@ -350,6 +361,7 @@ object DjMix {
         if (plan.reason.endsWith(":catch-up")) return plan
         if (plan.transitionStyle != TransitionStyle.DJ_BLEND) return plan
         if (plan.reason.contains("phrase")) return plan
+        if (!(exitKeyConfidence(analysis) >= 0.50) || !(entryKeyConfidence(nextAnalysis) >= 0.50)) return plan
         val left = camelotCode(exitKeyForMix(analysis))
         val right = camelotCode(entryKeyForMix(nextAnalysis))
         if (left == null || right == null || camelotCompatible(left, right)) return plan
@@ -381,6 +393,7 @@ object DjMix {
         // them moves the start behind the playhead and recreates the dead
         // stale window. Never re-size a catch-up.
         if (plan.reason.endsWith(":catch-up")) return plan
+        if (LocalBlendAdmission.MARKER in plan.policyReasons) return plan
         // 2B bounded decline (TransitionPlanner): the 4 s DJ_FILTER length is
         // intentional — the 4-bar club minimum would stretch it to ~8 bars
         // and recreate the exposed overlap. Never resize a decline plan.
@@ -434,11 +447,12 @@ object DjMix {
         val a = FxPolicy.measuredVocal(analysis, plan.transitionStart, plan.transitionEnd)
         val b = FxPolicy.measuredVocal(nextAnalysis, plan.incomingCueTime, plan.incomingCueTime + plan.fadeSeconds * plan.incomingPlaybackRate)
         val vocalClash = maxOf(plan.vocalOverlap, (a ?: 0.0) * (b ?: 0.0))
-        val cleanSpace = (a == null || a < VOCAL_ACTIVE_THRESHOLD) && (b == null || b < VOCAL_ACTIVE_THRESHOLD)
+        val measured = confident && a != null && b != null
+        val cleanSpace = measured && requireNotNull(a) < VOCAL_ACTIVE_THRESHOLD && requireNotNull(b) < VOCAL_ACTIVE_THRESHOLD
         val eligible = FxPolicy.select(
             outgoingId, incomingId,
             rhythmic = false,
-            measured = confident,
+            measured = measured,
             vocalClash = vocalClash,
             speechLike = false,
             drifting = FxPolicy.drifting(analysis, nextAnalysis),
@@ -541,10 +555,18 @@ object DjMix {
         if (outAt != null || inAt != null) {
             parts += "out ${outAt?.name?.lowercase() ?: "—"} → in ${inAt?.name?.lowercase() ?: "—"}"
         }
-        val left = camelotCode(exitKeyForMix(analysis))
-        val right = camelotCode(entryKeyForMix(nextAnalysis))
+        val left = camelotCode(exitKeyForMix(analysis)).takeIf { exitKeyConfidence(analysis) >= 0.25 }
+        val right = camelotCode(entryKeyForMix(nextAnalysis)).takeIf { entryKeyConfidence(nextAnalysis) >= 0.25 }
         if (left != null && right != null) {
-            parts += if (camelotCompatible(left, right)) "$left→$right" else "$left→$right clash"
+            val confident = exitKeyConfidence(analysis) >= 0.50 && entryKeyConfidence(nextAnalysis) >= 0.50
+            parts += when {
+                !confident -> "$left→$right (estimated)"
+                camelotCompatible(left, right) -> "$left→$right"
+                else -> "$left→$right clash"
+            }
+        } else if (analysis.key.isNotBlank() || analysis.keyTail.isNotBlank() ||
+            nextAnalysis.key.isNotBlank() || nextAnalysis.keyHead.isNotBlank()) {
+            parts += "key unknown"
         }
         val fx = ArrayList<String>()
         if (plan.transitionStyle == TransitionStyle.DJ_BLEND && plan.bassSwap) fx += "bass swap"

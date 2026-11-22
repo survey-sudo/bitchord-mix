@@ -67,7 +67,8 @@ class PhraseRescueInvariantTest {
             "in-clash",
             sections = listOf(PhraseSection(0, 24, SectionFn.CHORUS, SectionRole.RELEASE, 0.9f, 0, 0, 0.8f, 8, 0f, 0f, 0f, 0.5f, false)),
         )
-        val choice = assertNotNull(PhrasePlanner.select(out, inn, camelotSteps = 4, outBpm = 120.0, inBpm = 120.0))
+        val choice = assertNotNull(PhrasePlanner.select(out, inn, camelotSteps = 4, outBpm = 120.0, inBpm = 120.0,
+            outAnalysis = measuredQuiet(out), inAnalysis = measuredQuiet(inn)))
         assertEquals(MixTemplate.M6, choice.template)
         assertEquals(0, choice.overlapBars)
     }
@@ -85,8 +86,14 @@ class PhraseRescueInvariantTest {
             "in-multi",
             sections = listOf(PhraseSection(0, 24, SectionFn.CHORUS, SectionRole.RELEASE, 0.9f, 0, 0, 0.8f, 8, 0f, 0f, 0f, 0.5f, false)),
         )
-        val choice = assertNotNull(PhrasePlanner.select(out, inn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0))
+        val choice = assertNotNull(PhrasePlanner.select(out, inn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0,
+            outAnalysis = measuredQuiet(out), inAnalysis = measuredQuiet(inn)))
         assertTrue(choice.entry.startSec <= inn.durationSec * 0.25 + 1e-6)
         assertTrue(choice.exit.releaseSec >= out.durationSec * 0.68 - 1e-6)
     }
+
+    /** These fixtures explicitly contain instrumental audio on both sides. */
+    private fun measuredQuiet(map: SongMap) = TrackAnalysis(duration = map.durationSec, bpm = map.bpm,
+        beatInterval = 60.0 / map.bpm, vocalWindows = listOf(
+            CurveWindow(0.0, 20.0, FloatArray((map.durationSec * 20).toInt() + 2) { 0.02f }))).withMeasuredEchoEvidence(map)
 }

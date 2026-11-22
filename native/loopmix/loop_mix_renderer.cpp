@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace bitchord::loopmix {
 
@@ -670,6 +671,9 @@ void Renderer::prepare() {
     deck.started = false;
     deck.finished = deck.left.empty() || deck.left.size() != deck.right.size() || deck.knotTimes.size() < 2;
     deck.activeStartFrame = 0.0;
+    deck.heldStartup = false;
+    deck.heldPrimed = false;
+    deck.heldPreparedFrame = 0;
     if (!deck.knotTimes.empty() && deck.knotPositions.size() == deck.knotTimes.size()) {
       const double p0 = deck.knotPositions.front();
       size_t firstAdv = 0;
@@ -681,6 +685,7 @@ void Renderer::prepare() {
       }
       if (firstAdv > 1) {
         deck.activeStartFrame = deck.knotTimes[firstAdv - 1];
+        deck.heldStartup = true;
       } else if (firstAdv == 1) {
         deck.activeStartFrame = deck.knotTimes.front() -
             deck.preroll * double(sampleRate_) - deck.stretch.outputLatency();
@@ -720,6 +725,45 @@ void Renderer::prepare() {
     deck.shelfDb = 0;
     deck.highPassFreq = 0;
     deck.lowPassFreq = -1;
+
+    // Held non-loop-roll decks can be prepared here without changing the
+    // render-time loop-roll effective-loop geometry.
+    if (deck.heldStartup && !deck.loopRoll && !deck.finished &&
+        std::isfinite(deck.activeStartFrame) &&
+        std::abs(deck.activeStartFrame) < double(std::numeric_limits<int64_t>::max() / 2)) {
+      // renderDeck quantizes a fractional cue down to its containing frame via
+      // floor(activeStartFrame - integerFrame). Prime that exact runtime frame.
+      const int64_t preparedFrame = int64_t(std::floor(deck.activeStartFrame));
+      const double activeFrame = double(preparedFrame);
+      const double rateSampleAt = std::max(activeFrame, deck.activeStartFrame + 1.0);
+      const double rawRate = deck.knotRate(rateSampleAt);
+      const double heardPos = deck.knotHeard(activeFrame);
+      if (std::isfinite(activeFrame) && std::isfinite(rateSampleAt) &&
+          std::isfinite(rawRate) && std::isfinite(heardPos)) {
+        const double rate = std::clamp(rawRate, 0.75, 1.35);
+        const double readPos = heardPos + deck.stretch.inputLatency() +
+            rate * deck.stretch.outputLatency();
+        if (std::isfinite(rate) && std::isfinite(readPos) &&
+            std::abs(readPos) < double(std::numeric_limits<int64_t>::max() / 2)) {
+          const int seekLength = deck.stretch.outputSeekLength(rate);
+          if (seekLength > 0 && seekLength <= int(inLeft_.size()) &&
+              seekLength <= int(inRight_.size())) {
+            const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sampleRate_)));
+            const int64_t first = int64_t(std::llround(readPos)) - seekLength;
+            for (int i = 0; i < seekLength; ++i) {
+              deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+            }
+            float* seekInput[2] = {inLeft_.data(), inRight_.data()};
+            deck.stretch.outputSeek(seekInput, seekLength);
+            deck.readPos = double(first + seekLength);
+            deck.heardPos = heardPos;
+            deck.heard.store(deck.trackSecondsAt(heardPos, sampleRate_), std::memory_order_relaxed);
+            deck.heldPreparedFrame = preparedFrame;
+            deck.heldPrimed = true;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -778,10 +822,12 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   // djmix18: hold silent with readPos synchronized until the first advancing
   // knot (e.g., incomingHoldSec > 0), never calling stretch.process(0, frames).
   if (!deck.started && frameEnd <= deck.activeStartFrame) {
-    const double initPos = deck.knotPositions.empty() ? 0.0 : deck.knotPositions.front();
-    deck.heardPos = initPos;
-    deck.readPos = initPos;
-    deck.heard.store(deck.trackSecondsAt(initPos, sr), std::memory_order_relaxed);
+    if (!deck.heldPrimed) {
+      const double initPos = deck.knotPositions.empty() ? 0.0 : deck.knotPositions.front();
+      deck.heardPos = initPos;
+      deck.readPos = initPos;
+      deck.heard.store(deck.trackSecondsAt(initPos, sr), std::memory_order_relaxed);
+    }
     return;
   }
   const int silentFrames = (!deck.started && frameStart < deck.activeStartFrame && frames > 1)
@@ -790,28 +836,58 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   const int activeFrames = frames - silentFrames;
   const double activeFrameStart = frameStart + double(silentFrames);
   if (!deck.started) {
-    // Seeded at activeFrameStart, its read pointer the stretch's own latency
-    // ahead of what will be heard.
+    if (deck.heldStartup && (!std::isfinite(deck.activeStartFrame) ||
+        !std::isfinite(activeFrameStart))) {
+      deck.started = true;
+      return;
+    }
+    const bool exactHeldStart = deck.heldStartup &&
+        activeFrameStart == std::floor(deck.activeStartFrame);
+    const bool exactPreparedStart = exactHeldStart && deck.heldPrimed &&
+        activeFrameStart == double(deck.heldPreparedFrame);
     const double rateSampleAt = std::max(activeFrameStart, deck.activeStartFrame + 1.0);
-    const double rate = std::clamp(deck.knotRate(rateSampleAt), 0.75, 1.35);
-    deck.heardPos = deck.knotHeard(activeFrameStart);
-    deck.readPos = deck.heardPos + inLatency + rate * outLatency;
-    const int seekLength = deck.stretch.seekLength();
-    if (int(inLeft_.size()) < seekLength || int(inRight_.size()) < seekLength) {
+    const double rawRate = deck.knotRate(rateSampleAt);
+    if (deck.heldStartup && (!std::isfinite(rateSampleAt) || !std::isfinite(rawRate))) {
+      deck.started = true;
+      return;
+    }
+    const double rate = std::clamp(rawRate, 0.75, 1.35);
+    if (!exactPreparedStart) {
+      deck.heardPos = deck.knotHeard(activeFrameStart);
+      deck.readPos = deck.heardPos + inLatency + rate * outLatency;
+      if (deck.heldStartup && (!std::isfinite(deck.heardPos) || !std::isfinite(deck.readPos) ||
+          std::abs(deck.readPos) >= double(std::numeric_limits<int64_t>::max() / 2))) {
+        deck.started = true;
+        return;
+      }
+    }
+    const int seekLength = exactPreparedStart ? 0 : (deck.heldStartup
+        ? deck.stretch.outputSeekLength(rate)
+        : deck.stretch.seekLength());
+    if (!exactPreparedStart && (int(inLeft_.size()) < seekLength || int(inRight_.size()) < seekLength)) {
       deck.started = true; // never retry a resize on the audio thread
       return;
     }
-    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
-    const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
-    for (int i = 0; i < seekLength; ++i) {
-      const double mixSec = double(frame + silentFrames + i) / sr;
-      if (deck.loopRoll) deck.readEffective(first + i, seam, mixSec, inLeft_[i], inRight_[i]);
-      else deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+    if (!exactPreparedStart) {
+      const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+      const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
+      for (int i = 0; i < seekLength; ++i) {
+        const double mixSec = double(frame + silentFrames + i) / sr;
+        if (deck.loopRoll) deck.readEffective(first + i, seam, mixSec, inLeft_[i], inRight_[i]);
+        else deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+      }
+      float* seekInput[2] = {inLeft_.data(), inRight_.data()};
+      if (deck.heldStartup) {
+        // Exceptional held-start recovery: loop-roll retains the runtime
+        // effective-loop setup path, and rejected preparation or a skipped
+        // cue may use this callback fallback. Normal held starts are primed.
+        deck.stretch.outputSeek(seekInput, seekLength);
+      } else {
+        deck.stretch.reset();
+        deck.stretch.seek(seekInput, seekLength, rate);
+      }
+      deck.readPos = double(first + seekLength);
     }
-    float* seekInput[2] = {inLeft_.data(), inRight_.data()};
-    deck.stretch.reset();
-    deck.stretch.seek(seekInput, seekLength, rate);
-    deck.readPos = double(first + seekLength);
     deck.started = true;
   }
 

@@ -11,6 +11,8 @@ import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.ReleaseSplice
 import com.music.bitchord.playback.smart.RegionalLoudness
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.HandoffStatus
+import com.music.bitchord.playback.smart.qualifyMusicalHandoff
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
@@ -220,7 +222,7 @@ class LoopMixSession private constructor(
                 STARTUP_LEAD
             }
             val tBase = handoverTrack - (element - base)
-            var inStartAt = if (hold > 1e-9 && tBase < 0.0 && handoverTrack >= 2.5) {
+            var inStartAt = if (tBase < 0.0 && handoverTrack >= 2.5) {
                 max(base, (element - handoverTrack).coerceAtLeast(STARTUP_LEAD))
             } else {
                 base
@@ -262,6 +264,7 @@ class LoopMixSession private constructor(
             sungOut: List<LoopMix.Span>? = null,
             sungIn: List<LoopMix.Span>? = null,
             onRefusal: ((String) -> Unit)? = null,
+            onEnvelopeInstalled: ((deck: Int, kind: Int, times: DoubleArray, values: FloatArray) -> Unit)? = null,
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
@@ -279,20 +282,61 @@ class LoopMixSession private constructor(
             // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
             // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
             // read script?.incomingHoldSec — up to seconds apart on phrase plans).
-            val effectiveHoldSec = script?.incomingHoldSec ?: plan.incomingHoldSec
-            val effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec) {
-                plan.copy(incomingHoldSec = effectiveHoldSec)
+            val naturalHandoff = plan.handoff != null && plan.alternativeKind == "natural-end" &&
+                !plan.echoTail && script == null
+            val contractEcho = naturalHandoff || (plan.handoff != null && plan.echoTail &&
+                ((plan.rung == "Echo" && script == null) || script?.choice?.template == MixTemplate.M6))
+            val handoff = plan.handoff.takeIf { contractEcho }
+            if (handoff != null && (!plan.incomingHoldSec.isFinite() || abs(plan.incomingHoldSec - handoff.inHoldMixSec) > 1e-8 ||
+                    (script != null && (!script.incomingHoldSec.isFinite() ||
+                        abs(script.incomingHoldSec - handoff.inHoldMixSec) > 1e-8)))) {
+                return refuse("handoff_hold_mismatch")
+            }
+            val effectiveHoldSec = handoff?.inHoldMixSec ?: script?.incomingHoldSec ?: plan.incomingHoldSec
+            val effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec || (plan.handoff != null && !contractEcho)) {
+                plan.copy(incomingHoldSec = effectiveHoldSec, handoff = handoff)
             } else plan
             if (crown) {
                 val nominal = LoopMix.qualifyCrown(effectivePlan)
                 if (!nominal.accepted) return refuse("crown_nominal_${nominal.refusal ?: "invalid"}")
             }
             val clock = LoopMix.Clock(effectivePlan)
+            if (handoff != null) {
+                val qualification = qualifyMusicalHandoff(handoff, outAnalysis, inAnalysis, sungOut, sungIn)
+                Log.i(TAG, "handoff status=${qualification.status} reason=${qualification.reason} natural=$naturalHandoff outCoverage=${qualification.outCutMaskCoverage} inCoverage=${qualification.inEntryMaskCoverage} overlapCoverage=${qualification.overlapMaskCoverage}")
+                if (qualification.status == HandoffStatus.UNSAFE) {
+                    return refuse("handoff_${qualification.reason}")
+                }
+                if (qualification.status == HandoffStatus.UNKNOWN && !naturalHandoff) {
+                    return refuse("handoff_unmeasured_capture")
+                }
+                if (naturalHandoff && (handoff.outDryFallStart != handoff.outDryEnd ||
+                        abs(handoff.wetRetireMixSec - handoff.outDryEnd.mixSec) > 1e-8 || plan.reverbWash ||
+                        handoff.inCueSourceSec != handoff.inAudibleStart.sourceSec ||
+                        handoff.inAudibleStart.mixSec < handoff.outDryEnd.mixSec - 1e-8 ||
+                        abs(handoff.inFullLevelMixSec - handoff.inAudibleStart.mixSec) > 1e-8)) {
+                    return refuse("handoff_natural_geometry")
+                }
+                if (effectivePlan.outLoops || effectivePlan.inLoops || !effectivePlan.nativeIncoming ||
+                    abs(effectivePlan.inn.loopStart - handoff.inCueSourceSec) > 1e-8 ||
+                    abs(effectivePlan.out.loopStart - (handoff.outDryEnd.sourceSec - handoff.outDryEnd.mixSec)) > 1e-8 ||
+                    handoff.inLanding.mixSec > clock.releaseAt + 1e-8 ||
+                    handoff.outDryEnd.mixSec > clock.releaseAt + 1e-8) {
+                    return refuse("handoff_plan_geometry")
+                }
+            }
+            // Contract request starts are clamped to physical source zero by
+            // regionBounds, once for both parallel and fallback decode and
+            // identically for the controller's cache-ready query.
             // Nominal bounds shared with fast-ready checks. Actual tracked
             // knots below may extend the physical decode request before build.
             val bounds = LoopMix.regionBounds(effectivePlan)
             val echoHoldEarly = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
-            val outStopMixSec = clock.releaseAt + 0.05 + echoHoldEarly + effectivePlan.exitTailSeconds
+            val outStopMixSec = handoff?.wetRetireMixSec
+                ?: (clock.releaseAt + 0.05 + echoHoldEarly + effectivePlan.exitTailSeconds)
+            if (handoff != null && handoff.wetRetireMixSec > clock.releaseAt + 1e-8) {
+                return refuse("handoff_render_budget")
+            }
             val tailRateEarly = if (clock.beats >= 1) {
                 val b0 = clock.beatTimes[clock.beats - 1]
                 val b1 = clock.beatTimes[clock.beats]
@@ -306,6 +350,9 @@ class LoopMixSession private constructor(
             val outHasTailKnot = !effectivePlan.outLoops && outStopMixSec > clock.releaseAt + 1e-6
             val knots = buildDeckKnots(effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
                 outHasTailKnot, outStopMixSec, tailRateEarly)
+            if (handoff != null) {
+                qualifyHandoffKnots(effectivePlan, clock, sampleRate, knots)?.let { return refuse(it) }
+            }
             if (crown) {
                 val actual = qualifyCrownKnots(effectivePlan, clock, sampleRate, knots)
                 if (!actual.accepted) return refuse(requireNotNull(actual.refusal))
@@ -343,12 +390,15 @@ class LoopMixSession private constructor(
                 Log.i(TAG, "loop-domain rejected: incomplete physical PCM out=${outRegion.left.size}/${outRegion.right.size} in=${inRegion.left.size}/${inRegion.right.size} requiredOut=$requiredOutEnd requiredIn=${incomingGeometry.requiredEnd}")
                 return refuse("pcm_incomplete_physical_coverage")
             }
+            if (handoff != null && !coversHandoffPcm(effectivePlan, sampleRate, knots, outRegion, inRegion)) {
+                return refuse("handoff_pcm_before_protected_event")
+            }
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
             // instrumental when windowed stems are enabled. Worker thread only; null
             // falls back to the dry region so the build never fails on separation.
-            if (effectivePlan.acapella && separateStem != null) {
+            if (handoff == null && effectivePlan.acapella && separateStem != null) {
                 if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                     val split = runCatching {
                         separateStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate, true)
@@ -377,7 +427,10 @@ class LoopMixSession private constructor(
             // ran when the count-based test fired, which is exactly the noisy
             // case. Feasibility is the 21.5 s window and a separator that
             // actually answers; both are checked where they arise below.
-            if (!effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
+            // Contract qualification already rejects source-aligned simultaneous
+            // vocal intervals. Its valid pickups (including disjoint bursts)
+            // must not be re-ducked using the legacy whole-window projection.
+            if (handoff == null && !effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
                 val inWinFrom = plan.inn.loopStart
                 val inWinTo = maxOf(inWinFrom + 1.0, clock.elementTrackTime)
                 val inMask = if (!inAnalysis?.vocalWindows.isNullOrEmpty()) {
@@ -534,6 +587,11 @@ class LoopMixSession private constructor(
             if (!renderer.isValid) return refuse("renderer_build_failed")
             val sr = sampleRate.toDouble()
             fun samplesOf(region: LoopRegion, trackSeconds: Double) = (trackSeconds - region.start) * sr
+            fun installEnvelope(deck: Int, kind: Int, times: DoubleArray, values: FloatArray,
+                exponential: Boolean = false) {
+                renderer.setEnvelope(deck, kind, times, values, exponential)
+                onEnvelopeInstalled?.invoke(deck, kind, times.copyOf(), values.copyOf())
+            }
 
             // K-weighted loudness of the outgoing exit window against the incoming
             // entry window. The whole-track ratio is only the fallback when a
@@ -586,7 +644,7 @@ class LoopMixSession private constructor(
                     knotFrames = outKnotFrames,
                     knotPositions = outKnotPositions,
                     runOn = false,
-                    stopAt = clock.releaseAt + 0.05 + echoHold + effectivePlan.exitTailSeconds,
+                    stopAt = handoff?.wetRetireMixSec ?: (clock.releaseAt + 0.05 + echoHold + effectivePlan.exitTailSeconds),
                     preroll = 0.4,
                     level = 1f,
                 ),
@@ -616,48 +674,40 @@ class LoopMixSession private constructor(
                 ),
             )
 
-            val nativeEchoOut = effectivePlan.echoTail && effectivePlan.rung == "Echo" && script == null
+            val nativeEchoOut = contractEcho || (effectivePlan.echoTail && effectivePlan.rung == "Echo" && script == null)
+            val contractM6 = handoff != null && script?.choice?.template == MixTemplate.M6
             if (nativeEchoOut) {
-                val echoEnv = computeEchoOutEnvelopes(effectivePlan, clock, outStopAtSec)
-                renderer.setEcho(LoopMixRenderer.OUT, echoEnv.delaySec, echoEnv.feedback, 0.55f)
-                renderer.setEnvelope(
+                val outPcmEndSec = if (effectivePlan.outLoops) Double.POSITIVE_INFINITY else {
+                    straightOutPcmEndSec(outKnotFrames, outKnotPositions, outRegion.left.size, sr)
+                }
+                val echoEnv = computeEchoOutEnvelopes(effectivePlan, clock, outStopAtSec, outPcmEndSec, sampleRate)
+                if (!naturalHandoff) renderer.setEcho(LoopMixRenderer.OUT, echoEnv.delaySec, echoEnv.feedback, 0.55f)
+                if (!contractM6) installEnvelope(
                     LoopMixRenderer.OUT, LoopMixRenderer.KIND_ECHO_SEND,
                     echoEnv.echoSendTimes, echoEnv.echoSendValues,
                 )
-                renderer.setReverb(
+                if (!naturalHandoff) renderer.setReverb(
                     LoopMixRenderer.OUT,
                     roomSize = 2.2f, damping = PhraseConfig.REVERB_DAMPING, wet = PhraseConfig.REVERB_WET,
                 )
-                renderer.setEnvelope(
+                installEnvelope(
                     LoopMixRenderer.OUT, LoopMixRenderer.KIND_REVERB_SEND,
                     echoEnv.reverbSendTimes, echoEnv.reverbSendValues,
                 )
-                renderer.setEnvelope(
-                    LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
-                    echoEnv.outGainTimes, echoEnv.outGainValues,
-                )
-                renderer.setEnvelope(
-                    LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN,
-                    echoEnv.inGainTimes, echoEnv.inGainValues,
-                )
-                renderer.setEnvelope(
-                    LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_DB,
-                    echoEnv.outLowTimes, echoEnv.outLowValues,
-                )
-                renderer.setEnvelope(
-                    LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB,
-                    echoEnv.inLowTimes, echoEnv.inLowValues,
-                )
-                renderer.setEnvelope(
-                    LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_PASS_HZ,
-                    echoEnv.outHpTimes, echoEnv.outHpValues,
-                    exponential = true,
-                )
-                renderer.setEnvelope(
-                    LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_PASS_HZ,
-                    echoEnv.inLpTimes, echoEnv.inLpValues,
-                    exponential = true,
-                )
+                if (!contractM6) {
+                    installEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
+                        echoEnv.outGainTimes, echoEnv.outGainValues)
+                    installEnvelope(LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN,
+                        echoEnv.inGainTimes, echoEnv.inGainValues)
+                    installEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_DB,
+                        echoEnv.outLowTimes, echoEnv.outLowValues)
+                    installEnvelope(LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB,
+                        echoEnv.inLowTimes, echoEnv.inLowValues)
+                    installEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_HIGH_PASS_HZ,
+                        echoEnv.outHpTimes, echoEnv.outHpValues, exponential = true)
+                }
+                installEnvelope(LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_PASS_HZ,
+                    echoEnv.inLpTimes, echoEnv.inLpValues, exponential = true)
             } else {
                 if (effectivePlan.echoTail) {
                     val outBpmForEcho = if (effectivePlan.out.bpm > 0) effectivePlan.out.bpm else 120.0
@@ -891,7 +941,7 @@ class LoopMixSession private constructor(
                 }
                 }
                 if (script != null) {
-                    applyPhraseLanes(renderer, clock, effectivePlan, script)
+                    applyPhraseLanes(renderer, clock, effectivePlan, script, contractM6, ::installEnvelope)
                     renderer.setIsolate(LoopMixRenderer.OUT, true)
                     renderer.setIsolate(LoopMixRenderer.IN, true)
                 } else if (effectivePlan.carve || effectivePlan.clash || effectivePlan.rung == "Beat blend") {
@@ -912,6 +962,15 @@ class LoopMixSession private constructor(
                     )
                 }
             }
+            // M6's explicit contract has a generic Echo effects setup above,
+            // but the score-sheet lanes are the one authoritative set of
+            // overlapping gain/send/filter envelopes. Install them after the
+            // non-overlapping contract effect sends, before native prepare.
+            if (nativeEchoOut && contractM6 && script != null) {
+                applyPhraseLanes(renderer, clock, effectivePlan, script, contractM6, ::installEnvelope)
+                renderer.setIsolate(LoopMixRenderer.OUT, true)
+                renderer.setIsolate(LoopMixRenderer.IN, true)
+            }
             renderer.setHighQuality(highQuality)
             renderer.prepare()
             renderer.setFadeOut(LoopMixRenderer.IN, handoverTrackSec)
@@ -931,8 +990,26 @@ class LoopMixSession private constructor(
             clock: LoopMix.Clock,
             plan: LoopMix.Plan,
             script: com.music.bitchord.playback.smart.PhraseScript,
+            contractM6: Boolean = false,
+            install: (Int, Int, DoubleArray, FloatArray, Boolean) -> Unit =
+                { deck, kind, times, values, exponential -> renderer.setEnvelope(deck, kind, times, values, exponential) },
         ) {
+            val handoff = plan.handoff.takeIf { contractM6 }
+            val landingBeat = handoff?.let {
+                val (beat, fraction) = clock.beatAt(it.inLanding.mixSec)
+                beat + fraction
+            }
+            fun clockBeatTime(beat: Double): Double {
+                val times = clock.beatTimes
+                if (beat <= 0.0) return beat * (times[1] - times[0])
+                val last = times.lastIndex
+                if (beat >= last) return times[last] + (beat - last) * (times[last] - times[last - 1])
+                val k = beat.toInt()
+                val fraction = beat - k
+                return times[k] + (times[k + 1] - times[k]) * fraction
+            }
             fun seconds(beatFromLanding: Double): Double {
+                if (handoff != null) return clockBeatTime(requireNotNull(landingBeat) + beatFromLanding)
                 val landing = (plan.rampBars + plan.exitBars).coerceAtLeast(1) * 4.0
                 val beat = landing + beatFromLanding
                 if (beat <= 0.0) return beat * plan.out.beatSec
@@ -946,9 +1023,36 @@ class LoopMixSession private constructor(
             fun db(value: Float): Float = if (value <= -80f) 0f else 10.0.pow(value / 20.0).toFloat()
             fun put(deck: Int, kind: Int, lane: com.music.bitchord.playback.smart.Lane, asDb: Boolean, exponential: Boolean = lane.exponential) {
                 if (lane.beats.isEmpty()) return
-                val times = DoubleArray(lane.beats.size) { seconds(lane.beats[it]) }
                 val values = FloatArray(lane.values.size) { if (asDb) db(lane.values[it]) else lane.values[it] }
-                renderer.setEnvelope(deck, kind, times, values, exponential)
+                if (handoff == null) {
+                    val times = DoubleArray(lane.beats.size) { seconds(lane.beats[it]) }
+                    install(deck, kind, times, values, exponential)
+                    return
+                }
+                val mappedBeats = lane.beats.copyOf()
+                val points = mappedBeats.indices.map { seconds(mappedBeats[it]) to values[it] }.toMutableList()
+                if (handoff != null && deck == LoopMixRenderer.OUT && kind == LoopMixRenderer.KIND_GAIN) {
+                    // Keep the silent native preroll that the generic contract
+                    // used to provide, then let the M6 lane own the actual cut.
+                    points += (-LoopMix.HANDOVER_SEC to 0f)
+                    points += (handoff.wetRetireMixSec to 0f)
+                } else if (handoff != null && deck == LoopMixRenderer.IN && kind == LoopMixRenderer.KIND_GAIN) {
+                    // M6 encodes its landing point first, then the earlier cue
+                    // activation. Put events into renderer time order and make
+                    // the landing full-level, as the contract requires.
+                    points += (-LoopMix.HANDOVER_SEC to 0f)
+                    points += (0.0 to 0f)
+                    points += (handoff.inLanding.mixSec to 1f)
+                }
+                val ordered = points.sortedBy { it.first }.fold(mutableListOf<Pair<Double, Float>>()) { acc, point ->
+                    if (acc.isNotEmpty() && abs(acc.last().first - point.first) <= 1e-12) {
+                        acc[acc.lastIndex] = point
+                    } else acc += point
+                    acc
+                }
+                val times = DoubleArray(ordered.size) { ordered[it].first }
+                val orderedValues = FloatArray(ordered.size) { ordered[it].second }
+                install(deck, kind, times, orderedValues, exponential)
             }
             put(LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN, script.outGain, asDb = true)
             put(LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN, script.inGain, asDb = true)
@@ -971,6 +1075,65 @@ class LoopMixSession private constructor(
             val outGridSource: GridSource = GridSource.UNKNOWN,
             val inGridSource: GridSource = GridSource.UNKNOWN,
         )
+
+        /** Interpolate the exact arrays supplied to native, in source seconds. */
+        internal fun knotSourceAt(frames: DoubleArray, positions: DoubleArray, mixSec: Double, sampleRate: Int): Double? {
+            if (sampleRate <= 0 || !mixSec.isFinite() || frames.size != positions.size || frames.size < 2 ||
+                frames.any { !it.isFinite() } || positions.any { !it.isFinite() } ||
+                (1 until frames.size).any { frames[it] <= frames[it - 1] }) return null
+            val frame = mixSec * sampleRate
+            if (frame < frames.first() - 1e-6 || frame > frames.last() + 1e-6) return null
+            val right = frames.indexOfFirst { it >= frame }
+            if (right <= 0) return positions.first()
+            val f = (frame - frames[right - 1]) / (frames[right] - frames[right - 1])
+            return positions[right - 1] + f * (positions[right] - positions[right - 1])
+        }
+
+        /** A contract is checked against emitted coordinates before any decoder or JNI work. */
+        internal fun qualifyHandoffKnots(plan: LoopMix.Plan, clock: LoopMix.Clock, sampleRate: Int, knots: DeckKnots): String? {
+            val h = plan.handoff ?: return null
+            if (qualifyMusicalHandoff(h, null, null, null, null).status == HandoffStatus.UNSAFE) {
+                return "handoff_invalid_geometry"
+            }
+            if (sampleRate <= 0 || plan.outLoops || plan.inLoops || !plan.nativeIncoming ||
+                abs(clock.incomingHoldSec - h.inHoldMixSec) > 1e-8 ||
+                h.inLanding.mixSec > clock.releaseAt + 1e-8 || h.outDryEnd.mixSec > clock.releaseAt + 1e-8) {
+                return "handoff_plan_geometry"
+            }
+            val tolerance = 0.5 / sampleRate
+            fun agrees(frames: DoubleArray, positions: DoubleArray, source: (Double) -> Double): Boolean {
+                if (knotSourceAt(frames, positions, 0.0, sampleRate) == null || frames.first() != 0.0) return false
+                return frames.indices.all { abs(positions[it] - source(frames[it] / sampleRate)) <= tolerance }
+            }
+            if (!agrees(knots.outFrames, knots.outPositionsSec) { plan.out.loopStart + it }) return "handoff_out_knot_mapping"
+            if (!agrees(knots.inFrames, knots.inPositionsSec) {
+                    h.inCueSourceSec + (it - h.inHoldMixSec).coerceAtLeast(0.0)
+                }) return "handoff_in_knot_mapping"
+            if (knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inHoldMixSec, sampleRate)
+                    ?.let { abs(it - h.inCueSourceSec) > tolerance } != false) return "handoff_in_hold_mapping"
+            val outEvents = listOf(h.outCaptureStart, h.outDryFallStart, h.outDryEnd, h.outSendClose)
+            val inEvents = listOf(h.inAudibleStart, h.inLanding)
+            if (outEvents.any { p ->
+                    knotSourceAt(knots.outFrames, knots.outPositionsSec, p.mixSec, sampleRate)
+                        ?.let { abs(it - p.sourceSec) > tolerance } != false
+                }) return "handoff_out_event_mapping"
+            if (inEvents.any { p ->
+                    knotSourceAt(knots.inFrames, knots.inPositionsSec, p.mixSec, sampleRate)
+                        ?.let { abs(it - p.sourceSec) > tolerance } != false
+                }) return "handoff_in_event_mapping"
+            return null
+        }
+
+        internal fun coversHandoffPcm(plan: LoopMix.Plan, sampleRate: Int, knots: DeckKnots,
+            out: LoopRegion, inn: LoopRegion): Boolean {
+            val h = plan.handoff ?: return true
+            val dryEnd = knotSourceAt(knots.outFrames, knots.outPositionsSec, h.outDryEnd.mixSec, sampleRate) ?: return false
+            val entry = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inAudibleStart.mixSec, sampleRate) ?: return false
+            val landing = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inLanding.mixSec, sampleRate) ?: return false
+            // OUT may exhaust after dry end, while the effect continues to drain.
+            return coversPhysical(out, sampleRate, h.outCaptureStart.sourceSec, dryEnd) &&
+                coversPhysical(inn, sampleRate, minOf(h.inCueSourceSec, entry), landing + 1.0 / sampleRate)
+        }
 
         internal data class CrownKnotQualification(
             val accepted: Boolean,
@@ -1114,7 +1277,10 @@ class LoopMixSession private constructor(
 
         /** Coordinates here remain track seconds; native subtracts region.start. */
         internal fun incomingGeometry(plan: LoopMix.Plan, clock: LoopMix.Clock, knots: DeckKnots): IncomingGeometry {
-            val release = knots.inPositionsSec[clock.beats]
+            val handoff = plan.handoff
+            val release = handoff?.let {
+                it.inCueSourceSec + max(0.0, clock.releaseAt - it.inHoldMixSec)
+            } ?: knots.inPositionsSec[clock.beats]
             val loops = plan.inLoops && !plan.nativeIncoming && release >= plan.inn.loopEnd
             fun physical(position: Double) = if (loops) LoopMix.physicalTrackTime(
                 position, plan.inn.loopStart, plan.inn.loopEnd, release,
@@ -1151,6 +1317,20 @@ class LoopMixSession private constructor(
             val sr = sampleRate.toDouble()
             val beats = clock.beats
             val totalInBeats = beats + clock.settleBeats
+
+            if (plan.handoff != null) {
+                val h = requireNotNull(plan.handoff)
+                val outTimes = (clock.beatTimes.filter { it <= outStopAtSec } + listOf(0.0,
+                    h.outCaptureStart.mixSec, h.outDryFallStart.mixSec, h.outDryEnd.mixSec,
+                    h.outSendClose.mixSec, outStopAtSec)).distinct().sorted()
+                val inTimes = (clock.beatTimes.toList() + listOf(0.0, h.inHoldMixSec,
+                    h.inAudibleStart.mixSec, h.inFullLevelMixSec, h.inLanding.mixSec)).distinct().sorted()
+                return DeckKnots(DoubleArray(outTimes.size) { outTimes[it] * sr },
+                    DoubleArray(outTimes.size) { plan.out.loopStart + outTimes[it] },
+                    DoubleArray(inTimes.size) { inTimes[it] * sr },
+                    DoubleArray(inTimes.size) { h.inCueSourceSec + max(0.0, inTimes[it] - h.inHoldMixSec) },
+                    GridSource.NATIVE_CLOCK, GridSource.NATIVE_CLOCK)
+            }
 
             val outFrames = DoubleArray(beats + 1 + if (outHasTailKnot) 1 else 0) { i ->
                 if (i < beats + 1) clock.beatTimes[i] * sr else outStopAtSec * sr
@@ -1310,10 +1490,27 @@ class LoopMixSession private constructor(
             )
         }
 
+        /** Invert the emitted straight-deck knots at the last decoded OUT sample. */
+        private fun straightOutPcmEndSec(
+            frames: DoubleArray,
+            positions: DoubleArray,
+            pcmSize: Int,
+            sampleRate: Double,
+        ): Double {
+            val end = pcmSize - 1.0
+            val i = positions.indexOfFirst { it >= end }
+            if (i < 0) return Double.POSITIVE_INFINITY // PCM covers all the emitted knots.
+            if (i == 0) return frames.first() / sampleRate
+            val fraction = (end - positions[i - 1]) / (positions[i] - positions[i - 1])
+            return (frames[i - 1] + (frames[i] - frames[i - 1]) * fraction) / sampleRate
+        }
+
         internal fun computeEchoOutEnvelopes(
             plan: LoopMix.Plan,
             clock: LoopMix.Clock,
             outStopAtSec: Double,
+            outPcmEndSec: Double = Double.POSITIVE_INFINITY,
+            sampleRate: Int = 48000,
         ): EchoOutEnvelopes {
             val beatSec = plan.out.beatSec.coerceAtLeast(0.1)
             val outBpm = if (plan.out.bpm > 1.0) plan.out.bpm else 60.0 / beatSec
@@ -1324,13 +1521,74 @@ class LoopMixSession private constructor(
             }
             val delaySec = beatSec * delayBeats
             val feedback = PhraseConfig.ECHO_FEEDBACK_LONG.coerceIn(0.50f, 0.58f)
+            plan.handoff?.let { h ->
+                // Physical coverage was checked against the emitted knots in
+                // build; a shorter decoder result may never resize this lane.
+                val fall = if (h.outDryFallStart.mixSec == h.outDryEnd.mixSec) {
+                    // The last available source sample stays at unity; the
+                    // first sample at EOF is zero, satisfying native's exit
+                    // gate without fading any earlier source samples.
+                    doubleArrayOf(max(0.0, h.outDryEnd.mixSec - 1.0 / sampleRate),
+                        h.outDryEnd.mixSec) to floatArrayOf(1f, 0f)
+                } else MixGain.fallPoints(h.outDryFallStart.mixSec, h.outDryEnd.mixSec, steps = 8).also {
+                    // Float cos(pi/2) leaves a small residual. The contracted
+                    // dry endpoint is exact silence, including its bass lane.
+                    it.second[it.second.lastIndex] = 0f
+                }
+                val rise = if (h.inAudibleStart.mixSec == h.inFullLevelMixSec) {
+                    // Open over the preceding output sample while the source
+                    // cue is still held. Native's exact-point interpolation
+                    // must reach 1 on the very first attack sample.
+                    doubleArrayOf(max(0.0, h.inAudibleStart.mixSec - 1.0 / sampleRate),
+                        h.inAudibleStart.mixSec) to floatArrayOf(0f, 1f)
+                } else MixGain.risePoints(h.inAudibleStart.mixSec, h.inFullLevelMixSec, steps = 8)
+                val sendTimes = doubleArrayOf(0.0, h.outCaptureStart.mixSec,
+                    h.outDryFallStart.mixSec, h.outSendClose.mixSec)
+                val entryTimes = if (h.inAudibleStart.mixSec == 0.0 && h.inFullLevelMixSec == 0.0) {
+                    doubleArrayOf(0.0, clock.elementAt)
+                } else doubleArrayOf(-LoopMix.HANDOVER_SEC, *rise.first, clock.elementAt)
+                val entryValues = if (h.inAudibleStart.mixSec == 0.0 && h.inFullLevelMixSec == 0.0) {
+                    floatArrayOf(1f, 1f)
+                } else floatArrayOf(0f, *rise.second, 1f)
+                return EchoOutEnvelopes(delaySec, feedback, h.outDryFallStart.mixSec,
+                    sendTimes, if (plan.echoTail) floatArrayOf(0f, 0f, 0.90f, 0f) else FloatArray(4),
+                    sendTimes, if (plan.echoTail) floatArrayOf(0f, 0f, 0.28f, 0f) else FloatArray(4),
+                    doubleArrayOf(-LoopMix.HANDOVER_SEC, 0.0, *fall.first, outStopAtSec),
+                    floatArrayOf(0f, 1f, *fall.second, 0f), entryTimes, entryValues,
+                    fall.first, FloatArray(fall.second.size) { (LoopMix.BASS_CUT_DB * (1f - fall.second[it])).toFloat() },
+                    doubleArrayOf(0.0, clock.elementAt), floatArrayOf(0f, 0f),
+                    doubleArrayOf(0.0, h.outDryFallStart.mixSec, h.outDryEnd.mixSec, h.wetRetireMixSec),
+                    floatArrayOf(20f, 20f, 120f, 1600f),
+                    doubleArrayOf(0.0, clock.elementAt), floatArrayOf(20000f, 20000f))
+            }
             val swapAt = clock.enterEnd.coerceAtLeast(beatSec)
             val preChargeStart = (swapAt - 1.75 * beatSec).coerceAtLeast(0.0)
-            val cutEnd = swapAt + 0.10
             val sendClose = swapAt + 0.12
             val tailEnd = (swapAt + 4.0 * beatSec).coerceAtLeast(clock.releaseAt)
             val inOpenEnd = minOf(tailEnd, swapAt + 0.75 * beatSec)
-            val releaseEnd = clock.releaseAt.coerceAtLeast(cutEnd + 0.01)
+            // Give straight OUT's dry and bass lanes the same window as IN's rise.
+            // When PCM runs short, fit just the OUT lanes to the available audio.
+            val (fallTimes, fallGains) = if (plan.outLoops) {
+                doubleArrayOf(swapAt, swapAt + 0.10) to floatArrayOf(1f, 0f)
+            } else {
+                val fadeEnd = minOf(inOpenEnd, outPcmEndSec).coerceAtLeast(0.0)
+                // If OUT is already exhausted at swap, taper its last available audio.
+                val fadeStart = if (fadeEnd - swapAt >= 1e-6) swapAt else (fadeEnd - 0.10).coerceAtLeast(0.0)
+                if (fadeEnd <= 1e-6) {
+                    doubleArrayOf(0.0) to floatArrayOf(0f)
+                } else {
+                    val (times, gains) = MixGain.fallPoints(fadeStart, fadeEnd, steps = 8)
+                    gains[gains.lastIndex] = 0f
+                    times to gains
+                }
+            }
+            val fadeOutLow = FloatArray(fallGains.size) { i ->
+                (LoopMix.BASS_CUT_DB * (1f - fallGains[i])).toFloat()
+            }
+            val gainLeadTimes = if (fallTimes.first() > 0.0) doubleArrayOf(-LoopMix.HANDOVER_SEC, 0.0)
+                else doubleArrayOf(-LoopMix.HANDOVER_SEC)
+            val gainLeadValues = if (gainLeadTimes.size == 2) floatArrayOf(0f, 1f) else floatArrayOf(0f)
+            val releaseEnd = clock.releaseAt.coerceAtLeast(fallTimes.last() + 0.01)
             val stopEnd = outStopAtSec.coerceAtLeast(releaseEnd + 0.02)
 
             val (echoTimes, echoVals) = if (preChargeStart > 0.01) {
@@ -1356,12 +1614,12 @@ class LoopMixSession private constructor(
                 echoSendValues = echoVals,
                 reverbSendTimes = revTimes,
                 reverbSendValues = revVals,
-                outGainTimes = doubleArrayOf(-LoopMix.HANDOVER_SEC, 0.0, swapAt, cutEnd, releaseEnd, stopEnd),
-                outGainValues = floatArrayOf(0f, 1f, 1f, 0f, 0f, 0f),
+                outGainTimes = doubleArrayOf(*gainLeadTimes, *fallTimes, releaseEnd, stopEnd),
+                outGainValues = floatArrayOf(*gainLeadValues, *fallGains, 0f, 0f),
                 inGainTimes = inGainTimes,
                 inGainValues = inGainValues,
-                outLowTimes = doubleArrayOf(swapAt, cutEnd),
-                outLowValues = floatArrayOf(0f, LoopMix.BASS_CUT_DB.toFloat()),
+                outLowTimes = fallTimes,
+                outLowValues = fadeOutLow,
                 inLowTimes = doubleArrayOf(0.0, swapAt),
                 inLowValues = floatArrayOf(0f, 0f),
                 outHpTimes = doubleArrayOf(0.0, preHp, swapAt, tailEnd),

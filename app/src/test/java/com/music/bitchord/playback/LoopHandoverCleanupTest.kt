@@ -12,7 +12,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import org.junit.Assert.*
 import org.junit.Test
+import java.io.File
 import java.lang.reflect.Proxy
+import java.nio.file.Files
 import kotlin.math.roundToLong
 
 /** Exercises production finishLoop (and finish routing), not a copied decision helper. */
@@ -94,6 +96,10 @@ class LoopHandoverCleanupTest {
         private var invocationStart = 0L
         private var invocationEnd = 0L
         var completionReason: Any? = null
+        var completionInitiatingExitReason: Any? = null
+        var completionAcceptanceStatus: Any? = null
+        var completionTookOver: Any? = null
+        var nowMs = 10_000L
         // 12 beats including settle at 1/6 s gives elementAt=2 s, matching
         // the native freeze reproduction's cleanup at mix 2.3 / track 13.3.
         private val pick = LoopMix.Pick(100.0, 100.0 + 4.0 / 6, 1, 1.0 / 6, 360.0, 0.0, LoopMix.Check.MASK)
@@ -110,7 +116,13 @@ class LoopHandoverCleanupTest {
         ).apply { isAccessible = true }.newInstance(plan, clock, "out", "in", renderer, 48_000, anchor)
         val controller = CrossfadeController(
             scope, { if (adopted) inn.player else out.player }, { out.player }, { _, _ -> events.add("adopt") },
-            onBlendHeadroom = { completionReason = get("lastCompleteReason") },
+            onBlendHeadroom = {
+                completionReason = get("lastCompleteReason")
+                completionInitiatingExitReason = get("initiatingExitReason")
+                completionAcceptanceStatus = get("capturedTakeoverSpliceBufferStatus")
+                completionTookOver = get("capturedLoopTookOver")
+            },
+            nowMs = { nowMs },
         )
 
         init {
@@ -139,6 +151,18 @@ class LoopHandoverCleanupTest {
             invocationStart = System.nanoTime()
             CrossfadeController::class.java.getDeclaredMethod(name).apply { isAccessible = true }.invoke(controller)
             invocationEnd = System.nanoTime()
+        }
+        fun invokeLoopBail(reason: String) {
+            CrossfadeController::class.java.declaredMethods.single { it.name == "loopBail" && it.parameterCount == 4 }
+                .apply { isAccessible = true }.invoke(controller, reason, true, false, false)
+        }
+        fun invokeLoopFallback(reason: String) {
+            CrossfadeController::class.java.getDeclaredMethod("loopFallBack", String::class.java)
+                .apply { isAccessible = true }.invoke(controller, reason)
+        }
+        fun armNewLoopAttempt() {
+            CrossfadeController::class.java.declaredMethods.single { it.name == "armLoop" && it.parameterCount == 6 }
+                .apply { isAccessible = true }.invoke(controller, session, out.player, inn.player, 1, outPort, inPort)
         }
         fun assertRecoveryAtCurrentTarget() {
             val target = inn.seeks.single()
@@ -358,6 +382,83 @@ class LoopHandoverCleanupTest {
             assertTrue(r.inn.seeks.isEmpty())
             assertTrue(r.out.seeks.isEmpty())
             assertTrue(r.inn.destructive.isEmpty())
+        }
+    }
+
+    @Test fun pausedLoopBailCauseSurvivesGuardTailAndUnknownDelegateAcceptance() {
+        val dir = Files.createTempDirectory("loop-handover-cause-").toFile()
+        val telemetryDir = AutomixTelemetry::class.java.getDeclaredField("dir").apply { isAccessible = true }
+        val previousDir = telemetryDir.get(AutomixTelemetry)
+        try {
+            telemetryDir.set(AutomixTelemetry, dir)
+            Rig().use { r ->
+                r.set("executedRoute", mapOf("technique" to "native-bridge"))
+                r.invokeLoopBail("paused")
+                assertEquals("TAIL", r.get("phase").toString())
+                r.nowMs += 400L
+                r.invoke("driveTail")
+
+                assertEquals("IDLE", r.get("phase").toString())
+                assertEquals("paused", r.completionInitiatingExitReason)
+                assertNull(r.completionAcceptanceStatus)
+                assertEquals(true, r.completionTookOver)
+                assertEquals("emergency-retire-guard", r.completionReason)
+
+                val lines = File(dir, "automix-telemetry.jsonl").readLines()
+                val guard = lines.single { it.contains("\"ev\":\"mix.exit.guard\"") }
+                val complete = lines.single { it.contains("\"ev\":\"mix.complete\"") }
+                for (line in listOf(guard, complete)) {
+                    assertTrue(line, line.contains("\"initiatingExitReason\":\"paused\""))
+                    assertTrue(line, line.contains("\"takeoverSpliceBufferDelegateStatus\":null"))
+                    assertTrue(line, line.contains("\"tookOver\":true"))
+                    assertTrue(line, line.contains("\"handedOff\":true"))
+                    assertTrue(line, line.contains("\"technique\":\"native-bridge\""))
+                }
+                assertTrue(complete, complete.contains("\"reason\":\"emergency-retire-guard\""))
+            }
+            File(dir, "automix-telemetry.jsonl").writeText("")
+            Rig().use { r ->
+                r.outPort.publishTakeoverSpliceBufferStatus(
+                    r.outPort.generation, LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED,
+                )
+                r.invokeLoopFallback("paused")
+                assertEquals("TAIL", r.get("phase").toString())
+                assertEquals("paused", r.get("initiatingExitReason"))
+                assertEquals(LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED,
+                    r.get("capturedTakeoverSpliceBufferStatus"))
+                r.nowMs += 400L
+                r.invoke("driveTail")
+                val lines = File(dir, "automix-telemetry.jsonl").readLines()
+                val guard = lines.single { it.contains("\"ev\":\"mix.exit.guard\"") }
+                val complete = lines.single { it.contains("\"ev\":\"mix.complete\"") }
+                for (line in listOf(guard, complete)) {
+                    assertTrue(line, line.contains("\"initiatingExitReason\":\"paused\""))
+                    assertTrue(line, line.contains("\"takeoverSpliceBufferDelegateStatus\":\"UNRESOLVED\""))
+                    assertTrue(line, line.contains("\"tookOver\":true"))
+                }
+                assertTrue(complete, complete.contains("\"stage\":\"fallback\""))
+                assertTrue(complete, complete.contains("\"terminal\":false"))
+                assertEquals("paused", r.get("initiatingExitReason"))
+                assertNull(r.get("capturedTakeoverSpliceBufferStatus"))
+                assertNull(r.get("capturedLoopTookOver"))
+            }
+        } finally {
+            telemetryDir.set(AutomixTelemetry, previousDir)
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun newNativeArmClearsAttemptEvidenceButNotOpportunityOwnedContext() {
+        Rig().use { r ->
+            r.set("initiatingExitReason", "previous-attempt")
+            r.set("capturedTakeoverSpliceBufferStatus", LoopMixPort.TakeoverSpliceBufferStatus.UNRESOLVED)
+            r.set("capturedLoopTookOver", true)
+            r.armNewLoopAttempt()
+            assertNull(r.get("initiatingExitReason"))
+            assertNull(r.get("capturedTakeoverSpliceBufferStatus"))
+            assertNull(r.get("capturedLoopTookOver"))
+            assertNull(r.outPort.takeoverSpliceBufferStatus)
+            r.controller.release()
         }
     }
 }

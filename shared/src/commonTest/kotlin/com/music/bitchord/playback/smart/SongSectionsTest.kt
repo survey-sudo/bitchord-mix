@@ -63,8 +63,14 @@ class SongSectionsTest {
             )
             assertFalse(plan.blocked, "tail cue must not prevent a valid SMART plan: ${plan.reason}")
             assertTrue(plan.transitionStart.isFinite() && plan.transitionEnd.isFinite())
-            assertTrue(plan.transitionStart >= 0.0 && plan.transitionEnd > plan.transitionStart)
-            assertTrue(plan.fadeSeconds > 0.0 && plan.fadeSeconds.isFinite())
+            if (plan.transitionStyle == TransitionStyle.NATURAL) {
+                assertEquals(200.0, plan.transitionStart)
+                assertEquals(200.0, plan.transitionEnd)
+                assertEquals(0.0, plan.fadeSeconds)
+            } else {
+                assertTrue(plan.transitionStart >= 0.0 && plan.transitionEnd > plan.transitionStart)
+                assertTrue(plan.fadeSeconds > 0.0 && plan.fadeSeconds.isFinite())
+            }
             assertTrue(plan.mixSummary.isNotBlank(), "SMART plan must pass through DJ annotation")
         }
     }

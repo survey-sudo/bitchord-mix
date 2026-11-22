@@ -56,7 +56,8 @@ class PhrasePlannerTest {
             start = StartKind.VOCAL_PICKUP,
             pickup = 1f,
         )
-        val choice = assertNotNull(PhrasePlanner.select(a, b, 1, 120.0, 120.0))
+        val choice = assertNotNull(PhrasePlanner.select(a, b, 1, 120.0, 120.0,
+            outAnalysis = measuredVocal(a), inAnalysis = measuredVocal(b)))
         assertEquals(MixTemplate.M6, choice.template)
         assertEquals(4, choice.entry.landingBar)
         assertEquals(0.0, choice.tailBeats, 0.01)
@@ -79,7 +80,10 @@ class PhrasePlannerTest {
             sungFrom = 0,
             start = StartKind.COLD_VOCAL,
         )
-        val choice = assertNotNull(PhrasePlanner.select(a, b, 1, 120.0, 120.0))
+        // The chorus resolves before the fade interval; a sung bar label alone
+        // does not establish that its final half-second still contains a word.
+        val choice = assertNotNull(PhrasePlanner.select(a, b, 1, 120.0, 120.0,
+            outAnalysis = measuredVocal(a, quietAfter = a.durationSec - 0.5), inAnalysis = measuredVocal(b)))
         assertEquals(MixTemplate.M6, choice.template)
         assertEquals(0.75, choice.echoDelayBeats, 1e-9)
         assertEquals("ECHO_DELAY_BEATS", choice.echoDelayName)
@@ -296,8 +300,12 @@ class PhrasePlannerTest {
     @Test
     fun fourteenPercentTempoGoesToEcho() {
         val a = song("a", 100.0, 16, listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5)))
-        val b = song("b", 114.0, 16, listOf(section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5)))
-        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 100.0, 114.0))
+        val b = song("b", 114.0, 24, listOf(
+            section(0, 8, SectionFn.INTRO, SectionRole.GROOVE, energy = 5),
+            section(8, 24, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 5, vocal = 0.9f)),
+            firstVocal = 8, sungFrom = 8)
+        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 100.0, 114.0,
+            outAnalysis = measuredVocal(a), inAnalysis = measuredVocal(b)))
         assertEquals(MixTemplate.M6, choice.template)
     }
 
@@ -378,14 +386,9 @@ class PhrasePlannerTest {
     }
 
     @Test
-    fun musicalRescuePopulatesVocalClashEnergyAndOverlapBeats() {
-        // Force every strict template to veto on a measured vocal clash so
-        // musicalRescue runs: A is an all-sung chorus with no phrase-aligned
-        // unsung exit, so CuePoints falls through to the synthesized tail
-        // exit with roomBars = 8. B is a cold vocal, all sung, landing at
-        // bar 16 with a 16-bar lead-in. vocalEnergy is measured on both
-        // sides (0.9), so the weighted clash (0.81) vetoes every non-carve
-         // candidate; M6 rescue reports measured energy while its dry overlap is zero.
+    fun musicalRescueCannotForceSMinAfterMeasuredVocalVeto() {
+        // A synthesized roomBars=8 cannot override the locally measured 0.81
+        // clash, and a vocal across the dry cut also refuses ornamental M6.
         val a = song(
             "a", 120.0, 18,
             listOf(section(0, 18, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.9f)),
@@ -404,14 +407,13 @@ class PhrasePlannerTest {
             sungUntil = 32,
             start = StartKind.COLD_VOCAL,
         ).copy(vocalEnergy = FloatArray(32) { 0.9f })
-        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "rescue must produce a plan")
-        assertEquals(PhraseConfig.S_MIN, choice.score, 1e-9, "rescue carries S_MIN, got ${choice.score} via ${choice.template}")
-        assertNotNull(choice.vocalClashEnergy, "rescue must populate vocalClashEnergy")
-        assertTrue(choice.vocalOverlapBeats > 0.0, "rescue must populate vocalOverlapBeats, got ${choice.vocalOverlapBeats}")
+        assertNull(PhrasePlanner.musicalRescue(a, b, 0, 120.0, 120.0,
+            CuePoints.exits(a), CuePoints.entries(b), measuredVocal(a), measuredVocal(b)),
+            "Rescue must retain strict vocal and source coverage admission")
     }
 
     @Test
-    fun headEntryWithZeroLeadInBarsMeasuresClashOverPlannedOverlap() {
+    fun zeroLeadInHeadCannotRescueAcrossHardEnergyJump() {
         // HEAD @ bar 9: B's first non-silence section starts at 9 and its
         // first vocal bar (hence landing) is also 9, so leadInBars == 0.
         // Before the fix vocalClashEnergy used leadInBars alone and returned
@@ -433,12 +435,13 @@ class PhrasePlannerTest {
             sungFrom = 25,
             sungUntil = 25,
         ).copy(vocalEnergy = FloatArray(25) { 0.9f })
-        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0), "zero-lead-in HEAD must still produce a plan")
-        assertEquals(EntryKind.HEAD, choice.entry.kind)
-        assertEquals(9, choice.entry.startBar)
-        assertEquals(9, choice.entry.landingBar)
-        assertEquals(0, choice.entry.leadInBars)
-        assertNotNull(choice.vocalClashEnergy, "zero-lead-in HEAD must measure clash over the planned overlap")
+        val entry = assertNotNull(CuePoints.entries(b).firstOrNull { it.kind == EntryKind.HEAD })
+        assertEquals(9, entry.startBar)
+        assertEquals(9, entry.landingBar)
+        assertEquals(0, entry.leadInBars)
+        assertNull(PhrasePlanner.musicalRescue(a, b, 0, 120.0, 120.0,
+            CuePoints.exits(a), listOf(entry), measuredVocal(a), measuredVocal(b)),
+            "Zero lead-in does not exempt rescue from hard vocal/energy constraints")
     }
 
     @Test
@@ -492,6 +495,15 @@ class PhrasePlannerTest {
         val b = song("b", 120.0, 16, listOf(section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5)))
         return assertNotNull(PhrasePlanner.select(a, b, 0, 120.0, 120.0))
     }
+
+    /** Synthetic measured frames: sung bars are active, quiet room is 0.02. */
+    private fun measuredVocal(map: SongMap, quietAfter: Double = map.durationSec): TrackAnalysis =
+        TrackAnalysis(duration = map.durationSec, bpm = map.bpm, beatInterval = 60.0 / map.bpm,
+            vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray((map.durationSec * 20).toInt() + 2) { frame ->
+                val source = frame / 20.0
+                val bar = map.downbeats.indexOfLast { it <= source }
+                if (source < quietAfter && map.sungBars.getOrElse(bar) { false }) 0.9f else 0.02f
+            }))).withMeasuredEchoEvidence(map)
 
     private fun analysis(bpm: Double, duration: Double): TrackAnalysis {
         val frames = (duration * LEVEL_FRAME_RATE).toInt()

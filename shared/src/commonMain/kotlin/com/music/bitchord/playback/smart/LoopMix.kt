@@ -286,6 +286,8 @@ object LoopMix {
         val acapella: Boolean = false,
         /** djmix25 P1.12: bass-swap width in beats (MixGain.faderTemplate table). */
         val faderSwapBeats: Double = 1.0,
+        /** Explicit source/mix events for opted-in Echo handoffs. */
+        val handoff: MusicalHandoff? = null,
     ) {
         /** The tempo the ramp arrives at, in outgoing beats per minute. */
         val targetBpm: Double get() = targetBpmOverride ?: (inn.bpm / fold)
@@ -1124,7 +1126,8 @@ object LoopMix {
         val rampEnd: Double get() = beatTimes[rampTo]
 
         /** Middle of the ramp: the app moves to the incoming song. */
-        val handoffAt: Double get() = beatTimes[(rampFrom + rampTo) / 2]
+        val handoffAt: Double get() = plan.handoff?.let { maxOf(it.outDryEnd.mixSec, it.inFullLevelMixSec) }
+            ?: beatTimes[(rampFrom + rampTo) / 2]
 
         /**
          * djmix24 tight half-beat..1-beat LR4 bass swap (1 beat at mid-ramp). Was 1 bar.
@@ -1275,9 +1278,10 @@ object LoopMix {
                 .filter { it.fits(out, inn, decAnchor, decBeatSec) } else emptyList()
             var echoLazy: LoopMix.Plan? = null
             var echoBuilt = false
-            fun echoBase(): LoopMix.Plan? {
+            fun echoBase(forAlternative: Boolean = false): LoopMix.Plan? {
                 if (!echoBuilt) {
-                    echoLazy = echoPlan(out, inn, effectiveOutDuration, earliestOutSec, outGrid, inGrid, keys, sungIn, sungOut)
+                    echoLazy = echoPlan(out, inn, effectiveOutDuration, earliestOutSec, outGrid, inGrid, keys, sungIn, sungOut,
+                        musicalHandoff = !forAlternative)
                     echoBuilt = true
                 }
                 return echoLazy
@@ -1294,13 +1298,13 @@ object LoopMix {
                     val flagged = family.applyLoop(dropped)
                     return if (acapellaAllowed(out, inn)) flagged.copy(acapella = true) else flagged
                 } else {
-                    val e = echoBase() ?: return null
+                    val e = echoBase(forAlternative = true) ?: return null
                     val flagged = family.applyLoop(e)
                     return if (acapellaAllowed(out, inn)) flagged.copy(acapella = true) else flagged
                 }
             }
             val e = echoBase() ?: return null
-            return if (acapellaAllowed(out, inn)) e.copy(acapella = true) else e
+            return if (e.alternativeKind != "natural-end" && acapellaAllowed(out, inn)) e.copy(acapella = true) else e
         }
         if (outOk && inOk) {
             val outBeat = outGrid.beatSec
@@ -1340,7 +1344,7 @@ object LoopMix {
             }
         }
         val finalEcho = echoPlan(out, inn, effectiveOutDuration, earliestOutSec, outGrid, inGrid, keys, sungIn, sungOut)
-        return if (finalEcho != null && acapellaAllowed(out, inn)) finalEcho.copy(acapella = true) else finalEcho
+        return if (finalEcho != null && finalEcho.alternativeKind != "natural-end" && acapellaAllowed(out, inn)) finalEcho.copy(acapella = true) else finalEcho
     }
 
     private fun dropPlan(
@@ -1527,6 +1531,7 @@ object LoopMix {
         keys: String,
         sungIn: List<Span>? = null,
         sungOut: List<Span>? = null,
+        musicalHandoff: Boolean = true,
     ): Plan? {
         val outBeat = outGrid?.beatSec ?: inGrid?.beatSec ?: return null
         val inBeat = inGrid?.beatSec ?: outBeat
@@ -1536,45 +1541,94 @@ object LoopMix {
         val effectiveEnd = out.contentEndTime.takeIf {
             it.isFinite() && it > earliestOutSec + bar + 0.5 && it <= outDuration
         } ?: outDuration
-        val rawStart = (effectiveEnd - 2 * bar - 0.3).coerceAtLeast(earliestOutSec)
-        val maxStart = outDuration - bar - 0.2
-        val outStart = if (outGrid != null) {
-            snapOutStart(out, outGrid, rawStart, earliestOutSec, maxStart, sungOut)
-        } else {
-            out.downbeats.lastOrNull { beat ->
-                beat.isFinite() && beat >= earliestOutSec && beat <= maxStart && beat <= rawStart + bar * 0.5
-            } ?: rawStart
+        // Registered muffle/beatless alternatives own their existing geometry
+        // and DSP. They must not inherit the Echo handoff contract.
+        if (!musicalHandoff) {
+            val rawStart = (effectiveEnd - 2 * bar - 0.3).coerceAtLeast(earliestOutSec)
+            val maxStart = outDuration - bar - 0.2
+            val start = if (outGrid != null) snapOutStart(out, outGrid, rawStart, earliestOutSec, maxStart, sungOut)
+                else out.downbeats.lastOrNull { it.isFinite() && it >= earliestOutSec && it <= maxStart && it <= rawStart + bar * 0.5 }
+                    ?: rawStart
+            if (start >= outDuration - 0.5 || start + bar > outDuration - 0.2) return null
+            val cue = if (inGrid != null) cueOf(inn, sungIn)
+                else inn.audibleStartTime?.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
+            return Plan(straightPick(start, outBeat, outBpm), straightPick(cue, inBeat, inBpm),
+                fold = 1.0, enterBars = 1, rampBars = 0, exitBars = 1, totalBars = 2,
+                outLoops = false, inLoops = false, nativeIncoming = true, echoTail = true,
+                rung = "Echo", keys = keys, targetBpmOverride = outBpm, incomingHoldSec = bar,
+                exitTailSeconds = PhraseConfig.exitTailSeconds(outBeat), buildupRoll = false, reverbWash = true)
         }
-        if (outStart >= outDuration - 0.5 || outStart + bar > outDuration - 0.2) return null
-        val inCue = if (inGrid != null) {
+        val selectedCue = if (inGrid != null) {
             cueOf(inn, sungIn)
         } else {
             inn.audibleStartTime?.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0
         }
-        // True DJ Echo-Out (bkmasterplayer tempo_jump_plan + Apple AutoMix):
-        // Song A stays clean through the 1-bar pre-cut window while echo + subtle
-        // reverb pre-charge across the last 1.5-2 beats before swapAt (= bar),
-        // dry cuts sharply on the downbeat, and Song B enters cleanly at 1.0x
-        // while the echo/reverb tail rings out for 3-4 beats.
+        val inCue = minOf(selectedCue,
+            inn.pickupTime?.takeIf { it.isFinite() && it >= 0.0 } ?: selectedCue,
+            inn.audibleStartTime?.takeIf { it.isFinite() && it >= 0.0 } ?: selectedCue)
+        val fade = 0.75 * outBeat
+        val minCut = maxOf(earliestOutSec + bar, effectiveEnd - 4 * bar)
+        val targetCut = effectiveEnd - bar
+        val candidates = (out.phraseBoundaries + out.mixOutCandidates.map { it.time } +
+            listOf(out.mixOutTime) + out.tailBeats?.downbeats.orEmpty() + out.downbeats +
+            sungOut.orEmpty().filter { it.end == it.certainUntil }.map { it.end + 0.08 + fade } +
+            listOf(effectiveEnd))
+            .filter { it.isFinite() && it in minCut..effectiveEnd }
+            .distinct().sortedWith(compareBy<Double> { abs(it - targetCut) }.thenByDescending { it })
+            .take(128)
+        fun timing(cut: Double, natural: Boolean = false): MusicalHandoff? {
+            val start = if (natural) cut - 2 * bar - 0.3 else cut - bar
+            val endMix = cut - start
+            return nativeTiming(start, maxOf(start, cut - fade - 1.75 * outBeat),
+                if (natural) cut else cut - fade, cut, inCue, inCue, inCue,
+                if (natural) endMix else bar,
+                incomingOpenSec = 0.0,
+                wetDrainSec = if (natural) 0.0 else bar + 0.05 + outBeat * 8 + PhraseConfig.exitTailSeconds(outBeat))
+        }
+        // Evaluate the actual fade and capture interval. Completed sung phrases
+        // may feed the delay; this is straight playback, never a repeated loop.
+        val measured = candidates.firstNotNullOfOrNull { cut ->
+            timing(cut)?.takeIf {
+                qualifyMusicalHandoff(it, out, inn, sungOut, sungIn).status == HandoffStatus.QUALIFIED &&
+                    EchoAdmission.musicalRefusal(it, out, inn) == null
+            }
+        }
+        // If no measured musical exit exists, play through the physical end.
+        // A zero-width dry end cannot amputate a word or claim unknown is clean.
+        val handoff = measured ?: outDuration.takeIf {
+            it.isFinite() && it >= earliestOutSec + bar
+        }?.let { timing(it, natural = true) } ?: return null
+        val outStart = handoff.outDryEnd.sourceSec - handoff.outDryEnd.mixSec
+        // Reserve the straight clock through effect retirement as well as the
+        // dry endpoint and B's landing. Session stop/tail geometry is derived
+        // from releaseAt, so a qualified Echo cannot retire beyond its clock.
+        // Natural-end handoffs carry no wet retirement and preserve physical EOF.
+        val requiredEnd = maxOf(handoff.outDryEnd.mixSec, handoff.inLanding.mixSec, handoff.wetRetireMixSec)
+        val neededBars = ceil(requiredEnd / bar - 1e-9)
+        val maxBars = (PhraseConfig.O_MAX_SEC / bar).toInt() - SETTLE_BARS
+        if (!neededBars.isFinite() || maxBars < 2 || neededBars > maxBars) return null
+        val totalBars = maxOf(2, neededBars.toInt())
         return Plan(
             out = straightPick(outStart, outBeat, outBpm),
             inn = straightPick(inCue, inBeat, inBpm),
             fold = 1.0,
             enterBars = 1,
             rampBars = 0,
-            exitBars = 1,
-            totalBars = 2,
+            exitBars = totalBars - 1,
+            totalBars = totalBars,
             outLoops = false,
             inLoops = false,
             nativeIncoming = true,
-            echoTail = true,
-            rung = "Echo",
+            echoTail = measured != null,
+            rung = if (measured != null) "Echo" else "Natural handoff",
+            alternativeKind = if (measured != null) "" else "natural-end",
             keys = keys,
             targetBpmOverride = outBpm,
-            incomingHoldSec = bar,
+            incomingHoldSec = handoff.inHoldMixSec,
             exitTailSeconds = PhraseConfig.exitTailSeconds(outBeat),
             buildupRoll = false,
-            reverbWash = true,
+            reverbWash = measured != null,
+            handoff = handoff,
         )
     }
 
@@ -2119,10 +2173,15 @@ object LoopMix {
             maxOf(nominal, lastOutPos + tailTrack + 0.5, pastElement)
         }
         val inTail = if (plan.echoTail) 3.0 + plan.out.beatSec * 8.0 else 3.0
+        // Contract cues are physical source events, including source zero.
+        // Clamp request preroll here so build and the controller's cache-ready
+        // query use identical bounds without inventing negative-source PCM.
+        val outFrom = plan.out.loopStart - 1.0
+        val inFrom = plan.inn.loopStart - 1.0
         return RegionBounds(
-            outFrom = plan.out.loopStart - 1.0,
+            outFrom = if (plan.handoff != null) maxOf(0.0, outFrom) else outFrom,
             outTo = outTo,
-            inFrom = plan.inn.loopStart - 1.0,
+            inFrom = if (plan.handoff != null) maxOf(0.0, inFrom) else inFrom,
             inTo = clock.elementTrackTime + inTail,
         )
     }

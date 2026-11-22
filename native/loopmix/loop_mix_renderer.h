@@ -217,10 +217,14 @@ struct Deck {
   /** Track seconds heard at the end of the last rendered block. */
   std::atomic<double> heard{0.0};
 
-  // Live state, render thread only.
+  // Stretch state is configured/held-start primed in prepare(), then advanced
+  // by render(); all mutable playback state is otherwise render-thread only.
   signalsmith::stretch::SignalsmithStretch<float> stretch;
   bool started = false;
   bool finished = false;
+  bool heldStartup = false;
+  bool heldPrimed = false;
+  int64_t heldPreparedFrame = 0;
   double readPos = 0;      // unwrapped region samples, the next input sample to feed
   double heardPos = 0;     // unwrapped region samples heard at the end of the last block
   double lastKnotHeard = 0;

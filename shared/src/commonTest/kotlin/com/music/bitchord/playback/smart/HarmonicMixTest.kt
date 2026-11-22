@@ -120,9 +120,15 @@ class HarmonicMixTest {
     }
 
     @Test
-    fun aTempoGapPastTheStretchLimitEchoesOnTheBarInsteadOfAPlainFilter() {
-        val out = track(100.0, "C major", List(40) { 140.0 + it * 0.6 })
-        val next = track(140.0, "C major", List(32) { it * 60.0 / 140.0 })
+    fun aTempoGapPastTheStretchLimitNeedsMoreThanAPlainTempoEstimate() {
+        val out = track(100.0, "C major", List(40) { 140.0 + it * 0.6 }).copy(
+            energyCurve = List(180) { EnergySample(it.toDouble(), 1.0) },
+            vocalActivityMask = List(180) { 0.02 },
+        )
+        val next = track(140.0, "C major", List(32) { it * 60.0 / 140.0 }).copy(
+            energyCurve = List(180) { EnergySample(it.toDouble(), 1.0) },
+            vocalActivityMask = List(180) { 0.02 },
+        )
         val plan = planTransition(
             analysis = out,
             nextAnalysis = next,
@@ -133,9 +139,9 @@ class HarmonicMixTest {
             mode = CrossfadeMode.SMART,
             advanced = true,
         )
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
-        assertEquals(FilterTransitionVariant.ECHO_RIDE, plan.filterVariant)
-        assertTrue(plan.echoSeconds > 0.2)
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle)
+        assertEquals(0.0, plan.fadeSeconds)
+        assertEquals(0.0, plan.echoSeconds)
         assertEquals(1.0, plan.incomingPlaybackRate, 1e-6)
     }
 

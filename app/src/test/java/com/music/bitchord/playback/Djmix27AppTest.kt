@@ -111,12 +111,12 @@ class Djmix27AppTest {
     }
 
     @Test
-    fun declineWithoutCurvesKeepsBoundedFourSecondFilter() {
+    fun declineWithoutCurvesDefaultsToNaturalAdvance() {
         val out = build("out", 120.0, "C major").copy(lowEnergyCurve = emptyList())
         val inn = build("inn", 94.0, "F major", vocalProbability = 0.9).copy(lowEnergyCurve = emptyList())
         val p = plan(out, inn)
-        assertEquals(TransitionStyle.DJ_FILTER, p.transitionStyle)
-        assertEquals(4.0, p.fadeSeconds, 1e-9)
+        assertEquals(TransitionStyle.NATURAL, p.transitionStyle)
+        assertEquals(0.0, p.fadeSeconds, 1e-9)
         assertTrue(p.reason.contains("decline-to-mix"))
     }
 
@@ -130,7 +130,7 @@ class Djmix27AppTest {
         assertTrue("rung=" + bridgedNonNull.rung, bridgedNonNull.muffle || bridgedNonNull.beatlessBridge)
         assertFalse(bridgedNonNull.beatlessBridge)
         assertEquals("Muffle", bridgedNonNull.rung)
-        // No curves: the classic Echo rung, exactly as before vc69.
+        // Missing local coverage cannot authorize an ornamental Echo at a natural end.
         val bare = LoopMix.bridge(
             out.copy(lowEnergyCurve = emptyList()),
             200.0,
@@ -141,7 +141,8 @@ class Djmix27AppTest {
         assertNotNull(bare)
         assertFalse(bare.muffle)
         assertFalse(bare.beatlessBridge)
-        assertEquals("Echo", bare.rung)
+        assertEquals("Natural handoff", bare.rung)
+        assertFalse(bare.echoTail)
     }
 
     @Test

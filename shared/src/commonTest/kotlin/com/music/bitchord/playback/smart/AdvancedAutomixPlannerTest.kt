@@ -70,31 +70,30 @@ class AdvancedAutomixPlannerTest {
     }
 
     @Test
-    fun anUnmixablePairIsCrossfadedAtTheEndIntoTheIntro() {
+    fun anUnmixablePairDefaultsToNaturalAdvanceWithoutSkippingTheIntro() {
         // Tempo out of reach (post-fold delta >8%), clashing keys (>2 steps),
         // both sung: Task 2B classic decline fallback uses a short sculpted
         // 3.5-4.5s DJ_FILTER carve instead of 15s raw EQUAL_POWER overlap.
         val current = track("a", 120.0, "C major", vocal = 0.9)
         val next = track("b", 94.0, "F♯ major", vocal = 0.9)
         val plan = plan(current, next, advanced = true)
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
-        assertTrue(plan.fadeSeconds in 3.5..4.5, "fade=${plan.fadeSeconds}")
-        assertTrue(plan.filterSweep > 0.0)
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle)
+        assertEquals(0.0, plan.fadeSeconds)
+        assertEquals(0.0, plan.filterSweep)
         assertTrue(plan.reason.contains("decline-to-mix"))
-        assertTrue(plan.transitionEnd <= current.contentEndTime + 1e-6)
-        assertEquals(TransitionStyle.DJ_FILTER, plan(current, next, advanced = false).transitionStyle)
-        assertEquals(next.audibleStartTime!!, plan.incomingCueTime, 1e-6)
+        assertEquals(current.duration, plan.transitionEnd)
+        assertEquals(TransitionStyle.NATURAL, plan(current, next, advanced = false).transitionStyle)
+        assertEquals(0.0, plan.incomingCueTime)
     }
 
     @Test
-    fun aTempoOnlyMismatchIsStillFiltered() {
+    fun aTempoOnlyMismatchDoesNotInventAnEffectOrForcedOverlap() {
         val current = track("a", 120.0, "C major", vocal = 0.1)
         val next = track("b", 94.0, "C major", vocal = 0.1)
         val plan = plan(current, next, advanced = true)
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
-        val bars = plan.fadeSeconds / (4 * (60.0 / 120.0))
-        assertTrue(bars >= 4.0 - 0.05, "a filter mix should share at least 4 bars, was $bars")
-        assertTrue(bars <= 8.05, "a filter mix stays within 8 bars, was $bars")
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle)
+        assertEquals(0.0, plan.fadeSeconds)
+        assertEquals(DjEffect.NONE, plan.djEffect)
     }
 
     @Test
@@ -124,7 +123,7 @@ class AdvancedAutomixPlannerTest {
     }
 
     @Test
-    fun aGapPastTheStretchLimitEchoesOnTheBarAndEntersAtItsIntro() {
+    fun aGapPastTheStretchLimitCannotChooseEchoByPairHash() {
         val current = track("a", 120.0, "C major", vocal = 0.1).let {
             it.copy(contentEndTime = it.duration - 20, vocalActivityMask = it.energyCurve.map { 0.0 })
         }
@@ -132,16 +131,10 @@ class AdvancedAutomixPlannerTest {
             val next = track("echo-$index", 94.0, "C major", vocal = 0.1, bass = 1.0)
                 .let { it.copy(vocalActivityMask = it.energyCurve.map { 0.0 }) }
             val plan = plan(current, next, advanced = true)
-            assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
-            assertEquals(FilterTransitionVariant.ECHO_RIDE, plan.filterVariant)
-            // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
-            val effect = when (pairHash(current.trackId, next.trackId) % 3) {
-                2 -> DjEffect.REVERB
-                else -> DjEffect.ECHO
-            }
-            assertEquals(effect, plan.djEffect)
-            if (effect == DjEffect.ECHO) assertTrue(plan.echoSeconds > 0.2)
-            assertEquals(next.audibleStartTime!!, plan.incomingCueTime, 1e-6, "cued into the intro, not the drop")
+            assertEquals(TransitionStyle.NATURAL, plan.transitionStyle)
+            assertEquals(DjEffect.NONE, plan.djEffect)
+            assertEquals(0.0, plan.echoSeconds)
+            assertEquals(0.0, plan.incomingCueTime, "the normal queue preserves the whole intro")
         }
     }
 
@@ -176,7 +169,7 @@ class AdvancedAutomixPlannerTest {
         val current = track("a", 120.0, "C major", vocal = 0.1)
         val next = track("b", 135.0, "C major", vocal = 0.1)
         val plan = plan(current, next, advanced = true)
-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
+        assertEquals(TransitionStyle.NATURAL, plan.transitionStyle)
         assertEquals(1.0, plan.incomingPlaybackRate, "past the window the incoming song keeps its tempo")
         assertEquals(1.0, plan.outgoingPlaybackRate, "an audible deck must never change speed")
         // Inside the window (130: slowed by 7.7%) both modes slow the incoming song down.

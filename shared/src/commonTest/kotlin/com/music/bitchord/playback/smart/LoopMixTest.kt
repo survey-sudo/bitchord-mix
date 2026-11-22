@@ -540,12 +540,16 @@ class LoopMixTest {
 
     @Test
     fun aVocalPairPastSixPercentDoesNotStretch() {
-        val out = analysis(120.0, 200.0).copy(vocalProbability = 0.8)
-        val inn = analysis(128.0, 180.0).copy(vocalProbability = 0.8)
+        // The pair is vocal overall, with a measured clean final phrase exit.
+        val out = analysis(120.0, 200.0, listOf(vocals(0.0, 200.0, 0.8f,
+            listOf(196.0 to 200.0)))).copy(vocalProbability = 0.8)
+        val inn = analysis(128.0, 180.0, listOf(vocals(0.0, 180.0, 0.8f))).copy(vocalProbability = 0.8)
         val plan = assertNotNull(LoopMix.bridge(out, 200.0, inn, 180.0, 0.0))
-        assertEquals("Echo", plan.rung)
+        assertEquals("Natural handoff", plan.rung)
         assertTrue(plan.nativeIncoming)
-        assertTrue(plan.echoTail)
+        assertFalse(plan.echoTail)
+        assertEquals(HandoffStatus.QUALIFIED,
+            qualifyMusicalHandoff(assertNotNull(plan.handoff), out, inn, null, null).status)
     }
 
     @Test

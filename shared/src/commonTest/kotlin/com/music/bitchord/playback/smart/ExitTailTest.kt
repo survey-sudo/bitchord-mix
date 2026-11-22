@@ -110,7 +110,7 @@ class ExitTailTest {
 
     @Test
     fun everyCompiledTemplateEndsMuted() {
-        val templates = MixTemplate.entries.filter { it != MixTemplate.M2 }
+        val templates = MixTemplate.entries.filter { it != MixTemplate.M2 && it != MixTemplate.M6 }
         for (t in templates) {
             val choice = relaxedChoice().copy(template = t, rung = "x")
             val script = TransitionMoves.compile(choice, 120.0, 120.0)

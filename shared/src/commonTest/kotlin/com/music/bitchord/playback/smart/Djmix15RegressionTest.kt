@@ -148,6 +148,7 @@ class Djmix15RegressionTest {
             currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
             nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
             currentTime = 176.5, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = false,
+            allowRecoveryCrossfade = true, // exercise the last-resort recovery contract, not the default policy
         )
         // Standard start was length-fade = 172.0; playhead 176.5 is 4.5 s late
         // with 3.5 s left — must be re-anchored ahead, not the dead window.
@@ -188,6 +189,7 @@ class Djmix15RegressionTest {
             currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
             nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
             currentTime = 176.5, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = false,
+            allowRecoveryCrossfade = true,
         )
         // Timing preserved: still re-anchored ahead, not inflated back to 171.6.
         assertFalse(plan.blocked)

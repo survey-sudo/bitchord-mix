@@ -28,8 +28,8 @@ class LoopSourceGeometryTest {
         assertEquals(9.605, geometry.handoverTrack, 1e-9)
         assertEquals(19.155, geometry.releaseTrack, 1e-9)
         val (startAt, startTrack) = LoopMixSession.incomingStartFor(c, geometry.handoverTrack)
-        assertEquals(.5, startAt, 1e-9)
-        assertEquals(0.0, startTrack, 1e-9) // negative track time is sink-aligned silence
+        assertEquals(geometry.handoverTrack, startTrack + (c.elementAt - startAt), 1e-9)
+        assertEquals(0.0, startTrack, 1e-9) // deferred source start reaches the final join without silence debt
         val bounds = LoopMix.regionBounds(p)
         val samples = ceil((bounds.inTo - bounds.inFrom) * 48_000).toInt()
         assertTrue(LoopMixSession.coversPhysical(LoopRegion(FloatArray(samples), FloatArray(samples), bounds.inFrom),

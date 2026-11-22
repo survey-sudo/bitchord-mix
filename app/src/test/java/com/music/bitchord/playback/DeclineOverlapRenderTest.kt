@@ -13,7 +13,9 @@ import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.smart.DjEffect
 import com.music.bitchord.playback.smart.EnergySample
 import com.music.bitchord.playback.smart.FilterTransitionVariant
+import com.music.bitchord.playback.smart.MixGain
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.TransitionAlternatives
 import com.music.bitchord.playback.smart.TransitionEvidenceCache
 import com.music.bitchord.playback.smart.TransitionPlan
 import com.music.bitchord.playback.smart.TransitionStyle
@@ -34,6 +36,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -57,7 +60,8 @@ import kotlin.math.sin
  * Synthetic inputs are mechanism probes, not songs, voices, or a reported bad pair.
  *
  * Real start/tick -> planner -> prepare -> startFade -> incremental FADING -> one role swap
- * -> finish -> B/C planning. Controller fields are only inspected, never seeded/reset.
+ * -> finish -> B/C planning. The classic Echo cases substitute a deterministic
+ * render plan at arm time, then use the same production tick and PCM path.
  * PCM uses zero sink lead: filter.process(AudioBlock), callback trim, then player.volume.
  * Unequal nonzero leads have a separate command/routing test; future targets are not
  * represented as already-heard PCM. Both physical processors persist across handoff;
@@ -77,6 +81,66 @@ class DeclineOverlapRenderTest {
     @Test fun renderSynthetic120Over87PercussiveCollision() = runProbe(Probe.PERCUSSION)
 
     @Test fun renderCompatibleSamePhaseControl() = runProbe(Probe.PHASE_CONTROL)
+
+    @Test fun classicDropInEchoCarriesWetPastOverlapAndFadesByItsTailDeadline() =
+        renderClassicEcho(earlyEof = false)
+
+    @Test fun classicEchoWithShortGridClosesDryByOverlapAndFadesByKnownEof() =
+        renderClassicEcho(earlyEof = true)
+
+    private fun renderClassicEcho(earlyEof: Boolean) = withRig(compatible = false, leads = 0L to 0L) { r ->
+        val plan = r.startAndPlan()
+        assertEquals(4_000L, plan.fadeMs)
+        val start = (plan.transitionStart * 1_000).roundToLong()
+        r.first.position = start - PAD_MS
+        r.tick()
+        assertEquals("ARMING", r.phase)
+        r.useClassicEchoRender(plan, beatSeconds = if (earlyEof) 1.0 else 0.5)
+        r.first.position = start
+        r.tick()
+        assertEquals("FADING", r.phase)
+        if (earlyEof) r.first.durationMs = start + 4_400L
+
+        val echoAt = 2_000L
+        // The 750ms delay and five repeats would normally end at 5.75s.
+        val end = if (earlyEof) 4_400L else 5_750L
+        val outBlock = AudioBlock(CHANNELS, BLOCK_FRAMES)
+        var previous = 1f
+        var heardRepeatPastOverlap = false
+        val lastTick = ((end + BLOCK_MS - 1) / BLOCK_MS) * BLOCK_MS
+        for (t in 0L..lastTick step BLOCK_MS) {
+            r.tick()
+            val playing = r.first.playWhenReady && r.first.ready
+            val gain = if (playing) r.first.player.volume else 0f
+            val expected = if (t >= end) 0f else MixGain.fall((t - echoAt).toFloat() / (end - echoAt))
+            assertEquals("whole outgoing fader at $t ms", expected, gain, 1e-5f)
+            assertTrue("fader must never rise at $t ms", gain <= previous + 1e-6f)
+            previous = gain
+
+            if (playing) {
+                outBlock.reset(BLOCK_FRAMES)
+                for (sample in outBlock.samples.indices) {
+                    val seconds = t / 1_000.0 + (sample / CHANNELS).toDouble() / RATE
+                    outBlock.samples[sample] = if (t < echoAt) (0.4 * sin(2 * PI * 977 * seconds)).toFloat() else 0f
+                }
+                r.first.filter.process(outBlock)
+                if (t >= plan.fadeMs && t < end) {
+                    assertEquals("processor dry stays closed while the whole fader carries wet", 0f, r.first.filterValue("echoDry"), 0f)
+                    heardRepeatPastOverlap = heardRepeatPastOverlap ||
+                        outBlock.samples.any { kotlin.math.abs(it * gain * r.headroom) > 1e-5f }
+                }
+            }
+            if (t < lastTick) r.advanceBlock()
+        }
+        assertTrue("real classic DSP must still render a repeat after progress 1", heardRepeatPastOverlap)
+        assertEquals(listOf("A->B"), r.handoffs)
+        assertSame(r.second, r.activeDeck)
+        if (!earlyEof) {
+            assertEquals("IDLE", r.phase)
+            assertEquals(1, r.first.stops)
+            assertEquals(0, r.second.stops)
+        }
+    }
 
     @Test fun unequalPhysicalSinkLeadsStayWithTheirDeckAcrossOneHandoff() =
         runProbe(Probe.MULTITONE, routingOnly = true)
@@ -198,7 +262,7 @@ class DeclineOverlapRenderTest {
             r.second.position = maxOf(r.second.position, 36_000L)
             r.tick()
             assertEquals("IDLE", r.phase)
-            assertNotNull(r.controller.plannedTransitionFor("B"))
+            r.assertNaturalPlanFor("B")
             val evidence = TransitionEvidenceCache.recent(1).single()
             assertEquals("B", evidence.outId)
             assertEquals("C", evidence.inId)
@@ -258,7 +322,7 @@ class DeclineOverlapRenderTest {
             r.second.exactClock = false
             r.second.position = maxOf(r.second.position, 36_000L)
             r.tick()
-            assertNotNull(r.controller.plannedTransitionFor("B"))
+            r.assertNaturalPlanFor("B")
             r.assertTicker()
         }
     }
@@ -300,7 +364,7 @@ class DeclineOverlapRenderTest {
 
             AppSettings.smartFadeEnabled.value = true
             r.tick()
-            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            r.assertNaturalPlanFor("A") // manual disable/re-enable is a new, non-recovery choice
             r.assertTicker()
         }
 
@@ -341,7 +405,7 @@ class DeclineOverlapRenderTest {
 
             r.first.player.play()
             r.tick()
-            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            r.assertNaturalPlanFor("A") // a cancelled arming does not force a new overlap on resume
             r.assertTicker()
         }
     }
@@ -487,7 +551,7 @@ class DeclineOverlapRenderTest {
             r.wallMs += 400L
             r.tick()
             assertEquals("IDLE", r.phase)
-            assertEquals(start, r.controller.plannedTransitionFor("A"))
+            r.assertNaturalPlanFor("A") // a user seek does not inherit failed-native recovery
             assertFalse(AppSettings.automixStatus.value?.headline?.contains("Replanning") == true)
             r.assertTicker()
         }
@@ -618,7 +682,10 @@ class DeclineOverlapRenderTest {
             r.second.position = maxOf(r.second.position, 36_000L)
             r.tick()
             assertEquals("IDLE", r.phase)
-            assertNotNull(r.controller.plannedTransitionFor("B"))
+            if (probe == Probe.PHASE_CONTROL) {
+                assertNotNull("a qualified compatible blend keeps its normal priority", r.controller.plannedTransitionFor("B"))
+                assertEquals(TransitionStyle.DJ_BLEND, (r.get("lastSmartPlan") as TransitionPlan).transitionStyle)
+            } else r.assertNaturalPlanFor("B")
             val evidence = TransitionEvidenceCache.recent(1).single()
             assertEquals("B", evidence.outId)
             assertEquals("C", evidence.inId)
@@ -743,11 +810,45 @@ class DeclineOverlapRenderTest {
         fun get(name: String): Any? = CrossfadeController::class.java.getDeclaredField(name)
             .apply { isAccessible = true }.get(controller)
 
+        fun assertNaturalPlanFor(id: String) {
+            assertNull("a completed recovery must not authorize the next overlap", controller.plannedTransitionFor(id))
+            val next = get("lastSmartPlan") as TransitionPlan
+            assertEquals(TransitionStyle.NATURAL, next.transitionStyle)
+            assertEquals(0.0, next.fadeSeconds, 0.0)
+            assertEquals(0.0, next.echoSeconds, 0.0)
+            assertEquals(DjEffect.NONE, next.djEffect)
+            assertEquals("IDLE", phase)
+        }
+
+        fun useClassicEchoRender(plan: TransitionPlan, beatSeconds: Double) {
+            val dropIn = plan.copy(
+                transitionStyle = TransitionStyle.DROP_IN,
+                filterVariant = FilterTransitionVariant.SWEEP,
+                beatSeconds = beatSeconds,
+                echoSeconds = TransitionAlternatives.DROP_IN_ECHO_TAIL_SECONDS,
+            )
+            val render = CrossfadeController::class.java.getDeclaredMethod(
+                "renderFor", TransitionPlan::class.java, Boolean::class.javaPrimitiveType!!,
+            ).apply { isAccessible = true }.invoke(controller, dropIn, true)
+            CrossfadeController::class.java.getDeclaredField("render").apply { isAccessible = true }.set(controller, render)
+        }
+
         fun startAndPlan(): TransitionPlan {
             assertFalse("this JVM harness requires the native renderer to be unavailable", LoopMixRenderer.available)
             controller.start()
             ticker = get("tickerJob") as Job
             scheduler.runCurrent()
+            // These signal/lifecycle probes exercise the explicit last-resort
+            // renderer after a committed native route failed. A cold rejection
+            // alone now correctly leaves the normal queue to advance naturally.
+            val countdown = get("countdownStabilizer") as com.music.bitchord.playback.smart.CountdownStabilizer
+            countdown.reset()
+            val epoch = get("scrubEpoch") as Long
+            countdown.consider(com.music.bitchord.playback.smart.CountdownStabilizer.Candidate(
+                "A->B", epoch, com.music.bitchord.playback.smart.CountdownStabilizer.Family.NATIVE_BRIDGE,
+                "native", 20_000L, 200_000L), first.position)
+            countdown.onRungFailed("A->B", epoch,
+                com.music.bitchord.playback.smart.CountdownStabilizer.Family.NATIVE_BRIDGE)
             tick()
             assertEquals("IDLE", phase)
             assertNotNull(controller.plannedTransitionFor("A"))
@@ -847,6 +948,7 @@ class DeclineOverlapRenderTest {
             if (starting) onStart?.invoke()
         }
         var prepares = 0
+        var durationMs = DURATION_MS
         var stops = 0
         var clears = 0
         var seeks = 0
@@ -878,7 +980,7 @@ class DeclineOverlapRenderTest {
                 "hasNextMediaItem" -> nextIndex() != C.INDEX_UNSET
                 "getCurrentTimeline" -> timeline
                 "getCurrentPosition", "getContentPosition" -> position
-                "getDuration" -> if (index in items.indices) DURATION_MS else C.TIME_UNSET
+                "getDuration" -> if (index in items.indices) durationMs else C.TIME_UNSET
                 "getPlaybackState" -> state
                 "isPlaying" -> !exactClock && playWhenReady && ready
                 "getPlayWhenReady" -> playWhenReady

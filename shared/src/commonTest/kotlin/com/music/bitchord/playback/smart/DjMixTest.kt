@@ -91,21 +91,22 @@ class DjMixTest {
     }
 
     @Test
-    fun aKnownPairEchoesAndTheNextHashReverbs() {
-        // djmix19 intentionally changed: tempoGap rotates ECHO (2/3) <-> REVERB (1/3), never LOOP_ROLL.
+    fun pairHashCannotAuthorizeAnUnqualifiedEchoOrReplacementWash() {
         assertEquals(0, pairHash("a", "b") % 3)
-        val echoed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "b")
-        assertEquals(DjEffect.ECHO, echoed.djEffect)
-        assertTrue(echoed.echoSeconds > 0.2)
+        val out = track(100.0).let { it.copy(vocalActivityMask = List(it.energyCurve.size) { 0.02 }) }
+        val inn = track(140.0).let { it.copy(vocalActivityMask = List(it.energyCurve.size) { 0.02 }) }
+        val echoed = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "b")
+        assertEquals(DjEffect.NONE, echoed.djEffect)
+        assertEquals(0.0, echoed.echoSeconds)
         val echoId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 1 }
-        val stillEcho = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$echoId")
-        assertEquals(DjEffect.ECHO, stillEcho.djEffect)
-        assertTrue(stillEcho.echoSeconds > 0.2)
+        val stillEcho = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "id-$echoId")
+        assertEquals(DjEffect.NONE, stillEcho.djEffect)
+        assertEquals(0.0, stillEcho.echoSeconds)
         val reverbId = (0 until 64).first { pairHash("a", "id-$it") % 3 == 2 }
-        val reverbed = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$reverbId")
-        assertEquals(DjEffect.REVERB, reverbed.djEffect)
+        val reverbed = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "id-$reverbId")
+        assertEquals(DjEffect.NONE, reverbed.djEffect)
         assertEquals(0.0, reverbed.echoSeconds)
-        assertTrue(reverbed.mixSummary.contains("reverb wash"))
+        assertFalse(reverbed.mixSummary.contains("reverb wash"))
     }
 
     @Test

@@ -64,18 +64,14 @@ class Djmix19RegressionTest {
 
     @Test
     fun tempoGapNeverPicksLoopRoll() {
-        var echoes = 0
-        var reverbs = 0
+        val out = track(100.0).let { it.copy(vocalActivityMask = List(it.energyCurve.size) { 0.02 }) }
+        val inn = track(140.0).let { it.copy(vocalActivityMask = List(it.energyCurve.size) { 0.02 }) }
         for (i in 0..40) {
-            val plan = DjMix.annotate(gap(), track(100.0), track(140.0), outgoingId = "a", incomingId = "id-$i")
+            val plan = DjMix.annotate(gap(), out, inn, outgoingId = "a", incomingId = "id-$i")
             assertTrue(plan.djEffect != DjEffect.LOOP_ROLL, "id-$i picked LOOP_ROLL")
-            when (plan.djEffect) {
-                DjEffect.ECHO -> echoes++
-                DjEffect.REVERB -> reverbs++
-                else -> throw AssertionError("unexpected effect ${plan.djEffect} for id-$i")
-            }
+            assertEquals(DjEffect.NONE, plan.djEffect, "no ornamental Echo or substitute wash for id-$i")
+            assertEquals(0.0, plan.echoSeconds)
         }
-        assertTrue(echoes > 0 && reverbs > 0, "ECHO $echoes / REVERB $reverbs must both occur")
     }
 
     // ---- 2. regionBounds single source of truth ----
@@ -376,7 +372,10 @@ class Djmix19RegressionTest {
         assertTrue(entries.isNotEmpty())
         assertEquals(0.0, entries.first().startSec, 1e-6, "entry startSec must be 0.0 (not 18.37s skipping intro)")
         val choice = PhrasePlanner.select(outMap, inMap, camelotSteps = 0, outBpm = out.bpm, inBpm = inn.bpm)
-        assertNotNull(choice, "PhrasePlanner.select must not fail with no-choose tried=0 on sung outro: ${PhrasePlanner.lastVetoSummary}")
+        assertTrue(
+            choice == null || choice.template != MixTemplate.M6,
+            "unknown vocal evidence cannot qualify an M6 handoff; choice=${choice?.template} veto=${PhrasePlanner.lastVetoSummary}",
+        )
     }
 
     private fun tone(n: Int, rate: Int, amplitude: Double): FloatArray {

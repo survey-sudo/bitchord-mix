@@ -147,6 +147,9 @@ enum class TransitionStyle {
     /** Album siblings played through: a near-instant handoff, not a mix. */
     GAPLESS,
 
+    /** Ordinary queue advance at physical EOF, with no overlap, cue skip, or effect. */
+    NATURAL,
+
     /** Beat-aligned blend with a bass swap, for matching or near-matching tempi. */
     DJ_BLEND,
 
@@ -362,6 +365,8 @@ private fun itemText(track: TransitionTrackInfo?): String =
  * Public so lower-rung bridge/classic routing can share this preference.
  * A locally clean, executable two-sided LoopMix crown is qualified separately;
  * this whole-track predicate does not establish crown execution infeasibility.
+ * An ordinary straight blend may also override this preference, but only after
+ * [LocalBlendAdmission] checks that candidate's rate and covered local source spans.
  */
 fun shouldDeclineToMix(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Boolean {
     val outBpm = analysis.bpm.orZero()
@@ -539,7 +544,8 @@ private fun automixNotes(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): 
     val left = camelotCode(trustedExitKey(analysis))
     val right = camelotCode(trustedEntryKey(nextAnalysis))
     if (left != null && right != null) {
-        notes += if (camelotCompatible(left, right)) "camelot $left→$right" else "camelot $left→$right clash"
+        notes += if (exitKeyConfidence(analysis) >= 0.50 && entryKeyConfidence(nextAnalysis) >= 0.50 &&
+            !camelotCompatible(left, right)) "camelot $left→$right clash" else "camelot $left→$right"
     }
     val tail = analysis.tailBeats?.beats.orEmpty()
     val head = nextAnalysis.headBeats?.beats.orEmpty()
@@ -1706,6 +1712,8 @@ private fun isFullAnalysis(analysis: TrackAnalysis): Boolean {
  * @param mixWindow Confine the mix to the last and first [MIX_WINDOW_SECONDS] of the pair — see
  *   [clampToMixWindow]. The desktop asks for it; the phone leaves it off, so its plans are
  *   unchanged.
+ * @param listenerSpeed Listener playback speed used to keep a local blend's composed deck speed
+ *   at or below 3x. The default preserves the historical 1x planning behavior for other callers.
  */
 fun planTransition(
     analysis: TrackAnalysis = TrackAnalysis(),
@@ -1723,6 +1731,8 @@ fun planTransition(
     mixWindow: Boolean = false,
     lyricsOut: List<LyricCue> = emptyList(),
     lyricsIn: List<LyricCue> = emptyList(),
+    listenerSpeed: Double = 1.0,
+    allowRecoveryCrossfade: Boolean = false,
 ): TransitionPlan {
     val plan = planTransitionInner(
         analysis = analysis,
@@ -1737,6 +1747,10 @@ fun planTransition(
         albumSequential = albumSequential,
         advanced = advanced,
         phraseBars = phraseBars,
+        mixWindow = mixWindow,
+        lyricsOut = lyricsOut,
+        lyricsIn = lyricsIn,
+        listenerSpeed = listenerSpeed,
     )
     val windowed = if (!mixWindow) plan else clampToMixWindow(
         plan,
@@ -1766,10 +1780,38 @@ fun planTransition(
     // decline branch already recorded rich gate maps for its plans (the
     // decline reason or an alternative kind carries that); anything else is
     // recorded here so every armed transition stays replayable.
-    if (decorated.alternativeKind.isEmpty() && !decorated.reason.contains("decline-to-mix")) {
-        TransitionEvidenceCache.record(standardEvidence(decorated, analysis, nextAnalysis))
+    // Missing evidence is not permission to edit the songs. Dedicated native
+    // techniques still get their normal chance in the controller before this
+    // dry queue-advance plan is adopted. Crossfade remains available for an
+    // explicit recovery after a native transition has failed, or STANDARD mode.
+    val uncertainClassic = decorated.transitionStyle == TransitionStyle.EQUAL_POWER ||
+        decorated.filterVariant == FilterTransitionVariant.ECHO_RIDE ||
+        decorated.reason.contains("analysis-fallback") || decorated.reason.contains("plain-crossfade") ||
+        (decorated.reason.contains("decline-to-mix") && decorated.alternativeKind.isEmpty() &&
+            LocalBlendAdmission.MARKER !in decorated.policyReasons)
+    val chosen = if (!allowRecoveryCrossfade && !decorated.blocked && uncertainClassic) {
+        naturalHandoffPlan(max(duration.orZero(), trackDurationSeconds(currentTrack)), decorated.reason).copy(
+            policyReasons = (decorated.policyReasons + "natural-handoff-no-overlap").distinct(),
+        )
+    } else decorated
+    if (chosen.transitionStyle == TransitionStyle.NATURAL ||
+        (chosen.alternativeKind.isEmpty() && !chosen.reason.contains("decline-to-mix"))) {
+        TransitionEvidenceCache.record(standardEvidence(chosen, analysis, nextAnalysis))
     }
-    return decorated
+    return chosen
+}
+
+/** The player, not a second-deck fade, owns an uneventful end-of-track handoff. */
+fun naturalHandoffPlan(duration: Double, reason: String): TransitionPlan {
+    if (!duration.isFinite() || duration <= 0.0) return blocked("no-duration")
+    return TransitionPlan(
+        transitionStyle = TransitionStyle.NATURAL,
+        transitionStart = duration,
+        transitionEnd = duration,
+        reason = "natural-end:$reason",
+        mixSummary = "natural handoff",
+        policyReasons = listOf("natural-handoff-no-overlap"),
+    )
 }
 
 /**
@@ -1812,6 +1854,10 @@ private fun planTransitionInner(
     albumSequential: Boolean = false,
     advanced: Boolean = false,
     phraseBars: Int = 0,
+    mixWindow: Boolean = false,
+    lyricsOut: List<LyricCue> = emptyList(),
+    lyricsIn: List<LyricCue> = emptyList(),
+    listenerSpeed: Double = 1.0,
 ): TransitionPlan {
     val length = max(duration.orZero(), trackDurationSeconds(currentTrack))
     val playbackTime = max(0.0, currentTime.orZero())
@@ -1906,6 +1952,46 @@ private fun planTransitionInner(
 
     val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
 
+    // Offer the ordinary upstream phase-lockable blend before the whole-track
+    // preference. It earns this exception only on its final, decorated source
+    // spans: neither a strong grid nor whole-track vocals decide local safety.
+    var localBlendRefusal: String? = null
+    if (advanced && (isUnmixablePair(analysis, nextAnalysis) ||
+            mixPlan(analysis, nextAnalysis, mixAnchor, mixOutAnchor.type, nextLength,
+                PairTraits(analysis, nextAnalysis)).transitionStyle != TransitionStyle.DJ_BLEND)) {
+        localBlendRefusal = LocalBlendAdmission.gridRefusal(analysis, nextAnalysis)
+        if (localBlendRefusal == null) {
+            val traits = PairTraits(analysis, nextAnalysis)
+            var candidate = capIncomingSkip(
+                mixPlan(analysis, nextAnalysis, mixAnchor, mixOutAnchor.type, nextLength, traits, upstreamBlend = true),
+                nextAnalysis, nextLength,
+            )
+            if (mixWindow) candidate = clampToMixWindow(candidate, length, playbackTime)
+            candidate = DjMix.annotate(candidate, analysis, nextAnalysis, lyricsOut, lyricsIn)
+            // Structure decoration can move a cue; apply the source skip cap before admission too.
+            candidate = capIncomingSkip(candidate, nextAnalysis, nextLength)
+            val admission = LocalBlendAdmission.evaluate(candidate, analysis, nextAnalysis, lyricsOut, lyricsIn)
+            localBlendRefusal = admission.refusal
+            val speedFits = localBlendFitsDeckSpeedCap(listenerSpeed, candidate.incomingPlaybackRate)
+            if (admission.admitted && !speedFits) localBlendRefusal = "listener-speed-cap"
+            if (admission.admitted && speedFits && playbackTime <= candidate.transitionStart + 0.5) {
+                return candidate.copy(
+                    shouldStart = playbackTime >= candidate.transitionStart,
+                    vocalOverlap = requireNotNull(admission.simultaneousFraction),
+                    djEffect = DjEffect.NONE,
+                    echoSeconds = 0.0,
+                    phaseLock = false,
+                    buildup = false,
+                    policyReasons = policy.reasons + automixNotes(analysis, nextAnalysis) + LocalBlendAdmission.MARKER,
+                    reason = if (playbackTime >= candidate.transitionStart) LocalBlendAdmission.MARKER
+                        else "before-${LocalBlendAdmission.MARKER}",
+                )
+            }
+            if (admission.admitted && speedFits) localBlendRefusal = "blend-window-passed"
+        }
+    }
+    val localBlendNotes = listOfNotNull(localBlendRefusal?.let { "local-blend-refused:$it" })
+
     // A pair no speed-up can match that also clashes in key or sings on both
     // sides has nothing a DJ gesture can fix: every one of them put two loud,
     // unsynced songs on top of each other mid-arrangement. The listener's own
@@ -1939,7 +2025,8 @@ private fun planTransitionInner(
             TransitionEvidenceCache.record(
                 TransitionAlternatives.evidenceFor(analysis, nextAnalysis, candidate, finalMixAnchor),
             )
-            return capIncomingSkip(candidate.plan, nextAnalysis, nextLength)
+            return capIncomingSkip(candidate.plan.copy(policyReasons = candidate.plan.policyReasons + localBlendNotes),
+                nextAnalysis, nextLength)
         }
         val declineFade = 4.0.coerceAtMost(finalMixAnchor.coerceAtLeast(0.5))
         val transitionStart = max(0.0, finalMixAnchor - declineFade)
@@ -1966,6 +2053,7 @@ private fun planTransitionInner(
                 reason = if (playbackTime >= transitionStart) "decline-to-mix" else "before-decline-to-mix",
                 gates = buildMap {
                     put("decline-to-mix", declineToMixDetail(analysis, nextAnalysis) ?: "declined")
+                    localBlendRefusal?.let { put("local-blend", it) }
                     TransitionAlternatives.octaveGateDescription(analysis, nextAnalysis)?.let {
                         put("octave-relationship", it)
                     }
@@ -2000,7 +2088,7 @@ private fun planTransitionInner(
             incomingCueTime = incomingCueTime,
             incomingHandoffTime = incomingCueTime,
             vocalOverlap = maxOf(measuredOverlap, 0.85),
-            policyReasons = policy.reasons + "decline-to-mix" + listOfNotNull(declineToMixDetail(analysis, nextAnalysis)),
+            policyReasons = policy.reasons + "decline-to-mix" + listOfNotNull(declineToMixDetail(analysis, nextAnalysis)) + localBlendNotes,
             reason = if (started) "decline-to-mix" else "before-decline-to-mix",
         )
     }
@@ -2098,12 +2186,23 @@ private fun planTransitionInner(
     return capIncomingSkip(
         plan.copy(
             shouldStart = started,
-            policyReasons = policy.reasons + automixNotes(analysis, nextAnalysis),
+            policyReasons = policy.reasons + automixNotes(analysis, nextAnalysis) + localBlendNotes,
             reason = if (started) plan.reason else "before-${plan.reason}",
         ),
         nextAnalysis,
         nextLength,
     )
+}
+
+/** Whether the actual Float playback-speed composition can preserve a local blend's admitted rate. */
+fun localBlendFitsDeckSpeedCap(listenerSpeed: Double, admittedIncomingRate: Double): Boolean {
+    if (!listenerSpeed.isFinite() || listenerSpeed <= 0.0 ||
+        !admittedIncomingRate.isFinite() || admittedIncomingRate <= 0.0
+    ) return false
+    val listener = listenerSpeed.toFloat()
+    val incoming = admittedIncomingRate.toFloat()
+    val composite = listener * incoming
+    return listener.isFinite() && incoming.isFinite() && composite.isFinite() && composite <= 3f
 }
 
 /**
@@ -2118,6 +2217,7 @@ private fun mixPlan(
     mixOutType: String,
     nextLength: Double,
     traits: PairTraits?,
+    upstreamBlend: Boolean = false,
 ): TransitionPlan {
     val currentBpm = traits?.outgoingBpm ?: analysis.bpm.orZero()
     val nextBpm = traits?.incomingBpm ?: nextAnalysis.bpm.orZero()
@@ -2148,7 +2248,8 @@ private fun mixPlan(
         Double.POSITIVE_INFINITY
     }
     val withinCap = foldedRateDelta <= tempoCap
-    val sameBeatBlend = (
+    val sameBeatBlend = (upstreamBlend && incomingPlaybackRate >= 1.0 && traits?.phaseLockable == true &&
+        LocalBlendAdmission.gridRefusal(analysis, nextAnalysis) == null) || (
         currentBpm > 0 && nextBpm > 0 &&
             withinCap &&
             (analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE && nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE)
@@ -2300,7 +2401,8 @@ private fun mixPlan(
         handoffDuration = alignedOverlap,
         incomingCueTime = finalIncomingCueTime,
         incomingHandoffTime = incomingHandoffTime,
-        incomingPlaybackRate = incomingRateFor(incomingPlaybackRate, traits != null),
+        incomingPlaybackRate = if (upstreamBlend && sameBeatBlend) roundRate(incomingPlaybackRate)
+            else incomingRateFor(incomingPlaybackRate, traits != null),
         outgoingPlaybackRate = outgoingRateFor(incomingPlaybackRate, traits != null),
         pickupSeconds = pickupSeconds,
         transitionBeats = transitionBeats,

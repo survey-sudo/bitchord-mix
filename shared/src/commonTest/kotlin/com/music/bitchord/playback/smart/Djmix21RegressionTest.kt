@@ -341,9 +341,9 @@ class Djmix21RegressionTest {
     // ---- Addendum 2 item 3: vocal handoff matching ----
 
     @Test
-    fun vocalHandoffSeamBeatsInstrumentalGap() {
-        // A sung until bar 21, outro release near bar 24: short trail, and B's
-        // first vocal lands just after — the conversation seam.
+    fun vocalHandoffSeamDoesNotForceAnInfeasibleHeldLead() {
+        // A's measured vocal ends at bar 21 and B's starts at 23, but B's
+        // 23-bar instrumental lead cannot be held across A's short dry-end window.
         val out = song(
             "a", 120.0, 32,
             listOf(
@@ -351,10 +351,10 @@ class Djmix21RegressionTest {
                 section(4, 22, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
                 section(22, 32, SectionFn.OUTRO, energy = 6, loopable = true),
             ),
-            sungFrom = 4, sungUntil = 22,
+            sungFrom = 4, sungUntil = 21,
         )
-        // B's first sung bar lands 1-2 bars after A's last sung bar (21):
-        // seam = 23 - 22 = 1. Same B but with first vocal far away = no seam.
+        // B's first sung bar lands two bars after A's last measured sung bar:
+        // seam = 23 - 21 = 2. Same B but with first vocal far away = no seam.
         val seamInn = song(
             "b", 120.0, 48,
             listOf(
@@ -373,11 +373,18 @@ class Djmix21RegressionTest {
             ),
             sungFrom = 28, sungUntil = 40,
         )
-        val seamChoice = PhrasePlanner.select(out, seamInn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
+        val seamChoice = PhrasePlanner.select(
+            out, seamInn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0,
+            outAnalysis = analysis(out), inAnalysis = analysis(seamInn),
+        )
         val farChoice = PhrasePlanner.select(out, farInn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
-        assertNotNull(seamChoice, "seam pair must choose: ${PhrasePlanner.lastVetoSummary}")
+        assertTrue(
+            seamChoice == null || seamChoice.template != MixTemplate.M6,
+            "the two-bar song-level seam cannot authorize an M6 handoff that must hold B's 23-bar lead; " +
+                "choice=${seamChoice?.template} veto=${PhrasePlanner.lastVetoSummary}",
+        )
         // The far pair must fall to a short rung (or a much worse score).
-        if (farChoice != null) {
+        if (farChoice != null && seamChoice != null) {
             val long = farChoice.template in setOf(
                 MixTemplate.M1, MixTemplate.M3, MixTemplate.ROLLING, MixTemplate.M2,
                 MixTemplate.M7, MixTemplate.RELAXED, MixTemplate.M9,
@@ -385,8 +392,7 @@ class Djmix21RegressionTest {
             assertTrue(!long || farChoice.score < seamChoice.score,
                 "far-gap pair must not outscore the vocal seam: far=${farChoice.template} ${farChoice.score} seam=${seamChoice.template} ${seamChoice.score}")
         }
-        // Seam math: B's first sung bar follows A's last sung bar with a 1-2
-        // bar breath for the aligned candidate.
+        // Preserve the song-level seam proof independently of transition feasibility.
         val exits = CuePoints.exits(out)
         val entries = CuePoints.entries(seamInn)
         val seams = exits.flatMap { e -> entries.mapNotNull { en -> StructureMix.vocalSeamBars(out, seamInn, e, en) } }
@@ -454,6 +460,18 @@ class Djmix21RegressionTest {
         )
     }
 
+    private fun analysis(map: SongMap) = TrackAnalysis(
+        duration = map.durationSec,
+        bpm = map.bpm,
+        beatInterval = 60.0 / map.bpm,
+        vocalWindows = listOf(
+            CurveWindow(0.0, 20.0, FloatArray((map.durationSec * 20).toInt() + 2) { frame ->
+                val bar = map.downbeats.indexOfLast { it <= frame / 20.0 }
+                if (map.sungBars.getOrElse(bar) { false }) 0.9f else 0.02f
+            }),
+        ),
+    )
+
     private fun neverLetGoAnalysis(): TrackAnalysis {
         val bpm = 104.50
         val beat = 60.0 / bpm
@@ -511,8 +529,8 @@ class Djmix21RegressionTest {
         val inn = track("b", 94.0, "F\u266F major", vocal = 0.9)
         assertTrue(shouldDeclineToMix(out, inn))
         val declined = plan(out, inn)
-        assertEquals(TransitionStyle.DJ_FILTER, declined.transitionStyle)
-        assertTrue(declined.fadeSeconds in 3.5..4.5, "fade=${declined.fadeSeconds}")
+        assertEquals(TransitionStyle.NATURAL, declined.transitionStyle)
+        assertEquals(0.0, declined.fadeSeconds)
     }
 
     @Test
