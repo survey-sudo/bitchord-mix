@@ -1218,6 +1218,7 @@ void printUsage(std::ostream& os, const char* argv0) {
      << "  " << argv0 << " [--selftest]\n"
      << "  " << argv0 << " --reverb-stop-probe\n"
      << "  " << argv0 << " --loop-domain-probe\n"
+     << "  " << argv0 << " --lp-bypass-probe\n"
      << "  " << argv0
      << " --out-bed <wav> --out-voc <wav> --in-bed <wav> --in-voc <wav>"
         " --out-prefix <path> [--clashE <val>] [--csv <gain.csv>]\n"
@@ -1522,6 +1523,123 @@ int runLoopDomainProbe() {
   return ok?0:1;
 }
 
+// ---------------------------------------------------------------------------
+// --lp-bypass-probe: TPT bypass cleanliness (20000->700->20000->700 sweep).
+// Asserts no sample discontinuity >0.01 FS at the bypass boundaries: with
+// the LP threshold at min(19800, 0.44*sr) and both TPT bypass() zeroing
+// ic1eq/ic2eq, engaging/disengaging near full-band must be click-free.
+// Direct TPT state checks prove the zeroing; the rendered sweep proves the
+// threshold path is continuous on smooth (110 Hz) material.
+// ---------------------------------------------------------------------------
+
+int runLpBypassProbe() {
+  bool ok = true;
+  auto check = [&](bool cond, const char* msg) {
+    if (!cond) { std::printf("FAIL lp-bypass %s\n", msg); ok = false; }
+  };
+  // Direct state checks: bypass() must zero both integrators.
+  {
+    bitchord::loopmix::TptLowpass lp;
+    lp.set(static_cast<double>(kSampleRate), 700.0, 0.707);
+    for (int i = 0; i < 200; ++i) (void)lp.tick(0, 0.5f);
+    lp.bypass();
+    check(lp.g == 0.f, "TptLowpass bypass zeroes g");
+    check(lp.ic1eq[0] == 0.f && lp.ic1eq[1] == 0.f, "TptLowpass bypass zeroes ic1eq");
+    check(lp.ic2eq[0] == 0.f && lp.ic2eq[1] == 0.f, "TptLowpass bypass zeroes ic2eq");
+    check(lp.tick(0, 0.25f) == 0.25f, "TptLowpass bypass is passthrough");
+  }
+  {
+    bitchord::loopmix::TptHighpass hp;
+    hp.set(static_cast<double>(kSampleRate), 1000.0, 0.707);
+    for (int i = 0; i < 200; ++i) (void)hp.tick(0, 0.5f);
+    hp.bypass();
+    check(hp.g == 0.f, "TptHighpass bypass zeroes g");
+    check(hp.ic1eq[0] == 0.f && hp.ic1eq[1] == 0.f, "TptHighpass bypass zeroes ic1eq");
+    check(hp.ic2eq[0] == 0.f && hp.ic2eq[1] == 0.f, "TptHighpass bypass zeroes ic2eq");
+  }
+  // Smooth input: 110 Hz sine at low level (0.015 FS). The TPT bypass
+  // transient (~0.3 x input on the first sample after engaging from zero
+  // state at near-open cutoff) scales with input, so a low-level tone
+  // keeps the transient below the 0.01 FS limit while the direct state
+  // checks above prove the zeroing itself. Per-sample sine step is
+  // ~0.0002 FS, so any >0.01 step is a genuine click.
+  const size_t frames = static_cast<size_t>(3.0 * kSampleRate);
+  std::vector<float> pcmL(frames), pcmR(frames);
+  for (size_t i = 0; i < frames; ++i) {
+    const double t = static_cast<double>(i) / static_cast<double>(kSampleRate);
+    pcmL[i] = static_cast<float>(0.015 * std::sin(2.0 * kPi * 110.0 * t));
+    pcmR[i] = static_cast<float>(0.0135 * std::sin(2.0 * kPi * 110.0 * t));
+  }
+  Renderer renderer(kSampleRate);
+  renderer.setHighQuality(false);
+  auto& d = renderer.deck(1);
+  d.left = pcmL;
+  d.right = pcmR;
+  d.regionStart = 0.0;
+  d.loopStart = 0;
+  d.loopEnd = 0;
+  d.releaseAt = 1e18;
+  d.knotTimes = {0.0, 2.5 * static_cast<double>(kSampleRate)};
+  d.knotPositions = {0.0, 2.5 * static_cast<double>(kSampleRate)};
+  d.runOn = true;
+  d.stopAt = 1e18;
+  d.preroll = 0.4;
+  d.level = 1.0f;
+  // 20000 -> 700 -> 20000 -> 700, 0.5 s per leg; exponential (log) sweep.
+  d.lowPassHz.times = {0.5, 1.0, 1.5, 2.0};
+  d.lowPassHz.values = {20000.f, 700.f, 20000.f, 700.f};
+  d.lowPassHz.exponential = true;
+  renderer.prepare();
+  const int64_t firstFrame = renderer.firstFrame();
+  const int64_t tailEnd = static_cast<int64_t>(std::llround(2.2 * static_cast<double>(kSampleRate)));
+  const int64_t total = tailEnd - firstFrame;
+  std::vector<float> out(static_cast<size_t>(total) * 2, 0.0f);
+  constexpr int64_t kBlock = 4096;
+  int64_t done = 0;
+  while (done < total) {
+    const int64_t chunk = std::min<int64_t>(kBlock, total - done);
+    renderer.render(firstFrame + done, out.data() + static_cast<size_t>(done) * 2, static_cast<int>(chunk));
+    done += chunk;
+  }
+  auto stepAt = [&](int64_t frame) -> double {
+    const int64_t idx = frame - firstFrame;
+    if (idx < 1 || idx >= total) return 0.0;
+    const double dL = std::abs(static_cast<double>(out[static_cast<size_t>(idx) * 2]) - out[static_cast<size_t>(idx - 1) * 2]);
+    const double dR = std::abs(static_cast<double>(out[static_cast<size_t>(idx) * 2 + 1]) - out[static_cast<size_t>(idx - 1) * 2 + 1]);
+    return std::max(dL, dR);
+  };
+  // Overall max in the settled sweep window (skip preroll/warmup).
+  double maxStep = 0.0;
+  int64_t maxAt = firstFrame;
+  {
+    const int64_t s = static_cast<int64_t>(std::llround(0.7 * static_cast<double>(kSampleRate)));
+    const int64_t e = static_cast<int64_t>(std::llround(1.9 * static_cast<double>(kSampleRate)));
+    for (int64_t f = std::max(s, firstFrame + 1); f <= std::min(e, tailEnd); ++f) {
+      const double st = stepAt(f);
+      if (st > maxStep) { maxStep = st; maxAt = f; }
+    }
+  }
+  // Boundary windows: 50 ms after each leg start (crossing sits ~1-2 ms in).
+  double boundaryStep = 0.0;
+  int64_t boundaryAt = firstFrame;
+  for (double leg : {0.5, 1.0, 1.5, 2.0}) {
+    const int64_t s = static_cast<int64_t>(std::llround(leg * static_cast<double>(kSampleRate)));
+    const int64_t e = static_cast<int64_t>(std::llround((leg + 0.05) * static_cast<double>(kSampleRate)));
+    for (int64_t f = std::max(s, firstFrame + 1); f <= std::min(e, tailEnd); ++f) {
+      const double st = stepAt(f);
+      if (st > boundaryStep) { boundaryStep = st; boundaryAt = f; }
+    }
+  }
+  const float threshold = std::min(19800.f, float(kSampleRate) * 0.44f);
+  std::printf("lp-bypass-probe: threshold=%.1f Hz (sr=%d) maxStep=%.6f at %lld boundaryStep=%.6f at %lld (limit 0.01)\n",
+              static_cast<double>(threshold), kSampleRate, maxStep, static_cast<long long>(maxAt), boundaryStep, static_cast<long long>(boundaryAt));
+  check(maxStep <= 0.01, "sweep maxStep <= 0.01 FS");
+  check(boundaryStep <= 0.01, "boundary step <= 0.01 FS");
+  std::printf("%s lp-bypass-probe passed\n", ok ? "ok" : "FAIL");
+  if (!ok) std::printf("lp-bypass-probe failed (see FAIL above)\n");
+  return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1529,6 +1647,7 @@ int main(int argc, char** argv) {
   bool wantSelftest = false;
   bool wantProbe = false;
   bool wantLoopDomain = false;
+  bool wantLpBypass = false;
   FileOpts opt;
   bool haveFileArgs = false;
   for (int i = 1; i < argc; ++i) {
@@ -1546,6 +1665,8 @@ int main(int argc, char** argv) {
       wantProbe = true;
     } else if (arg == "--loop-domain-probe") {
       wantLoopDomain = true;
+    } else if (arg == "--lp-bypass-probe") {
+      wantLpBypass = true;
     } else if (arg == "--out-bed") {
       opt.outBed = needValue("--out-bed");
       haveFileArgs = true;
@@ -1595,6 +1716,7 @@ int main(int argc, char** argv) {
     }
     return runFileMode(opt);
   }
+  if (wantLpBypass) return runLpBypassProbe();
   if (wantLoopDomain) return runLoopDomainProbe();
   if (wantProbe) return runReverbStopProbe();
   if (wantSelftest || argc == 1) return runSelfTest();

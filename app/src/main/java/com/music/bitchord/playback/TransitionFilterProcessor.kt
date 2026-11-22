@@ -74,6 +74,15 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     private var filterStateDirty = false
 
     /**
+     * Dry/wet crossfade weights for the LP/HP stages (1 = fully filtered,
+     * 0 = fully dry). They ramp toward [lowOn]/[highOn] over a few control
+     * blocks so engagement is never a hard flag flip (which would pop the
+     * stale integrator head into the mix). Audio-thread only.
+     */
+    private var lowWet = 0f
+    private var highWet = 0f
+
+    /**
      * How far ahead of the speaker this filter is running, in media
      * microseconds; written by the sink, 0 when it has nothing to say.
      *
@@ -104,6 +113,12 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
 
     /** Written by the controller; read once per block on the audio thread. */
     @Volatile private var echoEngaged = false
+    /**
+     * True while [releaseEcho] is draining the tail: send is ramping to 0
+     * and the audio thread auto-parks when the ring stays below -60 dBFS.
+     * [parkEcho] stays the hard abort (immediate cut).
+     */
+    @Volatile private var echoReleasing = false
     @Volatile private var echoTargetSend = 0f
     @Volatile private var echoTargetDry = 1f
     @Volatile private var echoSeconds = 0f
@@ -175,18 +190,36 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         }
         echoTargetSend = send.coerceIn(0f, 1f)
         echoTargetDry = dry.coerceIn(0f, 1f)
+        echoReleasing = false
         echoEngaged = true
     }
 
     /**
      * Drops the echo and puts the dry signal back. For the end of a
      * transition, when the track it belonged to is gone or going: a tail
-     * still ringing is cut, not faded.
+     * still ringing is cut, not faded. Hard abort/teardown only; for a
+     * musical release use [releaseEcho].
      */
     fun parkEcho() {
         echoEngaged = false
+        echoReleasing = false
         echoTargetSend = 0f
         echoTargetDry = 1f
+    }
+
+    /**
+     * Musical echo release: ramps [echoTargetSend] smoothly to 0 (the
+     * audio thread ramps echoSend linearly across each block) while
+     * keeping the effect engaged so the delay tail rings out. The audio
+     * thread auto-parks (engaged=false, dry back to 1) once the stored
+     * tail stays below -60 dBFS. The controller lane calls this before
+     * [parkEcho]; [parkEcho] remains the hard teardown path (onReset).
+     */
+    fun releaseEcho() {
+        if (!echoEngaged) return
+        echoTargetSend = 0f
+        echoTargetDry = 1f
+        echoReleasing = true
     }
 
     /**
@@ -203,13 +236,29 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         if (midState.size != channelCount * 4) {
             midState = FloatArray(channelCount * 4)
         }
-        currentLowPassHz = targetLowPassHz
-        currentHighPassHz = targetHighPassHz
-        currentMidGainDb = targetMidGainDb
+        // Always clear every state array so re-engagement cannot pop a
+        // stale integrator head, even when the format is unchanged.
+        lowState.fill(0f)
+        highState.fill(0f)
+        midState.fill(0f)
         if (echoLow.size != channelCount) {
             echoLow = FloatArray(channelCount)
             echoHigh = FloatArray(channelCount)
         }
+        echoLow.fill(0f)
+        echoHigh.fill(0f)
+        if (echoRing.isNotEmpty()) echoRing.fill(0f)
+        echoSend = 0f
+        echoDry = 1f
+        echoPosition = 0
+        echoDelayFrames = 0
+        echoReleasing = false
+        lowWet = 0f
+        highWet = 0f
+        filterStateDirty = false
+        currentLowPassHz = targetLowPassHz
+        currentHighPassHz = targetHighPassHz
+        currentMidGainDb = targetMidGainDb
         echoLowCoefficient = onePole(ECHO_LOW_PASS_HZ, sampleRate)
         echoHighCoefficient = onePole(ECHO_HIGH_PASS_HZ, sampleRate)
         // A new format invalidates the ring's length in frames.
@@ -277,8 +326,11 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         val targetLow = targetLowPassHz
         val targetHigh = targetHighPassHz
         val targetMid = targetMidGainDb
+        // Parked only when the dry/wet crossfade has also settled, so a
+        // ramping-down wet tail is never cut by the early return.
         val parkedLowHigh = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ &&
-            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ
+            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ &&
+            lowWet <= FILTER_WET_EPS && highWet <= FILTER_WET_EPS
         val parkedMid = targetMid > -0.05f && currentMidGainDb > -0.05f
         if (parkedLowHigh && parkedMid) {
             clearStateIfNeeded()
@@ -296,16 +348,31 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             val lowOn = currentLowPassHz < OPEN_HZ - SETTLED_HZ
             val highOn = currentHighPassHz > OFF_HZ + SETTLED_HZ
             val midOn = !(currentMidGainDb > -0.05f && targetMid > -0.05f)
-            if (lowOn) updateLowCoefficients()
-            if (highOn) updateHighCoefficients()
+            // Short dry/wet crossfade instead of a hard flag flip: the
+            // filter keeps stepping state while its wet weight is moving,
+            // and the output blends dry -> filtered over ~10 sub-blocks.
+            val lowTargetWet = if (lowOn) 1f else 0f
+            val highTargetWet = if (highOn) 1f else 0f
+            lowWet = stepWet(lowWet, lowTargetWet)
+            highWet = stepWet(highWet, highTargetWet)
+            val lowActive = lowWet > FILTER_WET_EPS || lowOn
+            val highActive = highWet > FILTER_WET_EPS || highOn
+            if (lowActive) updateLowCoefficients()
+            if (highActive) updateHighCoefficients()
             if (midOn) updateMidCoefficients()
 
             for (f in 0 until subBlock) {
                 val baseIdx = (frameOffset + f) * channelCount
                 for (channel in 0 until channelCount) {
                     var sample = block.samples[baseIdx + channel]
-                    if (lowOn) sample = lowPass(channel, sample)
-                    if (highOn) sample = highPass(channel, sample)
+                    if (lowActive) {
+                        val wetSample = lowPass(channel, sample)
+                        sample = sample * (1f - lowWet) + wetSample * lowWet
+                    }
+                    if (highActive) {
+                        val wetSample = highPass(channel, sample)
+                        sample = sample * (1f - highWet) + wetSample * highWet
+                    }
                     if (midOn && midState.size == channelCount * 4) sample = midPeaking(channel, sample)
                     // Headroom preserved: no clamping to [-1.0f, +1.0f]
                     block.samples[baseIdx + channel] = sample
@@ -343,21 +410,45 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         currentHighPassHz = targetHighPassHz
         currentMidGainDb = targetMidGainDb
         filterStateDirty = false
+        lowWet = if (currentLowPassHz < OPEN_HZ - SETTLED_HZ) 1f else 0f
+        highWet = if (currentHighPassHz > OFF_HZ + SETTLED_HZ) 1f else 0f
         // Whatever the ring holds is from before the seek; start it clean.
+        if (echoLow.isNotEmpty()) echoLow.fill(0f)
+        if (echoHigh.isNotEmpty()) echoHigh.fill(0f)
+        if (echoRing.isNotEmpty()) echoRing.fill(0f)
+        echoSend = 0f
+        echoDry = 1f
+        echoPosition = 0
+        echoDelayFrames = 0
+        echoReleasing = false
         echoSeenGeneration = echoGeneration - 1
     }
 
     override fun onReset() {
+        // Hard teardown: full state wipe so the next bind cannot pop.
         parkEcho()
         parkColour()
         echoSeenGeneration = echoGeneration - 1
         targetLowPassHz = OPEN_HZ
         targetHighPassHz = OFF_HZ
         targetMidGainDb = 0f
+        currentLowPassHz = OPEN_HZ
+        currentHighPassHz = OFF_HZ
         currentMidGainDb = 0f
         lowState = FloatArray(0)
         highState = FloatArray(0)
         midState = FloatArray(0)
+        lowWet = 0f
+        highWet = 0f
+        filterStateDirty = false
+        if (echoRing.isNotEmpty()) echoRing.fill(0f)
+        if (echoLow.isNotEmpty()) echoLow.fill(0f)
+        if (echoHigh.isNotEmpty()) echoHigh.fill(0f)
+        echoSend = 0f
+        echoDry = 1f
+        echoPosition = 0
+        echoDelayFrames = 0
+        echoReleasing = false
         channelCount = 0
         sampleRate = 0
     }
@@ -373,7 +464,8 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         val targetHigh = targetHighPassHz
         val targetMid = targetMidGainDb
         val parkedLowHigh = targetLow >= OPEN_HZ && targetHigh <= OFF_HZ &&
-            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ
+            currentLowPassHz >= OPEN_HZ - SETTLED_HZ && currentHighPassHz <= OFF_HZ + SETTLED_HZ &&
+            lowWet <= FILTER_WET_EPS && highWet <= FILTER_WET_EPS
         val parkedMid = targetMid > -0.05f && currentMidGainDb > -0.05f
         if (parkedLowHigh && parkedMid) {
             clearStateIfNeeded()
@@ -396,15 +488,27 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             val lowOn = currentLowPassHz < OPEN_HZ - SETTLED_HZ
             val highOn = currentHighPassHz > OFF_HZ + SETTLED_HZ
             val midOn = !(currentMidGainDb > -0.05f && targetMid > -0.05f)
-            if (lowOn) updateLowCoefficients()
-            if (highOn) updateHighCoefficients()
+            val lowTargetWet = if (lowOn) 1f else 0f
+            val highTargetWet = if (highOn) 1f else 0f
+            lowWet = stepWet(lowWet, lowTargetWet)
+            highWet = stepWet(highWet, highTargetWet)
+            val lowActive = lowWet > FILTER_WET_EPS || lowOn
+            val highActive = highWet > FILTER_WET_EPS || highOn
+            if (lowActive) updateLowCoefficients()
+            if (highActive) updateHighCoefficients()
             if (midOn) updateMidCoefficients()
 
             repeat(subBlock) {
                 for (channel in 0 until channelCount) {
                     var sample = inputBuffer.short.toFloat() * invScale
-                    if (lowOn) sample = lowPass(channel, sample)
-                    if (highOn) sample = highPass(channel, sample)
+                    if (lowActive) {
+                        val wetSample = lowPass(channel, sample)
+                        sample = sample * (1f - lowWet) + wetSample * lowWet
+                    }
+                    if (highActive) {
+                        val wetSample = highPass(channel, sample)
+                        sample = sample * (1f - highWet) + wetSample * highWet
+                    }
                     if (midOn && midState.size == channelCount * 4) sample = midPeaking(channel, sample)
                     outputBuffer.putShort(PcmBoundary.clamp16FromFloat(sample))
                 }
@@ -428,6 +532,20 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         lowState.fill(0f)
         highState.fill(0f)
         midState.fill(0f)
+        lowWet = 0f
+        highWet = 0f
+        // Echo state: only when parked, so a ringing tail is never cut
+        // mid-release; parked state is left clean for the next engagement.
+        if (!echoEngaged) {
+            if (echoLow.isNotEmpty()) echoLow.fill(0f)
+            if (echoHigh.isNotEmpty()) echoHigh.fill(0f)
+            if (echoRing.isNotEmpty()) echoRing.fill(0f)
+            echoSend = 0f
+            echoDry = 1f
+            echoPosition = 0
+            echoDelayFrames = 0
+            echoReleasing = false
+        }
         filterStateDirty = false
     }
 
@@ -466,6 +584,13 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             }
             echoSend = targetSend
             echoDry = targetDry
+            if (echoReleasing && echoSend <= 0.0001f) {
+                echoEngaged = false
+                echoReleasing = false
+                echoTargetSend = 0f
+                echoTargetDry = 1f
+                echoDry = 1f
+            }
             return
         }
         val lowCoefficient = echoLowCoefficient
@@ -493,20 +618,46 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         echoPosition = position
         echoSend = targetSend
         echoDry = targetDry
+        // [releaseEcho] drain: once send has ramped to zero, scan the
+        // stored ring; below -60 dBFS (0.001) the tail is inaudible, so
+        // auto-park (dry back to 1) and let the processor go idle.
+        if (echoReleasing && echoSend <= 0.0001f && targetSend <= 0.0001f) {
+            var peak = 0f
+            val limit = delay * channels
+            var i = 0
+            while (i < limit) {
+                val a = abs(ring[i])
+                if (a > peak) peak = a
+                if (peak >= 0.001f) break
+                i++
+            }
+            if (peak < 0.001f) {
+                echoEngaged = false
+                echoReleasing = false
+                echoTargetSend = 0f
+                echoTargetDry = 1f
+                echoSend = 0f
+                echoDry = 1f
+                ring.fill(0f)
+                if (echoLow.isNotEmpty()) echoLow.fill(0f)
+                if (echoHigh.isNotEmpty()) echoHigh.fill(0f)
+            }
+        }
     }
 
     /** A new echo, on the audio thread: adopt any ring waiting for it and clear what it will use. */
     private fun startEcho() {
         echoSeenGeneration = echoGeneration
+        echoReleasing = false
         pendingEchoRing?.let {
             echoRing = it
             pendingEchoRing = null
         }
         val channels = channelCount.coerceAtLeast(1)
         echoDelayFrames = (echoSeconds * sampleRate).toInt().coerceIn(0, echoRing.size / channels)
-        echoRing.fill(0f, 0, echoDelayFrames * channels)
-        echoLow.fill(0f)
-        echoHigh.fill(0f)
+        if (echoDelayFrames > 0) echoRing.fill(0f, 0, echoDelayFrames * channels)
+        if (echoLow.isNotEmpty()) echoLow.fill(0f)
+        if (echoHigh.isNotEmpty()) echoHigh.fill(0f)
         echoPosition = 0
         echoSend = 0f
         echoDry = 1f
@@ -652,6 +803,20 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         /** Per-sub-block glide fraction. ~30 ms time constant, just under one fade tick. */
         private const val GLIDE_RATE = 0.05f
 
+        /**
+         * Per-sub-block dry/wet crossfade fraction for lowOn/highOn.
+         * ~10 sub-blocks (640 frames) to wet: a short crossfade that hides
+         * the integrator start/stop transient.
+         */
+        private const val FILTER_WET_RATE = 0.25f
+        /** Wet weight below this counts as fully dry (filter parked). */
+        private const val FILTER_WET_EPS = 0.001f
+        private fun stepWet(cur: Float, target: Float): Float = when {
+            cur < target -> min(target, cur + FILTER_WET_RATE)
+            cur > target -> kotlin.math.max(target, cur - FILTER_WET_RATE)
+            else -> target
+        }
+
         /** How close to a parked value counts as parked, so a glide terminates. */
         private const val SETTLED_HZ = 1f
 
@@ -717,6 +882,17 @@ interface TransitionFilters {
 
     /** Drops any echo on either sink. Called whenever a transition ends, however it ended. */
     fun parkEchoes() = Unit
+
+    /**
+     * Musical echo release on either sink (see
+     * [TransitionFilterProcessor.releaseEcho]): send ramps to 0, tail
+     * rings to below -60 dBFS, then auto-parks. The controller lane calls
+     * this before [parkEchoes]; the wiring fans out to both processors.
+     */
+    fun releaseEcho() = Unit
+
+    /** Plural alias of [releaseEcho] for both sinks. */
+    fun releaseEchoes() = Unit
 
     /**
      * Releases colour smoothly on both sinks (see

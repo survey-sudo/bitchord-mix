@@ -140,6 +140,54 @@ class LocalBlendAdmissionTest {
     }
 
     @Test
+    fun nativeRampedPlanAdmitsASlowdownTheClassicPathStillRefuses() {
+        val fasterIncoming = track("faster-in", out.bpm / 0.95, 0.02f)
+        // Measured spans on both sides, so only the rate gate differs between the
+        // two candidates: expectedRate here is exactly 0.95.
+        val classic = TransitionPlan(
+            transitionStyle = TransitionStyle.DJ_BLEND,
+            transitionStart = 10.0, transitionEnd = 14.0, fadeSeconds = 4.0,
+            incomingCueTime = 0.0, beatSeconds = 0.42, incomingPlaybackRate = 0.95,
+        )
+        assertEquals(
+            "upstream-incoming-slowdown",
+            LocalBlendAdmission.evaluate(classic, out, fasterIncoming).refusal,
+        )
+        val native = classic.copy(nativeRamped = true)
+        val verdict = LocalBlendAdmission.evaluate(native, out, fasterIncoming)
+        assertTrue(verdict.admitted, verdict.toString())
+        // The flag admits a slowdown; it never widens the executable window nor
+        // relaxes the outgoing side.
+        assertEquals(
+            "executed-rate-mismatch",
+            LocalBlendAdmission.evaluate(native.copy(incomingPlaybackRate = 0.92), out, fasterIncoming).refusal,
+        )
+        assertEquals(
+            "executed-rate-mismatch",
+            LocalBlendAdmission.evaluate(native.copy(outgoingPlaybackRate = 0.97), out, fasterIncoming).refusal,
+        )
+    }
+
+    @Test
+    fun declineVerdictsHoldTheHandoffWithADistinguishableRung() {
+        val b = inn.copy(vocalWindows = listOf(CurveWindow(0.0, 20.0, FloatArray(3760) { 0.9f })),
+            vocalActivityMask = List(189) { 0.9 })
+        val fallback = plan(out, b)
+        // A measured lead collision is an honest decline: the rescue ladder may
+        // not re-propose the overlap that evidence vetoed, and the rung that
+        // held it is distinguishable from a rung-less collapse.
+        assertEquals(TransitionStyle.NATURAL, fallback.transitionStyle)
+        assertEquals(0.0, fallback.fadeSeconds)
+        assertTrue(fallback.reason.contains("decline-to-mix"), fallback.reason)
+        assertTrue("decline-holds-no-overlap" in fallback.policyReasons, fallback.policyReasons.toString())
+        assertTrue("natural-handoff-no-overlap" in fallback.policyReasons, fallback.policyReasons.toString())
+        assertTrue(
+            fallback.policyReasons.any { it.startsWith("local-blend-refused:") },
+            fallback.policyReasons.toString(),
+        )
+    }
+
+    @Test
     fun tempoGapCannotSelectHashEchoFromMissingVocalInputs() {
         val base = TransitionPlan(transitionStyle = TransitionStyle.DJ_FILTER,
             transitionStart = 170.0, transitionEnd = 188.0, fadeSeconds = 18.0,

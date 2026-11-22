@@ -8,6 +8,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.unit.isSpecified
+import com.music.bitchord.playback.smart.AutomixStatus
 import com.music.bitchord.data.model.ArtistCredit
 import com.music.bitchord.data.model.CreditSegment
 import com.music.bitchord.data.model.creditSegments
@@ -477,6 +478,19 @@ private fun AutomixStatusLine(
                 textAlign = TextAlign.Center,
             )
         }
+        // One extra line: why the planner chose this rung. Same style as the
+        // diagnostic text, always visible so a degraded mix explains itself.
+        val why = automixReasonLine(status)
+        if (why.isNotBlank()) {
+            Text(
+                text = why,
+                style = textStyle,
+                color = Color.White.copy(alpha = 0.5f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+            )
+        }
         if (expanded && status != null) {
             Spacer(Modifier.height(2.dp))
             Text(
@@ -489,6 +503,15 @@ private fun AutomixStatusLine(
             )
         }
     }
+}
+
+/** Short "why this rung" line shared by the player status and the mix popup. */
+internal fun automixReasonLine(status: AutomixStatus?): String {
+    if (status == null || status.rung.isBlank()) return ""
+    val overlap = if (status.overlapBars > 0) "${status.overlapBars} bars" else "no overlap"
+    val reason = status.reason
+    // A bare rung reads as a list item; adding the reason reads as an excuse.
+    return if (reason.isBlank()) "${status.rung}, $overlap" else "${status.rung} — $overlap ($reason)"
 }
 
 @Composable

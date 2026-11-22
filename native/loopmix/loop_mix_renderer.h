@@ -61,7 +61,9 @@ struct TptLowpass {
   float ic2eq[2] = {0, 0};
 
   void set(double sampleRate, double frequency, double q);
-  void bypass() { g = 0; }
+  // Zero the integrators so re-engagement starts from clean state
+  // (stale head would pop at the bypass boundary).
+  void bypass() { g = 0; ic1eq[0] = ic1eq[1] = 0; ic2eq[0] = ic2eq[1] = 0; }
   inline float tick(int channel, float v0) {
     if (g <= 0.f) return v0;
     const float v3 = v0 - ic2eq[channel];
@@ -86,7 +88,9 @@ struct TptHighpass {
   float ic2eq[2] = {0, 0};
 
   void set(double sampleRate, double frequency, double q);
-  void bypass() { g = 0; k = 1.414f; }
+  // Zero the integrators so re-engagement starts from clean state
+  // (stale head would pop at the bypass boundary).
+  void bypass() { g = 0; k = 1.414f; ic1eq[0] = ic1eq[1] = 0; ic2eq[0] = ic2eq[1] = 0; }
   inline float tick(int channel, float v0) {
     if (g <= 0.f) return v0;
     const float v3 = v0 - ic2eq[channel];

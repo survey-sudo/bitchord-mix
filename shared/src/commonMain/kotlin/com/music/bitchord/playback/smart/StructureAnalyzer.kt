@@ -369,10 +369,14 @@ object StructureAnalyzer {
     }
 
     private fun segmentSim(bars: List<Bar>, bounds: IntArray, a: Int, b: Int): Double {
+        if (a !in 0 until bounds.size - 1 || b !in 0 until bounds.size - 1) return 0.0
         val a0 = bounds[a]
         val a1 = bounds[a + 1]
         val b0 = bounds[b]
         val b1 = bounds[b + 1]
+        if (a0 !in bars.indices || b0 !in bars.indices || a1 !in 0..bars.size || b1 !in 0..bars.size) {
+            return 0.0
+        }
         val len = min(a1 - a0, b1 - b0)
         if (len <= 0) return 0.0
         var best = 0.0
@@ -707,6 +711,8 @@ object StructureAnalyzer {
     // ---- PCM front end (tests and the fallback when native features are absent) ----
 
     private const val RATE = 22050
+    private val melBankCache: Array<FloatArray> by lazy { melBank() }
+
     private const val FRAME = 2048
     private const val HOP = 512
 
@@ -716,16 +722,21 @@ object StructureAnalyzer {
         if (mono.size < FRAME) return listOf(Frame(FloatArray(13), FloatArray(12), -80f, 0f, 0f))
         val fft = Fft(FRAME)
         val window = FloatArray(FRAME) { (0.5f - 0.5f * cos(2.0 * PI * it / (FRAME - 1))).toFloat() }
-        val mel = melBank()
+        val mel = melBankCache
         val out = ArrayList<Frame>(mono.size / HOP)
-        var prev = FloatArray(40)
+        // Reused across hops: the FFT and mel scratch is overwritten every hop,
+        // so hoisting it turns ~5 temporaries per hop into 5 arrays per call.
+        val real = FloatArray(FRAME)
+        val imag = FloatArray(FRAME)
+        val mag = FloatArray(FRAME / 2)
+        val melE = FloatArray(40)
+        val prev = FloatArray(40)
         var havePrev = false
         var at = 0
         while (at + FRAME <= mono.size) {
-            val real = FloatArray(FRAME) { mono[at + it] * window[it] }
-            val imag = FloatArray(FRAME)
+            for (i in 0 until FRAME) real[i] = mono[at + i] * window[i]
+            imag.fill(0f)
             fft.forward(real, imag)
-            val mag = FloatArray(FRAME / 2)
             var energy = 0.0
             var low = 0.0
             for (k in mag.indices) {
@@ -736,7 +747,7 @@ object StructureAnalyzer {
                 if (hz in 30.0..150.0) low += p
             }
             val rms = if (energy <= 1e-12) -80f else (10.0 * ln(energy / FRAME) / ln(10.0)).toFloat()
-            val melE = FloatArray(40)
+            melE.fill(0f)
             for (b in 0 until 40) {
                 var s = 0.0
                 val row = mel[b]
@@ -750,7 +761,7 @@ object StructureAnalyzer {
                     if (d > 0) flux += d
                 }
             }
-            prev = melE
+            melE.copyInto(prev)
             havePrev = true
             val chroma = if (rms < -50f) FloatArray(12) else chromaOf(mag)
             out.add(Frame(mfccOf(melE), chroma, rms, if (energy > 0) (low / energy).toFloat() else 0f, flux))
@@ -798,6 +809,7 @@ object StructureAnalyzer {
 
     private fun zscore(bars: List<Bar>) {
         if (bars.isEmpty()) return
+        if (bars.any { it.mfcc.size < 13 }) return
         for (c in 0 until 13) {
             var mean = 0.0
             for (b in bars) mean += b.mfcc[c]

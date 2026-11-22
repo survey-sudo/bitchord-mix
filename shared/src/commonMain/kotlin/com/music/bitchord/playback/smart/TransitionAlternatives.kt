@@ -1,6 +1,8 @@
 package com.music.bitchord.playback.smart
 
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.log10
 import kotlin.math.pow
@@ -583,11 +585,87 @@ object TransitionAlternatives {
         from * (to / from).pow(amount.coerceIn(0.0, 1.0))
 
     /**
+     * C1 raised-cosine weight s(u) = 0.5*(1-cos(pi*u)) for u in 0..1: 0 at
+     * both ends, 1 in the middle transition, derivative zero at both ends.
+     * Every LP leg samples this same shape in the log-Hz domain, so the
+     * slope is continuous (flat) at the turnaround and at full-band on
+     * either side: no p^1.4-to-linear kink.
+     */
+    fun raisedCosine(u: Double): Double =
+        0.5 * (1.0 - cos(PI * u.coerceIn(0.0, 1.0)))
+
+    /**
+     * C1 log-Hz glide between [from] and [to] with raised-cosine weight:
+     * geometric interpolation whose log slope is zero at both ends.
+     * Use for both close and reopen legs so the turnaround stays flat.
+     */
+    fun c1LogGlideHz(from: Double, to: Double, u: Double): Double =
+        glideHz(from, to, raisedCosine(u))
+
+    /**
+     * Proportional exit leg for a [beats]-beat transition:
+     * max(3, round(beats*0.4)) clamped to [2, beats-1] (1 for a 2-beat
+     * clock). Replaces the fixed 2-beat MUFFLE_EXIT_BEATS reopen so a
+     * long transition reopens proportionally instead of snatching.
+     */
+    fun proportionalExitBeats(beats: Int): Int {
+        if (beats <= 2) return 1
+        val raw = maxOf(3, (beats * 0.4).roundToInt())
+        return raw.coerceIn(2, beats - 1)
+    }
+
+    /** Entry fraction implied by the proportional exit leg (for live riders). */
+    fun proportionalEntryFraction(beats: Int): Double {
+        val b = beats.coerceAtLeast(2)
+        val exit = proportionalExitBeats(b)
+        return ((b - exit).toDouble() / b.toDouble()).coerceIn(0.05, 0.95)
+    }
+
+    /** Incoming LP reopen start (Hz): 500-700 Hz, never the old 300 Hz snatch base. */
+    const val IN_LP_START_HZ = 600.0
+    /** Incoming LP open span in beats (2.5-4.0): 3 beats keeps the open gradual. */
+    const val IN_LP_OPEN_BEATS = 3.0
+    /** Perceptual makeup ceiling for a surviving filtered deck (dB). */
+    const val SURVIVOR_MAKEUP_MAX_DB = 1.5
+
+    /**
+     * Gentle perceptual makeup for a SURVIVING filtered deck only (never a
+     * dying OUT deck): +0 dB at full-band, up to [SURVIVOR_MAKEUP_MAX_DB]
+     * at [floorHz], linear in log closure depth. The controller lane
+     * applies this to the survivor's gain while its LP is closed; the
+     * dying deck gets no makeup so it cannot blast as it fades.
+     */
+    fun survivorMakeupDb(
+        cutoffHz: Double,
+        openHz: Double = FULL_BAND_HZ,
+        floorHz: Double = MUFFLE_FLOOR_HZ_SHARED,
+    ): Double {
+        if (!cutoffHz.isFinite() || cutoffHz <= 0.0) return SURVIVOR_MAKEUP_MAX_DB
+        if (cutoffHz >= openHz) return 0.0
+        if (cutoffHz <= floorHz) return SURVIVOR_MAKEUP_MAX_DB
+        val num = log10(openHz / cutoffHz)
+        val den = log10(openHz / floorHz)
+        if (!den.isFinite() || den <= 0.0) return 0.0
+        return (SURVIVOR_MAKEUP_MAX_DB * (num / den).coerceIn(0.0, 1.0))
+    }
+
+    /** Linear-gain form of [survivorMakeupDb] (1.0 at full-band). */
+    fun survivorMakeupGain(
+        cutoffHz: Double,
+        openHz: Double = FULL_BAND_HZ,
+        floorHz: Double = MUFFLE_FLOOR_HZ_SHARED,
+    ): Double = 10.0.pow(survivorMakeupDb(cutoffHz, openHz, floorHz) / 20.0)
+
+    /**
      * Muffle low-pass at one overlap [progress] (0..1) with a real return leg.
-     * Entry closes open->floor over 0..[entryFraction]; return reopens
-     * floor->open over [entryFraction]..1. At progress 1 the cutoff is
-     * full-band (20000 Hz), so teardown never needs the open() glide.
-     * [sweep] scales the floor the same way the live rider does.
+     * Both legs sample the same C1 raised-cosine in log-Hz (see
+     * [c1LogGlideHz]): entry closes open->floor over 0..[entryFraction],
+     * return reopens floor->open over [entryFraction]..1, with zero log
+     * slope at the turnaround on both sides so the old p^1.4-vs-linear
+     * kink (2.14x/3.0x) is gone. At progress 1 the cutoff is full-band
+     * (20000 Hz), so teardown never needs the open() glide. [sweep]
+     * scales the floor the same way the live rider does. Live-rider only:
+     * the native dying-OUT envelope is monotonic (see [muffleEnvelope]).
      */
     fun muffleCutoffAt(
         progress: Double,
@@ -601,10 +679,10 @@ object TransitionAlternatives {
         val p = progress.coerceIn(0.0, 1.0)
         return if (p < ef) {
             val entryProg = (p / ef).coerceIn(0.0, 1.0)
-            glideHz(openHz, floor, entryProg.pow(MUFFLE_SHAPE))
+            c1LogGlideHz(openHz, floor, entryProg)
         } else {
             val ret = ((p - ef) / (1.0 - ef)).coerceIn(0.0, 1.0)
-            glideHz(floor, openHz, ret)
+            c1LogGlideHz(floor, openHz, ret)
         }
     }
 
@@ -612,9 +690,12 @@ object TransitionAlternatives {
     const val MUFFLE_SHAPE = 1.4
 
     /**
-     * Bridge return leg: park->open over [returnStartFraction]..1. Before the
-     * return the caller holds [parkHz]; this function only describes the
-     * trailing reopen, ending at full-band at progress 1.
+     * Bridge return leg: park->open over [returnStartFraction]..1 with the
+     * shared C1 raised-cosine in log-Hz (zero slope at park and at
+     * full-band). Before the return the caller holds [parkHz]; this
+     * function only describes the trailing reopen, ending at full-band
+     * at progress 1. Survivor (incoming) deck only; see
+     * [bridgeDeadOutEnvelope] for the dying OUT deck.
      */
     fun bridgeReopenCutoffAt(
         progress: Double,
@@ -626,39 +707,66 @@ object TransitionAlternatives {
         val p = progress.coerceIn(0.0, 1.0)
         if (p < rs) return parkHz
         val ret = ((p - rs) / (1.0 - rs)).coerceIn(0.0, 1.0)
-        return glideHz(parkHz, openHz, ret)
+        return c1LogGlideHz(parkHz, openHz, ret)
     }
 
     /**
-     * Native muffle low-pass envelope: open->floor->open, strictly increasing
-     * times, closing full-band at [LoopMix.Clock.releaseAt]. Breakpoints use
-     * beat indices, never the degenerate enterEnd==rampEnd pair, so the
-     * entry close spans beats instead of collapsing into one sample.
+     * Native muffle low-pass envelope for the DYING OUT deck: monotonic
+     * open->floor close over the whole 0..releaseAt span, sampled at each
+     * beat with the shared C1 raised-cosine in log-Hz (zero slope at both
+     * ends), ending at the 700 Hz muffle floor at [LoopMix.Clock.releaseAt]
+     * while the OUT fader falls to zero. No V-turnaround: the dying deck
+     * never reopens to 20 kHz right before it dies (the unity-gain
+     * brightness blast). Times are the beat grid (strictly increasing,
+     * no enterEnd==rampEnd collapse); the survivor (live rider) keeps its
+     * smoothed V via [muffleCutoffAt], but the rendered OUT is monotonic.
      */
     fun muffleEnvelope(clock: LoopMix.Clock): Pair<DoubleArray, FloatArray> {
         val beats = clock.beats.coerceAtLeast(2)
-        val exit = MUFFLE_EXIT_BEATS.coerceIn(1, (beats - 1).coerceAtLeast(1))
-        val keep = (beats - exit).coerceIn(1, beats - 1)
-        val returnStart = clock.beatTimes[keep]
-        val release = clock.releaseAt
-        // Strictly increasing: 0 < returnStart < release by construction.
-        val times = doubleArrayOf(0.0, returnStart, release)
-        val values = floatArrayOf(FULL_BAND_HZ.toFloat(), MUFFLE_FLOOR_HZ_SHARED.toFloat(), FULL_BAND_HZ.toFloat())
+        val times = DoubleArray(beats + 1) { clock.beatTimes[it] }
+        val values = FloatArray(beats + 1) { k ->
+            c1LogGlideHz(FULL_BAND_HZ, MUFFLE_FLOOR_HZ_SHARED, k.toDouble() / beats.toDouble()).toFloat()
+        }
         return times to values
     }
 
     /**
-     * Native bridge low-pass envelope: open->park->open on both decks,
-     * strictly increasing times, closing full-band at releaseAt.
+     * Native bridge low-pass envelope for the SURVIVING (incoming) deck:
+     * open->park->open, sampled at each beat with the shared C1
+     * raised-cosine in log-Hz on both legs (flat at park turnaround and
+     * at both ends). The return leg is proportional
+     * ([proportionalExitBeats], 2.5-4.0-beat class) so the survivor
+     * reopens gradually to full-band at releaseAt. Strictly increasing
+     * beat-grid times. The dying OUT deck uses [bridgeDeadOutEnvelope]
+     * (monotonic, no reopen).
      */
     fun bridgeEnvelope(clock: LoopMix.Clock): Pair<DoubleArray, FloatArray> {
         val beats = clock.beats.coerceAtLeast(2)
-        val exit = BRIDGE_EXIT_BEATS.coerceIn(1, (beats - 1).coerceAtLeast(1))
+        val exit = proportionalExitBeats(beats)
         val keep = (beats - exit).coerceIn(1, beats - 1)
-        val returnStart = clock.beatTimes[keep]
-        val release = clock.releaseAt
-        val times = doubleArrayOf(0.0, returnStart, release)
-        val values = floatArrayOf(FULL_BAND_HZ.toFloat(), BRIDGE_PARK_HZ_SHARED.toFloat(), FULL_BAND_HZ.toFloat())
+        val times = DoubleArray(beats + 1) { clock.beatTimes[it] }
+        val values = FloatArray(beats + 1) { k ->
+            if (k <= keep) {
+                c1LogGlideHz(FULL_BAND_HZ, BRIDGE_PARK_HZ_SHARED, k.toDouble() / keep.toDouble()).toFloat()
+            } else {
+                c1LogGlideHz(BRIDGE_PARK_HZ_SHARED, FULL_BAND_HZ, (k - keep).toDouble() / exit.toDouble()).toFloat()
+            }
+        }
+        return times to values
+    }
+
+    /**
+     * Native bridge low-pass envelope for the DYING OUT deck: monotonic
+     * open->park close over the whole 0..releaseAt span, sampled with the
+     * shared C1 raised-cosine in log-Hz and ending at the 1500 Hz park
+     * while the OUT fader falls to zero. No 20 kHz reopen before death.
+     */
+    fun bridgeDeadOutEnvelope(clock: LoopMix.Clock): Pair<DoubleArray, FloatArray> {
+        val beats = clock.beats.coerceAtLeast(2)
+        val times = DoubleArray(beats + 1) { clock.beatTimes[it] }
+        val values = FloatArray(beats + 1) { k ->
+            c1LogGlideHz(FULL_BAND_HZ, BRIDGE_PARK_HZ_SHARED, k.toDouble() / beats.toDouble()).toFloat()
+        }
         return times to values
     }
 

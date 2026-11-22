@@ -77,6 +77,14 @@
         tools:targetApi="34">
 
         <!--
+          QNN diagnostic / ADRPC library: the Qualcomm ADSP RPC client library
+          (libcdsprpc.so) belongs to the QNN runtime family. Declared optional so
+          the dormant QNN path can resolve it without making it a hard runtime
+          requirement of the shipped APK; inert while QNN is disabled.
+        -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+
+        <!--
           Lets a release build be sampled with simpleperf or Perfetto from adb,
           so jank is measured on the build users get rather than on a debug
           build that is slow for its own reasons. No runtime cost.

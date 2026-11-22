@@ -85,8 +85,8 @@ class ExitLegTest {
         return LoopMix.Clock(plan)
     }
 
-    private fun assertEnvelopeWellFormed(times: DoubleArray, vals: FloatArray, label: String) {
-        assertTrue(times.size >= 3, "$label needs entry, floor and return points: ${times.size}")
+    private fun assertEnvelopeTimesWellFormed(times: DoubleArray, vals: FloatArray, label: String) {
+        assertTrue(times.size >= 3, "$label needs >= 3 points: ${times.size}")
         assertEquals(times.size, vals.size, "$label times/vals size")
         for (i in 1 until times.size) {
             assertTrue(times[i] > times[i - 1], "$label times must strictly increase at $i: ${times.toList()}")
@@ -95,7 +95,6 @@ class ExitLegTest {
             // not one 64-frame block (~1.5 ms) or one sample.
             assertTrue(delta > 0.01, "$label collapse at $i delta=$delta: ${times.toList()}")
         }
-        assertEquals(20000.0, vals.last().toDouble(), 1e-3)
     }
 
     @Test
@@ -105,19 +104,32 @@ class ExitLegTest {
         // [enterEnd, rampEnd, releaseAt] collapsed 20000->2800 into one sample.
         assertEquals(clock.enterEnd, clock.rampEnd, 1e-9)
         val (times, vals) = TransitionAlternatives.muffleEnvelope(clock)
-        assertEnvelopeWellFormed(times, vals, "muffle")
-        // Entry close lands at the floor, return ends full-band.
-        assertTrue(abs(vals[1].toDouble() - 700.0) < 1e-3, "muffle floor=${vals.toList()}")
-        assertEquals(20000.0, vals[0].toDouble(), 1e-3)
-        assertEquals(20000.0, vals[2].toDouble(), 1e-3)
+        assertEnvelopeTimesWellFormed(times, vals, "muffle")
+        // vc91: dying OUT muffle is monotonic open -> 700 Hz floor (never reopens to 20 kHz).
+        assertEquals(20000.0, vals.first().toDouble(), 1e-3)
+        assertEquals(700.0, vals.last().toDouble(), 1e-3)
+        for (i in 1 until vals.size) {
+            assertTrue(vals[i] <= vals[i - 1] + 1e-3f, "muffle must not reopen at $i: ${vals.toList()}")
+        }
     }
 
     @Test
     fun nativeBridgeEnvelopeHasNoCollapse() {
         val clock = echoClock()
         val (times, vals) = TransitionAlternatives.bridgeEnvelope(clock)
-        assertEnvelopeWellFormed(times, vals, "bridge")
-        assertTrue(abs(vals[1].toDouble() - 1500.0) < 1e-3, "bridge park=${vals.toList()}")
+        assertEnvelopeTimesWellFormed(times, vals, "bridge")
+        assertEquals(20000.0, vals.first().toDouble(), 1e-3)
+        assertEquals(20000.0, vals.last().toDouble(), 1e-3)
+        val minHz = vals.minOrNull() ?: 0f
+        assertTrue(abs(minHz.toDouble() - 1500.0) < 1e-3, "bridge park=${vals.toList()}")
+        // vc91: dying OUT bridge closes monotonically 20k -> 1500 Hz.
+        val (outTimes, outVals) = TransitionAlternatives.bridgeDeadOutEnvelope(clock)
+        assertEnvelopeTimesWellFormed(outTimes, outVals, "bridgeDeadOut")
+        assertEquals(20000.0, outVals.first().toDouble(), 1e-3)
+        assertEquals(1500.0, outVals.last().toDouble(), 1e-3)
+        for (i in 1 until outVals.size) {
+            assertTrue(outVals[i] <= outVals[i - 1] + 1e-3f, "bridgeDeadOut must not reopen at $i: ${outVals.toList()}")
+        }
     }
 
     @Test

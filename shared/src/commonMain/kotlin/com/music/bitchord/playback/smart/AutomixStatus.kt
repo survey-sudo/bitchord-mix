@@ -27,4 +27,10 @@ data class AutomixStatus(
     val tempoPct: Float = 0f,
     /** True once the shown countdown froze the rung. */
     val locked: Boolean = false,
+    /** Planner rung behind this status, e.g. "Natural handoff" or "Beat blend". */
+    val rung: String = "",
+    /** Planner reason for that rung, e.g. "natural-end:before-smart-analysis-fallback-window". */
+    val reason: String = "",
+    /** Overlap length in bars; 0 means no overlap (a natural handoff). */
+    val overlapBars: Int = 0,
 )

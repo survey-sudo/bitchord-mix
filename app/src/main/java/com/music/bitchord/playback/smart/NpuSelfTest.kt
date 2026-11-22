@@ -23,6 +23,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * At most one run per process; off UI and audio threads; never throws; a
  * failure cannot affect playback; aborted when backgrounded.
+ *
+ * Test-build harness (vc91): while QNN is off the probe stays dormant, and
+ * the two dormant-build harnesses below (CPU-vs-XNNPACK benchmark, QNN
+ * diagnostic) run only when their test-build constants are flipped on.
  */
 object NpuSelfTest {
     private const val TAG = "BitChordNPU"
@@ -31,7 +35,18 @@ object NpuSelfTest {
     private const val THREADS = 2
     /** Bound on dummy-input elements (4M floats = 16 MB worst case). */
     private const val MAX_INPUT_ELEMENTS = 4_000_000L
+    /** Max logit delta tolerated between two providers for the parity check. */
+    private const val MAX_LOGIT_DELTA: Float = 1e-4f
     private val started = AtomicBoolean(false)
+
+    /**
+     * Test-build switches. Both default to off, which is the shipped
+     * behaviour: the QNN diagnostic (CPU EP fallback disabled + profiling)
+     * and the CPU-vs-XNNPACK benchmark do not run, so the probe behaves
+     * exactly as it did while QNN was disabled.
+     */
+    private const val QNN_DIAGNOSTIC_ENABLED = false
+    private const val BENCHMARK_CPU_VS_XNNPACK_ENABLED = false
 
     /**
      * Schedules the probe once. context is only read after attach
@@ -56,6 +71,7 @@ object NpuSelfTest {
             }
         }, "bitchord-npu-selftest").apply { isDaemon = true }.start()
     }
+
     private fun run(
         context: Context,
         vendor: () -> NpuSupport.Vendor,
@@ -109,7 +125,11 @@ object NpuSelfTest {
         var session: OrtSession? = null
         var qnnOk = false
         try {
-            session = NpuSession.openQnn(model, THREADS, NpuSupport.NpuConfig(), backend, cacheDir)
+            session = if (QNN_DIAGNOSTIC_ENABLED) {
+                NpuSession.openQnnDiagnostic(model, THREADS, NpuSupport.NpuConfig(), backend, cacheDir, soc)
+            } else {
+                NpuSession.openQnn(model, THREADS, NpuSupport.NpuConfig(), backend, cacheDir)
+            }
             qnnOk = true
             Log.i(TAG, "selftest qnn open OK")
         } catch (t: Throwable) {
@@ -120,9 +140,18 @@ object NpuSelfTest {
             inference = if (runDummyInference(session)) "ok" else "skipped"
         }
         runCatching { session?.close() }
-        Log.i(TAG, "selftest provider=" + (if (qnnOk) "QNN" else "QNN-FAILED") + " inference=" + inference)
+
+        var benchmark = "off"
+        if (BENCHMARK_CPU_VS_XNNPACK_ENABLED && model != null) {
+            benchmark = if (benchmarkCpuVsXnnpack(model, THREADS)) "ok" else "failed"
+        }
+        Log.i(
+            TAG,
+            "selftest provider=" + (if (qnnOk) "QNN" else "QNN-FAILED") + " inference=" + inference + " benchmark=" + benchmark,
+        )
         done()
     }
+
     /**
      * Runs one tiny forward pass on a zeros input shaped from the
      * session input metadata (forces the HTP graph to execute, not
@@ -155,6 +184,102 @@ object NpuSelfTest {
         }
     }
 
+    /**
+     * CPU-vs-XNNPACK benchmark: the same dummy input through a plain CPU
+     * session and an XNNPACK session, per-phase timings, and a max-logit-delta
+     * parity check between the two providers. A future quantization change must
+     * not silently degrade accuracy, so the delta is measured rather than assumed.
+     */
+    private fun benchmarkCpuVsXnnpack(modelPath: String, threads: Int): Boolean {
+        val cpuStarted = System.currentTimeMillis()
+        val cpuSession = NpuSession.openCpu(modelPath, threads)
+        val cpuOpenMs = System.currentTimeMillis() - cpuStarted
+        val xnnpackStarted = System.currentTimeMillis()
+        val xnnpackSession = createXnnpackSession(modelPath, threads)
+        val xnnpackOpenMs = System.currentTimeMillis() - xnnpackStarted
+        val cpuInferStarted = System.currentTimeMillis()
+        val cpuRun = runBenchLogits(cpuSession)
+        val cpuInferMs = System.currentTimeMillis() - cpuInferStarted
+        runCatching { cpuSession.close() }
+        val xnnpackInferStarted = System.currentTimeMillis()
+        val xnnpackRun = runBenchLogits(xnnpackSession)
+        val xnnpackInferMs = System.currentTimeMillis() - xnnpackInferStarted
+        runCatching { xnnpackSession.close() }
+        if (cpuRun == null || xnnpackRun == null) {
+            Log.i(TAG, "selftest benchmark cpuVsXnnpack FAILED (inference)")
+            return false
+        }
+        val maxDelta = maxLogitDelta(cpuRun.first, cpuRun.second, xnnpackRun.first, xnnpackRun.second)
+        Log.i(
+            TAG,
+            "selftest benchmark cpuVsXnnpack cpuOpenMs=" + cpuOpenMs + " cpuInferMs=" + cpuInferMs +
+                " xnnpackOpenMs=" + xnnpackOpenMs + " xnnpackInferMs=" + xnnpackInferMs + " maxLogitDelta=" + maxDelta,
+        )
+        return maxDelta <= MAX_LOGIT_DELTA
+    }
+
+    /** Session options for the XNNPACK delegate (intra-op threads come from the session). */
+    private fun createXnnpackSession(modelPath: String, threads: Int): OrtSession {
+        val options = OrtSession.SessionOptions().apply {
+            setIntraOpNumThreads(threads)
+            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            setCPUArenaAllocator(true)
+            setMemoryPatternOptimization(true)
+            addXnnpack(mapOf("intra_op_num_threads" to threads.toString()))
+        }
+        return OrtEnvironment.getEnvironment().createSession(modelPath, options)
+    }
+
+    /**
+     * One dummy forward pass per session, returning the beat and downbeat
+     * logits the provider produced for the same zeros input.
+     */
+    private fun runBenchLogits(session: OrtSession): Pair<FloatArray, FloatArray>? {
+        var tensor: OnnxTensor? = null
+        return try {
+            val infos = session.getInputInfo()
+            val first = infos.entries.firstOrNull() ?: return null
+            val tensorInfo = first.value.info as? ai.onnxruntime.TensorInfo ?: return null
+            val shape = tensorInfo.getShape().map { d -> if (d > 0) d else 8L }.toLongArray()
+            val elements = shape.fold(1L) { acc, d -> acc * d }
+            if (elements <= 0 || elements > MAX_INPUT_ELEMENTS) return null
+            val inputTensor = OnnxTensor.createTensor(
+                OrtEnvironment.getEnvironment(),
+                FloatBuffer.wrap(FloatArray(elements.toInt())),
+                shape,
+            )
+            tensor = inputTensor
+            val (beat, downbeat) = session.run(mapOf(first.key to inputTensor)).use { outputs ->
+                val beatLogit = (outputs.get(0).value as Array<FloatArray>)[0]
+                val downbeatLogit = (outputs.get(1).value as Array<FloatArray>)[0]
+                beatLogit to downbeatLogit
+            }
+            beat to downbeat
+        } catch (_: Throwable) {
+            null
+        } finally {
+            runCatching { tensor?.close() }
+        }
+    }
+
+    /** Max absolute logit delta across the beat and downbeat outputs of two runs. */
+    private fun maxLogitDelta(beatA: FloatArray, downA: FloatArray, beatB: FloatArray, downB: FloatArray): Float {
+        val beatDelta = maxAbsDiff(beatA, beatB)
+        val downDelta = maxAbsDiff(downA, downB)
+        return if (downDelta > beatDelta) downDelta else beatDelta
+    }
+
+    /** Max absolute element-wise difference between two equal-length logit vectors. */
+    private fun maxAbsDiff(a: FloatArray, b: FloatArray): Float {
+        if (a.size != b.size) return Float.MAX_VALUE
+        var max = 0.0f
+        for (index in a.indices) {
+            val delta = kotlin.math.abs(a[index] - b[index])
+            if (delta > max) max = delta
+        }
+        return max
+    }
+
     /** Copies a bundled asset to the self-test cache via tmp + rename. */
     private fun unpackModel(context: Context, name: String): String {
         val parent = File(context.noBackupFilesDir, "npu/selftest").apply { mkdirs() }
@@ -171,6 +296,7 @@ object NpuSelfTest {
         }
         return target.absolutePath
     }
+
     /**
      * True when the app is fully backgrounded: the probe does not spend
      * DSP or filesystem work on a one-shot check while a backgrounded

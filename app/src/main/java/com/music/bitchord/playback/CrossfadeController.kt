@@ -70,6 +70,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -603,6 +605,15 @@ class CrossfadeController(
     private val onMixPositionJump: (wrapped: Boolean) -> Unit = {},
     /** Monotonic wall clock (ms) for arming/fade deadlines; production uses [SystemClock.elapsedRealtime]. */
     private val nowMs: () -> Long = SystemClock::elapsedRealtime,
+    /**
+     * Emits a trackId whenever that track's analysis changes: cache restore,
+     * grid-ready intermediate, head publish, whole-track completion, or terminal
+     * failure. Collected in [scope] so a background pass landing mid-song
+     * re-plans the pending pair instead of leaving an analysis-fallback NATURAL
+     * handoff latched until the queue changes. An inert flow is the default for
+     * hosts that do not wire the analyser.
+     */
+    private val analysisUpdates: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 1),
 ) {
 
     private enum class Phase {
@@ -973,8 +984,31 @@ class CrossfadeController(
     private var idleStallPrepared = false
     /** vc77: wall of the progress==1 BUFFERING stall in driveFade (0 when not stalled). */
     private var fadingStallSinceMs = 0L
-    /** djmix13: wall of the most recent (re)plan, for arm-death accounting. */
-    private var lastPlanStartedAtMs = 0L
+    /** djmix13: wall of the most recent accepted (re)plan, for arm-death accounting; -1 = never. */
+    private var lastPlanStartedAtMs = -1L
+    /** Wall of the most recent successful planTransition attempt, accepted or not; -1 = never. */
+    private var planGeneratedAtMs = -1L
+    /** Truthful plan age for telemetry; null until the first planTransition attempt. */
+    private fun planAgeMs(now: Long = nowMs()): Long? =
+        planGeneratedAtMs.takeIf { it >= 0L }?.let { (now - it).coerceAtLeast(0L) }
+
+    // ---- Reactive re-planning on analyser updates ----------------------------
+    /** Monotonic token bumped whenever fresh analysis for the pending pair lands. */
+    private var planGeneration = 0L
+    /** Generation a plan result was computed against; an older result is discarded. */
+    private var planResultGeneration = -1L
+    /** Debounced analysis re-plan job; at most one is active. */
+    private var analysisReplanJob: Job? = null
+    /** The [analysisUpdates] collector, cancelled with the controller. */
+    private var analysisCollectorJob: Job? = null
+    /** True while an analysis-triggered plan pass is running (never two at once). */
+    private var replanning = false
+    /** Generation on which an analysis-fallback NATURAL was taken; -1 = none pending. */
+    private var fallbackNaturalGeneration = -1L
+    /** Media position before which a fallback NATURAL is provisional, or -1 = none. */
+    private var naturalProvisionalUntilPosMs = -1L
+    /** Last observed analysis signature for the pair, for hosts that do not pass [analysisUpdates]. */
+    private var lastPairAnalysisSignature: String? = null
     /** djmix13: shown loop pair that just failed; the loop is skipped for it. */
     private var loopSuppressedPair: String? = null
     private var loopSuppressedUntil = 0L
@@ -1209,7 +1243,7 @@ class CrossfadeController(
                             "positionBeforeMs" to oldPosition.positionMs,
                             "positionAfterMs" to newPosition.positionMs,
                             "action" to "handover-suppressed",
-                            "planAgeMs" to (nowMs0 - lastPlanStartedAtMs),
+                            "planAgeMs" to planAgeMs(nowMs0),
                         ),
                     )
                     return
@@ -1235,7 +1269,7 @@ class CrossfadeController(
                             "positionBeforeMs" to oldPosition.positionMs,
                             "positionAfterMs" to newPosition.positionMs,
                             "action" to "spurious-ignored",
-                            "planAgeMs" to (now - lastPlanStartedAtMs),
+                            "planAgeMs" to planAgeMs(now),
                         ),
                     )
                     return
@@ -1251,7 +1285,7 @@ class CrossfadeController(
                         "positionBeforeMs" to oldPosition.positionMs,
                         "positionAfterMs" to newPosition.positionMs,
                         "action" to action.name.lowercase(),
-                        "planAgeMs" to (now - lastPlanStartedAtMs),
+                        "planAgeMs" to planAgeMs(now),
                     ),
                 )
                 when (action) {
@@ -1433,6 +1467,9 @@ class CrossfadeController(
             opportunity = null
         }
         scrubEpoch++
+        planGeneration++
+        analysisReplanJob?.cancel()
+        analysisReplanJob = null
         countdownStabilizer.reset()
         scrubSettledAtMs = nowMs() + SCRUB_SETTLE_MS
         pinnedCatchUpKey = null
@@ -1507,6 +1544,10 @@ class CrossfadeController(
             terminalRecorded = true
             opportunity = null
         }
+        planGeneration++
+        analysisReplanJob?.cancel()
+        analysisReplanJob = null
+        lastSmartPlan = null
         discardPrime()
         loopPlanned = null
         loopScript = null
@@ -1546,8 +1587,76 @@ class CrossfadeController(
         listeningTo = target
     }
 
+    /**
+     * Collects [analysisUpdates] for the current pair in the controller's own
+     * main-thread scope. Re-reads [analysisFor] through the ordinary planning
+     * path on emission rather than waiting for the next IDLE tick.
+     */
+    private fun startAnalysisCollector() {
+        analysisCollectorJob?.cancel()
+        analysisCollectorJob = scope.launch {
+            analysisUpdates.collect { trackId ->
+                if (trackId.isBlank()) return@collect
+                val pair = runCatching {
+                    val p = active()
+                    val cur = p.currentMediaItem?.mediaId
+                    val idx = p.nextMediaItemIndex
+                    val next = if (idx != C.INDEX_UNSET) p.getMediaItemAt(idx).mediaId else null
+                    cur to next
+                }.getOrNull() ?: return@collect
+                if (trackId != pair.first && trackId != pair.second) return@collect
+                onPairAnalysisChanged(trackId)
+            }
+        }
+    }
+
+    /**
+     * A background analysis pass landed for one side of the pending pair.
+     * Coalesces bursts, bumps the generation token so a plan computed against
+     * older evidence is discarded, and re-plans only inside the pre-arm window:
+     * a plan already committed or firing is never cancelled or blocked.
+     */
+    private fun onPairAnalysisChanged(trackId: String) {
+        if (phase != Phase.IDLE) return
+        if (versionSwapActive() || ListenTogether.state.value.inParty) return
+        // A NATURAL taken on an analysis-fallback is provisional until the arm
+        // deadline. Newer evidence before that deadline invalidates it so the
+        // plan is re-attempted instead of staying latched for the whole song.
+        if (fallbackNaturalGeneration >= 0L) {
+            val untilPos = naturalProvisionalUntilPosMs
+            val pos = runCatching { active().currentPosition }.getOrNull()
+            if (pos == null || pos < untilPos || untilPos < 0L) {
+                fallbackNaturalGeneration = -1L
+                naturalProvisionalUntilPosMs = -1L
+                lastSmartPlan = null
+                plannedTransition = null
+                AppSettings.smartTransitionWindow.value = null
+            }
+        }
+        analysisReplanJob?.cancel()
+        analysisReplanJob = scope.launch {
+            delay(ANALYSIS_REPLAN_DEBOUNCE_MS)
+            if (!isActive || phase != Phase.IDLE) return@launch
+            val token = ++planGeneration
+            runCatching { replanForAnalysis(token) }
+        }
+    }
+
+    /** One plan pass for the current pair; the result is tagged with the token it used. */
+    private fun replanForAnalysis(token: Long) {
+        if (replanning) return
+        replanning = true
+        try {
+            planAutoTransition(active())
+            planResultGeneration = token
+        } finally {
+            replanning = false
+        }
+    }
+
     fun start() {
         listenTo(active())
+        startAnalysisCollector()
         tickerJob?.cancel()
         tickerJob = scope.launch {
             var failedTicks = 0L
@@ -1624,6 +1733,10 @@ class CrossfadeController(
     fun release() {
         tickerJob?.cancel()
         tickerJob = null
+        analysisCollectorJob?.cancel()
+        analysisCollectorJob = null
+        analysisReplanJob?.cancel()
+        analysisReplanJob = null
         loopBuildJob?.cancel()
         loopAlignJob?.cancel()
         loopSession?.let {
@@ -1802,7 +1915,7 @@ class CrossfadeController(
             shownCountdownKey = null
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to planAgeMs()),
             )
             loopFallBack(reason)
             return
@@ -1828,7 +1941,7 @@ class CrossfadeController(
             watchdogFired = true
             AutomixTelemetry.event(
                 "mix.arm.death",
-                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (nowMs() - lastPlanStartedAtMs)),
+                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to planAgeMs()),
             )
             loopFallBack(reason)
         }
@@ -2028,6 +2141,10 @@ class CrossfadeController(
         if (nextIndex == C.INDEX_UNSET) return
         val nextItem = player.getMediaItemAt(nextIndex)
         ensureOpportunity(currentItem.mediaId, nextItem.mediaId)
+        // Capture the token AFTER the opportunity is ensured (a new pair bumps
+        // it). A newer analysis signal during this pass makes its verdict stale,
+        // so it is discarded before it can latch a fallback NATURAL.
+        val generationAtEntry = planGeneration
         // Even a manual catalogue match is still video-origin. AutoMix's
         // analysis and cueing are deliberately never applied to either side
         // of a transition involving a video row.
@@ -2090,12 +2207,18 @@ class CrossfadeController(
             fadeSeconds = fallbackSeconds,
             mode = CrossfadeMode.SMART,
             advanced = advanced,
+            // Classic phrase length stays adaptive (0): the native PhrasePlanner
+            // owns bridge phrase length and there is no listener setting here.
+            phraseBars = 0,
             lyricsOut = outLyricCues,
             lyricsIn = inLyricCues,
             mixWindow = true,
             listenerSpeed = AppSettings.playbackSpeed.value.toDouble(),
             allowRecoveryCrossfade = recovery,
         )
+        // Set on every attempt, accepted or not: telemetry age must describe
+        // when the planner last ran, not when a route was finally accepted.
+        planGeneratedAtMs = nowMs()
         var plan = classicPlanFor(recoveryRequired())
         // djmix16 pin: ANY :catch-up plan for (pair, scrubEpoch) is pinned
         // ONCE and reused on every subsequent tick — never recomputed as
@@ -2130,6 +2253,10 @@ class CrossfadeController(
                 }
             }
         }
+        // A newer analysis generation arrived while this pass was in flight:
+        // discard its verdict rather than latching a stale fallback NATURAL.
+        // planResultGeneration also guards a result tagged by a later replan.
+        if (generationAtEntry != planGeneration || planResultGeneration > generationAtEntry) return
         // One line per distinct verdict rather than one per 250ms tick, so the
         // log says what the planner decided for this pair without burying it.
         val verdict = "${plan.reason}|${plan.transitionStyle}|fade=${plan.fadeMs}" +
@@ -2530,10 +2657,27 @@ class CrossfadeController(
         // A native arm can fail during this very tick. Admit its bounded
         // recovery immediately instead of waiting behind a stale natural plan.
         if (plan.transitionStyle == TransitionStyle.NATURAL && recoveryRequired()) {
+            planGeneratedAtMs = nowMs()
             plan = classicPlanFor(true)
         }
 
         if (plan.transitionStyle == TransitionStyle.NATURAL) {
+            // The planner answers NATURAL for an "uncertain classic" — no usable
+            // analysis yet — with a "natural-end:...analysis-fallback" reason (or
+            // a decline). That verdict is provisional until arming is due: record
+            // its generation so a newer analysis pass can replace it, rather than
+            // latching a handoff for the rest of the song.
+            val fromAnalysisFallback = plan.reason.startsWith("natural-end:") &&
+                (plan.reason.contains("analysis-fallback") || plan.reason.contains("decline-to-mix") ||
+                    plan.policyReasons.contains("natural-handoff-no-overlap"))
+            if (fromAnalysisFallback) {
+                naturalProvisionalUntilPosMs = (plan.transitionStart * 1000).roundToLong() -
+                    maxOf(ARM_LEAD_MS, FALLBACK_NATURAL_HORIZON_MS)
+                fallbackNaturalGeneration = if (player.currentPosition < naturalProvisionalUntilPosMs) planGeneration else -1L
+            } else {
+                naturalProvisionalUntilPosMs = -1L
+                fallbackNaturalGeneration = -1L
+            }
             // Leave both songs intact. No standby fade, countdown commitment,
             // seek, rate change, or pause-at-EOF: the existing queue owns advance.
             releaseHold()
@@ -2787,10 +2931,30 @@ class CrossfadeController(
         val currentItem = player.currentMediaItem
         val nextIndex = player.nextMediaItemIndex
         val nextItem = if (nextIndex == C.INDEX_UNSET) null else player.getMediaItemAt(nextIndex)
+        val outAnalysis = currentItem?.let { analysisFor(it) }
+        val inAnalysis = nextItem?.let { analysisFor(it) }
         AppSettings.smartAnalysis.value = SmartAnalysis(
-            current = currentItem?.let { stateOf(it, analysisFor(it)) } ?: TrackAnalysisState.WAITING,
-            next = nextItem?.let { stateOf(it, analysisFor(it)) } ?: TrackAnalysisState.WAITING,
+            current = currentItem?.let { stateOf(it, outAnalysis ?: TrackAnalysis()) } ?: TrackAnalysisState.WAITING,
+            next = nextItem?.let { stateOf(it, inAnalysis ?: TrackAnalysis()) } ?: TrackAnalysisState.WAITING,
         )
+        // Safety net for hosts that do not pass [analysisUpdates]: the tick's
+        // own observation of a fresher analysis feeds the same debounced
+        // re-plan path, so an analysis landing mid-song still replaces a
+        // provisional NATURAL instead of leaving it latched.
+        val signature = listOf(
+            currentItem?.mediaId.orEmpty(), nextItem?.mediaId.orEmpty(),
+            outAnalysis?.status.orEmpty(), outAnalysis?.quality.orEmpty(),
+            inAnalysis?.status.orEmpty(), inAnalysis?.quality.orEmpty(),
+            outAnalysis?.bpm ?: 0.0, inAnalysis?.bpm ?: 0.0,
+        ).joinToString("|")
+        val previous = lastPairAnalysisSignature
+        lastPairAnalysisSignature = signature
+        if (previous != null && previous != signature) {
+            // Either side of the pair changed; passing the outgoing id is enough
+            // for onPairAnalysisChanged to recognise the pending pair.
+            val pairId = currentItem?.mediaId ?: nextItem?.mediaId
+            if (!pairId.isNullOrBlank()) onPairAnalysisChanged(pairId)
+        }
     }
 
     /**
@@ -2837,10 +3001,13 @@ class CrossfadeController(
      * unread for three minutes and was analysed eight seconds before the fade it
      * was meant to inform, having been analysable the whole time.
      *
-     * The runtime is on the item already — queued from a row that knew it, and
-     * carried on the playback URI as `d=` because a cross-source match is made on
-     * it (see `Song.matchQuery`). Reading it here costs nothing and is available
-     * from the moment the queue is set.
+     * A zero here means *unknown*, not *no such track*: the analyser is still
+     * asked about [item] by mediaId/trackId, so its cache's sibling-rendition
+     * lookup runs regardless of the number returned. The runtime is on the item
+     * already — queued from a row that knew it and carried on the playback URI
+     * as `d=` (see `Song.matchQuery`) — and a stored analysis is another hint.
+     * Both are hints, never preconditions: a missing one leaves 0 (unknown), and
+     * analysis still proceeds with the only copy on disk.
      */
     private fun nextItemDurationMs(nextIndex: Int, item: MediaItem): Long {
         val timeline = active().currentTimeline
@@ -2849,7 +3016,9 @@ class CrossfadeController(
                 .takeIf { it != C.TIME_UNSET && it > 0 }
                 ?.let { return it }
         }
-        return queuedDurationMs(item)
+        return queuedDurationMs(item).takeIf { it > 0L }
+            ?: (analysisFor(item).duration * 1000).roundToLong().takeIf { it > 0L }
+            ?: 0L // unknown: requestAnalysis still runs, keyed by mediaId
     }
 
     /**
@@ -3225,7 +3394,7 @@ class CrossfadeController(
                 "stage" to "prepared", "technique" to "classic", "refusalCode" to refusalCode(reason),
                 "reason" to reason,
                 "phase" to phase.name,
-                "msSincePlan" to (nowMs() - lastPlanStartedAtMs),
+                "msSincePlan" to planAgeMs(),
             ),
         )
         if (armOutgoingPreFiltered) {
@@ -4280,6 +4449,10 @@ class CrossfadeController(
         // A pair changed without a measured terminal event: do not invent success.
         countdownStabilizer.clearFailedNativeRecovery()
         opportunity = Opportunity("$opportunityRunId:${++opportunitySequence}", outId, inId, scrubEpoch)
+        planGeneration++
+        planResultGeneration = -1L
+        fallbackNaturalGeneration = -1L
+        naturalProvisionalUntilPosMs = -1L
         planRevision = 0
         revisionRoute = null
         executedRoute = null
@@ -6362,9 +6535,12 @@ class CrossfadeController(
         bars: Int = 0,
         tempoPct: Float = 0f,
         locked: Boolean = false,
+        rung: String = "",
+        reason: String = "",
+        overlapBars: Int = 0,
     ): AutomixStatus {
         val (head, body) = MixDebug.decorate(headline, detail)
-        return AutomixStatus(head, body, style, progress, state, planType, bars, tempoPct, locked)
+        return AutomixStatus(head, body, style, progress, state, planType, bars, tempoPct, locked, rung, reason, overlapBars)
     }
 
     /** Seconds until [startMs] on the player clock, never negative. */
@@ -6411,6 +6587,8 @@ class CrossfadeController(
                 bars = session.plan.totalBars,
                 tempoPct = tempoPct(session.plan.out.bpm, session.plan.targetBpm),
                 locked = lockedNow,
+                rung = session.plan.rung,
+                overlapBars = session.plan.totalBars,
             )
         }
         val nextIndex = player.nextMediaItemIndex
@@ -6465,6 +6643,8 @@ class CrossfadeController(
                 bars = planned.totalBars,
                 tempoPct = tempoPct(planned.out.bpm, planned.targetBpm),
                 locked = lockedNow,
+                rung = planned.rung,
+                overlapBars = planned.totalBars,
             )
         }
         val plan = lastSmartPlan
@@ -6525,6 +6705,9 @@ class CrossfadeController(
                 bars = bars,
                 tempoPct = tempoPct(outBpm, inBpm),
                 locked = lockedNow,
+                rung = style.replaceFirstChar { it.uppercase() },
+                reason = plan.reason,
+                overlapBars = bars,
             )
         }
         fun label(target: MediaItem?, outgoing: Boolean): String {
@@ -6544,11 +6727,18 @@ class CrossfadeController(
         }
         val detail = "This song: ${label(item, true)}. Next: ${label(next, false)}."
         val nextLabel = label(next, false)
+        // A NATURAL plan clears the transition window, so it never reaches the
+        // classic status above. Carry its rung/reason out anyway: a handoff with
+        // no overlap is a degraded mix and the listener should see why.
+        val natural = plan?.takeIf { it.transitionStyle == TransitionStyle.NATURAL }
         return status(
             headline = "Next $nextLabel".take(42),
             detail = detail,
             style = "wait",
             progress = -1f,
+            rung = if (natural != null) "Natural handoff" else "",
+            reason = natural?.reason?.removePrefix("natural-end:")?.ifBlank { "analysis-fallback" } ?: "",
+            overlapBars = 0,
         )
     }
 
@@ -6889,7 +7079,7 @@ class CrossfadeController(
             openSpareFiltersWhenSilent()
         }
         filters.releaseColour()
-        filters.parkEchoes()
+        filters.releaseEchoes()
         onBlendHeadroom(1f)
         // A loop mix already plays the incoming player at 1× (the renderer did
         // the tempo). [incomingPlaybackRate] belongs to the dual-player path
@@ -6959,6 +7149,7 @@ class CrossfadeController(
         outgoingAnalysis = TrackAnalysis()
         incomingAnalysis = TrackAnalysis()
         localBlendInFlight = false
+        lastPairAnalysisSignature = null
         phase = Phase.IDLE
         if (wasTransitioning) {
             mixEvent("mix.complete", completionFields, completionContext)
@@ -8446,6 +8637,11 @@ class CrossfadeController(
         const val TEMPO_TOLERANCE = 0.005f
 
         const val IDLE_STEP_MS = 250L
+
+        /** Coalesces a burst of analysis updates for the same pair into one re-plan. */
+        const val ANALYSIS_REPLAN_DEBOUNCE_MS = 200L
+        /** A fallback NATURAL is final only once arming is at most this far away. */
+        const val FALLBACK_NATURAL_HORIZON_MS = 12_000L
 
         /**
          * Arming only waits on a buffer now — nothing is being converged — so

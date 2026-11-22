@@ -281,6 +281,13 @@ data class TransitionPlan(
      */
     val phaseLock: Boolean = false,
     /**
+     * Whether this plan actually runs through the native ramped renderer, so
+     * the incoming deck playback rate is real and measurable. The classic
+     * beatmatch path keeps a no-op tempo write, so its plans carry false and a
+     * local slowdown there stays refused.
+     */
+    val nativeRamped: Boolean = false,
+    /**
      * Advanced Automix echo out: the delay time, in seconds, the outgoing
      * track's last beat repeats at as it leaves, or 0 for no echo. Planned only
      * where the outgoing file has at least [ECHO_REPEATS] of these left after
@@ -1784,21 +1791,232 @@ fun planTransition(
     // techniques still get their normal chance in the controller before this
     // dry queue-advance plan is adopted. Crossfade remains available for an
     // explicit recovery after a native transition has failed, or STANDARD mode.
+    val nextLength = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
     val uncertainClassic = decorated.transitionStyle == TransitionStyle.EQUAL_POWER ||
         decorated.filterVariant == FilterTransitionVariant.ECHO_RIDE ||
         decorated.reason.contains("analysis-fallback") || decorated.reason.contains("plain-crossfade") ||
         (decorated.reason.contains("decline-to-mix") && decorated.alternativeKind.isEmpty() &&
             LocalBlendAdmission.MARKER !in decorated.policyReasons)
     val chosen = if (!allowRecoveryCrossfade && !decorated.blocked && uncertainClassic) {
-        naturalHandoffPlan(max(duration.orZero(), trackDurationSeconds(currentTrack)), decorated.reason).copy(
-            policyReasons = (decorated.policyReasons + "natural-handoff-no-overlap").distinct(),
-        )
+        val fallbackLength = max(duration.orZero(), trackDurationSeconds(currentTrack))
+        tieredFallback(decorated, analysis, nextAnalysis, currentTrack, nextTrack, lyricsOut, lyricsIn, fallbackLength, nextLength, currentTime, advanced)
     } else decorated
     if (chosen.transitionStyle == TransitionStyle.NATURAL ||
         (chosen.alternativeKind.isEmpty() && !chosen.reason.contains("decline-to-mix"))) {
         TransitionEvidenceCache.record(standardEvidence(chosen, analysis, nextAnalysis))
     }
     return chosen
+}
+
+/**
+ * vc91: the ordered rescue ladder behind the classic uncertain verdict.
+ *
+ * The previous behaviour converted any uncertain classic plan straight into the
+ * zero overlap natural handoff, which threw away real mix opportunities the
+ * stored analysis still supported. The ladder keeps each rung honest and reaches
+ * the honest handoff last, reserved for the cases no mix can rescue.
+ *
+ * Rung order, most ambitious first. Every rung is a plan this function can
+ * actually execute as a classic plan, and each carries its own marker:
+ *
+ *  0. `decline-holds-no-overlap` — an honest decline keeps its zero-overlap
+ *     [TransitionStyle.NATURAL] handoff; no rung may overrule that evidence.
+ *  1. `fallback-beatmix` — a real beat-matched blend ([TransitionStyle.DJ_BLEND]).
+ *  2. `safety-crossfade` — 2-4 beats, equal-power, no rate change, downbeat
+ *     snapped, ending at the content end.
+ *  3. `fallback-muffle` — a vc69 alternative family for an unmixable pair.
+ *  4. `fallback-echo` — a selective echo out on a trusted outgoing grid.
+ *  5. `tiered-fallback-exhausted` — the honest [TransitionStyle.NATURAL] handoff.
+ *
+ * The native bridge and the crown loop are deliberately **not** built here: the
+ * controller owns both (`CrossfadeController.loopPlanFor` / `nativeBridge`) and
+ * tries them before it adopts this classic plan. Synthesising a crown plan here
+ * produced a zero-fade `DJ_BLEND` that the controller could never arm, which
+ * silently suppressed the rungs below it.
+ *
+ * Stem-ducked crown loops are not admitted here either: no [TrackAnalysis] field
+ * exposes a separated vocal stem, so the planner has no evidence that
+ * `dryMinusVocal` could run. The clean-loop veto therefore stays honest rather
+ * than being relaxed on a guess.
+ */
+private fun tieredFallback(
+    decorated: TransitionPlan,
+    analysis: TrackAnalysis,
+    nextAnalysis: TrackAnalysis,
+    currentTrack: TransitionTrackInfo?,
+    nextTrack: TransitionTrackInfo?,
+    lyricsOut: List<LyricCue>,
+    lyricsIn: List<LyricCue>,
+    length: Double,
+    nextLength: Double,
+    currentTime: Double,
+    advanced: Boolean,
+): TransitionPlan {
+    val playbackTime = max(0.0, currentTime.orZero())
+    val beatSeconds = analysis.beatInterval.orZero().takeIf { it > 0 }
+        ?: (analysis.bpm.orZero().takeIf { it > 1.0 }?.let { 60.0 / it } ?: 0.5)
+    val outgoingGrid = analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE
+    val incomingGrid = nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE
+    // 0. An honest decline has already weighed every overlap gesture and said
+    // no: hard folded tempo delta plus a key clash or two live leads. The rungs
+    // below would re-propose exactly what that evidence vetoed, and for these
+    // pairs the zero-overlap natural handoff is the pinned outcome the listener
+    // hears as their own crossfade into the incoming intro. The decline reason
+    // survives the rewrite ("natural-end:decline-to-mix"), and this is a
+    // per-verdict hold mirroring the decline clause of `uncertainClassic` — not
+    // the old blanket empty-alternativeKind collapse: uncertain crossfade and
+    // echo-ride plans below still get every rung.
+    if (decorated.reason.contains("decline-to-mix") && decorated.alternativeKind.isEmpty() &&
+        LocalBlendAdmission.MARKER !in decorated.policyReasons
+    ) {
+        return naturalHandoffPlan(max(length, decorated.transitionEnd), decorated.reason).copy(
+            policyReasons = (decorated.policyReasons + "natural-handoff-no-overlap" + "decline-holds-no-overlap")
+                .distinct(),
+        )
+    }
+    // 1. A genuine beat-matched blend, not the filter ride mixPlan falls back
+    // to on its own: an unmatched pair has no shared grid, and its rate change
+    // would buy nothing the safety crossfade below cannot do at 1.0x.
+    if (advanced && length > 0.0 && nextLength > 0.0 && outgoingGrid && incomingGrid) {
+        val blend = mixPlan(
+            analysis, nextAnalysis, length, "content_end", nextLength,
+            PairTraits(analysis, nextAnalysis),
+        )
+        if (blend.transitionStyle == TransitionStyle.DJ_BLEND) {
+            val annotatedBlend = VocalDepthFilter.withVocalDepth(
+                DjMix.annotate(
+                    blend,
+                    analysis,
+                    nextAnalysis,
+                    lyricsOut,
+                    lyricsIn,
+                    currentTrack?.id.orEmpty(),
+                    nextTrack?.id.orEmpty(),
+                ),
+                analysis,
+                nextAnalysis,
+            )
+            val started = playbackTime >= annotatedBlend.transitionStart
+            return capIncomingSkip(
+                annotatedBlend.copy(
+                    shouldStart = started,
+                    policyReasons = (decorated.policyReasons + annotatedBlend.policyReasons + "fallback-beatmix").distinct(),
+                    reason = if (started) "smart-beatmix-fallback" else "before-smart-beatmix-fallback-window",
+                    mixSummary = annotatedBlend.mixSummary.ifBlank { "beat blend" },
+                ),
+                nextAnalysis,
+                nextLength,
+            )
+        }
+    }
+    // Folded tempo compatibility: classic has a no-op stretcher, so >10%
+    // tempo gaps are never forced into a 1.0x equal-power double-kick flam;
+    // CrossfadeController routes those through LoopMix / nativeBridge instead.
+    val outBpm = analysis.bpm.orZero()
+    val inBpm = nextAnalysis.bpm.orZero()
+    val foldedDelta = if (outBpm > 0.0 && inBpm > 0.0) {
+        val folded = alignTempoOctave(outBpm, inBpm)
+        if (folded > 0.0) abs(folded / outBpm - 1.0) else Double.POSITIVE_INFINITY
+    } else {
+        0.0
+    }
+    val tempoCompatible = foldedDelta <= 0.10 + 1e-6
+
+    // 2. The bounded safety crossfade. Only the outgoing grid is required when
+    // incoming tempo is unknown or within the 10% folded stretch window.
+    if (outgoingGrid && length > 0.0 && tempoCompatible) {
+        // 2-4 beats, floored at 2 s only where four beats are longer than that.
+        // A bare coerceIn(2.0, 4.0 * beatSeconds) throws above 120 BPM, which is
+        // most dance music, and the fade must end at the content end instead of
+        // running past it, or the rung never arms.
+        val fourBeats = 4.0 * beatSeconds
+        val targetOverlap = clamp(2.0 * beatSeconds, minOf(2.0, fourBeats), maxOf(2.0, fourBeats))
+        val start = alignedTransitionStart(
+            analysis,
+            max(0.0, length - targetOverlap),
+            length - 0.05,
+            preferEarlier = false,
+            minimum = 0.0,
+        )
+        val fade = length - start
+        if (fade > 0.0) {
+            val started = playbackTime >= start
+            return capIncomingSkip(
+                TransitionPlan(
+                    shouldStart = started,
+                    markerVisible = true,
+                    transitionStart = start,
+                    transitionEnd = length,
+                    fadeSeconds = fade,
+                    transitionStyle = TransitionStyle.EQUAL_POWER,
+                    incomingCueTime = incomingStartPoint(nextAnalysis),
+                    beatSeconds = beatSeconds,
+                    vocalOverlap = 0.0,
+                    incomingPlaybackRate = 1.0,
+                    outgoingPlaybackRate = 1.0,
+                    policyReasons = (decorated.policyReasons + "safety-crossfade").distinct(),
+                    reason = if (started) "smart-safety-crossfade" else "before-smart-safety-crossfade-window",
+                    mixSummary = "safety crossfade",
+                ),
+                nextAnalysis,
+                nextLength,
+            )
+        }
+    }
+    // 3. A carve/muffle/drop/bridge gesture, only for a pair nothing can mix.
+    if (UNMIXABLE_VETO_ENABLED && isUnmixablePair(analysis, nextAnalysis)) {
+        TransitionAlternatives.select(
+            out = analysis,
+            inn = nextAnalysis,
+            outAnchor = length,
+            nextLength = nextLength,
+            playbackTime = playbackTime,
+            beatSec = beatSeconds,
+        )?.let { candidate ->
+            return capIncomingSkip(
+                candidate.plan.copy(
+                    policyReasons = (decorated.policyReasons + candidate.plan.policyReasons + "fallback-muffle")
+                        .distinct(),
+                    reason = if (playbackTime >= candidate.plan.transitionStart) {
+                        "smart-muffle-fallback"
+                    } else {
+                        "before-smart-muffle-fallback"
+                    },
+                ),
+                nextAnalysis, nextLength,
+            )
+        }
+    }
+    // 4. A selective echo out. Below the DJ confidence floor the honest answer is
+    // the handoff below: an echo on a grid we do not trust is a guess, not a
+    // rescue. Requiring the grid also makes the NATURAL rung reachable at all,
+    // since beatSeconds carries a 0.5 s default even for a blank analysis.
+    if (beatSeconds > 0.0 && outgoingGrid && length > 0.0 && inBpm <= 0.0) {
+        val echoSeconds = beatSeconds.coerceIn(0.25, 1.0)
+        val start = max(0.0, length - echoSeconds)
+        val started = playbackTime >= start
+        return TransitionPlan(
+            shouldStart = started,
+            markerVisible = true,
+            transitionStart = start,
+            transitionEnd = length,
+            fadeSeconds = echoSeconds,
+            transitionStyle = TransitionStyle.DJ_FILTER,
+            incomingCueTime = incomingStartPoint(nextAnalysis),
+            beatSeconds = beatSeconds,
+            echoSeconds = echoSeconds,
+            policyReasons = (decorated.policyReasons + "fallback-echo").distinct(),
+            reason = if (started) "smart-echo-fallback" else "before-smart-echo-fallback-window",
+            mixSummary = "selective echo out",
+        )
+    }
+    // 5. Honest handoff. naturalHandoffPlan's own marker is kept: the
+    // controller's provisional NATURAL re-plan keys on it, and dropping it would
+    // latch the handoff for the rest of the song.
+    return naturalHandoffPlan(max(length, decorated.transitionEnd), decorated.reason).copy(
+        policyReasons = (decorated.policyReasons + "natural-handoff-no-overlap" + "tiered-fallback-exhausted")
+            .distinct(),
+    )
 }
 
 /** The player, not a second-deck fade, owns an uneventful end-of-track handoff. */
@@ -2421,6 +2639,11 @@ private fun mixPlan(
         // AudioTrack playback parameters mid-buffer and cracked on some phones.
         phaseLock = false,
         echoSeconds = echoSeconds,
+        // Classic dual-player blend: its incoming tempo write is the no-op one
+        // (TransitionFilterProcessor pins beatmatchTempo to 1f), so it never
+        // claims a native ramped rate. A sub-1.0 local slowdown therefore stays
+        // refused in LocalBlendAdmission, exactly as upstream did.
+        nativeRamped = false,
         reason = "smart-duration",
     )
 }

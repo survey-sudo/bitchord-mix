@@ -1017,7 +1017,9 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       const float hz = deck.lowPassHz.at((t0 + t1) / 2);
       if (std::abs(hz - deck.lowPassFreq) > 1.f) {
         deck.lowPassFreq = hz;
-        if (hz >= 18000.f) deck.lowPass.bypass();
+        // Near-open cutoff counts as bypass (Nyquist-safe, sr-relative).
+        const float lpBypass = std::min(19800.f, float(sr) * 0.44f);
+        if (hz >= lpBypass) deck.lowPass.bypass();
         else deck.lowPass.set(sr, hz, 0.707);
       }
     }

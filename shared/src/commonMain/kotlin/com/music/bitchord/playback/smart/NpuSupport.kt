@@ -18,6 +18,12 @@ package com.music.bitchord.playback.smart
  * open, inference stays on the CPU execution provider. Unlike Orchard,
  * CPU fallback is kept (session.disable_cpu_ep_fallback is 0): the NPU is
  * an optimization, never a requirement.
+ *
+ * Provider abstraction: the QNN switch is modelled as the [InferenceProvider]
+ * enum (CPU_DEFAULT, CPU_XNNPACK, QNN_GPU_FP16, QNN_HTP_QDQ) and resolved per
+ * device + config through [resolveProvider]; [defaultProvider] answers
+ * CPU_DEFAULT and the master [QNN_ENABLED] guard stays false, so the shipped
+ * build keeps running the plain CPU execution provider exactly as before.
  */
 object NpuSupport {
 
@@ -34,7 +40,7 @@ object NpuSupport {
      * Flip to true only to re-enable the dormant path (which still needs
      * the npu-addon jniLibs srcDir restored in app/build.gradle.kts).
      * Every QNN entry point checks this (shouldAttemptQnn below,
-     * NpuSession.open/openQnn, TrackAnalyzer preflight, NpuNative, and
+     * NpuSession.open/openQnn, TrackAnalyzer preflight, NpuNative,
      * NpuSelfTest.schedule); when false no QNN library is dlopened and
      * no QNN session is attempted.
      */
@@ -64,6 +70,25 @@ object NpuSupport {
     enum class Vendor { QUALCOMM, MEDIATEK, NONE }
 
     /**
+     * The inference provider a model may run on. Replaces the old single
+     * global QNN switch as the per-attempt choice; the master [QNN_ENABLED]
+     * guard underneath keeps the shipped build on [InferenceProvider.CPU_DEFAULT].
+     */
+    enum class InferenceProvider {
+        /** Plain CPU execution provider; the production default. */
+        CPU_DEFAULT,
+        /** CPU execution provider with the XNNPACK delegate (opt-in). */
+        CPU_XNNPACK,
+        /** Qualcomm QNN on the Adreno GPU backend (FP16). */
+        QNN_GPU_FP16,
+        /** Qualcomm QNN on the Hexagon HTP backend (QDQ). */
+        QNN_HTP_QDQ,
+    }
+
+    /** Production default inference provider: plain CPU, no NPU. */
+    fun defaultProvider(): InferenceProvider = InferenceProvider.CPU_DEFAULT
+
+    /**
      * Classifies the device from its build fields. Qualcomm when the SoC is
      * Qualcomm, the hardware reads qcom, or a Samsung model reads SM (the
      * Galaxy Snapdragon line); MediaTek for its mt hardware prefix. A Pixel
@@ -83,22 +108,84 @@ object NpuSupport {
         return Vendor.NONE
     }
 
+    /**
+     * True when the SoC model string identifies a Qualcomm SM8635, BitChord's
+     * sole NPU target (Poco F6). While set, the QNN provider options pin
+     * `htp_arch = "73"` so the QAIRT driver selects the V73 Hexagon kernel
+     * generation instead of resolving across the bundled V73/V75 pair.
+     */
+    fun isQualcommSm8635(socModel: String?): Boolean {
+        val model = (socModel ?: "").trim().uppercase()
+        if (model.isEmpty()) return false
+        return model.startsWith("SM8635", ignoreCase = true)
+    }
+
     /** True when QNN is allowed on and the config wants it on Qualcomm. */
     fun shouldAttemptQnn(config: NpuConfig, vendor: Vendor): Boolean =
         QNN_ENABLED && config.enabled && vendor == Vendor.QUALCOMM
+
+    /**
+     * Whether [provider] may run inference right now. CPU_DEFAULT never attempts
+     * (the plain CPU path runs it); CPU_XNNPACK is the opt-in delegate; the QNN
+     * providers need the master switch, the per-config flag and a QNN vendor.
+     */
+    fun shouldAttempt(provider: InferenceProvider, config: NpuConfig, vendor: Vendor): Boolean = when (provider) {
+        InferenceProvider.CPU_DEFAULT -> false
+        InferenceProvider.CPU_XNNPACK -> config.enabled
+        InferenceProvider.QNN_GPU_FP16,
+        InferenceProvider.QNN_HTP_QDQ -> QNN_ENABLED && config.enabled && vendor == Vendor.QUALCOMM
+    }
+
+    /**
+     * Resolves which [InferenceProvider] runs inference for a device + config.
+     * Returns CPU_DEFAULT while the master switch or the config flag are off, so
+     * the shipped build keeps running the plain CPU execution provider.
+     */
+    fun resolveProvider(config: NpuConfig, vendor: Vendor): InferenceProvider = when {
+        !QNN_ENABLED -> InferenceProvider.CPU_DEFAULT
+        !config.enabled -> InferenceProvider.CPU_DEFAULT
+        vendor == Vendor.QUALCOMM -> InferenceProvider.QNN_HTP_QDQ
+        else -> InferenceProvider.CPU_DEFAULT
+    }
 
     /**
      * QNN execution provider options map, mirroring Orchard qnn_runner.cpp:
      * the HTP backend library, burst performance, and the deepest graph
      * finalization optimization. backendPath is the bundled HTP backend
      * (see bundledBackendPath); when null the provider resolves its own
-     * backend.
+     * backend. backendType selects the QNN backend library family -- "gpu"
+     * for QnnGpu, "htp" for QnnHtp -- and is mutually exclusive with
+     * backendPath, so exactly one of them is set by the caller.
+     *
+     * A detected Qualcomm SM8635 (the sole BitChord NPU target, Poco F6)
+     * pins `htp_arch = "73"` so the QAIRT driver selects the V73 Hexagon
+     * kernel generation instead of resolving across the V73/V75 pair; with it
+     * unset the QNN open still failed with
+     * QNN_DEVICE_ERROR_INVALID_CONFIG (14001) before partitioning.
+     *
+     * ADSP_LIBRARY_PATH is deliberately not overridden here: while ORT
+     * manages the QNN backend (backend_path / backend_type above) the provider
+     * resolves the HTP libraries itself, and overriding the path from the app
+     * side would fight it. NpuNative still sets the bundled library search
+     * path for the dlopen preflight, which is the supported hook.
      */
-    fun qnnProviderOptions(backendPath: String?): Map<String, String> {
+    fun qnnProviderOptions(
+        backendPath: String?,
+        socModel: String? = null,
+        backendType: String? = null,
+    ): Map<String, String> {
         val options = mutableMapOf<String, String>()
+        if (!backendType.isNullOrBlank()) {
+            val selected = backendType.trim().lowercase()
+            // Accept both the QNN naming ("QnnGpu" / "QnnHtp") and the ORT
+            // backend_type values ("gpu" / "htp").
+            val backend = if (selected.startsWith("qnn")) selected.removePrefix("qnn").trim() else selected
+            if (backend.isNotEmpty()) options["backend_type"] = backend
+        }
         if (backendPath != null && backendPath.isNotBlank()) options["backend_path"] = backendPath
         options["htp_performance_mode"] = "burst"
         options["htp_graph_finalization_optimization_mode"] = "3"
+        if (isQualcommSm8635(socModel)) options["htp_arch"] = "73"
         return options
     }
 

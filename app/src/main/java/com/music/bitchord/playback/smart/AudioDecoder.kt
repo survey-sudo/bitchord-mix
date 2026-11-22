@@ -31,6 +31,7 @@ import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * Decodes a region of a cached track to mono float PCM, for [TrackAnalyzer].
@@ -139,7 +140,22 @@ object AudioDecoder {
         val decoded = decodeRaw(source, startSeconds, endSeconds, abort) { buffer, info, channels, _ ->
             toStereo(buffer, info, channels, left, right)
         } ?: return null
-        return StereoPcm(flatten(left), flatten(right), decoded.first) to decoded.second
+        // handoff_pcm_before_protected_event: a decoder that starts up to 80 ms
+        // late on a from-the-start request is paying encoder priming, not a gap.
+        // Prepend the missing zeros so the region still starts at 0.0; a later
+        // start is a broken file and is left alone rather than padded over.
+        var stereoLeft = flatten(left)
+        var stereoRight = flatten(right)
+        var startOut = decoded.second
+        if (startSeconds <= 0.05 && decoded.second > 0.0 && decoded.second <= 0.080 && decoded.first > 0.0) {
+            val pad = (decoded.second * decoded.first).roundToInt()
+            if (pad > 0) {
+                stereoLeft = FloatArray(pad) + stereoLeft
+                stereoRight = FloatArray(pad) + stereoRight
+                startOut = 0.0
+            }
+        }
+        return StereoPcm(stereoLeft, stereoRight, decoded.first) to startOut
     }
 
     /**
@@ -198,7 +214,7 @@ object AudioDecoder {
 
             val startUs = (startSeconds * 1_000_000).toLong()
             val endUs = (endSeconds * 1_000_000).toLong()
-            extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             codec = runCatching { MediaCodec.createDecoderByType(mime) }
                 .onFailure { Log.w(TAG, "No decoder for $mime", it) }

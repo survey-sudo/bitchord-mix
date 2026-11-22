@@ -3,14 +3,18 @@
 #
 # Mirrors Orchard mobile/android/npu-addon/build-ort.sh: ONNX Runtime 1.31.0
 # (checkout at the Orchard pin 402979ac1bef89dcd55add41eaa7277c407599eb)
-# with the QNN execution provider linked in, reduced to ops.config, then
-# bundled with the QAIRT 2.51.0.260929 HTP libraries in prebuilt/jniLibs.
+# with the QNN execution provider linked in via --use_qnn static_lib, from a
+# full ONNX Runtime source tree. A reduced --include_ops_by_config build is
+# never used here: the ops list must be regenerated from post-optimization
+# .ort artifacts (MatMulIntegerToFloat / DynamicQuantizeMatMul kernel gap that
+# broke vc69-vc70), so the full build keeps every operator ORT supports.
+# Then bundled with the QAIRT 2.51.0.260929 HTP libraries in prebuilt/jniLibs.
 # The Maven AAR JNI glue (libonnxruntime4j_jni.so) links directly to
 # OrtSessionOptionsAppendExecutionProvider_Nnapi with BIND_NOW, so the
 # reduced lib must export it. BitChord does not use NNAPI (CPU + QNN only),
-# so an Android stub in provider_registration.cc provides the symbol;
-# the full NNAPI EP would duplicate NodeAttrHelper with statically-linked
-# QNN and fail to link. ops.config limits ops, not EP symbols, so it is kept.
+# so an Android stub in provider_registration.cc provides the symbol; the
+# full NNAPI EP would duplicate NodeAttrHelper with statically-linked
+# QNN and fail to link.
 # app/build.gradle.kts adds that directory as a jniLibs source set and the
 # local libonnxruntime.so wins over the AAR copy via jniLibs pickFirsts.
 #
@@ -29,7 +33,7 @@ ARCHES="v73 v75"
 python "$ORT_SRC/tools/ci_build/build.py" --build_dir "$OUT" --config MinSizeRel --parallel "$(nproc)" \
   --skip_tests --build_shared_lib --android --android_abi arm64-v8a --android_api 31 \
   --android_sdk_path "$SDK" --android_ndk_path "$NDK" --disable_ml_ops --no_telemetry \
-  --use_qnn static_lib --qnn_home "$QNN_SDK" --include_ops_by_config "$HERE/ops.config" \
+  --use_qnn static_lib --qnn_home "$QNN_SDK" \
   --compile_no_warning_as_error --cmake_extra_defines onnxruntime_BUILD_UNIT_TESTS=OFF
 mkdir -p "$JNI"
 "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded \

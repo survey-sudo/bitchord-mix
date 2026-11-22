@@ -642,6 +642,42 @@ class PlaybackService : MediaLibraryService() {
     /** Automix's DSP analyzer — see [com.music.bitchord.playback.smart.TrackAnalyzer]. */
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
+    /**
+     * Every mediaId -> playback URI this service has ever seen, remembered at
+     * request time.
+     *
+     * A MediaItem rebuilt by MediaController or queue restore can arrive with
+     * `localConfiguration == null`, and `item.localConfiguration?.uri?.let { }`
+     * then silently drops the queued item from analysis entirely. The map is
+     * populated on every load where the URI is present (see [analysisUriForItem]),
+     * so a later rebuilt copy can fall back to it.
+     */
+    private val analysisUris = ConcurrentHashMap<String, Uri>()
+
+    /**
+     * The most honest URI available for [item], in order:
+     * localConfiguration, request metadata, the remembered map, the media
+     * repository (downloads), then the mediaId itself (local paths, plain
+     * YouTube ids, source-backed track keys). Null only when none of those
+     * can name the track — the caller logs that instead of dropping silently.
+     */
+    private fun analysisUriForItem(item: MediaItem): Uri? {
+        item.localConfiguration?.uri?.let { analysisUris[item.mediaId] = it; return it }
+        item.requestMetadata?.mediaUri?.let { analysisUris[item.mediaId] = it; return it }
+        analysisUris[item.mediaId]?.let { return it }
+        val id = item.mediaId
+        Downloads.verifiedSavedUri(id)?.let { return Uri.parse(it) }
+        return when {
+            id.startsWith("content://") || id.startsWith("file://") -> Uri.parse(id)
+            id.startsWith("/") -> Uri.fromFile(java.io.File(id))
+            else -> SourceRegistry.parseTrackKey(id)?.let { (config, track) ->
+                Uri.parse(SourceRegistry.trackUri(config, track))
+            } ?: id.takeIf {
+                it.length == 11 && it.all { c -> c.isLetterOrDigit() || c == '-' || c == '_' }
+            }?.let { Uri.parse("bitchord://watch?v=$it") }
+        }
+    }
+
     /** Shared with the crossfade's tail player, so both read the same disk cache. */
     private var mediaSourceFactory: DefaultMediaSourceFactory? = null
 
@@ -1972,9 +2008,9 @@ class PlaybackService : MediaLibraryService() {
             onHandoff = ::adoptPlayer,
             analysisFor = { item -> trackAnalyzer.analysisFor(item.mediaId) },
             requestAnalysis = { item, durationMs ->
-                item.localConfiguration?.uri?.let { uri ->
+                analysisUriForItem(item)?.let { uri ->
                     trackAnalyzer.request(item.mediaId, uri, durationMs / 1000.0)
-                }
+                } ?: Log.w("BitChord", "requestAnalysis: no resolvable URI for ${item.mediaId}")
             },
             // "Incoming" and "outgoing" here are session roles, not players:
             // the session player's sink and the spare's. The controller maps
@@ -2030,6 +2066,11 @@ class PlaybackService : MediaLibraryService() {
                     transitionFilterB.parkEcho()
                 }
 
+                override fun releaseEchoes() {
+                    transitionFilterA.releaseEcho()
+                    transitionFilterB.releaseEcho()
+                }
+
                 override fun releaseColour() {
                     transitionFilterA.releaseColour()
                     transitionFilterB.releaseColour()
@@ -2037,6 +2078,7 @@ class PlaybackService : MediaLibraryService() {
             },
             analysisRunningFor = { item -> trackAnalyzer.isAnalysing(item.mediaId) },
             yieldAnalysis = { trackAnalyzer.yieldToPlayback() },
+            analysisUpdates = trackAnalyzer.analysisUpdates,
             // The standby is still the spare when this runs — it only becomes
             // the session player at the handoff — so the incoming track is
             // levelled on its own sink before it renders a frame, and the

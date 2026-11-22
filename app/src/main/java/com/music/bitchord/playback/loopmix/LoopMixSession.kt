@@ -8,7 +8,6 @@ import com.music.bitchord.playback.smart.TransitionAlternatives
 import com.music.bitchord.playback.smart.MixTemplate
 import com.music.bitchord.playback.smart.PhraseConfig
 import com.music.bitchord.playback.smart.PhraseScript
-import com.music.bitchord.playback.smart.ReleaseSplice
 import com.music.bitchord.playback.smart.RegionalLoudness
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.HandoffStatus
@@ -239,7 +238,7 @@ class LoopMixSession private constructor(
         }
 
         /** Seconds of each song decoded either side of what the decks play. */
-        private const val PREROLL_SECONDS = 1.0
+        private const val PREROLL_SECONDS = 1.5
         private const val TAIL_SECONDS = 3.0
 
         /**
@@ -720,10 +719,14 @@ class LoopMixSession private constructor(
                     val feedback = script?.echoFeedback?.takeIf { it > 0f } ?: PhraseConfig.ECHO_FEEDBACK
                     renderer.setEcho(LoopMixRenderer.OUT, delay, feedback, 0.55f)
                     val open = (clock.releaseAt - effectivePlan.out.beatSec).coerceAtLeast(0.0)
+                    // Taper to explicit 0.0 by release+2 beats so the native
+                    // echoWetRetireStart fires musically (positive-to-zero
+                    // release) instead of falling back to stopAt-1s.
+                    val echoBeatSec = effectivePlan.out.beatSec.coerceAtLeast(0.1)
                     renderer.setEnvelope(
                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_ECHO_SEND,
-                        doubleArrayOf(0.0, open, clock.releaseAt),
-                        floatArrayOf(0f, 0f, 0.6f),
+                        doubleArrayOf(0.0, open, clock.releaseAt, clock.releaseAt + 2.0 * echoBeatSec),
+                        floatArrayOf(0f, 0f, 0.6f, 0f),
                     )
                 }
                 val wantFlanger = (script?.flanger == true) || effectivePlan.flanger
@@ -826,12 +829,12 @@ class LoopMixSession private constructor(
                     doubleArrayOf(swapFrom, swapTo), floatArrayOf(cut, 0f),
                 )
                 if (effectivePlan.muffle && !outStemSeparated) {
-                    // Muffle: steep low-pass closes over the outgoing deck
-                    // across the entry portion, then reopens floor->open
-                    // across the return leg. Breakpoints come from the
-                    // family registry builder: strictly increasing times,
-                    // closing full-band at releaseAt, no collapse on the
-                    // degenerate enterEnd == rampEnd clock.
+                    // Muffle DYING OUT: monotonic C1 raised-cosine close
+                    // open->floor (700 Hz) over the whole span, ending at the
+                    // floor at releaseAt while the OUT fader falls to zero.
+                    // No 20 kHz reopen right before death (no brightness
+                    // blast). Breakpoints come from the family registry
+                    // builder sampled on the beat grid, strictly increasing.
                     val (times, vals) = TransitionAlternatives.muffleEnvelope(clock)
                     renderer.setEnvelope(
                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ,
@@ -840,18 +843,20 @@ class LoopMixSession private constructor(
                     )
                 }
                 if (effectivePlan.beatlessBridge) {
-                    // Beatless bridge: ambient hold on both decks, then both
-                    // leave park->open over the return leg so the surviving
-                    // deck is full-band at releaseAt.
-                    val (times, vals) = TransitionAlternatives.bridgeEnvelope(clock)
+                    // Beatless bridge: dying OUT closes monotonically to park
+                    // (no 20 kHz reopen); survivor IN parks then reopens
+                    // park->open over the proportional C1 return leg so it
+                    // is full-band at releaseAt.
+                    val (outTimes, outVals) = TransitionAlternatives.bridgeDeadOutEnvelope(clock)
+                    val (inTimes, inVals) = TransitionAlternatives.bridgeEnvelope(clock)
                     renderer.setEnvelope(
                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ,
-                        times, vals,
+                        outTimes, outVals,
                         exponential = true,
                     )
                     renderer.setEnvelope(
                         LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_PASS_HZ,
-                        times, vals,
+                        inTimes, inVals,
                         exponential = true,
                     )
                     renderer.setEnvelope(
@@ -867,18 +872,13 @@ class LoopMixSession private constructor(
                     // already programmed above; never fall into the generic
                     // high-pass branch below.
                 }
-                if (effectivePlan.muffle || effectivePlan.beatlessBridge) {
-                    // vc69 P1 release-to-dry splice: at the handback the wet
-                    // deck releases into the dry one over a 0.25 s cosine
-                    // window instead of the generic fall, so the handoff
-                    // carries no audible splice artifact.
-                    val splice = ReleaseSplice.envelopeArrays(clock.releaseAt, ReleaseSplice.SPLICE_SECONDS, 4)
-                    val spliceDbValues = FloatArray(splice.second.size) { splice.second[it].toFloat() }
-                    renderer.setEnvelope(
-                        LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
-                        splice.first, spliceDbValues,
-                    )
-                }
+                // Muffle/bridge OUT keeps the planned MixGain fallPoints
+                // (rampEnd -> releaseAt) fall to zero: no unity-gain splice
+                // override here (the old ReleaseSplice 1.0-until-releaseAt
+                // holds the dying deck loud right before the handoff). The
+                // ReleaseSplice class is kept for genuine survivor-stem
+                // splices elsewhere; it is simply not used to hold a dying
+                // OUT at unity.
                 val beatBlendPocket = effectivePlan.rung == "Beat blend"
                 if (outStemSeparated) {
                     // vc73: stems already separate vocals; leave full-band. KIND_LOW_DB bass swap does the work.
@@ -1562,10 +1562,19 @@ class LoopMixSession private constructor(
                     doubleArrayOf(0.0, clock.elementAt), floatArrayOf(20000f, 20000f))
             }
             val swapAt = clock.enterEnd.coerceAtLeast(beatSec)
-            val preChargeStart = (swapAt - 1.75 * beatSec).coerceAtLeast(0.0)
-            val sendClose = swapAt + 0.12
+            // Raised-cosine bell: rise over ~0.75 beat to the peak at swapAt,
+            // brief hold, then cosine decay over ~0.75 beat to zero at the
+            // beat boundary swapAt+beatSec (replaces the 0.90->0 in 120 ms
+            // sendClose cliff).
+            val riseStart = (swapAt - 0.75 * beatSec).coerceAtLeast(0.0)
+            val peakEnd = swapAt + 0.25 * beatSec
+            val bellEnd = swapAt + beatSec
+            val sendClose = bellEnd
             val tailEnd = (swapAt + 4.0 * beatSec).coerceAtLeast(clock.releaseAt)
             val inOpenEnd = minOf(tailEnd, swapAt + 0.75 * beatSec)
+            // Incoming LP reopen: 600 Hz start over ~3.0 beats (2.5-4.0
+            // class) with the shared C1 shape (replaces 300->20000 snatch).
+            val inLpOpenEnd = minOf(tailEnd, swapAt + 3.0 * beatSec)
             // Give straight OUT's dry and bass lanes the same window as IN's rise.
             // When PCM runs short, fit just the OUT lanes to the available audio.
             val (fallTimes, fallGains) = if (plan.outLoops) {
@@ -1591,16 +1600,72 @@ class LoopMixSession private constructor(
             val releaseEnd = clock.releaseAt.coerceAtLeast(fallTimes.last() + 0.01)
             val stopEnd = outStopAtSec.coerceAtLeast(releaseEnd + 0.02)
 
-            val (echoTimes, echoVals) = if (preChargeStart > 0.01) {
-                doubleArrayOf(0.0, preChargeStart, swapAt, sendClose) to floatArrayOf(0f, 0f, 0.90f, 0f)
-            } else {
-                doubleArrayOf(0.0, swapAt, sendClose) to floatArrayOf(0f, 0.90f, 0f)
+            // Sampled raised-cosine bell (rise ~0.75 beat, hold, cosine decay
+            // ~0.75 beat to the beat boundary swapAt+beatSec). Native gain
+            // interpolation is linear per segment, so sampling the cosine
+            // keeps the send/reverb bells C1 at the ends.
+            fun bell(peak: Float): Pair<DoubleArray, FloatArray> {
+                val riseSteps = 4
+                val decaySteps = 4
+                val rt = ArrayList<Double>()
+                val rv = ArrayList<Float>()
+                rt.add(0.0)
+                rv.add(0f)
+                for (i in 1..riseSteps) {
+                    val u = i.toDouble() / riseSteps.toDouble()
+                    val s = 0.5 * (1.0 - cos(PI * u))
+                    val t = riseStart + (swapAt - riseStart) * u
+                    if (t > rt.last()) {
+                        rt.add(t)
+                        rv.add((peak * s).toFloat())
+                    }
+                }
+                if (peakEnd > rt.last()) {
+                    rt.add(peakEnd)
+                    rv.add(peak)
+                }
+                for (i in 1..decaySteps) {
+                    val u = i.toDouble() / decaySteps.toDouble()
+                    val s = 0.5 * (1.0 - cos(PI * u))
+                    val t = peakEnd + (bellEnd - peakEnd) * u
+                    if (t > rt.last()) {
+                        rt.add(t)
+                        rv.add((peak * (1.0 - s)).toFloat())
+                    }
+                }
+                if (rv.isNotEmpty()) rv[rv.lastIndex] = 0f
+                val tArr = DoubleArray(rt.size) { rt[it] }
+                val vArr = FloatArray(rv.size) { rv[it] }
+                return tArr to vArr
             }
-            val (revTimes, revVals) = if (preChargeStart > 0.01) {
-                doubleArrayOf(0.0, preChargeStart, swapAt, sendClose) to floatArrayOf(0f, 0f, 0.28f, 0f)
-            } else {
-                doubleArrayOf(0.0, swapAt, sendClose) to floatArrayOf(0f, 0.28f, 0f)
+            val (echoTimes, echoVals) = bell(0.90f)
+            val (revTimes, revVals) = bell(0.28f)
+            // Incoming LP sampled C1 reopen 600 -> 20000 Hz over ~3.0 beats.
+            val inLpTimesList = ArrayList<Double>()
+            val inLpValsList = ArrayList<Float>()
+            inLpTimesList.add(0.0)
+            inLpValsList.add(600f)
+            if (swapAt > 1e-9) {
+                if (swapAt > inLpTimesList.last()) {
+                    inLpTimesList.add(swapAt)
+                    inLpValsList.add(600f)
+                }
             }
+            val lpSteps = 8
+            val lpStartHz = 600.0
+            val lpOpenHz = 20000.0
+            for (i in 1..lpSteps) {
+                val u = i.toDouble() / lpSteps.toDouble()
+                val s = 0.5 * (1.0 - cos(PI * u))
+                val t = swapAt + (inLpOpenEnd - swapAt) * u
+                val v = (lpStartHz * (lpOpenHz / lpStartHz).pow(s)).toFloat()
+                if (t > inLpTimesList.last()) {
+                    inLpTimesList.add(t)
+                    inLpValsList.add(v)
+                }
+            }
+            val inLpTimesSampled = DoubleArray(inLpTimesList.size) { inLpTimesList[it] }
+            val inLpValuesSampled = FloatArray(inLpValsList.size) { inLpValsList[it] }
             val inRise = MixGain.risePoints(swapAt, inOpenEnd, steps = 8)
             val inGainTimes = doubleArrayOf(0.0, *inRise.first, clock.releaseAt.coerceAtLeast(inOpenEnd + 0.01))
             val inGainValues = floatArrayOf(0f, *inRise.second, 1f)
@@ -1624,8 +1689,8 @@ class LoopMixSession private constructor(
                 inLowValues = floatArrayOf(0f, 0f),
                 outHpTimes = doubleArrayOf(0.0, preHp, swapAt, tailEnd),
                 outHpValues = floatArrayOf(20f, 20f, 120f, 1600f),
-                inLpTimes = doubleArrayOf(0.0, swapAt, inOpenEnd),
-                inLpValues = floatArrayOf(300f, 300f, 20000f),
+                inLpTimes = inLpTimesSampled,
+                inLpValues = inLpValuesSampled,
             )
         }
 

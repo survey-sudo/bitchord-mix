@@ -260,6 +260,19 @@ internal fun MixViewContent(view: MixTransitionView, progress: State<Float>, liv
         MixDecks(view, progress, live, sweep)
         Spacer(Modifier.height(12.dp))
         DeckHeader(view.incoming, sweep, Modifier.padding(horizontal = 14.dp))
+        // Same one-line "why" the player status draws; no restyling of the card.
+        val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
+        val why = automixReasonLine(status)
+        if (why.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = why,
+                color = SecondaryText,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 

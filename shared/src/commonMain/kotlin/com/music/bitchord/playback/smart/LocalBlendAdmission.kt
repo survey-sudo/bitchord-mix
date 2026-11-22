@@ -73,9 +73,12 @@ object LocalBlendAdmission {
         if (!rate.isFinite() || rate !in MIN_INCOMING_RATE..MAX_INCOMING_RATE ||
             abs(rate - expectedRate) > 0.001 || plan.outgoingPlaybackRate != 1.0 || plan.phaseLock
         ) return refuse("executed-rate-mismatch")
-        // Upstream's advanced sameBeatBlend accelerated B (or left it at 1x).
-        // Reachability below 1x is context, not permission for this restoration.
-        if (rate < 1.0 || expectedRate < 1.0) return refuse("upstream-incoming-slowdown")
+        // A slowdown is only honest where a real stretcher executes it. The
+        // classic beatmatch path pins its tempo write to 1f, so its plans carry
+        // nativeRamped = false and keep the upstream refusal; only a plan that
+        // runs through the native ramped renderer may admit rate < 1.0.
+        // Reachability below 1x is still context, not permission.
+        if (rate < 1.0 && !plan.nativeRamped) return refuse("upstream-incoming-slowdown")
         if ((out.duration > 0.0 && plan.transitionEnd > out.duration + 0.05) ||
             (inn.duration > 0.0 && plan.incomingCueTime + span * rate > inn.duration + 0.05)
         ) return refuse("source-beyond-duration")
