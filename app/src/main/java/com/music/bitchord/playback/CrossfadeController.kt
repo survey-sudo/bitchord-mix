@@ -355,6 +355,32 @@ internal fun loopFinishAction(
 internal fun canAdoptSessionPlayer(loopIncomingStarted: Boolean): Boolean = loopIncomingStarted
 
 /**
+ * vc92 Lane1 (pre-splice identity, pure + JVM-testable): returns the abort
+ * reason when the live queue no longer matches the planned pair, or null
+ * when the splice may proceed. A queue edit inside the arm window changes
+ * [liveNextId]; a scrub/replan bumps [planGeneration] past
+ * [capturedGeneration]. Both must abort BEFORE any render, so a stale pair
+ * never becomes a render-then-abandon.
+ *
+ * A negative [capturedGeneration] means no capture was made (legacy arm
+ * path); the generation check is then skipped rather than failing closed on
+ * data the older call site never provided.
+ */
+internal fun preSpliceIdentityReason(
+    expectedInId: String?,
+    liveNextId: String?,
+    expectedOutId: String?,
+    currentOutId: String?,
+    capturedGeneration: Long,
+    planGeneration: Long,
+): String? = when {
+    expectedInId != null && expectedInId != liveNextId -> "pre-splice-identity-mismatch"
+    expectedOutId != null && currentOutId != null && expectedOutId != currentOutId -> "pre-splice-identity-mismatch"
+    capturedGeneration >= 0L && capturedGeneration != planGeneration -> "pre-splice-plan-generation-stale"
+    else -> null
+}
+
+/**
  * djmix24 Rung 0 consecutive-album guard (pure, scalars only). Same non-blank
  * album title/id AND trackNumber > 0 AND next == current + 1 -> GAPLESS.
  * Singles / blank album -> AutoMix. Exposed for Djmix24AppTest.
@@ -4430,6 +4456,14 @@ class CrossfadeController(
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
+    /**
+     * vc92 Lane1: the [planGeneration] the currently-planned loop pair was
+     * captured under. -1 means "no capture" (legacy/unplanned pair), in which
+     * case the pre-splice generation check is skipped. armLoop() re-validates
+     * it immediately before the splice so a queue edit or scrub between plan
+     * and arm aborts instead of rendering a stale pair.
+     */
+    private var armedPlanGenerationCaptured: Long = -1L
     /** One opportunity survives revisions, retries and native -> classic cleanup. */
     private data class Opportunity(val attemptId: String, val outId: String, val inId: String, val scrubEpoch: Long)
     private val opportunityRunId = java.util.UUID.randomUUID().toString()
@@ -5622,6 +5656,11 @@ class CrossfadeController(
     ) {
         loopOutItem = outItem
         loopInItem = inItem
+        // vc92 Lane1: capture the generation this pair was planned under.
+        // armLoop() re-validates it right before the splice, so a queue edit
+        // or scrub between planning and arming aborts before any render.
+        planGeneration++
+        armedPlanGenerationCaptured = planGeneration
         plannedNextId = inItem.mediaId
         loopOutAnalysis = outAnalysis
         loopInAnalysis = inAnalysis
@@ -5836,6 +5875,49 @@ class CrossfadeController(
                 loopFallBack(refusal)
                 return
             }
+        }
+        // vc92 Lane1 (pre-splice identity re-validation, fail closed): the
+        // decks are built and the decoder splice is imminent, but the live
+        // queue may have moved since this pair was planned - a user reorder
+        // changes out.nextMediaItemIndex, a scrub or replan bumps
+        // [planGeneration] past the captured value. Re-validate both here,
+        // before anything renders, so a stale pair aborts instead of being
+        // rendered and immediately abandoned. The generation arm is skipped
+        // when no capture exists (-1: an unplanned/legacy pair).
+        val expectedInId = session.inId
+        val expectedOutId = session.outId
+        val liveNextId = if (nextIndex == C.INDEX_UNSET || nextIndex >= out.mediaItemCount) {
+            null
+        } else {
+            out.getMediaItemAt(nextIndex).mediaId
+        }
+        val currentOutId = out.currentMediaItem?.mediaId
+        val identityReason = preSpliceIdentityReason(
+            expectedInId, liveNextId, expectedOutId, currentOutId,
+            armedPlanGenerationCaptured, planGeneration,
+        )
+        if (identityReason != null) {
+            // Distinct name: loopFallBack below records the refusal itself
+            // (mix.arm.death + mix.loop.fallback with this reason). This event
+            // carries the identity evidence that made the refusal certain.
+            mixEvent(
+                "mix.preSplice.identity",
+                mapOf(
+                    "reason" to identityReason,
+                    "phase" to phase.name,
+                    "expectedInId" to expectedInId,
+                    "liveNextId" to (liveNextId ?: "null"),
+                    "expectedOutId" to expectedOutId,
+                    "currentOutId" to (currentOutId ?: "null"),
+                    "planGeneration" to planGeneration,
+                    "capturedGeneration" to armedPlanGenerationCaptured,
+                    "msSincePlan" to planAgeMs(),
+                ),
+            )
+            Log.d(TAG, "pre-splice identity abort ($identityReason): loopBail before splice")
+            session.close()
+            loopFallBack(identityReason)
+            return
         }
         val items = (0 until out.mediaItemCount).map { out.getMediaItemAt(it) }
         queuedItemCount = items.size
