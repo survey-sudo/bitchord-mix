@@ -3572,6 +3572,7 @@ class CrossfadeController(
      * point it becomes the louder of the two. From here [outgoing] is the idle
      * player, still audible, being faded away.
      */
+    @JvmOverloads
     private fun handOff(
         out: ExoPlayer,
         into: ExoPlayer,
