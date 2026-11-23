@@ -28,9 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Test-build harness (vc91, extended in vc92): while QNN is off the probe
  * stays dormant for QNN, and the two dormant-build harnesses below
  * (CPU-vs-XNNPACK benchmark, QNN diagnostic) run only when their test-build
- * constants are flipped on. vc92 flips the benchmark on: it is a CPU-only
- * measurement (no QNN library is dlopened, no QNN session opened) that must
- * produce real SM8635 numbers before CPU_XNNPACK can ever become a default.
+ * constants are flipped on. Both stay off in the shipped release: the
+ * benchmark must produce real SM8635 numbers on a test build before
+ * CPU_XNNPACK can ever become a default, never on the release APK.
  */
 object NpuSelfTest {
     private const val TAG = "BitChordNPU"
@@ -58,11 +58,10 @@ object NpuSelfTest {
     private val started = AtomicBoolean(false)
 
     /**
-     * Test-build switches. QNN_DIAGNOSTIC_ENABLED stays off (the QNN path is
-     * dormant and fails on device); BENCHMARK_CPU_VS_XNNPACK_ENABLED is on for
-     * vc92 so the shipped build measures real Snapdragon SM8635 CPU_DEFAULT
-     * vs CPU_XNNPACK latency and logit parity. The benchmark touches CPU
-     * providers only, so it is safe with QNN_ENABLED=false.
+     * Test-build switches. Both are off in the shipped release: the QNN path
+     * is dormant and fails on device, and the CPU-vs-XNNPACK benchmark is a
+     * test-build-only measurement (it touches CPU providers only, so it is
+     * safe with QNN_ENABLED=false when a test build flips it on).
      */
     private const val QNN_DIAGNOSTIC_ENABLED = false
     private const val BENCHMARK_CPU_VS_XNNPACK_ENABLED = false
