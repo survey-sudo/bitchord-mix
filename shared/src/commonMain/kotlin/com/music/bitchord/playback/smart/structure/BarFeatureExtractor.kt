@@ -287,9 +287,33 @@ object BarFeatureExtractor {
         }
         var bestM = 0
         for (m in 1 until beatsPerBar) if (phase[m] > phase[bestM]) bestM = m
-        if (!(bestM != 0 && phase[bestM] > phase[0] * StructureTuning.GRID_MARGIN)) bestM = 0
+        if (!(bestM != 0 && phase[bestM] > 1e-6 && phase[bestM] > phase[0] * StructureTuning.GRID_MARGIN)) bestM = 0
         val first = offset + bestM * beat
         return Grid(uniform(first), first, conf, first > 1e-9)
+    }
+
+    /** Beat-grid alignment confidence for an existing downbeat array [downbeats]. */
+    fun gridConfidence(f: Frames, downbeats: DoubleArray, beatsPerBar: Int = 4, barSec: Double): Float {
+        if (f.count < 16 || downbeats.isEmpty() || beatsPerBar < 1) return 0f
+        var envSum = 0.0
+        for (v in f.flux) envSum += v
+        if (envSum < 1e-6) return 0f
+        val meanFlux = envSum / f.count
+        var hit = 0.0
+        var totalBeats = 0
+        for (i in downbeats.indices) {
+            val t0 = downbeats[i]
+            val span = if (i + 1 < downbeats.size) downbeats[i + 1] - t0 else barSec
+            if (span <= 0.0) continue
+            val beat = span / beatsPerBar
+            for (m in 0 until beatsPerBar) {
+                hit += interp(f.flux, frameIndex(f, t0 + m * beat))
+                totalBeats++
+            }
+        }
+        if (totalBeats == 0) return 0f
+        val baseline = meanFlux * totalBeats
+        return ((hit - baseline) / (hit + 1e-9)).toFloat().coerceIn(0f, 1f)
     }
 
     /** Beat-synchronous bar features on [downbeats]; the last bar is [barSec] long. */

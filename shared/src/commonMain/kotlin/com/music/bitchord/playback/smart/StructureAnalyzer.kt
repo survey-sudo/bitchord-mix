@@ -56,6 +56,8 @@ object StructureAnalyzer {
         stems: StemBars? = null,
         /** Proportional vocal mask (same convention as [mask]) read by v2 only when [mask] is null. */
         v2Vocal: FloatArray? = null,
+        /** V2 beat-grid confidence measured by [BarFeatureExtractor]; null falls back to [gridConfidence]. */
+        v2GridConfidence: Float? = null,
     ): SongMap {
         checkTime(startedMs, now)
         val n = bars.size
@@ -117,7 +119,7 @@ object StructureAnalyzer {
                 beatsPerBar = beatsPerBar,
                 vocal = BarFeatureExtractor.vocalPerBar(mask ?: v2Vocal, downbeats, barSecV2, durationSec),
                 lyricPrior = lyricPrior,
-                gridConfidence = gridConfidence,
+                gridConfidence = v2GridConfidence ?: gridConfidence,
                 stems = stems,
             )
         }.getOrNull() ?: return base
@@ -344,20 +346,26 @@ object StructureAnalyzer {
         // AUTOMIX-V2(D): own front end at the caller's rate + bar-phase repair. Skipped
         // (vc80 path untouched) when disabled or when half the time budget is gone.
         var v2Bars: List<V2Bar>? = null
+        var v2GridConfidence: Float? = null
         val budgetLeft = startedMs <= 0L || now() <= 0L || now() - startedMs < PhraseConfig.STRUCT_TIMEOUT_MS / 2
         if (AutomixV2Structure.enabled && budgetLeft) {
             runCatching {
                 val v2Frames = BarFeatureExtractor.frames(pcm, sampleRate)
                 val hinted = gridFromHint(downbeatsHint, barSec, pcmDurationSec)
-                val grid = when {
-                    hinted != null -> hinted
-                    AutomixV2Structure.estimateGrid -> BarFeatureExtractor.estimateGrid(v2Frames, bpm, pcmDurationSec).downbeats
-                    else -> null
+                val est = if (hinted == null && AutomixV2Structure.estimateGrid) {
+                    BarFeatureExtractor.estimateGrid(v2Frames, bpm, pcmDurationSec)
+                } else {
+                    null
                 }
+                val grid = hinted ?: est?.downbeats
                 val chosen = if (grid != null && grid.isNotEmpty() && (hinted != null || grid[0] > 1e-9)) grid else downbeats
                 v2Bars = BarFeatureExtractor.bars(v2Frames, chosen, 4, barSec)
                 downbeats = chosen
-            }.onFailure { v2Bars = null }
+                v2GridConfidence = est?.confidence ?: BarFeatureExtractor.gridConfidence(v2Frames, chosen, 4, barSec)
+            }.onFailure {
+                v2Bars = null
+                v2GridConfidence = null
+            }
         }
         val bars = beatSync(frames, downbeats, beatSec)
         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
@@ -367,6 +375,7 @@ object StructureAnalyzer {
             mask, lyricPrior, gridConfidence = if (activation < PhraseConfig.ACTIVATION_FLOOR) 0.3f else 0.8f,
             tempoStable = true, activation = activation, speechLike = false, partial = effectivePartial,
             startedMs = startedMs, now = now, v2Bars = v2Bars, stems = stems, v2Vocal = v2Vocal,
+            v2GridConfidence = v2GridConfidence,
         )
         return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
             map.copy(contentEndSec = effectiveDuration)
