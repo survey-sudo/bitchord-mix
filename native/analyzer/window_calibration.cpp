@@ -1,7 +1,7 @@
 // Calibration and invariant checks for the separated stem pair.
 //
-// Why this exists: vc75 shipped the first version of SeparateVocalWindow that
-// ever produced audio. Every automix heuristic that reads a vocal mask was
+// Why this exists: the first version of SeparateVocalWindow that ever produced
+// audio only recently shipped. Every automix heuristic that reads a vocal mask was
 // written against a path that always crashed, so none of its thresholds has
 // ever been checked against real separation. Before any of those numbers are
 // retuned, the transfer function they sit on has to be known, and the identity
@@ -198,7 +198,7 @@ void CheckComplementAndAlignment() {
   check(sum_err < 1e-4 * dry_rms + 1e-6, "vocals + instrumental reconstructs the dry left channel");
   check(sum_err_r < 1e-4 * dry_rms + 1e-6, "vocals + instrumental reconstructs the dry right channel");
 
-  // dry minus vocals vs the instrumental stem: the vc74 single-pass assumption.
+  // dry minus vocals vs the instrumental stem: the single-pass assumption.
   std::vector<float> subL(length), subR(length);
   for (size_t i = 0; i < length; ++i) {
     subL[i] = left[i] - vocL[i];

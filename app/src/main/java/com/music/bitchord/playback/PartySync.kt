@@ -467,7 +467,6 @@ class PartySync(
         }
     }
 
-    // ------------------------------------------------------------ inbound --
 
     private fun reconcile() {
         val party = ListenTogether.state.value
@@ -716,7 +715,6 @@ class PartySync(
         }
     }
 
-    // ----------------------------------------------------------- outbound --
 
     private fun publish() {
         val party = ListenTogether.state.value

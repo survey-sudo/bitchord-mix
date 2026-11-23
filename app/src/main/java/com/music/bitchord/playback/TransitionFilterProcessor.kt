@@ -103,7 +103,6 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      */
     val loop = com.music.bitchord.playback.loopmix.LoopMixPort()
 
-    // ---- Echo out ------------------------------------------------------------
     //
     // A feedback delay after the filters, for Advanced Automix's echo out: the
     // outgoing track's last beat keeps repeating, darker and thinner each
@@ -549,7 +548,6 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         filterStateDirty = false
     }
 
-    // ---- Echo ----------------------------------------------------------------
 
     /**
      * Runs the echo over [block] in place: the input goes out at [echoDry] and
@@ -663,7 +661,6 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         echoDry = 1f
     }
 
-    // ---- Filter ------------------------------------------------------------
 
     private fun glide(current: Float, target: Float): Float {
         val from = ln(current.coerceAtLeast(MIN_HZ))
@@ -774,6 +771,25 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             value -= highK[stage] * v1 + v2
         }
         return value
+    }
+
+    /**
+     * Read-only seam for JVM harnesses (e.g. `DeclineOverlapRenderTest`) that assert
+     * on filter state without reflection. Only fields a test actually needs are
+     * exposed; an unknown name fails loudly rather than silently returning a default.
+     */
+    internal fun testFieldValue(name: String): Float = when (name) {
+        "currentLowPassHz" -> currentLowPassHz
+        "currentHighPassHz" -> currentHighPassHz
+        "currentMidGainDb" -> currentMidGainDb
+        "targetLowPassHz" -> targetLowPassHz
+        "targetHighPassHz" -> targetHighPassHz
+        "targetMidGainDb" -> targetMidGainDb
+        "echoSend" -> echoSend
+        "echoDry" -> echoDry
+        "echoSeconds" -> echoSeconds
+        "leadUs" -> leadUs.toFloat()
+        else -> error("unknown test field $name")
     }
 
     companion object {

@@ -1,14 +1,14 @@
 // Host checks for SeparateVocalWindow: the successful path, not just the
-// fallback. A null-write bug shipped in vc73/vc74 because nothing ever called
-// this with a valid magnitude tensor and checked the outputs came back sized.
+// fallback. A null-write bug once shipped because nothing ever called this
+// with a valid magnitude tensor and checked the outputs came back sized.
 //
 //   g++ -O2 -std=c++17 -I native/analyzer native/analyzer/vocal_spectrogram_test.cpp \
 //       native/analyzer/vocal_spectrogram.cpp -o /tmp/vocal_spectrogram_test \
 //       && /tmp/vocal_spectrogram_test
 //
-// Exit 0 means every check passed. A segmentation fault is the failure the
-// vc74 crash presented as, so a crash here is a legible result: the test does
-// not need to catch it to report it.
+// Exit 0 means every check passed. A segmentation fault is how that null-write
+// bug presented, so a crash here is a legible result: the test does not need
+// to catch it to report it.
 #include "vocal_spectrogram.h"
 
 #include <cmath>
@@ -69,7 +69,7 @@ int main() {
   const size_t frames = frames_for(n);
   const std::vector<float> mag = magnitude(frames, 0.05f);
 
-  // 1. The success path. This is the check that did not exist in vc73/vc74:
+  // 1. The success path. This is the check that was missing:
   //    on a true return both outputs must be exactly input_length long, because
   //    the overlap-add loop writes them by index from 0 to input_length-1.
   {
@@ -129,7 +129,7 @@ int main() {
   }
 
   // 6. target_frames == 0 returns false: the JVM fallback contract, which is
-  //    the ONLY case the pre-vc75 tests covered.
+  //    the ONLY case the earlier tests covered.
   {
     std::vector<float> out_left, out_right;
     const bool ok = SeparateVocalWindow(

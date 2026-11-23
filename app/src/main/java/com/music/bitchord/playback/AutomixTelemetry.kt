@@ -5,7 +5,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Persistent Automix transition telemetry (djmix10).
+ * Persistent Automix transition telemetry ().
  *
  * Release builds strip `android.util.Log` (proguard `-assumenosideeffects`),
  * so logcat can never show a transition decision. This object appends one
@@ -24,6 +24,10 @@ object AutomixTelemetry {
 
     private val counter = AtomicLong(0)
     @Volatile private var dir: File? = null
+    internal fun setDirForTest(file: File?) { dir = file }
+
+    /** The current telemetry dir, so a JVM harness can restore it after its own redirect. */
+    internal fun savedDirForTest(): File? = dir
 
     /** Must be called once from a Context (PlaybackService). Safe to call repeatedly. */
     fun init(context: Context) {

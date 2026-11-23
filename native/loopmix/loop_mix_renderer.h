@@ -76,7 +76,7 @@ struct TptLowpass {
 };
 
 /**
- * djmix24 Cytomic TPT SVF high-pass (Simper zero-delay-feedback topology,
+ * Cytomic TPT SVF high-pass (Simper zero-delay-feedback topology,
  * allocation-free, stable to Nyquist). Q configurable (0.707 default,
  * ~0.95 musical DJM resonance during buildup sweeps).
  */
@@ -103,7 +103,7 @@ struct TptHighpass {
   }
 };
 
-/** djmix24 pre-allocated stereo plate reverb wash (Freeverb-class comb/allpass). */
+/** Pre-allocated stereo plate reverb wash (Freeverb-class comb/allpass). */
 struct ReverbWash {
   std::vector<float> combL0, combL1, combL2, combL3, combR0, combR1, combR2, combR3;
   std::vector<float> apL0, apL1, apR0, apR1;
@@ -137,7 +137,7 @@ struct PingPong {
 };
 
 /**
- * djmix24 stereo Jet Flanger (DJM-style): true stereo quadrature LFO
+ * Stereo Jet Flanger (DJM-style): true stereo quadrature LFO
  * (90 deg / 0.25 cycle offset, wide jet while mono-compatible), delay
  * sweep 0.65 ms .. 5.2 ms, metallic resonant feedback 0.64 with 1-pole
  * ~10 kHz HF damping + denormal guard + hard clamp [-0.78, 0.78], wet
@@ -193,19 +193,19 @@ struct Deck {
   Envelope lowPassHz;
   /** 0..1 send into the echo. Empty means shut during pre-roll and open after the first knot. */
   Envelope echoSend;
-  /** djmix24 0..1 multiplier on flanger wet (rising ramp into releaseAt + tail). */
+  /** 0..1 multiplier on flanger wet (rising ramp into releaseAt + tail). */
   Envelope flangerWet;
-  /** djmix24 0..1 send into the reverb wash. */
+  /** 0..1 send into the reverb wash. */
   Envelope reverbSend;
-  /** djmix24 beat-quantized tightening EDM buildup loop roll. */
+  /** Beat-quantized tightening EDM buildup loop roll. */
   bool loopRoll = false;
   double rollStartMixSec = 0.0;
   double rollBeatSec = 0.5;
   double rollReleaseMixSec = 0.0;
   double rollTotalBeats = 16.0;
-  /** djmix24 Cytomic SVF Q (0.707 default, 0.95 buildup). */
+  /** Cytomic SVF Q (0.707 default, 0.95 buildup). */
   float svfQ = 0.707f;
-  /** djmix24 effective loop end for the current block (samples); -1 = use loopEnd. */
+  /** Effective loop end for the current block (samples); -1 = use loopEnd. */
   int64_t effectiveLoopEnd = -1;
   double effectiveLoopLenSamples = -1.0;
   int64_t sampleAtEffective(int64_t unwrapped) const;
@@ -239,7 +239,7 @@ struct Deck {
   PingPong echo;
   ReverbWash reverb;
   Flanger flanger;
-  /** Phrase mixes run the LR4 isolator. The djmix6 path leaves this off. */
+  /** Phrase mixes run the LR4 isolator. The legacy path leaves this off. */
   bool isolate = false;
   PhraseIsolator isolator;
   float shelfDb = 0;
@@ -277,11 +277,11 @@ class Renderer {
   /** Tempo-synced echo on [index]. A non-positive delay turns it off. */
   void setEcho(int index, double delaySeconds, float feedback, float wet);
   void setIsolate(int index, bool on);
-  /** djmix24 beat-quantized tightening loop roll. */
+  /** Beat-quantized tightening loop roll. */
   void setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats);
-  /** djmix24 stereo plate reverb wash. */
+  /** Stereo plate reverb wash. */
   void setReverb(int index, float roomSize, float damping, float wet);
-  /** djmix24 Cytomic SVF Q. */
+  /** Cytomic SVF Q. */
   void setSvfQ(int index, float q);
 
   /** Call once both decks are filled in, before the first [render]. */
@@ -289,7 +289,7 @@ class Renderer {
 
   /** The earliest mix frame anything renders at (negative: before t0). */
   /**
-   * Beat-synced flanger on [index]'s tail (djmix11 graceful exit).
+   * Beat-synced flanger on [index]'s tail (graceful exit).
    * Depth is the delay's sweep in seconds (max 4 ms); lfoHz is one cycle
    * per 8 beats, so the phasing reads as a dissolve, never a wobble.
    */

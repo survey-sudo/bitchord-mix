@@ -13,7 +13,7 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Bounded one-shot NPU self-test (vc70 NPU dispatch proof).
+ * Bounded one-shot NPU self-test (NPU dispatch proof).
  *
  * Analysis never runs without playback, so without this the NPU path
  * cannot be verified on a real Snapdragon: session open and the HTP graph
@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * At most one run per process; off UI and audio threads; never throws; a
  * failure cannot affect playback; aborted when backgrounded.
  *
- * Test-build harness (vc91, extended in vc92): while QNN is off the probe
+ * Test-build harness (extended): while QNN is off the probe
  * stays dormant for QNN, and the two dormant-build harnesses below
  * (CPU-vs-XNNPACK benchmark, QNN diagnostic) run only when their test-build
  * constants are flipped on. Both stay off in the shipped release: the
@@ -41,7 +41,7 @@ object NpuSelfTest {
     private const val MAX_INPUT_ELEMENTS = 4_000_000L
     /**
      * Max logit delta tolerated between two providers for the parity check.
-     * vc92 tightens this from 1e-4 to 1e-3: the CPU-vs-XNNPACK comparison is
+     * tightens this from 1e-4 to 1e-3: the CPU-vs-XNNPACK comparison is
      * a delegate-vs-reference check, not a bit-exact one, and a delegate may
      * reorder float accumulation. Anything above 1e-3 means the delegate is
      * changing the prediction, not just the summation order.
@@ -227,7 +227,7 @@ object NpuSelfTest {
     }
 
     /**
-     * CPU-vs-XNNPACK benchmark (vc92): the same deterministic non-zero input
+     * CPU-vs-XNNPACK benchmark: the same deterministic non-zero input
      * through a plain CPU session and an XNNPACK session, 3 warmup + 20 timed
      * iterations each, median latency per provider, and a max-logit-delta
      * parity check between the two providers.

@@ -265,7 +265,6 @@ class EqualizerProcessor : BaseAudioProcessor() {
         outputBuffer.flip()
     }
 
-    // ---- Gliding -----------------------------------------------------------
 
     private fun snapToTarget() {
         val tuning = target
@@ -307,7 +306,6 @@ class EqualizerProcessor : BaseAudioProcessor() {
         return true
     }
 
-    // ---- Coefficients ------------------------------------------------------
 
     private fun prepareSections(): Int {
         var active = 0
@@ -374,7 +372,6 @@ class EqualizerProcessor : BaseAudioProcessor() {
         }
     }
 
-    // ---- Filter ------------------------------------------------------------
 
     private fun section(slot: Int, channel: Int, input: Float): Float {
         val i = (channel * EqLayout.SLOTS + slot) * 2

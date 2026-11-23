@@ -43,7 +43,6 @@ import org.junit.Test
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.file.Files
-import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Proxy
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -705,13 +704,10 @@ class DeclineOverlapRenderTest {
         private val failures = Collections.synchronizedList(mutableListOf<Throwable>())
         private val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(scheduler) +
             CoroutineExceptionHandler { _, failure -> failures.add(failure) })
-        private val telemetryField = if (captureTelemetry) {
-            AutomixTelemetry::class.java.getDeclaredField("dir").apply { isAccessible = true }
-        } else null
-        private val savedTelemetryDir = telemetryField?.get(AutomixTelemetry)
         private val telemetryDir = if (captureTelemetry) Files.createTempDirectory("decline-overlap-telemetry").toFile() else null
+        private val savedTelemetryDir = AutomixTelemetry.savedDirForTest()
         init {
-            telemetryField?.set(AutomixTelemetry, telemetryDir)
+            if (captureTelemetry) AutomixTelemetry.setDirForTest(telemetryDir)
         }
         var wallMs = 1_000L
         private val items = listOf("A", "B", "C").map { MediaItem.Builder().setMediaId(it).build() }
@@ -739,7 +735,6 @@ class DeclineOverlapRenderTest {
         var globalOpens = 0
             private set
         private var ticker: Job? = null
-        private val tickMethod = CrossfadeController::class.java.getDeclaredMethod("tick").apply { isAccessible = true }
         val phase get() = get("phase").toString()
         private fun cutoffs(deck: Deck, low: Float, high: Float) {
             cutoffWrites.add((get("handedOff") as Boolean) to deck)
@@ -807,8 +802,7 @@ class DeclineOverlapRenderTest {
             ?.filter { it.contains("\"ev\":\"$event\"") }
             .orEmpty()
 
-        fun get(name: String): Any? = CrossfadeController::class.java.getDeclaredField(name)
-            .apply { isAccessible = true }.get(controller)
+        fun get(name: String): Any? = controller.testFieldValue(name)
 
         fun assertNaturalPlanFor(id: String) {
             assertNull("a completed recovery must not authorize the next overlap", controller.plannedTransitionFor(id))
@@ -827,10 +821,8 @@ class DeclineOverlapRenderTest {
                 beatSeconds = beatSeconds,
                 echoSeconds = TransitionAlternatives.DROP_IN_ECHO_TAIL_SECONDS,
             )
-            val render = CrossfadeController::class.java.getDeclaredMethod(
-                "renderFor", TransitionPlan::class.java, Boolean::class.javaPrimitiveType!!,
-            ).apply { isAccessible = true }.invoke(controller, dropIn, true)
-            CrossfadeController::class.java.getDeclaredField("render").apply { isAccessible = true }.set(controller, render)
+            val render = controller.testRenderFor(dropIn, true)
+            controller.testSetField("render", render)
         }
 
         fun startAndPlan(): TransitionPlan {
@@ -860,8 +852,8 @@ class DeclineOverlapRenderTest {
         }
 
         fun tick() {
-            try { tickMethod.invoke(controller) } catch (failure: InvocationTargetException) {
-                throw AssertionError("production tick failed", failure.targetException)
+            try { controller.tickForTest() } catch (failure: Throwable) {
+                throw AssertionError("production tick failed", failure)
             }
             failures.firstOrNull()?.let { throw AssertionError("controller coroutine failed", it) }
             assertTicker()
@@ -907,7 +899,7 @@ class DeclineOverlapRenderTest {
         override fun close() {
             controller.release()
             scope.cancel()
-            telemetryField?.set(AutomixTelemetry, savedTelemetryDir)
+            if (captureTelemetry) AutomixTelemetry.setDirForTest(savedTelemetryDir)
             telemetryDir?.deleteRecursively()
         }
     }
@@ -940,8 +932,7 @@ class DeclineOverlapRenderTest {
             state = Player.STATE_BUFFERING
             listeners.toList().forEach { it.onPlaybackStateChanged(state) }
         }
-        fun filterValue(name: String): Float = TransitionFilterProcessor::class.java.getDeclaredField(name)
-            .apply { isAccessible = true }.getFloat(filter)
+        fun filterValue(name: String): Float = filter.testFieldValue(name)
         private fun playing(wanted: Boolean) {
             val starting = wanted && !playWhenReady
             playWhenReady = wanted
@@ -1095,8 +1086,7 @@ class DeclineOverlapRenderTest {
         }
         fun row(t: Long, r: Rig) {
             if (csv == null) return
-            fun value(deck: Deck, name: String) = TransitionFilterProcessor::class.java.getDeclaredField(name)
-                .apply { isAccessible = true }.getFloat(deck.filter)
+            fun value(deck: Deck, name: String) = deck.filter.testFieldValue(name)
             csv.appendLine(listOf(
                 t, r.first.position, r.second.position, r.first.player.volume, r.second.player.volume,
                 r.headroom, r.phase, r.get("handedOff"), r.activeDeck.name, r.spareDeck.name,

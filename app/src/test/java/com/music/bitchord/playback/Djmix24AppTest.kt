@@ -171,7 +171,12 @@ class Djmix24AppTest {
     fun fxRotationVariedAndDeterministic() {
         val slots = (0 until 100).map { TransitionMoves.fxSlot("track$it", "track${it + 1}") }.toSet()
         assertTrue("rotation must vary", slots.size >= 3)
-        assertEquals(TransitionMoves.fxSlot("a", "b"), TransitionMoves.fxSlot("a", "b"))
+        // Determinism: the same pair must resolve to one stable slot across
+        // repeated calls (no hidden state or randomness), and that slot must
+        // stay inside the valid 0..3 rotation range the movement table uses.
+        val samePairSlots = (0 until 16).map { TransitionMoves.fxSlot("a", "b") }.toSet()
+        assertEquals("fxSlot must be deterministic for a fixed pair", 1, samePairSlots.size)
+        assertTrue("fxSlot must return a valid slot in 0..3", samePairSlots.single() in 0..3)
         // Anti-repeat: consecutive queue pairs (a->b, b->c) rarely repeat the
         // same slot twice in a row when the pairs differ.
         var repeats = 0

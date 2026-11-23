@@ -191,7 +191,7 @@ class LoopMixSession private constructor(
          */
         const val STEM_DUCK_FLOOR = LoopMixDuck.MIN_FLOOR
 
-        /** Two-thread daemon pool for parallel OUT+IN region decode (vc73). */
+        /** Two-thread daemon pool for parallel OUT+IN region decode. */
         private val DECODE_EXECUTOR: java.util.concurrent.ExecutorService =
             java.util.concurrent.Executors.newFixedThreadPool(
                 2,
@@ -204,10 +204,10 @@ class LoopMixSession private constructor(
         /**
          * The incoming player's start, computed from a plan clock alone:
          * startAt into the mix, at track position startTrack. The hold
-         * branch can land the start after handoffAt (the vc64 freeze); the
+         * branch can land the start after handoffAt (the freeze); the
          * clamp keeps at least STARTUP_LEAD of decode head-room before
          * elementAt so driveLoopMix cannot run out of mix before the start
-         * (djmix23, vc65). Pure JVM, no renderer needed.
+         *. Pure JVM, no renderer needed.
          */
         fun incomingStartFor(
             clock: LoopMix.Clock,
@@ -277,7 +277,7 @@ class LoopMixSession private constructor(
             // qualify first, even without JNI, so a geometry refusal is not
             // misattributed to renderer capability (and never reaches decode).
             if (!crown && !LoopMixRenderer.available) return refuse("renderer_unavailable")
-            // djmix18: the script hold is the truth for the handover: pass it into the
+            // the script hold is the truth for the handover: pass it into the
             // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
             // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
             // read script?.incomingHoldSec — up to seconds apart on phrase plans).
@@ -419,7 +419,7 @@ class LoopMixSession private constructor(
                 }
             }
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
-            // vc67: on-device umxhq Wiener stem separation for the acapella rung.
+            // on-device umxhq Wiener stem separation for the acapella rung.
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
             // instrumental when windowed stems are enabled. Worker thread only; null
             // falls back to the dry region so the build never fails on separation.
@@ -502,11 +502,11 @@ class LoopMixSession private constructor(
                     Log.i(TAG, "stem-duck out=${effectivePlan.out.loopStart} in=${plan.inn.loopStart} clashE=$clashE outFloor=${duck.outFloor} inFloor=${duck.inFloor} duckIn=${duck.duckIncoming}")
                     val beatSec73 = effectivePlan.out.beatSec.takeIf { it > 0 } ?: 0.5
                     if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
-                        // vc74 (djmix32): single-pass contract - only the vocal stem is
+                        // single-pass contract - only the vocal stem is
                         // inferred; the instrumental is dry minus vocal locally (the
                         // native OLA is sample-aligned: same framing, pad-centred,
                         // renormalised by win_sq), so no second Wiener pass per deck.
-                        // vc77: prefer the exact (voc, inst) pair from VocalTracker
+                        // prefer the exact (voc, inst) pair from VocalTracker
                         // (no rate round-trip residual); fall back to stem + local
                         // subtraction when the pair is absent or mis-sized.
                         val (voc, instL, instR) = run {
@@ -564,7 +564,7 @@ class LoopMixSession private constructor(
                     // that skip the veto — in practice the incoming duck rests
                     // on inHasEarlyVocal.
                     if (duck.duckIncoming && inRegion.left.size / sampleRate.toDouble() <= 21.5) {
-                        // vc77: exact pair first (see OUT above), stem fallback.
+                        // exact pair first (see OUT above), stem fallback.
                         val (vocIn, instInL, instInR) = run {
                             val pair = if (separateVocalPair != null) {
                                 runCatching { separateVocalPair(LoopMix.Side.IN, inRegion.left, inRegion.right, sampleRate) }.getOrNull()
@@ -642,7 +642,7 @@ class LoopMixSession private constructor(
                 inTo = samplesOf(inRegion, inEndSec).toInt(),
                 sampleRate = sampleRate,
             )
-            // djmix14 peak-safe regional loudness: -6.0..+4.5 dB (was +-3 dB),
+            // peak-safe regional loudness: -6.0..+4.5 dB (was +-3 dB),
             // capped by peak headroom so loud masters never slam the limiter
             // while quiet tracks still match energy. Peak is the max abs over
             // the incoming region; boosting above 1.0 is capped at 0.92/peak.
@@ -814,7 +814,7 @@ class LoopMixSession private constructor(
                         roomSize = 2.2f, damping = reverbDamping, wet = reverbWet,
                     )
                     val open = (clock.releaseAt - effectivePlan.out.beatSec).coerceAtLeast(0.0)
-                    // vc77: taper the send back to zero by outStopMixSec so
+                    // taper the send back to zero by outStopMixSec so
                     // the wash never hard-cuts at stopAt.
                     renderer.setEnvelope(
                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_REVERB_SEND,
@@ -914,7 +914,7 @@ class LoopMixSession private constructor(
                 // OUT at unity.
                 val beatBlendPocket = effectivePlan.rung == "Beat blend"
                 if (outStemSeparated) {
-                    // vc73: stems already separate vocals; leave full-band. KIND_LOW_DB bass swap does the work.
+                    // stems already separate vocals; leave full-band. KIND_LOW_DB bass swap does the work.
                 } else {
                 when {
                     effectivePlan.dropIn -> {
@@ -947,7 +947,7 @@ class LoopMixSession private constructor(
                         }
                     }
                     beatBlendPocket -> {
-                        // vc73: no LP/HP muffle. KIND_LOW_DB bass swap + computeVocalMidCarve (KIND_MID_DB) keep it clear.
+                        // no LP/HP muffle. KIND_LOW_DB bass swap + computeVocalMidCarve (KIND_MID_DB) keep it clear.
                     }
                     effectivePlan.clash && effectivePlan.outLoops -> {
                         renderer.setEnvelope(

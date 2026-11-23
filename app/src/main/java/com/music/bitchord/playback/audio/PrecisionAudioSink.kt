@@ -316,7 +316,7 @@ class PrecisionAudioSink(
         presentationTimeUs: Long,
         encodedAccessUnitCount: Int,
     ): Boolean {
-        // vc75: raise the render thread once, on the thread that does the
+        // raise the render thread once, on the thread that does the
         // work. Above the precision check on purpose - the delegate
         // passthrough is audio work too.
         if (!audioPrioritySet) {
