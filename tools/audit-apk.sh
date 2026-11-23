@@ -56,8 +56,8 @@ fi
 onnx_count=$(printf '%s\n' "$listing" | grep -c 'lib/arm64-v8a/libonnxruntime\.so$')
 onnx_size=$(printf '%s\n' "$listing" | awk '/lib\/arm64-v8a\/libonnxruntime\.so$/{print $1}' | head -1)
 [ "$onnx_count" -eq 1 ] && ok "exactly one libonnxruntime.so" || bad "$onnx_count libonnxruntime.so copies"
-# AUTOMIX-V2(A): onnxruntime-android-qnn 1.29.0; pin its size here after the first CI build prints it.
-echo "        onnxruntime is ${onnx_size:-absent} B (onnxruntime-android-qnn 1.29.0)"
+# AUTOMIX-V2(A): onnxruntime-android-qnn 1.29.0; pinned to the vc93 release build.
+[ "${onnx_size:-0}" = "23990744" ] && ok "onnxruntime is 23990744 B (onnxruntime-android-qnn 1.29.0)" || bad "onnxruntime is ${onnx_size:-absent} B, expected 23990744"
 
 # QNN/HTP: count NATIVE OBJECTS only. The first version of this check grepped
 # the whole listing for 'qnn|htp' and flagged the Qualcomm licence notice in
