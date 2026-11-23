@@ -18,7 +18,7 @@ git remote add origin https://github.com/<you>/<repo>.git
 git push -u origin vc91-djmix49
 ```
 
-The default branch should be `vc91-djmix49` (or edit the workflow triggers), because `.github/workflows/android-ci.yml` fires on `master` only. If you keep `master` as the default, either rename the branch or change `branches: [master]` in that workflow.
+The default branch is `vc91-djmix49`. `.github/workflows/android-ci.yml` fires on pushes and PRs on **any** branch, so CI runs on whatever branch an agent works from. The older `master` branch is kept only for history — do not build from it.
 
 Do not reuse the old `.git` from the vc80 archive — this repository already contains the correct history and branches.
 
