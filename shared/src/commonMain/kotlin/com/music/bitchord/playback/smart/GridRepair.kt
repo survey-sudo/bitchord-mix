@@ -119,7 +119,7 @@ object GridRepair {
     }
 
     /**
-     * djmix24 bkmasterplayer snap_to_onsets (±35 ms): each beat/downbeat
+     * bkmasterplayer snap_to_onsets (±35 ms): each beat/downbeat
      * candidate moves to the nearest local onset peak within [windowSec]
      * (default 35 ms). Beats without a clear attack keep their grid time,
      * so breakdowns (no drums) are not dragged. Needs >= 8 beats and a

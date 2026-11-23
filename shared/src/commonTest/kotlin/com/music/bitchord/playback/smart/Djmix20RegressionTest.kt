@@ -12,7 +12,7 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFalse
 
 /**
- * djmix20 (vc62) shared regression suite:
+ * Shared regression suite for the conservative decline-to-mix gate:
  * P0: decline gate, analyse-ahead (HEAD next usable), loop-build drop.
  * P1: outro-loop drop, phrase extension, echo-past-EOF lane.
  * Flanger: per-pair deterministic, low-vocal only, never on echo gap.
@@ -247,21 +247,9 @@ class Djmix20RegressionTest {
     }
 
     // ---- flanger ----
-    private fun findIds(slot: Int, limit: Int = 500): Pair<String, String> {
-        for (i in 0 until limit) {
-            val a = "flanger-out-$i"; val b = "flanger-in"
-            if (pairHash(a, b) % 4 == slot) return a to b
-        }
-        for (i in 0 until limit) {
-            val a = "flanger-out"; val b = "flanger-in-$i"
-            if (pairHash(a, b) % 4 == slot) return a to b
-        }
-        throw AssertionError("no pairHash slot $slot")
-    }
-
     @Test
     fun flangerFiresOnEligibleLowVocalBeatmixForRightPairHash() {
-        val (outId, inId) = findIds(0)
+        val (outId, inId) = fxSlotIds(0, "flanger")
         assertTrue(pairHash(outId, inId) % 4 == 0)
         assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId, measured = true))
         val settings = effectSettings(DjEffect.FLANGER)
@@ -295,7 +283,7 @@ class Djmix20RegressionTest {
 
     @Test
     fun flangerNeverOnDualVocalClash() {
-        val (outId, inId) = findIds(0)
+        val (outId, inId) = fxSlotIds(0, "flanger")
         assertTrue(blendColour(0.85, outId, inId, measured = true) != DjEffect.FLANGER, "dual vocal must not flange")
         val raw = TransitionPlan(
             transitionStyle = TransitionStyle.DJ_BLEND,
@@ -322,7 +310,7 @@ class Djmix20RegressionTest {
 
     @Test
     fun flangerNeverReplacesTempoGapEchoOrReverb() {
-        val (outId, inId) = findIds(0)
+        val (outId, inId) = fxSlotIds(0, "flanger")
         val gap = TransitionPlan(
             transitionStyle = TransitionStyle.DJ_FILTER,
             filterVariant = FilterTransitionVariant.ECHO_RIDE, echoSeconds = 0.6,

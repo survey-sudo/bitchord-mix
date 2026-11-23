@@ -53,7 +53,7 @@ object TransitionMoves {
     const val KILL_DB = -40f
 
     /**
-     * djmix24 Rung 0 consecutive-album guard (scalars only): same non-blank
+     * Rung 0 consecutive-album guard (scalars only): same non-blank
      * album title/id AND current trackNumber > 0 AND next == current + 1.
      * Singles (blank album) and non-consecutive album siblings still AutoMix.
      */
@@ -70,7 +70,7 @@ object TransitionMoves {
         return trackNumA > 0 && trackNumB == trackNumA + 1
     }
 
-    /** djmix24: deterministic EDM dance-pair check (scalars only, patent-safe). */
+    /** Deterministic EDM dance-pair check (scalars only, patent-safe). */
     fun isEdmDancePair(outBpm: Double, inBpm: Double): Boolean {
         if (outBpm !in 110.0..150.0 || inBpm !in 110.0..150.0) return false
         if (outBpm <= 1.0 || inBpm <= 1.0) return false
@@ -80,11 +80,11 @@ object TransitionMoves {
         return delta <= PhraseConfig.TEMPO_HARD_DELTA + 1e-9
     }
 
-    /** djmix24 FX rotation slot: 0=FLANGER, 1=CLEAN_SWAP, 2=ECHO, 3=REVERB. Deterministic per pair. */
+    /** FX rotation slot: 0=FLANGER, 1=CLEAN_SWAP, 2=ECHO, 3=REVERB. Deterministic per pair. */
     fun fxSlot(outId: String, inId: String): Int = ((pairHash(outId, inId) % 4) + 4) % 4
 
     /**
-     * djmix25 P1.6 acapella-over-instrumental gate (scalars only): same
+     * Acapella-over-instrumental gate (scalars only): same
      * Camelot, both key confidences >= 0.6, incoming starts instrumental
      * (energy-based lead: low whole-track vocal share), outgoing carries a
      * vocal to ride over it.
@@ -102,7 +102,7 @@ object TransitionMoves {
     }
 
     /**
-     * djmix25 P1.6: acapella-over-instrumental move. The outgoing vocal
+     * Acapella-over-instrumental move. The outgoing vocal
      * (from sung bars / the umxhq mask) rides over the incoming
      * instrumental intro for up to 8 bars. Compiles via [compile] with the
      * carve lanes forced and the acapella carrier set, so the renderer
@@ -120,7 +120,7 @@ object TransitionMoves {
         return compile(capped, outBpm, inBpm, flanger, outgoingId, incomingId, acapella = true)
     }
 
-    /** djmix24: 8-beat LFO helper (Bug A2). One sweep per 8 beats. */
+    /** 8-beat LFO helper. One sweep per 8 beats. */
     fun lfoHzForBeatSec(beatSec: Double): Double =
         if (beatSec > 1e-6 && beatSec.isFinite()) 1.0 / (8.0 * beatSec) else 0.0
 
@@ -131,18 +131,18 @@ object TransitionMoves {
         flanger: Boolean = false,
         outgoingId: String = "",
         incomingId: String = "",
-        /** djmix25 P1.2: extend the original outro loop by N bars (phrase reuse). */
+        /** extend the original outro loop by N bars (phrase reuse). */
         interpolationExtendBars: Int = 0,
-        /** djmix25 P1.6: acapella-over-instrumental carrier. */
+        /** acapella-over-instrumental carrier. */
         acapella: Boolean = false,
     ): PhraseScript {
-        // djmix24 Bug A4: deterministic EDM buildup + pair-hash FX rotation.
-        // EDM dance pairs (110..150 BPM post-fold within 8%, low dual-vocal)
-        // ALWAYS get flanger + tightening roll (Bug A1 scalar carrier in
-        // Plan). Non-EDM eligible blends use deterministic pair-hash rotation
-        // FLANGER / CLEAN_SWAP / ECHO / REVERB — never flanging over
-        // dual-vocal overlap (vocalOverlapBeats >= 1.0). Tempo-gap templates
-        // (M6/M10/CUT/M11/RELAXED) never flange (echo/reverb own them).
+        // Deterministic EDM buildup + pair-hash FX rotation. EDM dance pairs
+        // (110..150 BPM post-fold within 8%, low dual-vocal) ALWAYS get flanger
+        // + tightening roll (carried in Plan scalars). Non-EDM eligible blends
+        // use deterministic pair-hash rotation FLANGER / CLEAN_SWAP / ECHO /
+        // REVERB — never flanging over dual-vocal overlap (vocalOverlapBeats >=
+        // 1.0). Tempo-gap templates (M6/M10/CUT/M11/RELAXED) never flange
+        // (echo/reverb own them).
         val eligibleTemplate = choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 ||
             choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 ||
             choice.template == MixTemplate.ROLLING || choice.template == MixTemplate.M2
@@ -166,9 +166,9 @@ object TransitionMoves {
         val wantFlanger = flanger || edmBuildup || rotationFlanger || legacyAuto
         val legacy = choice.legacyLoop
         if (legacy != null) {
-            // Bug A1: legacy crown plans (LoopMix.plan) already carry the
-            // deterministic FX in Plan scalars. Merge so sheet() never
-            // drops a plan-flagged flanger/buildup.
+            // Legacy crown plans (LoopMix.plan) already carry the deterministic
+            // FX in Plan scalars. Merge so sheet() never drops a plan-flagged
+            // flanger/buildup.
             val mergedFlanger = wantFlanger || legacy.flanger
             return sheet(choice, legacy, mergedFlanger, holdSec = 0.0, echoDelaySec = 0.0, echoFeedback = 0f)
         }
@@ -204,7 +204,7 @@ object TransitionMoves {
         } else {
             if (prep > 0) prep else if (overlap == 0) 0 else 1
         }
-        // vc73 A4: ramp + exit must not pull start 45-60s early before
+        // ramp + exit must not pull start 45-60s early before
         // CONTENT_END. Cap ramp down (keeping >=1 when tempoDelta) and
         // exit to 8 so start >= release - 28.0.
         if (choice.exit.kind == ExitKind.CONTENT_END && !loopingForCap && (ramp + exit) * bar > 28.0) {
@@ -215,14 +215,14 @@ object TransitionMoves {
         val total = (ramp + exit).coerceAtLeast(1)
         val release = choice.exit.releaseSec
         val start = (release - total * bar).coerceAtLeast(0.0)
-        // djmix24 outro loop extension: a clean loopable outro phrase
+        // outro loop extension: a clean loopable outro phrase
         // shorter than the planned overlap loop-extends A's outro
         // underneath B's intro/buildup (Clock seamlessly loops) instead
         // of rushing past EOF. Music-end protection (cold hits vs
         // fade-out) is respected by CuePoints' release choice — this
         // only extends when loopableRoom is already true.
         val needsExtension = choice.exit.loopableRoom && choice.exit.roomBars < overlap && choice.exit.roomBars >= 1
-        // djmix25 P1.2: "extend the original loop by N bars" instead of the
+        // "extend the original loop by N bars" instead of the
         // hard 4-bar cap, when a repeated phrase lets the outro replay.
         val requestedLoopBars = if (choice.exit.roomBars in 1..2) 2 else 4 + interpolationExtendBars.coerceAtLeast(0)
         val availableBars = (release / bar).toInt().coerceAtLeast(0)
@@ -245,18 +245,17 @@ object TransitionMoves {
         val echo = choice.echoGated || choice.template == MixTemplate.M6 || rotationEcho
         val delayBeats = PhraseConfig.echoDelayBeats(inBpm, choice.template == MixTemplate.ROLLING).second
         val delaySec = if (echo) delayBeats * inBeat else 0.0
-        // djmix25 P1.11: per-template echo density (M6 full tail; M10/CUT half).
+        // per-template echo density (M6 full tail; M10/CUT half).
         val fadeSecForEcho = total * bar
         val echoFeedbackForPlan = PhraseConfig.echoFeedbackFor(choice.template.name, fadeSecForEcho)
         val exitTail = PhraseConfig.exitTailSeconds(outBeat)
         val inStartSec = choice.entry.startSec + (choice.entry.leadInBars - exit).coerceAtLeast(0) * inBar
         val inPick = LoopMix.Pick(inStartSec, inStartSec, 4, inBeat, inBpm, 0.0, LoopMix.Check.MASK)
         val keyClash = choice.keyClash && !forceUnity
-        // djmix24 Bug A1 scalar FX carrier: plan.flanger/buildupRoll/
-        // reverbWash/hpSweepEndHz carry the deterministic decision so
-        // LoopMixSession.build honours it even when loopScript is null
-        // (loopPlanFor / bridge paths). Slip-roll (Rung 4) reuses
-        // buildupRoll; its 1->1/2->1/4 schedule is native-side.
+        // Scalar FX carrier: plan.flanger/buildupRoll/reverbWash/hpSweepEndHz
+        // carry the deterministic decision so LoopMixSession.build honours it
+        // even when loopScript is null (loopPlanFor / bridge paths). Slip-roll
+        // (Rung 4) reuses buildupRoll; its 1->1/2->1/4 schedule is native-side.
         val planFlanger = (wantFlanger || legacyAuto) && !echo && !keyClash && eligibleTemplate
         val planRoll = edmBuildup && !keyClash && (looping || choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 || choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 || choice.template == MixTemplate.ROLLING)
         val planReverb = (edmBuildup || rotationReverb) && !echo && !keyClash
@@ -284,7 +283,7 @@ object TransitionMoves {
             reverbWash = planReverb,
             hpSweepEndHz = planHpEnd,
             acapella = acapella,
-            // djmix25 P1.12: per-template bass swap (club 1 beat legacy).
+            // per-template bass swap (club 1 beat legacy).
             faderSwapBeats = if (keyClash) 1.0 else when (choice.template) {
                 MixTemplate.M7, MixTemplate.ENERGY_LIFT -> 0.5
                 MixTemplate.M9, MixTemplate.RELAXED -> 2.0
@@ -353,7 +352,7 @@ object TransitionMoves {
         val start = -o * 4.0
         val kill = KILL_DB
         val mute = MUTE_DB
-        // djmix21 incoming-vocal crisp rule: when B's own lead-in carries
+        // incoming-vocal crisp rule: when B's own lead-in carries
         // vocal (scalar presence from its own sung bars), the incoming mid/
         // high lanes stay at unity through the landing and the separation
         // work happens on the OUTGOING mid instead. Instrumental pairs
@@ -508,7 +507,7 @@ object TransitionMoves {
             echoDelaySec = echoDelaySec,
             echoFeedback = echoFeedback,
             incomingHoldSec = holdSec,
-            // djmix20: eligible beatmix templates only (M1/M3/M7/M8/ROLLING/M2
+            // eligible beatmix templates only (M1/M3/M7/M8/ROLLING/M2
             // legacy). Echo/cut/crossfade/relaxed/vocal-blend never flange.
             flanger = flanger && (choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 ||
                 choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 ||
@@ -519,17 +518,14 @@ object TransitionMoves {
     }
 
     /**
-     * Graceful-exit guarantee (djmix11): the outgoing deck may never end
-     * audible. The lane's final mute knot is placed at its last knot plus
-     * the planned dissolve, giving it a real equal-power fall instead of a
-     * chop at unity (RELAXED/VOCAL_OVER_OUTRO used to ride flat at 0 dB).
-     * Lanes already ending muted get flat silence — harmless.
-     */
-    /**
-     * Graceful-exit guarantee (djmix11, shaped djmix12): the outgoing deck
-     * may never end audible. Lanes already ending muted get flat silence.
-     * Otherwise 16 equal-power samples from [last] to the mute knot so the
-     * fall is monotone and no segment jumps between loud shorts.
+     * Graceful-exit guarantee: the outgoing deck may never end audible.
+     *
+     * The lane's final mute knot is placed at its last knot plus the planned
+     * dissolve, giving it a real equal-power fall instead of a chop at unity
+     * (RELAXED/VOCAL_OVER_OUTRO would otherwise ride flat at 0 dB). The fall
+     * is rendered as 16 equal-power samples from [last] to the mute knot, so
+     * it is monotone and no segment jumps between loud shorts. Lanes already
+     * ending muted get flat silence — harmless.
      */
     private fun withExitTail(lane: Lane, tailBeats: Double): Lane {
         if (lane.beats.isEmpty()) return lane

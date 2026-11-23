@@ -40,13 +40,6 @@ fun effectSettings(effect: DjEffect): EffectSettings = when (effect) {
 }
 
 /**
- * Colour for one blend. Tempo-gap echo, roll and reverb are chosen earlier
- * and are left alone. Two singers do not get a flanger. An instrumental
- * blend does, on half the pairs, so it is actually heard. Reverb is not a
- * choice here: a wash on an ordinary beatmix is what was muffling songs
- * that had a better mix in them.
- */
-/**
  * Whether this blend should rise into the next section.
  *
  * A pre-chorus, or an instrumental or bridge whose own energy is climbing,
@@ -97,7 +90,13 @@ fun blendColour(
 
 /** Pair hash selects only among effects already justified by measured musical evidence. */
 object FxPolicy {
-    /** Musical policy gate: when false (default) [select] returns the exact existing lottery so the contract suite pins unchanged. */
+    /**
+     * Owner: FxPolicy. Purpose: switch between the legacy pair-hash lottery
+     * and [selectMusical].
+     * Guard: while false, [select] returns the legacy lottery unchanged, so
+     * the contract suite pins existing behaviour; [selectMusical] is dead code
+     * in production until this flips.
+     */
     const val MUSICAL_FX_POLICY_ENABLED = false
 
     fun fxSlot(outgoingId: String, incomingId: String): Int =
@@ -140,14 +139,14 @@ object FxPolicy {
     }
 
     /**
-     * Pure deterministic musical FX policy (Feature 7). No lottery rotation:
-     * buildup -> LOOP_ROLL when energy rising else FLANGER; cleanSpace ->
-     * ECHO when tempoGap > 0.08 else REVERB; vocalClash >= 0.18 -> ECHO if
-     * rhythmic (else NONE). All NONE guards are kept: !measured, speechLike,
-     * drifting, non-finite vocalClash, or vocalClash > 0.20 (plus blank ids).
-     * pairHash is never a primary selector here; it is only a stable
-     * tie-breaker and is intentionally not used to rotate in this branch.
-     * Wired via MUSICAL_FX_POLICY_ENABLED (default false retains the lottery).
+     * Pure deterministic musical FX policy. No lottery rotation: buildup ->
+     * LOOP_ROLL when energy rising else FLANGER; cleanSpace -> ECHO when
+     * tempoGap > 0.08 else REVERB; vocalClash >= 0.18 -> ECHO if rhythmic
+     * (else NONE). All NONE guards are kept: !measured, speechLike, drifting,
+     * non-finite vocalClash, or vocalClash > 0.20 (plus blank ids). pairHash is
+     * never a primary selector here; it is only a stable tie-breaker and is
+     * intentionally not used to rotate in this branch. Dormant until
+     * MUSICAL_FX_POLICY_ENABLED flips.
      */
     fun selectMusical(
         outgoingId: String,
@@ -252,7 +251,7 @@ object DjMix {
         next = colour(next, analysis, nextAnalysis, outgoingId, incomingId)
         val handoff = vocalHandoff(next, analysis, nextAnalysis)
         val extend = phraseExtend(next, analysis, lyricsOut, outSections)
-        // djmix20: phrase extension never overwrites a chosen FLANGER (or
+        // phrase extension never overwrites a chosen FLANGER (or
         // any non-NONE colour); it only fills a NONE slot with LOOP_ROLL,
         // and only on a beatmix. phraseExtendBars is kept for every style
         // so the summary can still name the outro phrase.
@@ -274,7 +273,7 @@ object DjMix {
             inAt,
             energyRise(analysis, next.transitionStart, next.transitionEnd),
         )
-        // djmix21 buildup-aware: the incoming track's own rise counts too. A
+        // buildup-aware: the incoming track's own rise counts too. A
         // cue inside B's buildup/pre-chorus — or inside a quiet INTRO that
         // then rises (mirrors the A-side INST branch in buildupFits) — is a
         // buildup blend even when A's side alone would not read as one.
@@ -319,7 +318,7 @@ object DjMix {
         outSections: List<Section>,
         inSections: List<Section>,
     ): TransitionPlan {
-        // djmix15-pilot: catch-up timing is playhead-anchored (0.6-1.5 s lead
+        // pilot: catch-up timing is playhead-anchored (0.6-1.5 s lead
         // sized to the room left). Never snap it onto lyrics/sections — that
         // would move transitionEnd/fade/cue off the anchor. Metadata helpers
         // (vocalHandoff, phraseExtend, colour, tempoGap, summary) still run.
@@ -330,7 +329,7 @@ object DjMix {
         var start = plan.transitionStart
         var cue = plan.incomingCueTime
         if (lyricsOut.isNotEmpty()) {
-            // djmix21 mid-vocal guard: never end A mid-line on a blend. Extend
+            // mid-vocal guard: never end A mid-line on a blend. Extend
             // to the line end when it is within LYRIC_EXTENSION_MAX_SEC, else
             // move the exit to before the line instead of amputating it.
             val cut = lyricsOut.firstOrNull { end > it.startSec + 0.4 && end < it.endSec - 0.4 }
@@ -400,7 +399,7 @@ object DjMix {
         analysis: TrackAnalysis,
         nextAnalysis: TrackAnalysis,
     ): TransitionPlan {
-        // djmix15-pilot: catch-up timing is playhead-anchored; clashFilter
+        // pilot: catch-up timing is playhead-anchored; clashFilter
         // would re-anchor a DJ_BLEND catch-up to a key-clash filter window
         // (transitionStart/fade), destroying the re-anchor. No re-timing.
         if (plan.reason.endsWith(":catch-up")) return plan
@@ -433,7 +432,7 @@ object DjMix {
      * that much music left before [TransitionPlan.transitionEnd].
      */
     private fun ensureOverlap(plan: TransitionPlan, analysis: TrackAnalysis): TransitionPlan {
-        // djmix15: catch-up quick dissolves (1.2-3.5 s in <2.5 s of room)
+        // catch-up quick dissolves (1.2-3.5 s in <2.5 s of room)
         // are intentionally shorter than the 4-bar club minimum. Lengthening
         // them moves the start behind the playhead and recreates the dead
         // stale window. Never re-size a catch-up.

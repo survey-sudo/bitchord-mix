@@ -9,7 +9,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * djmix24 shared suite (vc66) — pillars A–D scalars only (patent-safe).
+ * Shared suite for the EDM pillar work — pillars A–D scalars only (patent-safe).
  */
 class Djmix24SharedTest {
 
@@ -337,11 +337,10 @@ class Djmix24SharedTest {
 
     @Test
     fun fxRotationIsDeterministicAndVaried() {
-        // Same pair -> same slot (deterministic, anti-repeat by pair hash).
+        // Same pair -> same slot, every call (anti-repeat is by pair hash).
         for (slot in 0..3) {
-            val (a, b) = findIds(slot)
+            val (a, b) = fxSlotIds(slot, "djmix24")
             assertEquals(slot, TransitionMoves.fxSlot(a, b), "fxSlot must be deterministic")
-            assertEquals(slot, TransitionMoves.fxSlot(a, b), "fxSlot must repeat for same pair")
         }
         // Varied across pairs (all 4 slots reachable). Sequential
         // "out-N/in-N" ids alias to 2 slots due to hash structure; use
@@ -350,15 +349,6 @@ class Djmix24SharedTest {
         assertTrue(slots.size >= 3, "rotation must vary across pairs, got $slots")
         // LoopMix fxSlot agrees with TransitionMoves (same pairHash).
         assertEquals(TransitionMoves.fxSlot("x", "y"), LoopMix.fxSlotForPair("x", "y"))
-    }
-
-    private fun findIds(slot: Int, limit: Int = 500): Pair<String, String> {
-        for (i in 0 until limit) {
-            val a = "djmix24-out-$i"
-            val b = "djmix24-in"
-            if (TransitionMoves.fxSlot(a, b) == slot) return a to b
-        }
-        error("no ids for slot $slot")
     }
 
     // ---- Pillar B: outro extension, snap, phase gate ----

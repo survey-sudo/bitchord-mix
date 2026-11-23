@@ -3,7 +3,7 @@ package com.music.bitchord.playback.smart
 import kotlin.math.roundToInt
 
 /**
- * In-memory PCM region cache (djmix14). Loop mixes decode two regions over
+ * In-memory PCM region cache. Loop mixes decode two regions over
  * the network (streamed Opus); a cold decode right after a scrub cannot
  * make a 4.5 s splice. This bounded LRU keeps the last few decoded stereo
  * slices so a region covering [reqStart, reqEnd] can be sub-sliced in RAM

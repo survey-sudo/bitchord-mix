@@ -9,12 +9,12 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
- * djmix21 (vc63) shared regression suite — structure-aware automix:
+ * Shared regression suite for structure-aware automix:
  *  1. vocal continuity (gap budget, mid-line guard, spotlight);
  *  2. buildup-aware blends (B-side buildup, flanger, quiet-intro guard);
  *  3. vocal separation tier (incoming vocal stays crisp, outgoing mid
  *     carves; vocal handoff seams pay; clash still guarded).
- * Plus the carried regression proofs from vc61/vc62.
+ * Plus the carried regression proofs from earlier suites.
  */
 class Djmix21RegressionTest {
 
@@ -92,18 +92,6 @@ class Djmix21RegressionTest {
             }
         }
         return lane.values.last().toDouble()
-    }
-
-    private fun findIds(slot: Int, limit: Int = 500): Pair<String, String> {
-        for (i in 0 until limit) {
-            val a = "djmix21-out-$i"; val b = "djmix21-in"
-            if (pairHash(a, b) % 4 == slot) return a to b
-        }
-        for (i in 0 until limit) {
-            val a = "djmix21-out"; val b = "djmix21-in-$i"
-            if (pairHash(a, b) % 4 == slot) return a to b
-        }
-        throw AssertionError("no pairHash slot $slot")
     }
 
     // ---- 1a vocal gap budget ----
@@ -217,7 +205,7 @@ class Djmix21RegressionTest {
         assertTrue(choice.entry.landingBar in 12..13, "landing=${choice.entry.landingBar} must be the buildup peak")
 
         // Classic annotate path: B-side rise across the cue window is a buildup.
-        val (outId, inId) = findIds(0)
+        val (outId, inId) = fxSlotIds(0, "djmix21")
         val curve = List(180) { i ->
             val t = i.toDouble()
             EnergySample(t, if (t < 50.0) 0.3 + (t - 34.0).coerceIn(0.0, 16.0) * 0.04 else 0.95)
@@ -427,7 +415,7 @@ class Djmix21RegressionTest {
             "dual-vocal seam must be carved/short, not a crisp stack: choice=${choice?.template} overlap=${choice?.vocalOverlapBeats}")
     }
 
-    // ---- carried regressions vc61/vc62 ----
+    // ---- carried regressions from earlier suites ----
 
     private fun beautifulAnalysis(): TrackAnalysis {
         val bpm = 99.93

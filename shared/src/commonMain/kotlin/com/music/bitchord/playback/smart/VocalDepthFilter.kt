@@ -3,7 +3,7 @@ package com.music.bitchord.playback.smart
 import kotlin.math.pow
 
 /**
- * Vocal-depth-modulated filter ride (vc69 P1). Orchard spends a filter sweep
+ * Vocal-depth-modulated filter ride. Orchard spends a filter sweep
  * only as far as the material justifies: a depth curve scales how much of
  * the cutoff travel actually happens (earmark dsp filters.rs: depth 0.5 is
  * half the octaves, applied as a running maximum so the filter never

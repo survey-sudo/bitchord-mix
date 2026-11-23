@@ -1,7 +1,7 @@
 package com.music.bitchord.playback.smart
 
 /**
- * Per-transition decision evidence (vc69 P2): why this mix point was chosen,
+ * Per-transition decision evidence: why this mix point was chosen,
  * which gates passed or failed, and the vocal, beat, key, and flow scores
  * behind it. Orchard records every pair planner input and decision to
  * ORCHARD_MIX_DUMP=<dir> as one JSON record per pair for offline replay

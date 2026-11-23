@@ -1,10 +1,10 @@
 package com.music.bitchord.playback.smart
 
 /**
- * Wave 2 unified transition intent (pure KMP). One IR naming the geometry both
- * the loop mix ([LoopMix.Plan]) and the planner ([TransitionPlan]) produce,
- * so future templates can be compared and round-tripped without re-deciding
- * musical policy. No platform, audio, or player dependency: scalars only.
+ * Unified transition intent (pure KMP). One IR naming the geometry both the
+ * loop mix ([LoopMix.Plan]) and the planner ([TransitionPlan]) produce, so
+ * templates can be compared and round-tripped without re-deciding musical
+ * policy. No platform, audio, or player dependency: scalars only.
  */
 data class MixTemplateIR(
     /** Which template family produced this intent ("loopmix" or "transition"). */

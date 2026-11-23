@@ -28,7 +28,7 @@ object SongMaps {
         } else {
             rawOutroStart
         }
-        // djmix24 BUILD/DROP mapping: per-bar energy slope (scalars only).
+        // BUILD/DROP mapping: per-bar energy slope (scalars only).
         // Build a tiny scalar energy array from vocalWindows levels coverage
         // is absent — use sung flags + section position as fallback, but
         // when energyCurve exists compute bar energies for slope detection.
@@ -101,7 +101,7 @@ object SongMaps {
             for (b in dRange) buildDropBars[b] = SectionFn.DROP
         }
         val bodyEnd = if (outroStart > introEnd) outroStart else n
-        // djmix25 P1.1: VERSE/CHORUS/BRIDGE/POST/PRE painting with StructureAnalyzer
+        // VERSE/CHORUS/BRIDGE/POST/PRE painting with StructureAnalyzer
         // parity (scalars only: per-bar energy + sung flags). Chorus = repeated
         // high-energy sung blocks (>=4 bars, >=2 hits, similar length/energy);
         // VERSE = sung body before the first chorus; BRIDGE = a one-off block
@@ -222,7 +222,6 @@ object SongMaps {
                     vb = ve
                 } else vb++
             }
-            // Emit body split by overlay + buildDropBars.
             var b = introEnd
             while (b < bodyEnd) {
                 val fn = buildDropBars[b] ?: overlay[b] ?: if (sung[b] && (first != null && b >= first && (last == null || b <= last))) SectionFn.VERSE else SectionFn.INSTRUMENTAL

@@ -15,7 +15,7 @@ import kotlin.math.sqrt
  * Bar features to a [SongMap]. Frame extraction is pure Kotlin so the JVM
  * tests run it; the phone may swap in the native front end and still call
  * [analyseBars]. A timeout or a thrown error is the caller's signal to keep
- * the djmix6 plan.
+ * the classic plan.
  */
 object StructureAnalyzer {
     class Timeout(message: String) : RuntimeException(message)
@@ -515,7 +515,7 @@ object StructureAnalyzer {
                 conf[s + 1] = 0.55f
             }
         }
-        // djmix24 DROP painting: phrase-aligned (>=4 bars) high-energy
+        // DROP painting: phrase-aligned (>=4 bars) high-energy
         // arrival with delta-energy >= +0.16 (energyRel jump) or
         // top-quartile energy + strong bass/kick, following BUILD/INTRO/
         // BREAK. Overwrites POST_CHORUS where the arrival is a true drop.
@@ -708,7 +708,7 @@ object StructureAnalyzer {
         return s[s.size / 2]
     }
 
-    // ---- PCM front end (tests and the fallback when native features are absent) ----
+    // PCM front end: tests and the fallback when native features are absent.
 
     private const val RATE = 22050
     private val melBankCache: Array<FloatArray> by lazy { melBank() }

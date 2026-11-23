@@ -42,7 +42,7 @@ import kotlin.math.pow
 data class TrackAnalysis(
     /**
      * Blank means "no status was reported": the planner treats blank as
-     * NOT ready (djmix10) so default fields can never authorize beat
+     * NOT ready so default fields can never authorize beat
      * math. Any other value must be [STATUS_READY] for the planner to
      * trust the rest of the fields.
      */
@@ -121,7 +121,7 @@ data class TrackAnalysis(
      * sites stay valid.
      */
     val quality: String = QUALITY_NONE,
-    // djmix25 per-region keys (libkeyfinder-style): head = first half,
+    // per-region keys (libkeyfinder-style): head = first half,
     // tail = second half. Blank means "no regional evidence"; the global
     // [key] stays the fallback. Declared after [quality] to keep
     // positional constructor sites valid.
@@ -131,7 +131,7 @@ data class TrackAnalysis(
     val keyTailConfidence: Double = 0.0,
     /**
      * Instrumental share over the same windows as [vocalWindows]
-     * (djmix25): 1 - vocal per frame, for "acapella-over-instrumental"
+     * : 1 - vocal per frame, for "acapella-over-instrumental"
      * handoffs. Empty when the vocal model did not run. Mirror of
      * [vocalWindows], reusing [CurveWindow] so planners read one shape.
      */

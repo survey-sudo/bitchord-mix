@@ -1,63 +1,63 @@
 package com.music.bitchord.playback.smart
 
 /**
- * NPU execution provider configuration (vc69 NPU): Snapdragon QNN for the
- * Beat This and umxhq models, with CPU fallback. Orchard ships a separate
- * add-on (liborchard_qnn.so over its own ONNX Runtime, QNN execution provider
- * in burst performance mode with context caching, CPU fallback disabled)
- * for its Nirovi and Syvenu models. BitChord keeps one ONNX Runtime
- * (onnxruntime-android 1.31.0 with the bundled source-built QNN runtime
- * from npu-addon/) and resolves the QNN execution provider from inside it,
- * so there is no second runtime to keep in sync. This file is the
- * pure and testable part: vendor detection and option maps. The
- * SessionOptions plumbing lives in the JVM trackers (BeatTracker and
- * VocalTracker) and the Android wiring in TrackAnalyzer.
+ * NPU execution provider configuration: Snapdragon QNN for the Beat This and
+ * umxhq models, with CPU fallback. Orchard ships a separate add-on
+ * (liborchard_qnn.so over its own ONNX Runtime, QNN execution provider in
+ * burst performance mode with context caching, CPU fallback disabled) for its
+ * Nirovi and Syvenu models. BitChord keeps one ONNX Runtime
+ * (onnxruntime-android 1.31.0 with the bundled source-built QNN runtime from
+ * npu-addon/) and resolves the QNN execution provider from inside it, so there
+ * is no second runtime to keep in sync. This file is the pure and testable
+ * part: vendor detection and option maps. The SessionOptions plumbing lives in
+ * the JVM trackers (BeatTracker and VocalTracker) and the Android wiring in
+ * TrackAnalyzer.
  *
  * Device scope: Snapdragon Hexagon HTP (V68 and later) via the QNN execution
  * provider. When the device has no Qualcomm NPU, or the provider fails to
- * open, inference stays on the CPU execution provider. Unlike Orchard,
- * CPU fallback is kept (session.disable_cpu_ep_fallback is 0): the NPU is
- * an optimization, never a requirement.
+ * open, inference stays on the CPU execution provider. Unlike Orchard, CPU
+ * fallback is kept (session.disable_cpu_ep_fallback is 0): the NPU is an
+ * optimization, never a requirement.
  *
  * Provider abstraction: the QNN switch is modelled as the [InferenceProvider]
  * enum (CPU_DEFAULT, CPU_XNNPACK, QNN_GPU_FP16, QNN_HTP_QDQ) and resolved per
  * device + config through [resolveProvider]; [defaultProvider] answers
  * CPU_DEFAULT and the master [QNN_ENABLED] guard stays false, so the shipped
- * build keeps running the plain CPU execution provider exactly as before.
+ * build keeps running the plain CPU execution provider.
  *
- * vc92 measurement: [InferenceProvider.CPU_XNNPACK] is now openable (see
- * NpuSession.openXnnpack) but stays opt-in only. It is never returned by
- * [resolveProvider] and never selected as a default: the on-device self-test
- * benchmark (NpuSelfTest.benchmarkCpuVsXnnpack) must first prove lower latency
- * and logit parity on the target Snapdragon SM8635 before anything flips.
+ * [InferenceProvider.CPU_XNNPACK] is openable (see NpuSession.openXnnpack) but
+ * stays opt-in only. It is never returned by [resolveProvider] and never
+ * selected as a default: the on-device self-test benchmark
+ * (NpuSelfTest.benchmarkCpuVsXnnpack) must first prove lower latency and logit
+ * parity on the target Snapdragon SM8635 before anything flips.
  */
 object NpuSupport {
 
     /**
-     * Hard switch for the entire QNN path (vc70 ORT restore).
+     * Hard switch for the entire QNN path.
      *
-     * QNN has never executed an inference on the target device: QAIRT
-     * fails with QNN_DEVICE_ERROR_INVALID_CONFIG before partitioning,
-     * and the reduced-ORT build dropped optimizer-introduced kernels
-     * (MatMulIntegerToFloat, DynamicQuantizeMatMul) so both models fail
-     * on both backends since vc69. Until both are fixed, QNN stays OFF
-     * and inference runs on the full Maven ORT CPU provider.
+     * Owner: NpuSupport. Purpose: single guard over every QNN entry point.
+     * Guard: when false no QNN library is dlopened and no QNN session is
+     * attempted (shouldAttemptQnn, NpuSession.open/openQnn, TrackAnalyzer
+     * preflight, NpuNative, NpuSelfTest.schedule); inference runs on the
+     * plain Maven ORT CPU provider.
      *
-     * Flip to true only to re-enable the dormant path (which still needs
-     * the npu-addon jniLibs srcDir restored in app/build.gradle.kts).
-     * Every QNN entry point checks this (shouldAttemptQnn below,
-     * NpuSession.open/openQnn, TrackAnalyzer preflight, NpuNative,
-     * NpuSelfTest.schedule); when false no QNN library is dlopened and
-     * no QNN session is attempted. The vc92 CPU-vs-XNNPACK benchmark does
-     * NOT need this flag: it runs on CPU providers only.
+     * Dormant because QNN has never executed an inference on the target
+     * device: QAIRT fails with QNN_DEVICE_ERROR_INVALID_CONFIG before
+     * partitioning, and the reduced-ORT build dropped optimizer-introduced
+     * kernels (MatMulIntegerToFloat, DynamicQuantizeMatMul), so both models
+     * fail on both backends. Flip to true only once both are fixed; the
+     * dormant path also needs the npu-addon jniLibs srcDir restored in
+     * app/build.gradle.kts. The CPU-vs-XNNPACK benchmark does NOT need this
+     * flag: it runs on CPU providers only.
      */
     const val QNN_ENABLED = false
 
     /**
-     * How inference uses the NPU. Off keeps the CPU execution provider
-     * exactly as before vc69; on attempts QNN on Snapdragon and falls back
-     * to CPU automatically. The master QNN_ENABLED switch above wins over
-     * this per-config flag.
+     * How inference uses the NPU. Off keeps the plain CPU execution
+     * provider; on attempts QNN on Snapdragon and falls back to CPU
+     * automatically. The master QNN_ENABLED switch above wins over this
+     * per-config flag.
      */
     data class NpuConfig(
         val enabled: Boolean = true,
@@ -86,8 +86,8 @@ object NpuSupport {
         CPU_DEFAULT,
         /**
          * CPU execution provider with the XNNPACK delegate. Opt-in only and
-         * never resolved automatically: vc92 measures it against CPU_DEFAULT
-         * on the target device before it can ever become a default.
+         * never resolved automatically: it must first be measured against
+         * CPU_DEFAULT on the target device before it can become a default.
          */
         CPU_XNNPACK,
         /** Qualcomm QNN on the Adreno GPU backend (FP16). */
@@ -241,10 +241,9 @@ object NpuSupport {
     /**
      * Path of the bundled QNN backend for the provider options map. Orchard
      * loads its add-on libQnnHtp.so by this same libDir plus name scheme
-     * (qnn_runner open, backend_path). The /vendor probe shipped with vc69
-     * is gone: Android linker namespaces keep a process from referencing
-     * vendor libraries on every supported API level, so the bundled
-     * backend is the only path that can work.
+     * (qnn_runner open, backend_path). A /vendor probe cannot work: Android
+     * linker namespaces keep a process from referencing vendor libraries on
+     * every supported API level, so the bundled backend is the only path.
      */
     fun bundledBackendPath(nativeLibraryDir: String): String =
         nativeLibraryDir + "/" + QNN_BACKEND_FILE_NAME

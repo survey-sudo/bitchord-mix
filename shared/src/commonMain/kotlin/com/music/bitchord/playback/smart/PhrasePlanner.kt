@@ -70,7 +70,7 @@ data class PhraseChoice(
 
 /**
  * Pairs two songs' own cues. The only inputs are scalars. A thrown error or a
- * missing map returns null so the caller keeps the djmix6 plan.
+ * missing map returns null so the caller keeps the classic plan.
  */
 object PhrasePlanner {
     class Timeout(message: String) : RuntimeException(message)
@@ -106,7 +106,7 @@ object PhrasePlanner {
         fun consider(nowSec: Double, secondsToRelease: Double, fresh: PhraseChoice?): PhraseChoice? {
             val held = choice
             if (held != null && (locked || shown)) {
-                // djmix26: once locked or shown, never overwrite choice with a
+                // once locked or shown, never overwrite choice with a
                 // fresh plan whose release time jumped by > 1.5 s or slipped
                 // behind the held release (e.g. HEAD -> FULL or earliestBar drift).
                 if (fresh != null && fresh.template == held.template &&
@@ -224,7 +224,7 @@ object PhrasePlanner {
         inAnalysis: TrackAnalysis? = null,
     ): PhraseChoice? {
         val limited = limitedTo(out, inn)
-        // djmix14-review: rescue (and strict search) must not pick a past
+        // review: rescue (and strict search) must not pick a past
         // exit. Filter to future exits; if none remain, strict/rescue both die.
         val effectivePlayable = if (playableOutDurationSec > 1.0) playableOutDurationSec else out.durationSec
         val exitsAll = CuePoints.exits(out, effectivePlayable, outAnalysis)
@@ -365,7 +365,7 @@ object PhrasePlanner {
             }
             ExitKind.FADE_START -> list.add(MixTemplate.M9)
             ExitKind.PRE_CHORUS_END -> list.add(MixTemplate.ENERGY_LIFT)
-            // djmix25 P1.3/P1.4: VERSE_END strongly preferred over CONTENT_END
+            // VERSE_END strongly preferred over CONTENT_END
             // for pop/rap; BRIDGE_END preferred for ECHO/CUT_ON_ONE.
             ExitKind.VERSE_END -> {
                 // Beat blend when the entry is instrumental, otherwise echo.
@@ -399,7 +399,7 @@ object PhrasePlanner {
         list.add(MixTemplate.M6)
         list.add(MixTemplate.M11)
         if (out.coarse || inn.coarse) {
-            // djmix10: a noisy grid still earns a beat blend (M1) when the
+            // a noisy grid still earns a beat blend (M1) when the
             // fold-corrected ratio is close; echo/cut-only turned every
             // low-confidence streamed pair into a wasted chance. The overlap
             // length is shaped by lengthScore, not by vetoing M1 here.
@@ -468,7 +468,7 @@ object PhrasePlanner {
         val allowSungExit = (exit.kind == ExitKind.CONTENT_END || exit.kind == ExitKind.HARD_END || exit.kind == ExitKind.FADE_START ||
             exit.kind == ExitKind.VERSE_END || exit.kind == ExitKind.BRIDGE_END || exit.cutsBars <= 2) &&
             (carve(template) || template in setOf(MixTemplate.M1, MixTemplate.M6, MixTemplate.M10, MixTemplate.M11, MixTemplate.RELAXED, MixTemplate.CUT_ON_ONE))
-        // djmix25 P1.10: reverb+echo (M6/M10/CUT_ON_ONE) is never an illegal
+        // reverb+echo (M6/M10/CUT_ON_ONE) is never an illegal
         // combo; the FX rotation must never be vetoed for producing it.
         if (out.sungBars.getOrElse(exit.releaseBar) { false } && !allowSungExit) return "cuts a sung bar"
         if (!out.isPhraseDownbeat(exit.releaseBar) && out.anchors.none { it == exit.releaseBar }) return "A off the phrase"
@@ -494,7 +494,7 @@ object PhrasePlanner {
             return "energy jump"
         }
         if (template == MixTemplate.VOCAL_OVER_OUTRO && ((steps ?: 9) > 1 || inn.gridConfidence < 0.8f)) return "vocal outro fit"
-        // djmix21 vocal continuity: no long empty beatmatch across the seam.
+        // vocal continuity: no long empty beatmatch across the seam.
         // Long blends hear the gap; short rungs (echo/cut/vocal-carve) do not,
         // so vetoing here re-routes to a trimmed entry or a short rung instead
         // of riding an awkward no-vocal dead zone. Pure instrumental pairs
@@ -510,7 +510,7 @@ object PhrasePlanner {
                 if (eventBar == null || eventBar - entry.startBar > overlap) return "quiet intro"
             }
         }
-        // djmix12 (BK tempo discipline): the relaxed long blend is not exempt
+        // Tempo discipline: the relaxed long blend is not exempt
         // from the 8% cap. Post-fold deltas beyond it downgrade to echo/cut
         // (M6/M10/M11/CUT_ON_ONE), never a long lurching ramp.
         if (template == MixTemplate.RELAXED && abs(ratio - 1.0) > PhraseConfig.TEMPO_HARD_DELTA) {
@@ -523,7 +523,7 @@ object PhrasePlanner {
         template == MixTemplate.ROLLING || template == MixTemplate.VOCAL_OVER_OUTRO
 
     /**
-     * djmix21: long blends that hear a no-vocal seam. Echo/cuts/crossfades and
+     * Long blends that hear a no-vocal seam. Echo/cuts/crossfades and
      * the vocal-carve templates never hear it the same way.
      */
     private val LONG_BLENDS = setOf(
@@ -736,7 +736,7 @@ object PhrasePlanner {
         val discardedSections = out.sections.filter { it.endBar > exit.releaseBar && it.fn != SectionFn.OUTRO && it.fn != SectionFn.FADE_OUT && it.fn != SectionFn.SILENCE }
         val vocalSectionPenalty = if (discardedSections.any { it.vocal > 0.20f }) 0.25 else 0.0
         val chorusReleasePenalty = if (discardedSections.any { it.fn == SectionFn.CHORUS || it.role == SectionRole.RELEASE }) 0.35 else 0.0
-        // djmix21 structure scoring (scalars only, each from its own track):
+        // Structure scoring (scalars only, each from its own track):
         // - vocal gap above the soft budget costs, so a trimmable entry or a
         //   short rung beats a long empty beatmatch;
         // - a vocal handoff seam (A's last sung bar 1-2 before B's first) pays;
@@ -744,10 +744,10 @@ object PhrasePlanner {
         //   (started inside it) costs, and a quiet non-spotlight landing costs.
         // Pure instrumental pairs (no sung-bar evidence either side) are never
         // gapped: vocal-gap costs/bonuses only apply when at least one side
-        // has sung evidence (djmix21 instrumental-evidence guard).
+        // has sung evidence.
         val hasVocalEvidence = out.firstVocalBar != null || inn.firstVocalBar != null
         val gapBars = if (hasVocalEvidence) StructureMix.vocalGap(out, inn, exit, entry, overlap).totalBars else 0
-        // djmix21: gap above the soft budget is a tie-breaker only (capped at
+        // gap above the soft budget is a tie-breaker only (capped at
         // 0.05) — the hard veto above does the real work for truly long seams.
         // Uncapped, the cost would cut A's own outro spotlight early to chase
         // a shorter (but same-landing) overlap.
@@ -760,10 +760,9 @@ object PhrasePlanner {
         val landingAtPeak = buildup != null && entry.landingBar in buildup.endBar..buildup.endBar + 1
         val buildupBonus = (if (atBuildupStart) 0.08 else 0.0) + (if (landingAtPeak) 0.05 else 0.0)
         val quietLanding = !StructureMix.isSpotlight(entry) && StructureMix.quietLeadFraction(inn, entry) > 0.5f
-        // djmix25 P1.2: an exit at a repeated-bar index costs less (the
-        // phrase can be loop-extended seamlessly), and P1.4: section
-        // alignment (exit at a section boundary, entry landing at one) is
-        // a stackable bonus.
+        // An exit at a repeated-bar index costs less (the phrase can be
+        // loop-extended seamlessly), and section alignment (exit at a section
+        // boundary, entry landing at one) is a stackable bonus.
         val repeatedExit = InterpolationAnalyzer.repeatedBars(out, exit.releaseBar) > 0
         val interpDiscount = if (repeatedExit) 0.04 else 0.0
         val exitAtBoundary = out.sections.any { it.endBar == exit.releaseBar }
@@ -800,12 +799,11 @@ object PhrasePlanner {
             vocalSectionPenalty + chorusReleasePenalty + gapCost + clashCost +
             (if (insideBuildup && !atBuildupStart) 0.15 else 0.0) +
             (if (quietLanding) 0.15 else 0.0) - interpDiscount
-        // Stacked format bonuses used to reach 0.37 while the largest possible
-        // vocal penalty was 0.20: a dual-chorus collision could be outvoted by
-        // seam + buildup + alignment + kind preferences, all of which simply
-        // restate that the planner likes the shape of this exit. Capped at
-        // 0.08 — bonuses may break ties, they may not overturn a measured
-        // musical defect.
+        // Stacked format bonuses are capped at 0.08: bonuses may break ties,
+        // they may not overturn a measured musical defect. Seam + buildup +
+        // alignment + kind preferences all restate that the planner likes the
+        // shape of this exit, and must never outvote the vocal penalty on a
+        // dual-chorus collision.
         val bonuses = (seamBonus + buildupBonus + alignBonus + kindBonus).coerceAtMost(0.08)
         val total = 0.18 * struct + 0.30 * vocalScore + 0.12 * phrase + 0.14 * energy +
             0.08 * length + 0.08 * key + 0.10 * tempo - cost + bonuses
@@ -887,7 +885,7 @@ object PhrasePlanner {
 
     private fun structScore(template: MixTemplate, exit: ExitCue, entry: EntryCue, out: SongMap? = null): Double {
         val outro = exit.kind == ExitKind.OUTRO_START || exit.kind == ExitKind.OUTRO_PHRASE
-        // vc73 A3: never let VERSE_END/BRIDGE_END chop a full final
+        // never let VERSE_END/BRIDGE_END chop a full final
         // chorus/outro (>8 bars, >2 sung bars) early just to fire the kind
         // bonus. When the cut discards more than a phrase of sung music,
         // fall through to the neutral else so CONTENT_END/OUTRO_START wins.
@@ -896,7 +894,7 @@ object PhrasePlanner {
                 exit.cutsBars > 8 && exit.cutsSungBars > 2 &&
                 out?.sections?.lastOrNull()?.endBar != exit.releaseBar
             )
-        // djmix25 P1.4: BRIDGE_END is the natural echo/cut seam; VERSE_END
+        // BRIDGE_END is the natural echo/cut seam; VERSE_END
         // outranks a CONTENT_END fade for pop/rap-style vocal entries.
         if (!chopsFinal && exit.kind == ExitKind.BRIDGE_END && template in setOf(MixTemplate.M6, MixTemplate.CUT_ON_ONE, MixTemplate.M10, MixTemplate.M11)) return 0.95
         if (!chopsFinal && exit.kind == ExitKind.VERSE_END && template == MixTemplate.M1 && entry.leadInVocal < 0.2f) return 0.92

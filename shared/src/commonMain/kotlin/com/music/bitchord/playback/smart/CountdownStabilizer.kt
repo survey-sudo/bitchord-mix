@@ -5,7 +5,7 @@ import kotlin.math.ceil
 import kotlin.math.roundToLong
 
 /**
- * Single authoritative countdown commit & anti-oscillation lock (djmix26, Task 2A).
+ * Single authoritative countdown commit and anti-oscillation lock.
  *
  * Governs what the UI (`describeAutomix`, `smartTransitionWindow`) and scheduler
  * commit to once a countdown is visible or inside the commit window (`<= 45 s`).

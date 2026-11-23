@@ -45,16 +45,16 @@ object LoopMix {
     /** The longest loop, in each song's own bars; shorter ones are tried when no 4 clean bars exist. */
     const val LOOP_BARS = 4
 
-    /** djmix24 EDM buildup range: steady dance tempo (BPM, post-fold). */
+    /** EDM buildup range: steady dance tempo (BPM, post-fold). */
     const val EDM_MIN_BPM = 110.0
     const val EDM_MAX_BPM = 150.0
-    /** djmix24 EDM buildup HPF sweep end (Hz) + Q for the resonant Cytomic SVF. */
+    /** EDM buildup HPF sweep end (Hz) + Q for the resonant Cytomic SVF. */
     const val BUILDUP_HP_END_HZ = 500f
     const val BUILDUP_HP_Q = 0.95f
-    /** djmix24 flanger depths: buildup (metallic jet) vs subtle colour. */
+    /** flanger depths: buildup (metallic jet) vs subtle colour. */
     const val FLANGER_DEPTH_BUILDUP_SEC = 0.0045
     const val FLANGER_DEPTH_COLOUR_SEC = 0.003
-    /** djmix24 jet flanger wet (energy-balanced) + feedback. */
+    /** jet flanger wet (energy-balanced) + feedback. */
     const val FLANGER_WET = 0.48f
     const val FLANGER_FEEDBACK = 0.64f
 
@@ -125,15 +125,15 @@ object LoopMix {
 
     /** Element <-> deck handovers: identical audio crossed this quickly is heard as one. */
     const val HANDOVER_SEC = 0.025
-    /** djmix24: 8-beat LFO — one sweep cycle per 8 beats (Bug A2). NEVER 60/beatSec/8. */
+    /** 8-beat LFO — one sweep cycle per 8 beats. NEVER 60/beatSec/8. */
     fun lfoHzForBeatSec(beatSec: Double): Double =
         if (beatSec > 1e-6 && beatSec.isFinite()) 1.0 / (8.0 * beatSec) else 0.0
 
-    /** djmix24: strict 25 ms phase gate (scalar ms). */
+    /** Strict 25 ms phase gate (scalar ms). */
     const val PHASE_GATE_MS = 25.0
     fun phaseGateOk(phaseErrorMs: Double): Boolean = abs(phaseErrorMs) <= PHASE_GATE_MS + 1e-9
 
-    /** djmix24 deterministic EDM detection (scalars only, patent-safe). */
+    /** Deterministic EDM detection (scalars only, patent-safe). */
     fun isEdmPair(outBpm: Double, inBpm: Double, fold: Double): Boolean {
         if (outBpm !in EDM_MIN_BPM..EDM_MAX_BPM || inBpm !in EDM_MIN_BPM..EDM_MAX_BPM) return false
         if (fold <= 0.0 || !fold.isFinite()) return false
@@ -144,7 +144,7 @@ object LoopMix {
     }
 
     /**
-     * djmix24 deterministic pair-hash FX rotation for non-EDM pairs.
+     * Deterministic pair-hash FX rotation for non-EDM pairs.
      * Scalars only (hash of the two track ids). Never returns FLANGER when
      * dual-vocal overlap is active.
      * 0=FLANGER, 1=CLEAN_SWAP, 2=ECHO, 3=REVERB.
@@ -237,13 +237,13 @@ object LoopMix {
          */
         val nativeIncoming: Boolean = false,
         /**
-         * vc69 P0 muffle: the outgoing deck keeps its level while a steep
+         * Muffle: the outgoing deck keeps its level while a steep
          * low-pass closes over it across the overlap. Native session
          * rendering only; the picks stay the declined pair echo picks.
          */
         val muffle: Boolean = false,
         /**
-         * vc69 P0 beatless bridge: both decks fade through a brief ambient
+         * Beatless bridge: both decks fade through a brief ambient
          * moment on their beatless edges. Native session rendering only.
          */
         val beatlessBridge: Boolean = false,
@@ -254,7 +254,7 @@ object LoopMix {
          * explicit unfiltered arm instead of falling into a generic branch.
          */
         val dropIn: Boolean = false,
-        /** Which vc69 alternative family produced this native plan, or "" when none. */
+        /** Which alternative family produced this native plan, or "" when none. */
         val alternativeKind: String = "",
         /** Tempo-synced echo on the outgoing deck, ringing on after its dry signal ends. */
         val echoTail: Boolean = false,
@@ -267,24 +267,24 @@ object LoopMix {
         /** Camelot codes, "8B→9B", when both keys are known. */
         val keys: String = "",
         /**
-         * Graceful-exit dissolve (djmix11): seconds of equal-power fall the
-         * outgoing deck takes past the release before silence. Compiled
-         * phrase plans always carry it; legacy plans default to 0.
+         * Graceful-exit dissolve: seconds of equal-power fall the outgoing
+         * deck takes past the release before silence. Compiled phrase plans
+         * always carry it; legacy plans default to 0.
          */
         val exitTailSeconds: Double = 0.0,
         val targetBpmOverride: Double? = null,
         val incomingHoldSec: Double = 0.0,
-        /** djmix24 stereo jet flanger on the outgoing tail (Bug A1 scalar FX carrier). */
+        /** Stereo jet flanger on the outgoing tail (scalar FX carrier). */
         val flanger: Boolean = false,
-        /** djmix24 beat-quantized tightening EDM buildup loop roll. */
+        /** Beat-quantized tightening EDM buildup loop roll. */
         val buildupRoll: Boolean = false,
-        /** djmix24 stereo plate reverb wash send. */
+        /** stereo plate reverb wash send. */
         val reverbWash: Boolean = false,
-        /** djmix24 resonant HPF sweep end (Hz); 0 = no sweep. 420..600 Hz for buildup. */
+        /** resonant HPF sweep end (Hz); 0 = no sweep. 420..600 Hz for buildup. */
         val hpSweepEndHz: Float = 0f,
-        /** djmix25 P1.6: outgoing vocal rides over incoming instrumental intro. */
+        /** outgoing vocal rides over incoming instrumental intro. */
         val acapella: Boolean = false,
-        /** djmix25 P1.12: bass-swap width in beats (MixGain.faderTemplate table). */
+        /** bass-swap width in beats (MixGain.faderTemplate table). */
         val faderSwapBeats: Double = 1.0,
         /** Explicit source/mix events for opted-in Echo handoffs. */
         val handoff: MusicalHandoff? = null,
@@ -384,7 +384,7 @@ object LoopMix {
         return summary.copy(accepted = true)
     }
 
-    // ---- Choosing the loops ----------------------------------------------------------------
+    // Choosing the loops.
 
     /**
      * The bars to loop on each side, or null when there is no loop mix to make:
@@ -460,7 +460,7 @@ object LoopMix {
         /** When this step had to be finished: the planned loop start, on the same wall clock. */
         val deadlineMs: Long,
     ) {
-        // djmix16: wall-only, via DeckBudget (sentinel-guarded). Raw
+        // wall-only, via DeckBudget (sentinel-guarded). Raw
         // (endedMs - deadlineMs) subtracted a 0 sentinel as the boot
         // uptime (374320 ms) and a media position as wall (116245 ms).
         // Horizon (stale-epoch) is applied in lateStepReason, which has nowMs.
@@ -474,15 +474,12 @@ object LoopMix {
      * the honest "paused" rather than a bogus overrun number. When nothing
      * provably overran, the longest step is reported with its wall duration.
      *
-     * djmix15: wall and media clocks can never subtract, and a stale wall
-     * deadline from a prior track can never report as lateness. deadlineMs
-     * must be THIS build's wall instant: 0, NO_DEADLINE, or older than the
-     * horizon means no budget in force.
-     * djmix16: the 120 s horizon let 116245 ms through (116 s < 120 s);
-     * the horizon is now LOOP_BUDGET_HORIZON_MS (40 s, the loop lead)
-     * and is applied to PER-SPAN deadlines too (the old span path had
-     * no horizon check at all). Wall is only compared to wall; media
-     * mixSeconds lateness must never be passed as a span deadline.
+     * Wall and media clocks can never subtract, and a stale wall deadline
+     * from a prior track can never report as lateness. deadlineMs must be
+     * THIS build's wall instant: 0, NO_DEADLINE, or older than
+     * [DeckBudget.LOOP_BUDGET_HORIZON_MS] means no budget in force. The
+     * horizon is applied to PER-SPAN deadlines too. Media mixSeconds
+     * lateness must never be passed as a span deadline.
      */
     fun lateStepReason(spans: List<PrepSpan>, nowMs: Long, deadlineMs: Long): String {
         val late = spans.maxByOrNull { DeckBudget.provenOverrunMs(it.endedMs, it.deadlineMs, nowMs) }
@@ -502,18 +499,17 @@ object LoopMix {
     }
 
     /**
-     * djmix16 cold-loop yield (pure, scalars only). A cold loop (decks
-     * not in RAM) needs a full classic arm lead to fall back to, not
-     * 4.5 s: the old <4.5 s gate left <4 s to buffer a cold HTTP
-     * ExoPlayer standby for a 9.1 s DJ_FILTER blend. Yield when the
-     * loop start is within [max] (8.5 s decode floor, the learned arm
-     * lead, or 25 s while the next stream warms) and the loop is cold.
-     * Fast-ready loops never yield (decks already in RAM). djmix17:
-     * actively-building loops may run while still outside the hard
-     * cold-build deadline (14 s while the next stream warms, 10 s when
-     * ready), but a slow/hung primeJob yields inside that deadline —
-     * riding it to dry EOF starved classic begin() on Never Let Go ->
-     * S.A.D.
+     * Cold-loop yield (pure, scalars only). A cold loop (decks not in RAM)
+     * needs a full classic arm lead to fall back to, not 4.5 s, otherwise a
+     * cold HTTP ExoPlayer standby cannot buffer a DJ_FILTER blend in time.
+     * Yield when the loop start is within [max] (8.5 s decode floor, the
+     * learned arm lead, or 25 s while the next stream warms) and the loop is
+     * cold. Fast-ready loops never yield (decks already in RAM).
+     *
+     * Actively-building loops may run while still outside the hard cold-build
+     * deadline (14 s while the next stream warms, 10 s when ready), but a
+     * slow/hung primeJob yields inside that deadline: riding it to dry EOF
+     * starves classic begin().
      */
     fun shouldYieldColdLoop(
         loopStartMs: Long,
@@ -533,17 +529,14 @@ object LoopMix {
             return remainingMs < 8_000L
         }
         if (building) {
-            // djmix17: an active build may run during the outer prime
-            // window (> hard deadline before loopStart), but a slow or
-            // hung primeJob must not ride to dry EOF. Once within the
-            // hard cold-build deadline (14 s while the next stream warms,
-            // 10 s when ready; never below the 6.5 s floor) yield so
-            // classic begin() still has >= 6.5 s to buffer and blend.
-            // djmix17-harden: 10 s (ready) / 14 s (warming) instead of
-            // 8.5/12 — if contentEnd sits ~3 s before loopStart (silence
-            // tail), a yield at 8.5 s before loopStart leaves only 5.5 s
-            // to contentEnd, marginal for a cold classic arm. 10/14
-            // leaves 7/11 s.
+            // An active build may run during the outer prime window
+            // (> hard deadline before loopStart), but a slow or hung primeJob
+            // must not ride to dry EOF. Once within the hard cold-build
+            // deadline (14 s while the next stream warms, 10 s when ready;
+            // never below the 6.5 s floor) yield so classic begin() still has
+            // >= 6.5 s to buffer and blend. The 10/14 s floor (not 8.5/12)
+            // leaves enough room to contentEnd when a silence tail sits ~3 s
+            // before loopStart.
             val hardDeadlineMs = maxOf(if (nextStreamReady) 10_000L else 14_000L, 6_500L)
             return remainingMs <= hardDeadlineMs
         }
@@ -577,7 +570,7 @@ object LoopMix {
             outDuration * PhraseConfig.MIN_PLAY_FRACTION,
             out.outroStartTime.takeIf { it > 0.0 } ?: (outDuration - 32.0),
         )
-        // vc73 A1: outro preference is for the latest-first plan search.
+        // outro preference is for the latest-first plan search.
         // A shift walks forward to the next bar, so it keeps forward order
         // and must not be dragged to the latest outro loop.
         val effectiveOutroFrom = if (shift) Double.POSITIVE_INFINITY else outroFloor
@@ -628,7 +621,7 @@ object LoopMix {
             checkedBy = clean.checkedBy,
             anchorBeats = anchors,
         )
-        // djmix24 Bug A4: deterministic EDM buildup. Both sides dance tempo,
+        // deterministic EDM buildup. Both sides dance tempo,
         // post-fold delta within TEMPO_HARD_DELTA, clean instrumental loops
         // (firstClean already guarantees low vocal share), low dual-vocal
         // clash. Then flanger + tightening roll + HPF sweep. Non-EDM pairs
@@ -804,7 +797,7 @@ object LoopMix {
     }
 
     /**
-     * djmix24 loop-seam continuity (scalar RMS only, patent-safe): RMS just
+     * Loop-seam continuity (scalar RMS only, patent-safe): RMS just
      * before the loop end vs just after the loop start. Smaller is smoother.
      * NaN when windows don't reach (treated as neutral).
      */
@@ -827,10 +820,10 @@ object LoopMix {
     ): Clean? {
         for (bars in LOOP_LENGTHS) {
             val raw = candidates(bars)
-            // djmix24: prefer seam-continuous loops first (no mid-transient
+            // prefer seam-continuous loops first (no mid-transient
             // chop when an adjacent clean bar is smoother). Stable sort keeps
             // the original order (latest-out / earliest-in) within ties.
-            // vc73 A1: when searching the outro (outgoing), never let tiny
+            // when searching the outro (outgoing), never let tiny
             // seamDelta noise in an earlier verse/chorus outrank clean outro
             // loops inside outroFrom; bucket seamDelta coarsely (0.15) so
             // latest-first order survives within a bucket.
@@ -911,7 +904,7 @@ object LoopMix {
                 return Clean(loop.start, loop.end, bars, mask.share, Check.MASK)
             }
         }
-        // ---- Gated MASK_DUCKED second pass (Feature 5) ----
+        // Gated MASK_DUCKED second pass.
         // Strict clean pass above is untouched (MAX_SUNG_SHARE = 0.03) and
         // maskRejects is never widened. Only when it returns null, admit a
         // boundary-consistent loop whose measured vocal share is moderate but
@@ -1149,7 +1142,7 @@ object LoopMix {
         return hits(plan.out, sungOut, plan.outLoops) || hits(plan.inn, sungIn, plan.inLoops)
     }
 
-    // ---- Putting it on the clock -----------------------------------------------------------
+    // Putting it on the clock.
 
     /**
      * A plan laid out in time, t0 = 0 being the moment the outgoing song
@@ -1192,9 +1185,9 @@ object LoopMix {
             ?: beatTimes[(rampFrom + rampTo) / 2]
 
         /**
-         * djmix24 tight half-beat..1-beat LR4 bass swap (1 beat at mid-ramp). Was 1 bar.
-         * djmix25 P1.12: width from the MixGain.faderTemplate table via
-         * [Plan.faderSwapBeats] ("club" keeps 1 beat; templates vary it).
+         * Tight half-beat..1-beat LR4 bass swap (1 beat at mid-ramp). Width
+         * comes from the MixGain.faderTemplate table via [Plan.faderSwapBeats]
+         * ("club" keeps 1 beat; templates vary it).
          */
         val swapBar: Double get() = 60 / tempo((rampFrom + rampTo) / 2) * plan.faderSwapBeats
 
@@ -1283,7 +1276,7 @@ object LoopMix {
         playableOutDurationSec: Double = outDuration,
     ): Plan? {
         if (outVideo || inVideo) return null
-        // djmix25: decline-to-mix skips drop/blend but still gets an echo-out
+        // decline-to-mix skips drop/blend but still gets an echo-out
         // (bkmasterplayer tempo_jump_plan doctrine: large gap -> echo on the
         // bar, not a forced blend). Only the Rung 4 echo/cut handles it; if
         // that is null the caller falls to the phrase-length EQUAL_POWER.
@@ -1305,10 +1298,10 @@ object LoopMix {
             (out.beatConfidence >= 0.45 || (steadyGridMatch && out.beatConfidence >= MIN_DJ_CONFIDENCE))
         val inOk = inGrid != null && inn.bpm > 0 &&
             (inn.beatConfidence >= 0.45 || (steadyGridMatch && inn.beatConfidence >= MIN_DJ_CONFIDENCE))
-        // djmix25 P1.9: regional keys (outgoing tail vs incoming head).
+        // regional keys (outgoing tail vs incoming head).
         val keys = camelotPair(exitKeyForMix(out), entryKeyForMix(inn))
         val steps = regionalCamelotSteps(out, inn)
-        // djmix25 P1.6: acapella-over-instrumental rung. Same key + both
+        // acapella-over-instrumental rung. Same key + both
         // confidences >= 0.6 + incoming instrumental intro + outgoing vocal.
         // Routes through the normal drop/blend/echo picks with the carrier on.
         if (acapellaAllowed(out, inn)) {
@@ -1316,12 +1309,12 @@ object LoopMix {
             // (Reuses the out/in grids already computed above.)
         }
         if (declinedToMix) {
-            // vc73 D1: keep FAMILIES precedence (drop/muffle/beatless-bridge
+            // keep FAMILIES precedence (drop/muffle/beatless-bridge
             // ahead of echoBase). Umxhq vocal-separation muffle is owned by
             // the Part 2 LoopMixSession flag; this bridge change deliberately
             // keeps the registry order so declined curves-less pairs stay Echo.
-            // djmix25 R2: declined pairs take the Echo rung only (no drop/blend).
-            // vc69 P0: the alternative families still fit some declined
+            // declined pairs take the Echo rung only (no drop/blend).
+            // the alternative families still fit some declined
             // pairs (muffle over the 8..10 percent band, beatless bridge on
             // beatless edges, drop-in on high-energy entries). Each requires
             // bass-curve evidence, so curve-less pairs keep the Echo rung
@@ -1509,8 +1502,8 @@ object LoopMix {
         val maxStart = min(outDuration - 0.5, outDuration - need * 0.75)
         val outStart = snapOutStart(out, outGrid, rawStart, earliestOutSec, maxStart, sungOut)
         if (outStart >= outDuration - 0.5 || outDuration - outStart < need * 0.75) return null
-        // djmix24 Bug A4 (bridge path): deterministic EDM buildup on clean
-        // instrumental blends; rotation otherwise. Never flange dual-vocal or key-clash.
+        // Deterministic EDM buildup on clean instrumental blends; rotation
+        // otherwise. Never flange dual-vocal or key-clash.
         val blendEdm = !bothSing && !keyClash && windowClean && isEdmPair(outBpm, inBpm, fold)
         val blendFx = if (blendEdm) Quad(true, true, false, false)
         else if (bothSing || keyClash) Quad(false, false, false, false)
@@ -1543,7 +1536,7 @@ object LoopMix {
     }
 
     /**
-     * djmix25 P1.6 gate (scalar mirror of TransitionMoves.shouldAcapella,
+     * Acapella gate (scalar mirror of TransitionMoves.shouldAcapella,
      * kept local so LoopMix stays acyclic): same Camelot, confident keys,
      * instrumental incoming intro, vocal outgoing.
      */
@@ -1559,7 +1552,7 @@ object LoopMix {
     }
 
     /**
-     * djmix25 P1.5: mean instrumental share over [from]..[to]. Prefers the
+     * Mean instrumental share over [from]..[to]. Prefers the
      * explicit [TrackAnalysis.instrumentalWindows]; falls back to
      * 1 - vocal over [TrackAnalysis.vocalWindows]. Null when neither exists.
      */
@@ -1763,7 +1756,7 @@ object LoopMix {
         return snapped
     }
 
-    // ---- 2B downbeat alignment, clock-consistency & envelope specs ----
+    // Downbeat alignment, clock-consistency and envelope specs.
 
     /**
      * Last downbeat of [out] at or before [raw] within one bar

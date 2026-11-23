@@ -1,7 +1,7 @@
 package com.music.bitchord.playback.smart
 
 /**
- * Scrub handling (djmix14). The phase the controller is in when the user
+ * Scrub handling. The phase the controller is in when the user
  * seeks decides what the (possible) half-armed mix becomes:
  *
  * - Pre-audible (IDLE, ARMING, LOOP_ARMING before splice takeover): cancel
@@ -13,8 +13,8 @@ package com.music.bitchord.playback.smart
  *   double-fire. Seeking mid-mix dissolves gracefully, then the playhead
  *   rests at the scrub target and replans from IDLE.
  *
- * LOOP is kept for backward compatibility (pre-djmix14 call sites) and
- * maps to pre-audible CANCEL. New code uses LOOP_ARMING / LOOP_RUNNING.
+ * LOOP is kept for backward compatibility with older call sites and maps
+ * to pre-audible CANCEL. New code uses LOOP_ARMING / LOOP_RUNNING.
  */
 object SeekAction {
     enum class Phase { IDLE, ARMING, FADING, TAIL, LOOP, LOOP_ARMING, LOOP_RUNNING, BAILING, SLEEP }
@@ -23,7 +23,7 @@ object SeekAction {
 
     fun decide(phase: Phase, markerShown: Boolean): Action = when (phase) {
         Phase.FADING -> Action.EMERGENCY_TAIL
-        // djmix25: TAIL-phase seeks honour the planned tail dissolve instead of
+        // TAIL-phase seeks honour the planned tail dissolve instead of
         // stacking an emergency 350 ms tail on top of it. The 4x exit.tail
         // cascade comes from re-issuing EMERGENCY_TAIL while already
         // dissolving; HONOUR lets the in-flight tail finish.
@@ -39,7 +39,7 @@ object SeekAction {
     fun planStillValid(planStartMs: Long, positionMs: Long): Boolean = positionMs <= planStartMs
 
     /**
-     * djmix15 queue-edit decision for the "next vs plan wanted" check.
+     * Queue-edit decision for the "next vs plan wanted" check.
      * After the handoff the session IS the incoming track (i+1), so its
      * "next" is i+2 by definition — comparing that to the armed expected
      * (i+1) is a certain false queueEdit ~1.7-6.9 s after every classic
@@ -50,7 +50,7 @@ object SeekAction {
         !handedOff && expected != null && nextId != expected
 
     /**
-     * djmix26 (Task 2A): spurious DISCONTINUITY_REASON_SEEK events (0 -> 0,
+     * Spurious DISCONTINUITY_REASON_SEEK events (0 -> 0,
      * same-position prepare/rendition seeks, or tiny <= 1200 ms non-user seeks
      * on the same item while IDLE) must never trigger resetPlansForScrub().
      */
@@ -69,7 +69,7 @@ object SeekAction {
     }
 
     /**
-     * djmix26 (Task 2A): when EMERGENCY_TAIL runs on an audible LOOP_RUNNING
+     * When EMERGENCY_TAIL runs on an audible LOOP_RUNNING
      * session and a 350 ms native fade-out was scheduled on the renderer, defer
      * disarming the retiring port until the fade finishes instead of disarming
      * instantaneously in loopBail.

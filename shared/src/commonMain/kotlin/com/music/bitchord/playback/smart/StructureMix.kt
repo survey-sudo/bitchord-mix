@@ -1,7 +1,7 @@
 package com.music.bitchord.playback.smart
 
 /**
- * Structure-aware blend helpers (djmix21). Everything here reads one track's
+ * Structure-aware blend helpers. Everything here reads one track's
  * own scalars (bars, sections, sung flags) and returns scalars. No frame is
  * ever compared across tracks — the caller pairs two scalars and scores them,
  * which is the US 8,280,539-safe shape the planner already uses.
@@ -31,7 +31,7 @@ object StructureMix {
      */
     fun trailingNoVocalBars(out: SongMap, exit: ExitCue, overlapBars: Int): Int {
         val window = overlapBars.coerceAtLeast(0)
-        // djmix21 per-side evidence: a track that never sings has no vocal
+        // per-side evidence: a track that never sings has no vocal
         // gap — its outro is structure, not a dead zone after a vocal.
         if (out.firstVocalBar == null) return 0
         var trail = 0
@@ -52,7 +52,7 @@ object StructureMix {
      */
     fun leadingNoVocalBars(inn: SongMap, entry: EntryCue, overlapBars: Int): Int {
         val window = overlapBars.coerceAtLeast(0)
-        // djmix21 per-side evidence: a track that never sings has no intro
+        // per-side evidence: a track that never sings has no intro
         // vocal gap — its intro is structure, not dead air before a vocal.
         if (inn.firstVocalBar == null) return 0
         val event = firstEventBarFromEntry(inn, entry)

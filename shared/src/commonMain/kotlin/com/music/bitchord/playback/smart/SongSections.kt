@@ -18,9 +18,8 @@ enum class SectionKind {
     BRIDGE,
     INST,
     OUTRO,
-    // djmix21: appended so existing ordinals (and the slot coding below)
-    // never shift. djmix24: now actively painted by labelSections (EDM
-    // buildup -> bass-drop; see paintBuildDrop below).
+    // Appended so existing ordinals (and the slot coding below) never shift.
+    // Painted by labelSections: EDM buildup -> bass-drop, see paintBuildDrop.
     BUILD,
     DROP,
 }
@@ -135,7 +134,7 @@ fun labelSections(analysis: TrackAnalysis, lyrics: List<LyricCue> = emptyList())
 }
 
 /**
- * djmix24 BUILD / DROP painting (single-track scalars only, patent-safe).
+ * BUILD / DROP painting (single-track scalars only, patent-safe).
  *
  * BUILD: 4-16 bar span with positive energy/flux slope, reduced low-end
  * weight or rising centroid/high-band (proxied by energy curvature + flux
@@ -203,7 +202,6 @@ private fun paintBuildDrop(analysis: TrackAnalysis, end: Double, slots: IntArray
         }
     }
     for (dropBar in 4 until totalBars - 4) {
-        // Check DROP arrival at dropBar (4-bar phrase).
         var prevMean = 0.0; var pc = 0
         for (b in maxOf(0, dropBar - 4) until dropBar) { prevMean += barE[b]; pc++ }
         if (pc == 0) continue
@@ -244,7 +242,7 @@ private fun paintBuildDrop(analysis: TrackAnalysis, end: Double, slots: IntArray
             val slope = slopePct(buildFrom, buildUntil)
             // Rising: need positive energy slope (flux proxy). Bell-ballads have ~0.
             if (slope < 0.12) continue
-            // djmix24 gradual (not a step): a cold 0.2->1.0 edge has one
+            // gradual (not a step): a cold 0.2->1.0 edge has one
             // jump; a true EDM buildup rises bar-by-bar. Require >=2
             // increments of >=5% so DjMixTest step intros (0.2 flat then
             // 1.0 flat) never paint BUILD.
@@ -334,8 +332,8 @@ private val PRIORITY = intArrayOf(
     6, // BRIDGE, same rank as pre-chorus; painted later so it can sit in a gap
     3, // INST
     4, // OUTRO
-    6, // BUILD (djmix21, never painted)
-    7, // DROP (djmix21, never painted)
+    6, // BUILD
+    7, // DROP
 )
 
 private data class LyricBlock(val start: Double, val end: Double, val signature: String)

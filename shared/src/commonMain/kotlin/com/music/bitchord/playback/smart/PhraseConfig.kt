@@ -6,7 +6,7 @@ package com.music.bitchord.playback.smart
  * The planner logs the name of the value it actually used.
  */
 object PhraseConfig {
-    /** Master switch. False, or any thrown error, and the djmix6 planner runs. */
+    /** Master switch. False, or any thrown error, and the classic planner runs. */
     const val PHRASE_PLANNER_ENABLED = true
 
     const val ALLOW_RADIO_EDIT = false
@@ -16,7 +16,7 @@ object PhraseConfig {
 
     const val SONGMAP_SCHEMA = 1
 
-    /** Spec 1 minimum score. Below this the djmix6 planner runs. */
+    /** Spec 1 minimum score. Below this the classic planner runs. */
     const val S_MIN = 0.55
 
     const val O_MAX_BARS = 32
@@ -28,14 +28,14 @@ object PhraseConfig {
     const val NOVELTY_KERNEL_HALF_BARS = 4
     const val NOVELTY_KERNEL_HALF_BARS_WIDE = 8
 
-    /** Spec 1 SSM mix was 0.5/0.5. Spec 2 is the default. */
+    /** Spec 2 mix (default); spec 1 used an even 0.5/0.5 split. */
     const val SSM_CHROMA = 0.45
     const val SSM_TIMBRE = 0.40
     const val SSM_ENERGY = 0.15
     const val SSM_CHROMA_SPEC1 = 0.50
     const val SSM_TIMBRE_SPEC1 = 0.50
 
-    /** Spec 1 novelty was 0.5/0.25/0.25. Spec 2 adds bass and is the default. */
+    /** Spec 2 novelty (default); spec 1 used 0.5/0.25/0.25 without bass. */
     const val NOV_SSM = 0.50
     const val NOV_ENERGY = 0.20
     const val NOV_VOCAL = 0.20
@@ -74,7 +74,7 @@ object PhraseConfig {
     const val SWAP_RAMP_BLEND_MS = 120
 
     /**
-     * Graceful-exit guarantee (djmix11): the outgoing deck may never go
+     * Graceful-exit guarantee: the outgoing deck may never go
      * audible→silence faster than the planned dissolve, and even emergency
      * paths (bail, fallback settle) take the shortened version. Planned
      * length is 2 beats with an 800 ms floor and a 2 s cap.
@@ -84,7 +84,7 @@ object PhraseConfig {
     const val EXIT_TAIL_BEATS = 2.0
     const val EXIT_TAIL_MAX_SEC = 2.0
 
-    /** Shared tempo discipline (djmix12, after bkmasterplayer): beyond this post-fold
+    /** Shared tempo discipline (after bkmasterplayer): beyond this post-fold
      * delta a long blend is never rampable -- downgrade to short/echo. */
     const val TEMPO_HARD_DELTA = 0.08
     /** Short-rung overlap cap for the downgraded rung. */
@@ -109,18 +109,18 @@ object PhraseConfig {
     const val ECHO_LPF_HZ = 6000.0
     const val ECHO_TAIL_CAP_SEC = 4.0
     const val ECHO_FEEDBACK = 0.52f
-    /** djmix25 P1.11: feedback tuning by fade length + template density. */
+    /** feedback tuning by fade length + template density. */
     const val ECHO_FEEDBACK_LONG = 0.55f
     const val ECHO_FEEDBACK_SHORT = 0.45f
     const val ECHO_SEND_PEAK = 0.6f
-    /** djmix25 P1.11: reverb tuning for EDM buildups (plate). */
+    /** reverb tuning for EDM buildups (plate). */
     const val REVERB_DAMPING_EDM = 0.48f
     const val REVERB_WET_EDM = 0.42f
     const val REVERB_DAMPING = 0.55f
     const val REVERB_WET = 0.35f
 
     /**
-     * djmix25 echo density: long fades (>12s) ring fuller (0.55), short
+     * Echo density: long fades (>12s) ring fuller (0.55), short
      * (<=8s) sit tighter (0.45), mid keeps 0.52. CUT/ten-cut templates
      * get half the feedback (the cut itself is the gesture).
      */
@@ -140,13 +140,13 @@ object PhraseConfig {
     const val LIFT_MIN_ENERGY = 5
     const val BALLAD_ENERGY = 0.3f
 
-    /** djmix21 vocal continuity: a seam may not play more than this many
+    /** vocal continuity: a seam may not play more than this many
      * continuous no-vocal bars without trimming the entry or shortening. */
     const val VOCAL_GAP_SOFT_BARS = 8
     const val VOCAL_GAP_HARD_BARS = 16
-    /** djmix21 mid-line guard: extend to the line/section end by at most this. */
+    /** mid-line guard: extend to the line/section end by at most this. */
     const val LYRIC_EXTENSION_MAX_SEC = 6.0
-    /** djmix21 buildup: late/early energy ratio that counts as rising. */
+    /** buildup: late/early energy ratio that counts as rising. */
     const val BUILDUP_RISE_MIN = 1.12
 
     const val PLAN_LEAD_SEC = 60.0
@@ -158,11 +158,12 @@ object PhraseConfig {
     const val HEAD_STRUCTURE_BARS = 64
     const val VOCAL_MASK_SEC = 120.0
 
-    // vc74 (djmix32): was 5_000 (djmix14; before that 2000). Timeout checkpoints are
-    // coarse (fromPcm after frames(), novelty after the O(n^2) similarity()), so a
-    // contended pass overshoots the nominal value by 4-6x; at 5 s a merely-busy phone
-    // published NO SongMap and the phrase/loop planner had nothing, whereas a
-    // slow-but-complete map degrades gracefully (coarse grid) instead of vanishing.
+    // A contended pass overshoots its nominal timeout by 4-6x, because the
+    // checkpoints are coarse (fromPcm after frames(), novelty after the O(n^2)
+    // similarity()). A shorter timeout published NO SongMap on a merely-busy
+    // phone and left the phrase/loop planner with nothing, whereas a
+    // slow-but-complete map degrades gracefully (coarse grid) instead of
+    // vanishing.
     const val STRUCT_TIMEOUT_MS = 20_000L
     const val PLAN_TIMEOUT_MS = 120L
     const val ACTIVATION_FLOOR = 0.15f

@@ -3,7 +3,7 @@ package com.music.bitchord.playback.smart
 enum class ExitKind {
     OUTRO_START, OUTRO_PHRASE, LAST_CHORUS_END, POST_CHORUS_END,
     FADE_START, HARD_END, CONTENT_END, PRE_CHORUS_END,
-    // djmix25: section-boundary exits. VERSE_END exits right after a verse;
+    // section-boundary exits. VERSE_END exits right after a verse;
     // BRIDGE_END exits at the end of a bridge (good for echo-outs).
     VERSE_END, BRIDGE_END,
 }
@@ -97,7 +97,7 @@ object CuePoints {
                     found.add(exit(map, ExitKind.PRE_CHORUS_END, pre.endBar, pre))
                 }
             }
-            // djmix25 P1.3: VERSE_END / BRIDGE_END exits. Each VERSE end is a
+            // VERSE_END / BRIDGE_END exits. Each VERSE end is a
             // musical seam (a verse boundary, never mid-verse); each BRIDGE
             // end is an echo-out candidate. The minSec + passesExit filters
             // below keep only the tail-plausible ones.
@@ -136,7 +136,7 @@ object CuePoints {
             }
             .filter { passesExit(map, it) }
             .distinctBy { it.releaseBar to it.kind }
-            .take(10) // djmix25: headroom for the new VERSE_END/BRIDGE_END exits.
+            .take(10) // Headroom so VERSE_END/BRIDGE_END exits are never crowded out.
 
         if (filtered.isNotEmpty()) return filtered
         val synthesized = synthesizeTailExits(map, effectiveDuration, musicEnd, minSec, analysis)
@@ -353,7 +353,7 @@ object CuePoints {
             val build = map.sections.firstOrNull { it.fn == SectionFn.BUILD }
             if (build != null) found.add(entry(map, EntryKind.BUILD, build.startBar, build.endBar, map.sectionAt(build.endBar)?.fn ?: SectionFn.CHORUS))
         }
-        // djmix21 structure-aware: a labelled head buildup/pre-chorus is its own
+        // structure-aware: a labelled head buildup/pre-chorus is its own
         // entry cue whatever the start kind, so the planner can play B's
         // buildup under A's outro and land the peak at handover.
         val headBuild = StructureMix.headBuildup(map)
@@ -406,7 +406,7 @@ object CuePoints {
     }
 
     private fun passesExit(map: SongMap, cue: ExitCue): Boolean {
-        // djmix25 P1.3: VERSE_END/BRIDGE_END are scored in PhrasePlanner.
+        // VERSE_END/BRIDGE_END are scored in PhrasePlanner.
         // The release bar is the first bar of the NEXT section, which may
         // legitimately be sung (verse -> sung bridge), so the sung-bar
         // veto would discard every verse followed by sung material.
@@ -415,7 +415,7 @@ object CuePoints {
             map.sungBars.getOrElse(cue.releaseBar) { false }) return false
         if (map.chorusCount >= 2) {
             val last = map.sections.lastOrNull { it.fn == SectionFn.CHORUS && (map.lastVocalBar == null || it.startBar <= map.lastVocalBar) }
-            // djmix25: VERSE_END/BRIDGE_END are scored in PhrasePlanner (not
+            // VERSE_END/BRIDGE_END are scored in PhrasePlanner (not
             // hard-vetoed here), so they reach the scorer; the chorus
             // discard penalty there prices the radio-edit alternative.
             if (last != null && cue.releaseBar < last.endBar &&

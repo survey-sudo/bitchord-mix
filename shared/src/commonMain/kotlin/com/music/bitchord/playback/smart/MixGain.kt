@@ -25,7 +25,7 @@ object MixGain {
     }
 
     /**
-     * Headroom trim for the sum of two faders. djmix9: floored at
+     * Headroom trim for the sum of two faders. floored at
      * [HEADROOM_FLOOR] so a midpoint no longer costs ~3 dB; the native
      * -1 dBTP limiter handles true peaks.
      */
@@ -51,7 +51,7 @@ object MixGain {
     }
 
     /**
-     * djmix25 P1.12 learned EQ/fader template (djmix-analysis from stats,
+     * Learned EQ/fader template (djmix-analysis from stats,
      * Kim et al. ISMIR 2020): the bass-swap moment and fader shape per
      * template, as a small 9-breakpoint table. [swapBeats] is the bass-swap
      * width in beats; [breakpoints] are the outgoing fader gains at

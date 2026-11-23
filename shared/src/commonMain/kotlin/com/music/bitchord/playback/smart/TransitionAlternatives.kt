@@ -9,13 +9,13 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
- * Muffle, drop-in, and beatless-bridge transition families (vc69 P0).
+ * Muffle, drop-in, and beatless-bridge transition families.
  * Ported from Orchard pairTransitionGates.js, muffle.js, beatlessBridge.js,
  * and transitionArrangement.js: when a pair would currently be declined or
  * produce a weak blend, offer one of these instead of falling back to raw
  * overlap or silence. Every family requires the bass curve evidence the
- * planner already stores: pairs with no measured curves behave exactly as
- * they did before vc69, so decline behavior never moves without evidence.
+ * planner already stores: pairs with no measured curves keep the plain
+ * decline, so decline behavior never moves without evidence.
  *
  * Family gates mirror Orchard where BitChord has the same scalars, and
  * diverge deliberately where BitChord declines on tempo distance rather

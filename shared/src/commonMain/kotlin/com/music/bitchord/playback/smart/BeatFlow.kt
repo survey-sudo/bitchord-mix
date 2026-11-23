@@ -8,7 +8,7 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * Beat-flow continuity ranking (vc69 P2): how well the beat the listener
+ * Beat-flow continuity ranking: how well the beat the listener
  * already hears carries through a candidate overlap and past the handoff.
  * Ported from Orchard transitionFlow.js beatFlow (FLOW_SAMPLES 16, equal
  * power weighting, deficit and late-drop accounting). BitChord has no bass

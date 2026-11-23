@@ -4,7 +4,7 @@ import kotlin.math.abs
 import kotlin.math.roundToLong
 
 /**
- * Late-scrub catch-up re-anchoring (djmix14). When the playhead has already
+ * Late-scrub catch-up re-anchoring. When the playhead has already
  * crossed [TransitionPlan.transitionStart] (scrubbed near EOF), the planner
  * would otherwise show a dead 0s countdown whose start is 15-20 s in the
  * past and never fire. This pure planner re-anchors a tight, beat-snapped
@@ -23,9 +23,9 @@ object CatchUpPlanner {
      * preserving room for a quick dissolve). Overlap shape:
      * - >=7.0 s and tempo delta <=8%: 4-bar DJ_BLEND (bass swap + mid carve)
      * - >=3.5 s or tempo >8%: 2-bar DJ_FILTER/ECHO_RIDE (filter + echo tail)
-     * - 1.2-3.5 s (djmix15, was 1.6): 1-bar quick blend/filter at full
-     *   available overlap — 0.6 s lead + 1.2-1.6 s DJ filter dissolve where
-     *   a 2.5 s floor would have played dry to EOF.
+     * - 1.2-3.5 s: 1-bar quick blend/filter at full available overlap —
+     *   0.6 s lead + 1.2-1.6 s DJ filter dissolve, where a 2.5 s floor
+     *   would instead play dry to EOF.
      *
      * Below 2.0 s of effective room (contentEnd-aware) there is no lead +
      * dissolve that can breathe: return null so the planner blocks
@@ -159,14 +159,14 @@ object CatchUpPlanner {
 }
 
 /**
- * djmix16 catch-up pin (pure, scalars only). Any :catch-up plan for a
+ * Catch-up pin (pure, scalars only). Any :catch-up plan for a
  * (pair, scrubEpoch) is pinned ONCE and reused on every subsequent IDLE
  * tick for that key — never recomputed as playbackTime + lead, which
  * pushed transitionStart forward every tick (fadeSec 4.59 -> 3.98 ->
  * 2.26 -> 1.2 on Never Let Go -> S.A.D) and kept `remaining` at +900 ms
  * so pos never caught the start. The caller drops the pin on pair or
  * scrubEpoch change; the pin otherwise holds until the mix arms or any
- * valid non-catch-up plan arrives (djmix17).
+ * valid non-catch-up plan arrives.
  */
 object CatchUpPins {
     /** Key for a pair at a scrub epoch. */

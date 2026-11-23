@@ -224,7 +224,7 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
     if (value.isFinite()) max(min, min(max, value)) else min
 
 /**
- * The single shared octave fold (djmix12): the fold in {1, 2, 0.5} bringing
+ * The single shared octave fold: the fold in {1, 2, 0.5} bringing
  * [incomingBpm] nearest to [outgoingBpm] on the log domain. Every caller
  * that halves or doubles tempo goes through here so thresholds agree.
  */
@@ -571,13 +571,13 @@ private fun mixOutCandidatesOf(analysis: TrackAnalysis, contentEnd: Double): Lis
     // to exit anchors waits for the easy gap (or skips the vocal tail entirely) instead of asking
     // the filter ride and gain curves to blend it. Only structural and energy candidates choose
     // the exit. The transition always has somewhere to end: where the content does.
-    // djmix9: a relaxed break outro (low mid-band energy, quiet vocals) sustained
+    // a relaxed break outro (low mid-band energy, quiet vocals) sustained
     // to near the content end is the mix-out of choice (e.g. Beautiful's break
     // outro into Never Let Go's intro): prefer it over a blind content_end.
     detectBreakOutro(analysis, contentEnd)?.let { candidate ->
         if (candidates.none { abs(it.time - candidate.time) < 0.05 }) candidates += candidate
     }
-    // djmix10 EOF holdback: with no interior/break cue the blind content_end
+    // EOF holdback: with no interior/break cue the blind content_end
     // is the only anchor and the outgoing blend rides straight into EOF.
     // Hold back up to 8 bars (bounded by the 12s discard cap so the
     // candidate survives ranking) so the overlap ends before the content
@@ -599,7 +599,7 @@ private fun mixOutCandidatesOf(analysis: TrackAnalysis, contentEnd: Double): Lis
 }
 
 /**
- * djmix9: finds a break outro - a tail run of at least 4 bars whose mean energy
+ * Finds a break outro - a tail run of at least 4 bars whose mean energy
  * stays under [BREAK_ENERGY_FRACTION] of the track's own 85th-percentile
  * energy, ending within 2 bars of [contentEnd]. Returns the run start as a
  * mix-out candidate, or null when no break qualifies. Public for tests.
@@ -677,7 +677,7 @@ fun rankMixOutCandidates(
     return mixOutCandidatesOf(analysis, end)
         .map { candidate ->
             val measured = audibleSecondsBetween(analysis, candidate.time, end)
-            // djmix12: scalar vocal adjustment on A's own curve (never
+            // scalar vocal adjustment on A's own curve (never
             // cross-track): quieter overlap windows rank above louder ones.
             val share = vocalActivityBetween(analysis, candidate.time, end) ?: 0.0
             val adj = (0.5 - share.coerceIn(0.0, 1.0)) * 0.10
@@ -764,7 +764,7 @@ fun assessTransitionTier(
     if (!stretchOk) reasons += "tempo-distance"
     val lowConf = outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE
     if (lowConf) {
-        // djmix10 taste rescue: a stable grid (many downbeats) with a folded
+        // taste rescue: a stable grid (many downbeats) with a folded
         // ratio inside 4% is beatmatchable even when Beat This confidence
         // reads low on pop/rap. Without the rescue these demote to a filter
         // ride and read as wasted chances; with it they blend at half length
