@@ -1,0 +1,2763 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index db92d9e..25edb38 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -137,6 +137,85 @@ import java.util.Locale
+  * it is what makes a long crossfade sound like a blend instead of a dip.
+  */
+ @UnstableApi
++/**
++ * Hard deck-speed discipline (djmix18, HANDOVER_MASTER \u00a76 Bug 1 &amp; Bug 2): the beatmatch
++ * rate a deck may play at. Returns `1.0f` when [raw] is not a beatmatch (the caller stacked
++ * a listener speed on a non-mix rate) or not finite, and strictly clamps to
++ * `[0.92f, 1.08f]` (\u00b18\u2009max) — never `1.94\u00d7` or `999\u00d7`, under any circumstance.
++ * The listener's own speed is stacked on top of this in [deckSpeed]: clamping the rate here
++ * keeps user speed (0.25\u20133\u00d7) working while the mix component can never run away.
++ * Pure scalar; unit-tested in `Djmix18AppHandoffTest`.
++ */
++internal fun safeDeckSpeed(raw: Float, beatmatched: Boolean = true): Float {
++    if (!beatmatched || !raw.isFinite()) return 1.0f
++    return raw.coerceIn(0.92f, 1.08f)
++}
++
++/**
++ * [safeDeckSpeed] applied to a mix [rate] (1.0 = no stretch) before [deckSpeed] stacks it with
++ * the listener speed. [rate] may arrive as `NaN` (unknown BPM ratio): that is `1.0f`, never
++ * a stretch. Every `setPlaybackSpeed` that carries a beatmatch rate goes through here so the
++ * `[0.92f, 1.08f]` ceiling cannot be bypassed.
++ */
++internal fun safeRateForDeck(rate: Double, beatmatched: Boolean = true): Double =
++    safeDeckSpeed(rate.toFloat(), beatmatched).toDouble()
++
++/**
++ * Final `ExoPlayer` speed for a mix [rate]: listener speed stacked on [safeRateForDeck].
++ * Use this for every beatmatch `setPlaybackSpeed`. Non-beatmatched decks play at the
++ * listener speed (`rate` is forced to `1.0`).
++ */
++internal fun deckSpeedSafe(user: Float, rate: Double, beatmatched: Boolean = true): Float =
++    deckSpeed(user, safeRateForDeck(rate, beatmatched))
++
++/**
++ * Cold-loop yield headroom (djmix18, Bug&nbsp;4): once both tracks are analysed, a `LoopMix.plan`
++ * that returned `null` is deterministically ineligible for that pair. Waiting for it until
++ * `10s\u201314s` before `contentEnd` starves an 8\u201316 bar (`19\u201338s`) beatmix. Yield to
++ * `PhrasePlanner` → `LoopMix.bridge` at the earlier of `30s` before the first phrase/outro
++ * exit or `max(28s, 10\u00d7barSec)` before `contentEnd`, so the phrase mix has a full 8 bars to
++ * arm and fire. Pure scalar; unit-tested in `Djmix18AppHandoffTest`.
++ *
++ * @param contentEndMs outgoing `contentEndTime` in ms, or `durationMs` when unknown.
++ * @param currentPositionMs playhead in ms.
++ * @param outBpm outgoing BPM for `10\u00d7barSec` (`barSec = 240/bpm`); `<= 0` falls back to `28s`.
++ * @param earliestExitMs earliest phrase/outro exit `releaseSec` in ms, or `null` when unknown.
++ * Pure scalar; unit-tested in `Djmix18AppHandoffTest`.
++ */
++internal fun shouldYieldColdLoopForContentEnd(
++    contentEndMs: Long,
++    currentPositionMs: Long,
++    outBpm: Double,
++    earliestExitMs: Long?,
++): Boolean {
++    val barSec = if (outBpm.isFinite() && outBpm > 1.0) 240.0 / outBpm else 0.0
++    val byBarsMs = (10.0 * barSec * 1000.0).roundToLong().coerceAtLeast(28_000L)
++    val byContentEndMs = contentEndMs - currentPositionMs
++    if (byContentEndMs in 0L..byBarsMs) return true
++    if (earliestExitMs != null) {
++        val byExitMs = earliestExitMs - currentPositionMs
++        if (byExitMs in 0L..30_000L) return true
++    }
++    return false
++}
++
++/**
++ * Exact handover target (djmix18, Bug&nbsp;2): the incoming deck's heard position is truth when
++ * it is valid (a rendered block, at or past `plan.inn.loopStart - 0.05`), else the clock's
++ * `handoverTrackSec`. With `incomingHoldSec &gt; 0` both land at
++ * `inn.loopStart + (elementAt - incomingHoldSec)` — never `inn.loopStart + elementAt`.
++ * Pure scalar; unit-tested in `Djmix18AppHandoffTest`.
++ */
++internal fun handoverTargetSec(
++    heardInSec: Double?,
++    clockHandoverSec: Double,
++    innLoopStartSec: Double,
++): Double {
++    val heard = heardInSec
++    return if (heard != null && heard.isFinite() && heard >= innLoopStartSec - 0.05) heard
++    else clockHandoverSec
++}
++
+ class CrossfadeController(
+     private val scope: CoroutineScope,
+     /** The player backing the session right now. Moves at every [onHandoff]. */
+@@ -639,6 +718,21 @@ class CrossfadeController(
+      */
+     private var settledAt = 0L
+ 
++    /**
++     * djmix18 (Bug 2): a seek issued by the loop-mix handover itself ([finishLoop]'s
++     * corrective seek) must never be read as a user scrub. While [internalHandoverSeek]
++     * is true (or within [suppressScrubUntilMs] after it), [listener]'s
++     * `onPositionDiscontinuity` is ignored so `resetPlansForScrub` never tears down a
++     * just-completed mix or fires a second seek after unmuting.
++     */
++    @Volatile private var internalHandoverSeek = false
++    @Volatile private var suppressScrubUntilMs = 0L
++
++    /** Exact handover telemetry captured in [finishLoop], emitted on `mix.complete`. */
++    private var handoverExpectedMs = 0L
++    private var handoverHeardMs = -1L
++    private var handoverTargetMs = 0L
++
+     /**
+      * Gain the outgoing track was at when the fade was interrupted, so the ramp
+      * out starts from where it actually is rather than from full volume.
+@@ -778,6 +872,23 @@ class CrossfadeController(
+             // The listener moving the playhead. djmix13: never silently
+             // fire a stale plan or double-fire the incoming deck.
+             if (reason == Player.DISCONTINUITY_REASON_SEEK) {
++                // djmix18 (Bug 2): the loop-mix handover's own corrective seek is not a
++                // scrub. Ignore it entirely — no resetPlansForScrub, no second seek.
++                val nowMs0 = SystemClock.elapsedRealtime()
++                if (internalHandoverSeek || nowMs0 < suppressScrubUntilMs) {
++                    internalHandoverSeek = false
++                    AutomixTelemetry.event(
++                        "mix.seek",
++                        mapOf(
++                            "phase" to phase.name,
++                            "positionBeforeMs" to oldPosition.positionMs,
++                            "positionAfterMs" to newPosition.positionMs,
++                            "action" to "handover-suppressed",
++                            "planAgeMs" to (nowMs0 - lastPlanStartedAtMs),
++                        ),
++                    )
++                    return
++                }
+                 val nowMs = SystemClock.elapsedRealtime()
+                 val tookOver = loopSession?.outPort?.tookOver == true
+                 val seekPhase = when (phase) {
+@@ -1572,11 +1683,16 @@ class CrossfadeController(
+         if (!suppressingLoop && pairKey != loopSuppressedPair) {
+             loopSuppressedPair = null
+         }
+-        var loop = if (!suppressingLoop) loopPlanFor(
+-            player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration, analysisState,
+-        ) ?: nativeBridge(
+-            player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
+-        ) else null
++        var loop: LoopMix.Plan? = null
++        var planLoop: LoopMix.Plan? = null
++        if (!suppressingLoop) {
++            planLoop = loopPlanFor(
++                player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration, analysisState,
++            )
++            loop = planLoop ?: nativeBridge(
++                player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
++            )
++        }
+         // djmix16 cold-loop yield: a cold loop (decks not in RAM) needs
+         // a full classic arm lead, not 4.5 s. Never Let Go -> S.A.D
+         // (104.5 -> 66.5 BPM) primed for 47 s and never built:
+@@ -1597,7 +1713,50 @@ class CrossfadeController(
+             val sampleRateTmp = loopPortOf(player)?.sampleRate ?: 48000
+             val fastReadyTmp = isLoopFastReady(loop, currentItem, nextItem, sampleRateTmp)
+             val buildingTmp = primeJob?.isActive == true
+-            if (com.music.bitchord.playback.smart.LoopMix.shouldYieldColdLoop(
++            // djmix18 (Bug 4): a LoopMix.plan that returned null once both tracks are analysed
++            // is deterministically ineligible — do not keep waiting on a cold loop until
++            // 10s-14s before contentEnd. Yield by T-30s before the earliest phrase/outro
++            // exit or max(28s, 10*barSec) before contentEnd so an 8-16 bar phrase mix has
++            // full headroom. Takes effect even when shouldYieldColdLoop says wait.
++            val playedOutSec = (player.duration.takeIf { it != C.TIME_UNSET && it > 1_000L } ?: 0L) / 1000.0
++            val contentEndMs = (currentAnalysis.contentEndTime.takeIf { it.isFinite() && it > 1.0 }
++                ?: playedOutSec.takeIf { it > 1.0 }
++                ?: (duration / 1000.0)).let { (it * 1000).roundToLong() }
++            val earliestExitMs = runCatching {
++                val outMapForYield = PhraseMaps.get(currentItem.mediaId)
++                    ?: SongMaps.fromAnalysis(currentItem.mediaId, currentAnalysis)
++                if (outMapForYield == null) null
++                else com.music.bitchord.playback.smart.CuePoints.exits(
++                    outMapForYield, playedOutSec, currentAnalysis,
++                ).firstOrNull()?.let { (it.releaseSec * 1000).roundToLong() }
++            }.getOrNull()
++            val bothAnalysed = currentAnalysis.quality != TrackAnalysis.QUALITY_HEAD &&
++                nextAnalysis.quality != TrackAnalysis.QUALITY_HEAD
++            val yieldForHeadroom = planLoop == null && bothAnalysed &&
++                shouldYieldColdLoopForContentEnd(
++                    contentEndMs, player.currentPosition, currentAnalysis.bpm, earliestExitMs,
++                )
++            if (yieldForHeadroom) {
++                // LoopMix.plan is already ineligible; the current `loop` IS the bridge/phrase
++                // plan (or null). If the bridge is cold and the outro headroom is nearly gone,
++                // yield it to classic now rather than building decks that will miss the splice.
++                // Otherwise keep the bridge — it is the correct rung, just in time.
++                if (!fastReadyTmp && !buildingTmp) {
++                    val fbKey = "cold-loop-headroom-using-classic|${loop.out.loopStart}"
++                    if (fbKey != lastFallbackLogKey) {
++                        lastFallbackLogKey = fbKey
++                        AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to "cold-loop-headroom-using-classic", "phase" to phase.name))
++                    }
++                    loop = null
++                    loopPlanned = null
++                    loopScript = null
++                    loopPlanKey = null
++                    loopSuppressedPair = pairKey
++                    loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++                    discardPrime()
++                }
++            }
++            if (loop != null && com.music.bitchord.playback.smart.LoopMix.shouldYieldColdLoop(
+                     loopStartMsTmp, player.currentPosition, fastReadyTmp, buildingTmp,
+                     blendArmLeadMs, nextStreamReady(nextItem),
+                 )
+@@ -1607,13 +1766,34 @@ class CrossfadeController(
+                     lastFallbackLogKey = fbKey
+                     AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to "insufficient-cold-lead-using-classic", "phase" to phase.name))
+                 }
+-                loop = null
+-                loopPlanned = null
+-                loopScript = null
+-                loopPlanKey = null
+-                loopSuppressedPair = pairKey
+-                loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+-                discardPrime()
++                // djmix18: when the yielded plan was the crown (LoopMix.plan) the bridge was
++                // never tried (planLoop ?: bridge short-circuits). Retry the bridge rung now
++                // so an 8-16 bar phrase mix still gets its headroom instead of collapsing to
++                // classic. Bridge null -> classic below on this same tick.
++                val yieldedWasCrown = planLoop != null
++                loop = if (yieldedWasCrown) {
++                    nativeBridge(player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration)
++                } else null
++                if (loop != null) {
++                    // Bridge survived the yield: it becomes the loop (will arm if lead allows).
++                    // Re-check its freshness against the same lead; if too near, fall to classic.
++                    val bridgeStartMs = (loop.out.loopStart * 1000).roundToLong()
++                    val bridgeRate = loopPortOf(player)?.sampleRate ?: 48000
++                    if (!isLoopFastReady(loop, currentItem, nextItem, bridgeRate) &&
++                        bridgeStartMs - player.currentPosition <= maxOf(blendArmLeadMs, 0L)
++                    ) {
++                        // Bridge cold and too near to build: classic must arm this tick.
++                        loop = null
++                    }
++                }
++                if (loop == null) {
++                    loopPlanned = null
++                    loopScript = null
++                    loopPlanKey = null
++                    loopSuppressedPair = pairKey
++                    loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++                    discardPrime()
++                }
+             }
+         }
+         if (loop != null) {
+@@ -2040,7 +2220,8 @@ class CrossfadeController(
+         // Stacks on top of the listener's speed control rather than replacing
+         // it, so a beatmatched transition and "play everything at 1.25x" don't
+         // fight each other. Undone in [finish].
+-        into.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, incomingPlaybackRate))
++        // djmix18: beatmatch rate clamped to [0.92f, 1.08f] via safeDeckSpeed.
++        into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate))
+         buildupSpeed = into.playbackParameters.speed
+         // Tempo only. The old pitch corrector turned a small transpose into a
+         // time factor of about a thousand, which is the 999x runaway.
+@@ -2279,7 +2460,7 @@ class CrossfadeController(
+         // on the incoming tempo.
+         if (rampSteps > 0 && rampStep < rampSteps) {
+             rampStep = rampSteps
+-            out.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, outgoingPlaybackRate))
++            out.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, outgoingPlaybackRate))
+             tracks.outgoingTempo(1f)
+         }
+         outgoingAnalysis = out.currentMediaItem?.let(analysisFor) ?: TrackAnalysis()
+@@ -2313,6 +2494,24 @@ class CrossfadeController(
+             bail()
+             return
+         }
++        // djmix18 (Bug 1): never call setPlaybackSpeed after handover with WSOLA steps across
++        // B's solo intro. Reset the incoming player cleanly to the listener speed here, while
++        // the outgoing tail still masks the single parameter change, and cancel any in-flight
++        // ease so finish() cannot restart stepped WSOLA speed changes on the solo. Classic
++        // mixes finish the blend at the incoming rate; the stretch came off at this line.
++        // Native LoopMix decks are already at 1x (the renderer did the tempo), so this is a
++        // no-op there — and still a guard that no ease is pending when the player takes over.
++        runCatching {
++            easing = null
++            easeOnActive = false
++            softSpeedJob?.cancel()
++            softSpeedJob = null
++            nudgeUntil = 0L
++            lockCount = 0
++            // Beatmatched=false: listener speed only, never the mix stretch across the solo.
++            into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, 1.0, beatmatched = false))
++            tracks.incomingTempo(1f)
++        }
+         // AutoPlay may have appended to the queue since the standby was loaded
+         // with a copy of it — during arming or the first half of the blend,
+         // both of which the outgoing player owned — and those tracks would
+@@ -3279,6 +3478,9 @@ class CrossfadeController(
+         val armed = phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING
+         val seekPast = sticky != null && player.currentPosition > sticky.out.loopStart * 1000 + 1_500
+         val why = StringBuilder()
++        // djmix18 (Bug 3): clamp to the live playable stream so rendition mismatches
++        // (analysis.duration=220s vs stream=180s) never place the loop start past EOF.
++        val playableOutSec = (player.duration.takeIf { it != C.TIME_UNSET && it > 1_000L } ?: 0L) / 1000.0
+         val candidate = LoopMix.plan(
+             out = currentAnalysis,
+             outDuration = durationMs / 1000.0,
+@@ -3292,6 +3494,7 @@ class CrossfadeController(
+             sungOut = outLyrics?.spans,
+             sungIn = inLyrics?.spans,
+             why = why,
++            playableOutDurationSec = playableOutSec,
+         )
+         val stickyVeto = sticky != null && LoopMix.vetoes(sticky, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans)
+         val replacement = candidate?.takeIf { !LoopMix.vetoes(it, currentAnalysis, nextAnalysis, outLyrics?.spans, inLyrics?.spans) }
+@@ -3439,6 +3642,7 @@ class CrossfadeController(
+             noteLoopVerdict(pair, stamped, null)
+             return stamped
+         }
++        val playableOutSecBridge = (player.duration.takeIf { it != C.TIME_UNSET && it > 1_000L } ?: 0L) / 1000.0
+         val plan = LoopMix.bridge(
+             out = currentAnalysis,
+             outDuration = durationMs / 1000.0,
+@@ -3449,6 +3653,7 @@ class CrossfadeController(
+             sungIn = lyricSpans[next.mediaId]?.spans,
+             outVideo = current.isVideoOrigin,
+             inVideo = next.isVideoOrigin,
++            playableOutDurationSec = playableOutSecBridge,
+         ) ?: return null
+         val stamped = stamp(plan, currentAnalysis, nextAnalysis)
+         run {
+@@ -3482,12 +3687,15 @@ class CrossfadeController(
+     ): LoopMix.Plan {
+         if (!legacy.outLoops || !legacy.inLoops || !PhraseConfig.PHRASE_PLANNER_ENABLED) return legacy
+         return runCatching {
++            val playableCrown = if (out.duration.isFinite() && out.duration > 1.0) out.duration else 0.0
+             val choice = PhrasePlanner.select(
+                 SongMaps.fromAnalysis(current.mediaId, out),
+                 SongMaps.fromAnalysis(next.mediaId, inn),
+                 camelotSteps(out.key, inn.key),
+                 out.bpm, inn.bpm,
+                 legacyLoop = legacy,
++                playableOutDurationSec = playableCrown,
++                outAnalysis = out,
+             )
+             val kept = choice?.legacyLoop ?: return legacy
+             if (kept.out.bars >= legacy.out.bars && kept.inn.bars >= legacy.inn.bars && kept.outLoops && kept.inLoops) kept else legacy
+@@ -3524,7 +3732,14 @@ class CrossfadeController(
+             phraseMemoFresh
+         } else {
+             val computed = runCatching {
+-                PhrasePlanner.select(outMap, inMap, camelotSteps(out.key, inn.key), out.bpm, inn.bpm, earliestExitSec = player.currentPosition / 1000.0)
++                // djmix18: live playable duration so cue exits never land past EOF.
++                val playableOutSecPhrase = (player.duration.takeIf { it != C.TIME_UNSET && it > 1_000L } ?: 0L) / 1000.0
++                PhrasePlanner.select(
++                    outMap, inMap, camelotSteps(out.key, inn.key), out.bpm, inn.bpm,
++                    earliestExitSec = player.currentPosition / 1000.0,
++                    playableOutDurationSec = playableOutSecPhrase,
++                    outAnalysis = out,
++                )
+             }.getOrNull()
+             phraseMemoKey = memoKey
+             phraseMemoFresh = computed
+@@ -4271,6 +4486,43 @@ class CrossfadeController(
+             Log.i("AutomixScript", TransitionMoves.scriptJson(script, counts[0], counts[1], counts[2], slides = phraseLock.slides, lockedAt = phraseLock.lockedAtSec))
+             Log.i("BitChordPhrase", TransitionMoves.phraseLine(script.choice))
+         }
++        // djmix18 (Bug 2): exact handover target. heard(IN) is the deck truth; the clock
++        // is the fallback. With incomingHoldSec > 0 both must equal
++        // inn.loopStart + (elementAt - incomingHoldSec), never + elementAt.
++        // No AudioTrack output-latency API is exposed here, so no latency subtraction;
++        // the heard position is already compared as track seconds. Log all three in
++        // mix.complete (handoverExpectedMs/HeardMs/TargetMs) for verification.
++        val sess = session
++        val expectedHandoverMs = if (sess == null) 0L else (sess.clock.handoverTrackSec * 1000).roundToLong()
++        val heardInSecRaw = if (sess == null) null else runCatching { sess.renderer.heard(LoopMixRenderer.IN) }.getOrNull()
++        val heardValidSec = heardInSecRaw?.takeIf { it.isFinite() && it != 0.0 &&
++            sess != null && it >= sess.plan.inn.loopStart - 0.05 }
++        val targetSec = if (sess == null) 0.0 else handoverTargetSec(heardValidSec, sess.clock.handoverTrackSec, sess.plan.inn.loopStart)
++        val targetMs = (targetSec * 1000).roundToLong()
++        handoverExpectedMs = expectedHandoverMs
++        handoverHeardMs = heardValidSec?.let { (it * 1000).roundToLong() } ?: -1L
++        handoverTargetMs = targetMs
++        // Corrective seek only when the silent ExoPlayer drifted beyond the sink alignment's
++        // reach. The player was pre-positioned by setMediaItems (no cold 0 -> 19s seek at the
++        // splice); a mid-loop pre-seek would trip the inPort interrupted bail, so it is never
++        // done here. A small drift (<150ms) is left alone — seeking it would stutter.
++        val sessionPlayer = if (handedOff) incoming else outgoing
++        if (sessionPlayer != null && sessionPlayer.playbackState == Player.STATE_READY) {
++            val driftMs = targetMs - sessionPlayer.currentPosition
++            if (abs(driftMs) > 150L) {
++                AutomixTelemetry.event(
++                    "mix.seek",
++                    mapOf("phase" to phase.name, "reason" to "loop-handover-correct",
++                        "expectedHandoverMs" to expectedHandoverMs,
++                        "actualHeardMs" to handoverHeardMs, "targetMs" to targetMs,
++                        "driftMs" to driftMs),
++                )
++                internalHandoverSeek = true
++                suppressScrubUntilMs = SystemClock.elapsedRealtime() + 1_200L
++                sessionPlayer.seekTo(targetMs.coerceAtLeast(0L))
++                internalHandoverSeek = false
++            }
++        }
+         loopAlignJob?.cancel()
+         loopAlignJob = null
+         // djmix15: the native renderer already brought the outgoing deck
+@@ -4782,13 +5034,19 @@ class CrossfadeController(
+             // and owns the queue from here, and the outgoing one is spare.
+             incoming?.let {
+                 it.volume = 1f
+-                // Undoes whatever [begin] stacked on for a beatmatched handoff,
+-                // walked back a beat at a time over a few bars rather than in
+-                // one jump — the tempo lurch a DJ never lets anyone hear. An
+-                // unstretched track goes straight to the listener's speed.
+-                // A native mix skips this: the player is already at that speed,
+-                // and setting it again is a playback-params reset on the splice.
+-                if (!nativeHandover) beginEase(it, releaseFrom, incomingAnalysis)
++                // djmix18 (Bug 1): NEVER run beginEase()/driveEase() WSOLA speed steps
++                // across B's solo intro after handover. handOff() already reset this player
++                // to the listener speed while the outgoing tail masked the single change;
++                // finish() now only re-asserts that speed (no steps). Stepping 1.62s apart
++                // over the solo intro is what stuttered on vocals/beats. A native mix skips
++                // this for the same reason; classic handoffs get the same guarantee.
++                @Suppress("UNUSED_VARIABLE") val releaseFromUnused = releaseFrom
++                easing = null
++                softSpeedJob?.cancel()
++                softSpeedJob = null
++                nudgeUntil = 0L
++                it.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, 1.0, beatmatched = false))
++                filters.incomingTempo(1f)
+             }
+             outgoing?.let(::retire)
+         } else {
+@@ -4820,7 +5078,8 @@ class CrossfadeController(
+         if (wasTransitioning) {
+             AutomixTelemetry.event(
+                 "mix.complete",
+-                mapOf("phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm, "tailMs" to tailMs, "reason" to completeReason),
++                mapOf("phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm, "tailMs" to tailMs, "reason" to completeReason,
++                    "expectedHandoverMs" to handoverExpectedMs, "actualHeardMs" to handoverHeardMs, "targetMs" to handoverTargetMs),
+             )
+             onSettled()
+         }
+@@ -5435,6 +5694,12 @@ class CrossfadeController(
+             lockCount = 0
+             return
+         }
++        // djmix18 (Bug 1): phase-lock micro-speed pulsing disabled. Repeated +/-3%
++        // setPlaybackSpeed writes stutter the Sonic WSOLA stretcher on live vocals/beats.
++        // Hold the incoming deck at its beatmatch rate for the whole blend; the mix is
++        // already beat-aligned by the ramp and the grid, and a pulsing correction is worse
++        // than a small drift. No new nudge is ever started here.
++        return
+         // Once the outgoing track is on its way out its beat stops mattering.
+         if (progress >= LOCK_UNTIL || now < lockQuietUntil) return
+         if (!out.isPlaying || !into.isPlaying) {
+@@ -5463,12 +5728,12 @@ class CrossfadeController(
+             minOf(1f + NUDGE, (MAX_TOTAL_SPEED_UP / incomingPlaybackRate).toFloat())
+         }
+         if (factor <= 1f && median < 0) return
+-        into.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, incomingPlaybackRate * factor))
++        into.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate * factor))
+         tracks.incomingTempo(1f)
+         nudgeUntil = now + (abs(median) / (base * abs(factor - 1f)) * 1000).roundToLong().coerceIn(1L, MAX_NUDGE_MS)
+     }
+ 
+-    private fun incomingBaseSpeed(): Float = deckSpeed(AppSettings.playbackSpeed.value, incomingPlaybackRate)
++    private fun incomingBaseSpeed(): Float = deckSpeedSafe(AppSettings.playbackSpeed.value, incomingPlaybackRate)
+ 
+     /**
+      * The buildup. Speed and pitch rise together by [BUILDUP_RISE] across the
+@@ -5480,7 +5745,10 @@ class CrossfadeController(
+         val into = incoming ?: return
+         if (!render.buildup || handedOff) return
+         val lift = BUILDUP_RISE * progress.toDouble() * progress.toDouble()
+-        val target = deckSpeed(AppSettings.playbackSpeed.value, incomingPlaybackRate, lift)
++        // djmix18: clamp the beatmatch rate to [0.92f, 1.08f] before the buildup lift so the
++        // tempo lift can never push a deck past the hard ceiling. deckPlayedRate re-clamps
++        // rate + lift to [0.94, 1.15]; safeRateForDeck first pins rate to [0.92, 1.08].
++        val target = deckSpeed(AppSettings.playbackSpeed.value, safeRateForDeck(incomingPlaybackRate) + lift)
+         if (abs(target - buildupSpeed) < 0.008f) return
+         buildupSpeed = target
+         into.setPlaybackSpeed(target)
+@@ -5588,7 +5856,7 @@ class CrossfadeController(
+         easeNextAtMs = player.currentPosition + easeStepMs
+         easing = player
+         easeOnActive = if (player === incoming) handedOff else !handedOff
+-        player.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, audible))
++        player.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, audible))
+         easeTempo(player, 1f)
+     }
+ 
+@@ -5617,7 +5885,7 @@ class CrossfadeController(
+             endEase(clickless = false)
+             return
+         }
+-        player.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, easeRate))
++        player.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, easeRate))
+         easeTempo(player, 1f)
+         easeNextAtMs += easeStepMs
+     }
+@@ -5634,7 +5902,7 @@ class CrossfadeController(
+         if (due <= rampStep) return
+         rampStep = due
+         val rate = 1.0 + (outgoingPlaybackRate - 1.0) * due / rampSteps
+-        out.setPlaybackSpeed(deckSpeed(AppSettings.playbackSpeed.value, rate))
++        out.setPlaybackSpeed(deckSpeedSafe(AppSettings.playbackSpeed.value, rate))
+         tracks.outgoingTempo(1f)
+     }
+ 
+diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+index 9b2d7d9..86e88b8 100644
+--- a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
++++ b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+@@ -143,10 +143,37 @@ class LoopMixSession private constructor(
+             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
+         ): LoopMixSession? {
+             if (!LoopMixRenderer.available || sampleRate <= 0) return null
+-            val clock = LoopMix.Clock(plan)
++            // djmix18: the script hold is the truth for the handover: pass it into the
++            // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
++            // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
++            // read script?.incomingHoldSec — up to seconds apart on phrase plans).
++            val effectiveHoldSec = script?.incomingHoldSec ?: plan.incomingHoldSec
++            val effectivePlan = if (effectiveHoldSec != plan.incomingHoldSec) {
++                plan.copy(incomingHoldSec = effectiveHoldSec)
++            } else plan
++            val clock = LoopMix.Clock(effectivePlan)
+             // Single source of truth for decode bounds (matches isLoopFastReady).
+-            val bounds = LoopMix.regionBounds(plan)
+-            val outTo = bounds.outTo
++            val bounds = LoopMix.regionBounds(effectivePlan)
++            // djmix18: straight outgoing decks (M1/M9/RELAXED/beatblend/echo/drop:
++            // outLoops == false) run their tail past the last knot at the steady tail
++            // rate until stopAt. regionBounds only adds exitTailSeconds on the nominal
++            // track span — it does not cover the settle to elementAt nor echoHold — so
++            // extend outTo to cover stopAt in track seconds. The decoder returns what it
++            // has when the track ends early; asking for more is safe.
++            val echoHoldEarly = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
++            val outStopMixSec = clock.releaseAt + 0.05 + echoHoldEarly + effectivePlan.exitTailSeconds
++            val tailRateEarly = if (clock.beats >= 1) {
++                val b0 = clock.beatTimes[clock.beats - 1]
++                val b1 = clock.beatTimes[clock.beats]
++                (effectivePlan.out.beatSec / (b1 - b0).coerceAtLeast(1e-6)).coerceIn(0.85, 1.15)
++            } else 1.0
++            val outTo = if (!effectivePlan.outLoops) {
++                val lastOutPos = effectivePlan.out.loopStart + clock.beats * effectivePlan.out.beatSec
++                val tailTrack = (outStopMixSec - clock.releaseAt).coerceAtLeast(0.0) * tailRateEarly
++                val pastElement = effectivePlan.out.loopStart + clock.elementAt +
++                    maxOf(echoHoldEarly, effectivePlan.exitTailSeconds) + 0.5
++                maxOf(bounds.outTo, lastOutPos + tailTrack + 0.5, pastElement)
++            } else bounds.outTo
+             val inTail = bounds.inTo - clock.elementTrackTime
+             val outRegion = decode(
+                 LoopMix.Side.OUT,
+@@ -201,50 +228,69 @@ class LoopMixSession private constructor(
+                 rawGain
+             }
+ 
+-            val echoHold = if (plan.echoTail) plan.out.beatSec * 8 else 0.0
++            val echoHold = echoHoldEarly
++            val outStopAtSec = outStopMixSec
+             // Outgoing: its loop, knot by knot, looping forever (it stops at the release).
+-            val outKnotFrames = DoubleArray(beats + 1) { clock.beatTimes[it] * sr }
+-            val outKnotPositions = DoubleArray(beats + 1) { samplesOf(outRegion, clock.outPositionAt(it)) }
+-            val outLoopEnd = if (plan.outLoops) plan.out.loopEnd else plan.out.loopStart
++            // djmix18: straight decks get an explicit knot at stopAt on the steady tail
++            // rate so the dissolve has decoded PCM and knots all the way to silence.
++            val outHasTailKnot = !effectivePlan.outLoops && outStopAtSec > clock.releaseAt + 1e-6
++            val outKnotFrames = DoubleArray(beats + 1 + (if (outHasTailKnot) 1 else 0)) { i ->
++                if (i < beats + 1) clock.beatTimes[i] * sr else outStopAtSec * sr
++            }
++            val outKnotPositions = DoubleArray(beats + 1 + (if (outHasTailKnot) 1 else 0)) { i ->
++                if (i < beats + 1) samplesOf(outRegion, clock.outPositionAt(i))
++                else {
++                    val lastPos = effectivePlan.out.loopStart + clock.beats * effectivePlan.out.beatSec
++                    val stopPos = lastPos + (outStopAtSec - clock.releaseAt) * tailRateEarly
++                    samplesOf(outRegion, stopPos)
++                }
++            }
++            val outLoopEnd = if (effectivePlan.outLoops) effectivePlan.out.loopEnd else effectivePlan.out.loopStart
+             renderer.setDeck(
+                 LoopMixRenderer.OUT,
+                 LoopMixRenderer.DeckSetup(
+                     left = outRegion.left,
+                     right = outRegion.right,
+                     regionStart = outRegion.start,
+-                    loopStart = samplesOf(outRegion, plan.out.loopStart).roundToLong(),
++                    loopStart = samplesOf(outRegion, effectivePlan.out.loopStart).roundToLong(),
+                     loopEnd = samplesOf(outRegion, outLoopEnd).roundToLong(),
+                     releaseAt = 1e18,
+                     knotFrames = outKnotFrames,
+                     knotPositions = outKnotPositions,
+                     runOn = false,
+-                    stopAt = clock.releaseAt + 0.05 + echoHold + plan.exitTailSeconds,
++                    stopAt = clock.releaseAt + 0.05 + echoHold + effectivePlan.exitTailSeconds,
+                     preroll = 0.4,
+                     level = 1f,
+                 ),
+             )
+             // Incoming: its loop until the release, then on from the loop end at rate 1.
++            // djmix18: with a hold, derive knots from clock.inTrackTimeAt so the hold is
++            // honoured on its 1:1 timeline (was: stretched decks used inPositionAt, which
++            // ignores the hold and lands seconds into the intro at handover). Holds occur
++            // only on phrase plans where inLoops == false, so this is unwrapped here.
+             val inKnotFrames = DoubleArray(beats + 1) { clock.beatTimes[it] * sr }
+             val inKnotPositions = DoubleArray(beats + 1) {
+-                val at = if (plan.nativeIncoming) {
+-                    val hold = script?.incomingHoldSec ?: 0.0
+-                    val played = (clock.beatTimes[it] - hold).coerceAtLeast(0.0)
+-                    plan.inn.loopStart + played
+-                } else {
+-                    clock.inPositionAt(it)
++                val mixSec = clock.beatTimes[it]
++                val at = when {
++                    clock.incomingHoldSec > 1e-9 -> clock.inTrackTimeAt(mixSec)
++                    effectivePlan.nativeIncoming -> effectivePlan.inn.loopStart + mixSec
++                    else -> clock.inPositionAt(it)
+                 }
+                 samplesOf(inRegion, at)
+             }
+-            val inLoopEnd = if (plan.inLoops) plan.inn.loopEnd else plan.inn.loopStart
++            val inLoopEnd = if (effectivePlan.inLoops) effectivePlan.inn.loopEnd else effectivePlan.inn.loopStart
++            val inReleaseTrackSec = if (clock.incomingHoldSec > 1e-9 && !effectivePlan.inLoops) {
++                clock.inTrackTimeAt(clock.releaseAt)
++            } else clock.inReleasePosition
+             renderer.setDeck(
+                 LoopMixRenderer.IN,
+                 LoopMixRenderer.DeckSetup(
+                     left = inRegion.left,
+                     right = inRegion.right,
+                     regionStart = inRegion.start,
+-                    loopStart = samplesOf(inRegion, plan.inn.loopStart).roundToLong(),
++                    loopStart = samplesOf(inRegion, effectivePlan.inn.loopStart).roundToLong(),
+                     loopEnd = samplesOf(inRegion, inLoopEnd).roundToLong(),
+-                    releaseAt = samplesOf(inRegion, clock.inReleasePosition),
++                    releaseAt = samplesOf(inRegion, inReleaseTrackSec),
+                     knotFrames = inKnotFrames,
+                     knotPositions = inKnotPositions,
+                     runOn = true,
+@@ -421,7 +467,7 @@ class LoopMixSession private constructor(
+             // Either way the deck is silent 25 ms later, so it does not keep
+             // playing under the player.
+             renderer.setFadeOut(LoopMixRenderer.IN, clock.elementTrackTime)
+-            return LoopMixSession(plan, clock, outId, inId, renderer, sampleRate).also { it.planIncomingStart() }
++            return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate).also { it.planIncomingStart() }
+         }
+ 
+         /**
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+index 576e2bc..b581a22 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+@@ -1126,25 +1126,39 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+         val features = TrackFeatures.analyze(samples, effectiveDuration)
+         if (features != null && !skipPhraseStructure()) {
+             val started = SystemClock.elapsedRealtime()
+-            val cap = (structRate * PhraseConfig.HEAD_STRUCTURE_SEC).toInt().coerceAtLeast(1)
+-            val head = if (samples.size > cap) samples.copyOf(cap) else samples
++            // djmix18 (Bug 3): the full-track mono PCM is already in memory (decoded for
++            // TrackFeatures). Let StructureAnalyzer see it — up to 360s / 160 bars — so
++            // SongMap has real OUTRO sections in the final 22% of the song. The beat-sync
++            // DSP is ~<50ms at 360s. The 120s cap only ever truncated the duration flag,
++            // producing SongMap(durationSec=120, partial) on 210s tracks and early exits.
++            // partial is derived from fullTrackDurationSec (shared: full > pcm + 1.0).
++            val fullCap = (structRate * 360.0).toInt().coerceAtLeast(1)
++            val fullPcm = if (samples.size > fullCap) samples.copyOf(fullCap) else samples
+             val map = runCatching {
+                 StructureAnalyzer.fromPcm(
+                     trackKey = trackId,
+-                    pcm = head,
++                    pcm = fullPcm,
+                     sampleRate = structRate.toInt(),
+                     bpm = features.bpm.coerceAtLeast(1.0),
+-                    partial = samples.size > cap,
++                    partial = samples.size > fullCap,
+                     startedMs = started,
+                     now = { SystemClock.elapsedRealtime() },
++                    fullTrackDurationSec = effectiveDuration,
+                 )
+             }.onFailure { Log.i("BitChordPhrase", "structure skipped: ${it.message}") }.getOrNull()
+-            if (map != null) {
+-                PhraseMaps.put(trackId, map)
++            // djmix18: when the head path truncates (pcm < effectiveDuration), the map
++            // is partial by definition — assert it so a 120s buffer can never publish a
++            // 120s-duration non-partial map on a longer track.
++            val correctedMap = if (map != null && !map.partial && effectiveDuration > (fullPcm.size / structRate) + 1.0) {
++                map.copy(partial = true)
++            } else map
++            if (correctedMap != null) {
++                PhraseMaps.put(trackId, correctedMap)
+                 Log.i(
+                     "BitChordPhrase",
+-                    "structMs=${map.structMs} structWallMs=${SystemClock.elapsedRealtime() - started} " +
+-                        "bars=${map.sections.lastOrNull()?.endBar ?: 0} partial=${map.partial}",
++                    "structMs=${correctedMap.structMs} structWallMs=${SystemClock.elapsedRealtime() - started} " +
++                        "bars=${correctedMap.sections.lastOrNull()?.endBar ?: 0} partial=${correctedMap.partial} " +
++                        "duration=${correctedMap.durationSec} contentEnd=${correctedMap.contentEndSec}",
+                 )
+             }
+         }
+diff --git a/app/src/test/java/com/music/bitchord/playback/Djmix18AppHandoffTest.kt b/app/src/test/java/com/music/bitchord/playback/Djmix18AppHandoffTest.kt
+new file mode 100644
+index 0000000..432d214
+--- /dev/null
++++ b/app/src/test/java/com/music/bitchord/playback/Djmix18AppHandoffTest.kt
+@@ -0,0 +1,253 @@
++package com.music.bitchord.playback
++
++import com.music.bitchord.playback.smart.CuePoints
++import com.music.bitchord.playback.smart.EntryCue
++import com.music.bitchord.playback.smart.EntryKind
++import com.music.bitchord.playback.smart.ExitCue
++import com.music.bitchord.playback.smart.ExitKind
++import com.music.bitchord.playback.smart.LoopMix
++import com.music.bitchord.playback.smart.MixTemplate
++import com.music.bitchord.playback.smart.PhraseChoice
++import com.music.bitchord.playback.smart.PhrasePlanner
++import com.music.bitchord.playback.smart.SectionFn
++import com.music.bitchord.playback.smart.SectionRole
++import com.music.bitchord.playback.smart.StructureAnalyzer
++import com.music.bitchord.playback.smart.TransitionMoves
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.math.PI
++import kotlin.math.max
++import kotlin.math.sin
++
++/**
++ * djmix18 `:app` handoff/analyzer/speed discipline.
++ *
++ * Pure JVM (no native renderer, no Android): the helpers under test are the
++ * scalars the controller and LoopMixSession build on. LoopMixSession itself
++ * needs the native renderer, so its knot/outTo logic is verified through the
++ * shared [LoopMix.Clock] it derives from (same hold, same clock), which is
++ * what guarantees `handoverTrackSec` / `inKnotPositions` / `setFadeOut` share
++ * one timestamp.
++ */
++class Djmix18AppHandoffTest {
++
++    // ---- 1. safeDeckSpeed hard [0.92, 1.08] / 1.0 clamp ----
++
++    @Test
++    fun safeDeckSpeedNeverAllows194or999() {
++        assertEquals(1.08f, safeDeckSpeed(1.94f, beatmatched = true), 1e-6f)
++        assertEquals(1.08f, safeDeckSpeed(999f, beatmatched = true), 1e-6f)
++        assertEquals(1.0f, safeDeckSpeed(Float.POSITIVE_INFINITY, beatmatched = true), 1e-6f)
++        assertEquals(1.0f, safeDeckSpeed(Float.NEGATIVE_INFINITY, beatmatched = true), 1e-6f)
++        assertEquals(0.92f, safeDeckSpeed(0.5f, beatmatched = true), 1e-6f)
++        assertEquals(0.92f, safeDeckSpeed(0.0f, beatmatched = true), 1e-6f)
++        assertEquals(1.0f, safeDeckSpeed(1.0f, beatmatched = true), 1e-6f)
++        assertEquals(1.05f, safeDeckSpeed(1.05f, beatmatched = true), 1e-6f)
++        // Non-beatmatched and non-finite are always 1.0.
++        assertEquals(1.0f, safeDeckSpeed(1.94f, beatmatched = false), 1e-6f)
++        assertEquals(1.0f, safeDeckSpeed(Float.NaN, beatmatched = true), 1e-6f)
++        assertEquals(1.0f, safeDeckSpeed(Float.NaN, beatmatched = false), 1e-6f)
++    }
++
++    @Test
++    fun deckSpeedSafeStacksListenerSpeedOverClampedRate() {
++        // Listener speed still works; only the mix component is clamped.
++        assertEquals(1.08f, deckSpeedSafe(1.0f, 999.0, beatmatched = true), 1e-5f)
++        assertEquals(1.0f, deckSpeedSafe(1.0f, 1.0, beatmatched = false), 1e-5f)
++        assertEquals(1.0f, deckSpeedSafe(1.0f, Double.NaN, beatmatched = true), 1e-5f)
++        // 1.25x user speed over a 1.94 mix rate: rate clamps to 1.08, stacked = 1.35.
++        assertEquals(1.25f * 1.08f, deckSpeedSafe(1.25f, 1.94, beatmatched = true), 1e-4f)
++    }
++
++    // ---- 2. LoopMixSession knot / handover exactness with hold + exitTail ----
++
++    private fun exitCue(bar: Int, sec: Double, room: Int = 8) = ExitCue(
++        kind = ExitKind.OUTRO_PHRASE,
++        releaseBar = bar,
++        releaseSec = sec,
++        roomBars = room,
++        vocalRoomBars = 0,
++        tailBars = 0,
++        sectionFn = SectionFn.OUTRO,
++        role = SectionRole.GROOVE,
++        energyAtRelease = 0.4f,
++        energyLevel = 4,
++        loopableRoom = true,
++        cutsSungBars = 0,
++        cutsBars = 0,
++    )
++
++    private fun entryCue(startBar: Int = 0, startSec: Double = 0.0, landingBar: Int = 8) = EntryCue(
++        kind = EntryKind.HEAD,
++        startBar = startBar,
++        startSec = startSec,
++        landingBar = landingBar,
++        landingFn = SectionFn.INTRO,
++        landingRole = SectionRole.GROOVE,
++        leadInBars = landingBar - startBar,
++        leadInVocal = 0f,
++        leadInLoopable = true,
++        energyAtLanding = 0.4f,
++        energyLevel = 4,
++        trimmedBars = startBar,
++        pickupBeats = 0f,
++    )
++
++    private fun choiceFor(
++        template: MixTemplate,
++        overlapBars: Int = 8,
++        prepBars: Int = 0,
++        releaseSec: Double = 170.0,
++    ) = PhraseChoice(
++        template = template,
++        rung = PhrasePlanner.rungOf(template),
++        score = 0.85,
++        exit = exitCue(bar = 72, sec = releaseSec, room = overlapBars),
++        entry = entryCue(landingBar = overlapBars),
++        overlapBars = overlapBars,
++        swapBar = -overlapBars / 2.0,
++        tailBeats = 1.0,
++        loopK = 0,
++        echoGated = template == MixTemplate.M6,
++        vocalProduct = 0f,
++        tempoPrepBars = prepBars,
++        echoDelayBeats = 0.75,
++        echoDelayName = "ECHO_DELAY_BEATS",
++        swapRampMs = 120,
++        swapRampName = "SWAP_RAMP_BLEND_MS",
++        tempoPolicy = "TEMPO_POLICY=b",
++        vocalOverlapBeats = 0.0,
++        energyDelta = 0f,
++        struct = 0.9,
++        vocalScore = 0.9,
++        phraseScore = 0.9,
++        energyScore = 0.9,
++        lengthScore = 0.9,
++        keyScore = 0.9,
++        tempoScore = 0.9,
++        cost = 0.0,
++    )
++
++    @Test
++    fun clockWithIncomingHoldSecSharesOneHandoverTimestamp() {
++        // M1 at 100 BPM: bar = 2.4s, 4 prep bars hold B for 9.6s.
++        val choice = choiceFor(MixTemplate.M1, overlapBars = 8, prepBars = 4)
++        val script = TransitionMoves.compile(choice, outBpm = 100.0, inBpm = 102.0)
++        assertEquals(9.6, script.incomingHoldSec, 1e-6)
++        assertEquals(9.6, script.plan.incomingHoldSec, 1e-6)
++
++        // LoopMixSession builds Clock(plan, effectiveHold) — effectiveHold is the script
++        // hold, so the clock must already land at loopStart + (elementAt - hold).
++        val clock = LoopMix.Clock(script.plan, incomingHoldSec = script.incomingHoldSec)
++        val expected = script.plan.inn.loopStart + (clock.elementAt - script.incomingHoldSec)
++        assertEquals(expected, clock.handoverTrackSec, 0.001)
++        assertEquals(expected, clock.elementTrackTime, 0.001)
++        assertEquals(clock.handoverTrackSec, clock.elementTrackTime, 1e-9)
++        // During the hold IN stays at the cue; after it, 1:1 from the cue.
++        assertEquals(script.plan.inn.loopStart, clock.inTrackTimeAt(0.0), 1e-9)
++        assertEquals(script.plan.inn.loopStart, clock.inTrackTimeAt(9.6), 1e-9)
++        assertEquals(script.plan.inn.loopStart + 4.0, clock.inTrackTimeAt(13.6), 1e-9)
++        // Handover must NOT be loopStart + elementAt (the multi-second intro jump).
++        val naive = script.plan.inn.loopStart + clock.elementAt
++        assertTrue("handover ${clock.handoverTrackSec} must differ from naive $naive by hold", (naive - clock.handoverTrackSec) > 9.0)
++    }
++
++    @Test
++    fun straightOutDeckOutToCoversStopAtWithoutTruncation() {
++        // Straight OUT deck (M1: outLoops == false) with exitTail dissolve.
++        val choice = choiceFor(MixTemplate.M1, overlapBars = 8, prepBars = 0)
++        val script = TransitionMoves.compile(choice, outBpm = 120.0, inBpm = 121.0)
++        val plan = script.plan
++        assertEquals(false, plan.outLoops)
++        assertTrue("phrase plans carry exitTail", plan.exitTailSeconds > 0.0)
++        val clock = LoopMix.Clock(plan)
++        val outBeat = plan.out.beatSec
++        val echoHold = if (plan.echoTail) outBeat * 8 else 0.0
++        val stopAt = clock.releaseAt + 0.05 + echoHold + plan.exitTailSeconds
++        val tailRate = if (clock.beats >= 1) {
++            val b0 = clock.beatTimes[clock.beats - 1]
++            val b1 = clock.beatTimes[clock.beats]
++            (outBeat / (b1 - b0).coerceAtLeast(1e-6)).coerceIn(0.85, 1.15)
++        } else 1.0
++        // Replicates LoopMixSession.build's requiredOutTo (djmix18).
++        val bounds = LoopMix.regionBounds(plan)
++        val required = if (!plan.outLoops) {
++            val lastPos = plan.out.loopStart + clock.beats * outBeat
++            val tailTrack = (stopAt - clock.releaseAt).coerceAtLeast(0.0) * tailRate
++            val pastElement = plan.out.loopStart + clock.elementAt + maxOf(echoHold, plan.exitTailSeconds) + 0.5
++            maxOf(bounds.outTo, lastPos + tailTrack + 0.5, pastElement)
++        } else bounds.outTo
++        // The tail knot sits at stopAt on the steady rate; required outTo must cover it +0.5.
++        val lastPos = plan.out.loopStart + clock.beats * outBeat
++        val stopPos = lastPos + (stopAt - clock.releaseAt) * tailRate
++        assertTrue("required outTo $required must cover stopPos $stopPos", required >= stopPos - 1e-6)
++        assertTrue("required outTo $required must be past elementAt+tail", required >= plan.out.loopStart + clock.elementAt + maxOf(echoHold, plan.exitTailSeconds) - 1e-6)
++    }
++
++    // ---- 3. Cold-loop yield headroom ----
++
++    @Test
++    fun coldLoopYieldLeaves28sOr10BarsBeforeContentEnd() {
++        // No exit known, 120 BPM: 10 bars = 20s < 28s floor, so 28s rules.
++        assertTrue(shouldYieldColdLoopForContentEnd(210_000L, 182_000L, 120.0, null))
++        assertTrue(!shouldYieldColdLoopForContentEnd(210_000L, 181_000L, 120.0, null)) // 29s left
++        // 60 BPM: bar = 4s, 10 bars = 40s > 28s floor.
++        assertTrue(shouldYieldColdLoopForContentEnd(210_000L, 175_000L, 60.0, null)) // 35s < 40s
++        assertTrue(!shouldYieldColdLoopForContentEnd(210_000L, 165_000L, 60.0, null)) // 45s > 40s
++        // Earliest exit 30s: 25s before exit yields even when contentEnd is far.
++        assertTrue(shouldYieldColdLoopForContentEnd(300_000L, 200_000L, 120.0, 225_000L))
++        assertTrue(!shouldYieldColdLoopForContentEnd(300_000L, 200_000L, 120.0, 235_000L)) // 35s to exit
++    }
++
++    @Test
++    fun coldLoopYieldNeverYieldsInThePastOrBeforeLead() {
++        assertTrue(!shouldYieldColdLoopForContentEnd(210_000L, 100_000L, 120.0, null))
++        // Unknown BPM falls back to 28s floor.
++        assertTrue(shouldYieldColdLoopForContentEnd(210_000L, 185_000L, 0.0, null))
++        assertTrue(!shouldYieldColdLoopForContentEnd(210_000L, 180_000L, 0.0, null))
++    }
++
++    // ---- 4. Exact handover target (heard vs clock) ----
++
++    @Test
++    fun handoverTargetPrefersValidHeardElseClock() {
++        val loopStart = 8.0
++        assertEquals(12.5, handoverTargetSec(12.5, 12.0, loopStart), 1e-9)
++        assertEquals(12.0, handoverTargetSec(null, 12.0, loopStart), 1e-9)
++        assertEquals(12.0, handoverTargetSec(Double.NaN, 12.0, loopStart), 1e-9)
++        // Heard far before the cue is not a handover.
++        assertEquals(12.0, handoverTargetSec(1.0, 12.0, loopStart), 1e-9)
++        assertEquals(12.0, handoverTargetSec(0.0, 12.0, loopStart), 1e-9)
++    }
++
++    // ---- 5. fromPcm full duration (Bug 3, SongMap) ----
++
++    @Test
++    fun head120MapOn210TrackKeepsFullDurationAndPartial() {
++        val sr = 22050
++        val pcm = FloatArray((120.0 * sr).toInt()) { i ->
++            (0.4 * sin(2 * PI * 110.0 * i / sr)).toFloat()
++        }
++        val map = StructureAnalyzer.fromPcm(
++            trackKey = "app-handoff-210",
++            pcm = pcm,
++            sampleRate = sr,
++            bpm = 120.0,
++            fullTrackDurationSec = 210.0,
++        )
++        assertTrue(map.partial)
++        assertEquals(210.0, map.durationSec, 0.5)
++        val exits = CuePoints.exits(map, playableOutDurationSec = 210.0)
++        assertTrue(exits.isNotEmpty())
++        for (e in exits) {
++            assertTrue("exit at ${e.releaseSec} eats >22% of 210s", e.releaseSec >= 210.0 * 0.78 - 1e-6)
++        }
++        // Without playable duration the map still must not emit early exits.
++        val exitsDefault = CuePoints.exits(map)
++        assertTrue(exitsDefault.isNotEmpty())
++        for (e in exitsDefault) {
++            assertTrue(e.releaseSec >= 210.0 * 0.78 - 1e-6)
++        }
++    }
++}
+diff --git a/build.gradle.kts b/build.gradle.kts
+index fc40215..2bd3919 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 59
+-extra["bitchordVersionName"] = "2.2.3-djmix17"
++extra["bitchordVersionCode"] = 60
++extra["bitchordVersionName"] = "2.2.3-djmix18"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/native/loopmix/loop_mix_renderer.cpp b/native/loopmix/loop_mix_renderer.cpp
+index 6da527e..35316ae 100644
+--- a/native/loopmix/loop_mix_renderer.cpp
++++ b/native/loopmix/loop_mix_renderer.cpp
+@@ -299,6 +299,25 @@ void Renderer::prepare() {
+     else deck.stretch.presetCheaper(2, float(sampleRate_), true);
+     deck.started = false;
+     deck.finished = deck.left.empty() || deck.knotTimes.size() < 2;
++    deck.activeStartFrame = 0.0;
++    if (!deck.knotTimes.empty() && deck.knotPositions.size() == deck.knotTimes.size()) {
++      const double p0 = deck.knotPositions.front();
++      size_t firstAdv = 0;
++      for (size_t i = 1; i < deck.knotPositions.size(); ++i) {
++        if (std::abs(deck.knotPositions[i] - p0) > 0.5) {
++          firstAdv = i;
++          break;
++        }
++      }
++      if (firstAdv > 1) {
++        deck.activeStartFrame = deck.knotTimes[firstAdv - 1];
++      } else if (firstAdv == 1) {
++        deck.activeStartFrame = deck.knotTimes.front() -
++            deck.preroll * double(sampleRate_) - deck.stretch.outputLatency();
++      } else {
++        deck.activeStartFrame = 1e18;
++      }
++    }
+     // Flanger history never survives a session boundary.
+     std::fill(deck.flanger.left.begin(), deck.flanger.left.end(), 0.f);
+     std::fill(deck.flanger.right.begin(), deck.flanger.right.end(), 0.f);
+@@ -341,10 +360,9 @@ void Renderer::render(int64_t frame, float* interleaved, int frames) {
+ }
+ 
+ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+-  if (deck.finished) return;
++  if (deck.finished || frames <= 0) return;
+   const double sr = sampleRate_;
+   const double blockStart = frame / sr;
+-  const double blockEnd = (frame + frames) / sr;
+   if (blockStart >= deck.stopAt) {
+     // Graceful-exit gate (djmix11): the outgoing may only go silent at
+     // stopAt once its gain is already below -60 dB. The plan's lane and
+@@ -358,16 +376,28 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+   }
+   const double inLatency = deck.stretch.inputLatency();
+   const double outLatency = deck.stretch.outputLatency();
+-  const double startTime = deck.knotTimes.front() / sr - deck.preroll - outLatency / sr;
+   const double frameStart = double(frame);
+   const double frameEnd = double(frame + frames);
++  // djmix18: hold silent with readPos synchronized until the first advancing
++  // knot (e.g., incomingHoldSec > 0), never calling stretch.process(0, frames).
++  if (!deck.started && frameEnd <= deck.activeStartFrame) {
++    const double initPos = deck.knotPositions.empty() ? 0.0 : deck.knotPositions.front();
++    deck.heardPos = initPos;
++    deck.readPos = initPos;
++    deck.heard.store(deck.trackSecondsAt(initPos, sr), std::memory_order_relaxed);
++    return;
++  }
++  const int silentFrames = (!deck.started && frameStart < deck.activeStartFrame && frames > 1)
++      ? std::clamp(int(std::floor(deck.activeStartFrame - frameStart)), 0, std::max(0, frames - 1))
++      : 0;
++  const int activeFrames = frames - silentFrames;
++  const double activeFrameStart = frameStart + double(silentFrames);
+   if (!deck.started) {
+-    if (blockEnd <= startTime) return;
+-    // Seeded at this block's start, its read pointer the stretch's own latency
+-    // ahead of what will be heard: the first outLatency samples are pre-roll,
+-    // over by the time the deck's gain opens.
+-    const double rate = deck.knotRate(frameStart);
+-    deck.heardPos = deck.knotHeard(frameStart);
++    // Seeded at activeFrameStart, its read pointer the stretch's own latency
++    // ahead of what will be heard.
++    const double rateSampleAt = std::max(activeFrameStart, deck.activeStartFrame + 1.0);
++    const double rate = std::clamp(deck.knotRate(rateSampleAt), 0.75, 1.35);
++    deck.heardPos = deck.knotHeard(activeFrameStart);
+     deck.readPos = deck.heardPos + inLatency + rate * outLatency;
+     const int seekLength = deck.stretch.seekLength();
+     if (int(inLeft_.size()) < seekLength || int(inRight_.size()) < seekLength) {
+@@ -384,8 +414,15 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+     deck.started = true;
+   }
+ 
+-  // Where the block must end, heard: on the knots, or (past the last one, the
+-  // incoming song running on) at rate 1.
++  if (int(outLeft_.size()) < frames || int(outRight_.size()) < frames) return;
++  for (int i = 0; i < silentFrames; ++i) {
++    outLeft_[i] = 0.f;
++    outRight_[i] = 0.f;
++  }
++
++  // Where the block must end, heard: on the knots, or (past the last one) at
++  // rate 1 (incoming run-on) or extrapolated steady tail rate [0.85, 1.15]
++  // during exitTailSeconds / echoHold.
+   double heardEnd;
+   double rateEnd;
+   const double lastKnot = deck.knotTimes.back();
+@@ -393,35 +430,81 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+     heardEnd = deck.knotHeard(frameEnd);
+     rateEnd = deck.knotRate(frameEnd - 1);
+   } else if (deck.runOn) {
+-    const double from = std::max(frameStart, lastKnot);
+-    const double base = frameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
++    const double from = std::max(activeFrameStart, lastKnot);
++    const double base = activeFrameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
+     heardEnd = base + (frameEnd - from);
+-    rateEnd = 1;
++    rateEnd = 1.0;
+   } else {
+-    heardEnd = deck.knotPositions.back();
+-    rateEnd = deck.knotRate(lastKnot - 1);
++    const double tailRate = std::clamp(deck.knotRate(lastKnot - 1), 0.85, 1.15);
++    const double from = std::max(activeFrameStart, lastKnot);
++    const double base = activeFrameStart < lastKnot ? deck.knotPositions.back() : deck.heardPos;
++    heardEnd = base + (frameEnd - from) * tailRate;
++    rateEnd = tailRate;
+   }
+-  if (deck.started) {
+-    // A bad knot used to jump the read pointer by hundreds of times in one
+-    // block. Two samples of song per sample of mix is as fast as a loop goes.
++  {
+     const double advance = heardEnd - deck.heardPos;
+-    const double maxAdvance = double(frames) * 2.0;
++    const double maxAdvance = double(activeFrames) * 1.35;
+     if (advance > maxAdvance) heardEnd = deck.heardPos + maxAdvance;
++    if (advance < 0.0) heardEnd = deck.heardPos;
+   }
+-  const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
+-  int inputSamples = int(std::floor(readEnd - deck.readPos));
+-  inputSamples = std::clamp(inputSamples, 0, frames * 8);
+-  // No resize on the audio thread (pre-allocated in prepare()).
+-  if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
+-  const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+-  const int64_t readFrom = int64_t(deck.readPos);
+-  for (int i = 0; i < inputSamples; ++i) deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
+-  deck.readPos += inputSamples;
+ 
+-  if (int(outLeft_.size()) < frames || int(outRight_.size()) < frames) return;
+-  float* input[2] = {inLeft_.data(), inRight_.data()};
+-  float* output[2] = {outLeft_.data(), outRight_.data()};
+-  deck.stretch.process(input, inputSamples, output, frames);
++  const bool loopsForever = (deck.loopEnd > deck.loopStart && deck.releaseAt > 1e15);
++  const int64_t deckSize = int64_t(deck.left.size());
++  const int64_t readFrom = int64_t(std::floor(deck.readPos));
++  const int minInput = std::max(1, int(std::floor(double(activeFrames) * 0.75)));
++  const int maxInput = std::max(minInput, int(std::ceil(double(activeFrames) * 1.35)));
++  const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, deckSize - readFrom);
++
++  if (!loopsForever && remaining <= 0) {
++    // Past decoded PCM EOF: silence dry audio without calling stretch.process(0, frames),
++    // letting only wet echo/flanger tails ring out until stopAt.
++    std::fill(outLeft_.begin() + silentFrames, outLeft_.begin() + frames, 0.f);
++    std::fill(outRight_.begin() + silentFrames, outRight_.begin() + frames, 0.f);
++    deck.readPos = double(deckSize);
++  } else if (!loopsForever && remaining < minInput) {
++    const int avail = std::min(activeFrames, int(remaining));
++    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
++    for (int i = 0; i < avail; ++i) {
++      deck.read(readFrom + i, seam, outLeft_[silentFrames + i], outRight_[silentFrames + i]);
++    }
++    const int fadeLen = std::min(avail, 64);
++    const int fadeStart = avail - fadeLen;
++    for (int i = 0; i < fadeLen; ++i) {
++      const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
++      outLeft_[silentFrames + fadeStart + i] *= f;
++      outRight_[silentFrames + fadeStart + i] *= f;
++    }
++    for (int i = avail; i < activeFrames; ++i) {
++      outLeft_[silentFrames + i] = 0.f;
++      outRight_[silentFrames + i] = 0.f;
++    }
++    deck.readPos = double(deckSize);
++  } else {
++    const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
++    int inputSamples = int(std::floor(readEnd - deck.readPos));
++    inputSamples = std::clamp(inputSamples, minInput, maxInput);
++    if (!loopsForever) {
++      inputSamples = std::min<int>(inputSamples, int(remaining));
++    }
++    // No resize on the audio thread (pre-allocated in prepare()).
++    if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
++    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
++    for (int i = 0; i < inputSamples; ++i) deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
++    deck.readPos += double(inputSamples);
++
++    float* input[2] = {inLeft_.data(), inRight_.data()};
++    float* output[2] = {outLeft_.data() + silentFrames, outRight_.data() + silentFrames};
++    deck.stretch.process(input, inputSamples, output, activeFrames);
++    if (!loopsForever && readFrom + inputSamples >= deckSize) {
++      const int fadeLen = std::min(activeFrames, 64);
++      const int fadeStart = frames - fadeLen;
++      for (int i = 0; i < fadeLen; ++i) {
++        const float f = fadeLen > 1 ? float(fadeLen - 1 - i) / float(fadeLen - 1) : 0.f;
++        outLeft_[fadeStart + i] *= f;
++        outRight_[fadeStart + i] *= f;
++      }
++    }
++  }
+ 
+   const double heardStart = deck.heardPos;
+   deck.heardPos = heardEnd;
+@@ -470,7 +553,11 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+       const int n = at + i;
+       float g = (g0 + (g1 - g0) * (float(i) / count)) * deck.level;
+       if (fadeAt >= 0) {
+-        const double heard = heardStart + (heardEnd - heardStart) * (double(n) / frames);
++        const double heard = silentFrames > 0
++            ? (n < silentFrames
++                ? heardStart
++                : heardStart + (heardEnd - heardStart) * (double(n - silentFrames) / double(std::max(1, activeFrames))))
++            : (heardStart + (heardEnd - heardStart) * (double(n) / double(frames)));
+         const double fade = std::clamp((fadeAt + fadeSamples - heard) / fadeSamples, 0.0, 1.0);
+         g *= float(fade);
+       }
+diff --git a/native/loopmix/loop_mix_renderer.h b/native/loopmix/loop_mix_renderer.h
+index 011c9c7..cf875a2 100644
+--- a/native/loopmix/loop_mix_renderer.h
++++ b/native/loopmix/loop_mix_renderer.h
+@@ -161,6 +161,7 @@ struct Deck {
+   double readPos = 0;      // unwrapped region samples, the next input sample to feed
+   double heardPos = 0;     // unwrapped region samples heard at the end of the last block
+   double lastKnotHeard = 0;
++  double activeStartFrame = 0;
+   Biquad shelf;
+   Biquad highPass;
+   TptLowpass lowPass;
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
+index 676ed0e..37d0a53 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
+@@ -43,53 +43,197 @@ data class EntryCue(
+  * Cues from one track's own [SongMap]. No other track is consulted.
+  */
+ object CuePoints {
+-    fun exits(map: SongMap): List<ExitCue> {
++    fun exits(
++        map: SongMap,
++        playableOutDurationSec: Double = map.durationSec,
++        analysis: TrackAnalysis? = null,
++    ): List<ExitCue> {
++        val effectiveDuration = if (playableOutDurationSec > 1.0) minOf(map.durationSec, playableOutDurationSec) else map.durationSec
++        val musicEnd = minOf(
++            effectiveDuration,
++            (analysis?.contentEndTime?.takeIf { it > 1.0 } ?: map.contentEndSec).takeIf { it > 1.0 } ?: effectiveDuration,
++        )
++        val minSec = minOf(
++            effectiveDuration * PhraseConfig.MIN_PLAY_FRACTION,
++            maxOf(effectiveDuration * 0.65, musicEnd - 40.0),
++        )
++        val earlyOutroMinSec = effectiveDuration * 0.68
++        val coveredEndSec = map.barTime((map.sections.lastOrNull()?.endBar ?: map.downbeats.size).coerceAtLeast(0))
++        val mapCoversTail = !map.partial || coveredEndSec >= effectiveDuration * PhraseConfig.MIN_PLAY_FRACTION - 1.0
++
+         val found = ArrayList<ExitCue>()
+-        val outro = map.sections.firstOrNull { it.fn == SectionFn.OUTRO || it.fn == SectionFn.FADE_OUT }
+-        val lastChorus = map.sections.lastOrNull { it.fn == SectionFn.CHORUS }
+-        if (outro != null && outro.fn == SectionFn.OUTRO) {
+-            found.add(exit(map, ExitKind.OUTRO_START, outro.startBar, outro))
+-            var phrases = 0
+-            var bar = outro.startBar
+-            while (bar < outro.endBar && phrases < 3) {
+-                if (bar > outro.startBar && map.isPhraseDownbeat(bar)) {
+-                    found.add(exit(map, ExitKind.OUTRO_PHRASE, bar, outro))
+-                    phrases++
++        if (mapCoversTail) {
++            val outro = map.sections.firstOrNull { it.fn == SectionFn.OUTRO || it.fn == SectionFn.FADE_OUT }
++            val lastChorus = map.sections.lastOrNull { it.fn == SectionFn.CHORUS }
++            if (outro != null && outro.fn == SectionFn.OUTRO) {
++                found.add(exit(map, ExitKind.OUTRO_START, outro.startBar, outro))
++                var phrases = 0
++                var bar = outro.startBar
++                while (bar < outro.endBar && phrases < 3) {
++                    if (bar > outro.startBar && map.isPhraseDownbeat(bar)) {
++                        found.add(exit(map, ExitKind.OUTRO_PHRASE, bar, outro))
++                        phrases++
++                    }
++                    bar++
+                 }
+-                bar++
++                if (outro.endBar > outro.startBar) found.add(exit(map, ExitKind.OUTRO_PHRASE, outro.endBar, outro))
+             }
+-            if (outro.endBar > outro.startBar) found.add(exit(map, ExitKind.OUTRO_PHRASE, outro.endBar, outro))
+-        }
+-        if (lastChorus != null) {
+-            found.add(exit(map, ExitKind.LAST_CHORUS_END, lastChorus.endBar, lastChorus))
+-            val after = map.sections.firstOrNull {
+-                it.startBar == lastChorus.endBar && (it.fn == SectionFn.POST_CHORUS || it.fn == SectionFn.DROP)
++            if (lastChorus != null) {
++                found.add(exit(map, ExitKind.LAST_CHORUS_END, lastChorus.endBar, lastChorus))
++                val after = map.sections.firstOrNull {
++                    it.startBar == lastChorus.endBar && (it.fn == SectionFn.POST_CHORUS || it.fn == SectionFn.DROP)
++                }
++                if (after != null) found.add(exit(map, ExitKind.POST_CHORUS_END, after.endBar, after))
++                val pre = map.sections.lastOrNull { it.fn == SectionFn.PRE_CHORUS || it.fn == SectionFn.BUILD }
++                if (pre != null && map.chorusCount >= PhraseConfig.LIFT_MIN_CHORUSES) {
++                    found.add(exit(map, ExitKind.PRE_CHORUS_END, pre.endBar, pre))
++                }
+             }
+-            if (after != null) found.add(exit(map, ExitKind.POST_CHORUS_END, after.endBar, after))
+-            val pre = map.sections.lastOrNull { it.fn == SectionFn.PRE_CHORUS || it.fn == SectionFn.BUILD }
+-            if (pre != null && map.chorusCount >= PhraseConfig.LIFT_MIN_CHORUSES) {
+-                found.add(exit(map, ExitKind.PRE_CHORUS_END, pre.endBar, pre))
++            val fade = map.sections.firstOrNull { it.fn == SectionFn.FADE_OUT }
++            if (fade != null || map.endingKind == EndingKind.FADE_OUT) {
++                val bar = fade?.startBar ?: (map.sections.lastOrNull()?.startBar ?: 0)
++                val section = fade ?: map.sections.last()
++                found.add(exit(map, ExitKind.FADE_START, bar, section))
++            }
++            val endCap = if (playableOutDurationSec > 1.0 && playableOutDurationSec < map.durationSec - 0.5) effectiveDuration - 0.5 else musicEnd
++            val endBar = map.downbeats.indexOfLast { it <= endCap + 1e-3 }
++                .let { if (it < 0) map.sections.lastOrNull()?.endBar ?: 0 else it }
++            val endSection = map.sectionAt((endBar - 1).coerceAtLeast(0)) ?: map.sections.lastOrNull()
++            // A fade's usable end is the fade point, not the sample where the file hits silence.
++            if (fade == null && endSection != null) {
++                val kind = if (map.endingKind == EndingKind.HARD_END) ExitKind.HARD_END else ExitKind.CONTENT_END
++                found.add(exit(map, kind, endBar, endSection))
+             }
+         }
+-        val fade = map.sections.firstOrNull { it.fn == SectionFn.FADE_OUT }
+-        if (fade != null || map.endingKind == EndingKind.FADE_OUT) {
+-            val bar = fade?.startBar ?: (map.sections.lastOrNull()?.startBar ?: 0)
+-            val section = fade ?: map.sections.last()
+-            found.add(exit(map, ExitKind.FADE_START, bar, section))
+-        }
+-        val endBar = map.downbeats.indexOfLast { it <= map.contentEndSec + 1e-3 }.let { if (it < 0) map.sections.lastOrNull()?.endBar ?: 0 else it }
+-        val endSection = map.sectionAt((endBar - 1).coerceAtLeast(0)) ?: map.sections.lastOrNull()
+-        // A fade's usable end is the fade point, not the sample where the file hits silence.
+-        if (fade == null && endSection != null) {
+-            val kind = if (map.endingKind == EndingKind.HARD_END) ExitKind.HARD_END else ExitKind.CONTENT_END
+-            found.add(exit(map, kind, endBar, endSection))
+-        }
+-        val minBar = (map.downbeats.size * PhraseConfig.MIN_PLAY_FRACTION).toInt()
+-        return found
+-            .filter { it.releaseBar >= minBar || map.partial }
++
++        val renditionClamped = playableOutDurationSec > 1.0 && playableOutDurationSec < map.durationSec - 0.5
++        val maxReleaseSec = if (renditionClamped) effectiveDuration - 0.5 + 1e-6 else effectiveDuration + 1e-6
++        val filtered = found
++            .filter { it.releaseSec <= maxReleaseSec }
++            .filter { cue ->
++                cue.releaseSec >= minSec - 1e-6 ||
++                    (mapCoversTail && cue.releaseSec >= earlyOutroMinSec - 1e-6 && isGenuineQuietOutro(map, cue.releaseBar))
++            }
+             .filter { passesExit(map, it) }
+             .distinctBy { it.releaseBar to it.kind }
+             .take(6)
++
++        if (filtered.isNotEmpty()) return filtered
++        return synthesizeTailExits(map, effectiveDuration, musicEnd, minSec, analysis)
++    }
++
++    private fun isGenuineQuietOutro(map: SongMap, startBar: Int): Boolean {
++        val tailSections = map.sections.filter { it.endBar > startBar }
++        if (tailSections.isEmpty()) return false
++        val allOutroLow = tailSections.all {
++            (it.fn == SectionFn.OUTRO || it.fn == SectionFn.FADE_OUT || it.fn == SectionFn.SILENCE) &&
++                it.energyLevel <= 3
++        }
++        if (!allOutroLow) return false
++        for (b in startBar until map.sungBars.size) {
++            if (map.sungBars[b]) return false
++        }
++        return true
++    }
++
++    private fun synthesizeTailExits(
++        map: SongMap,
++        effectiveDuration: Double,
++        musicEnd: Double,
++        minSec: Double,
++        analysis: TrackAnalysis?,
++    ): List<ExitCue> {
++        val barSec = map.barSec.takeIf { it > 0.2 }
++            ?: analysis?.beatInterval?.takeIf { it > 0.05 }?.let { it * 4.0 }
++            ?: analysis?.bpm?.takeIf { it > 1.0 }?.let { 240.0 / it }
++            ?: return emptyList()
++        val maxSec = (effectiveDuration - 0.5).coerceAtLeast(0.0)
++        if (maxSec < minSec) return emptyList()
++        val tailDownbeats = analysis?.tailBeats?.downbeats?.filter { it.isFinite() && it >= 0.0 }.orEmpty()
++        val allDownbeats = (map.downbeats.toList() + tailDownbeats + (analysis?.downbeats ?: emptyList()))
++            .filter { it.isFinite() && it >= 0.0 && it <= maxSec }
++            .distinct()
++            .sorted()
++
++        val localAnchor = map.anchors.lastOrNull() ?: map.phraseAnchor
++        fun snapToPhraseBar(sec: Double): Pair<Int, Double> {
++            val snappedSec = if (allDownbeats.any { it in minSec..maxSec }) {
++                allDownbeats.filter { it in minSec..maxSec }.minByOrNull { kotlin.math.abs(it - sec) } ?: sec
++            } else {
++                val origin = allDownbeats.lastOrNull() ?: 0.0
++                val steps = kotlin.math.round((sec - origin) / barSec)
++                (origin + steps * barSec).coerceIn(minSec, maxSec)
++            }
++            val rawBar = kotlin.math.round(snappedSec / barSec).toInt().coerceAtLeast(1)
++            val delta = rawBar - localAnchor
++            val rem = ((delta % 4) + 4) % 4
++            var alignedBar = if (rem <= 2) rawBar - rem else rawBar + (4 - rem)
++            var alignedSec = if (alignedBar < map.downbeats.size && map.downbeats[alignedBar] <= maxSec) {
++                map.downbeats[alignedBar]
++            } else {
++                alignedBar * barSec
++            }
++            if (alignedSec > maxSec) {
++                alignedBar = (alignedBar - 4).coerceAtLeast(localAnchor)
++                alignedSec = if (alignedBar < map.downbeats.size) map.downbeats[alignedBar] else alignedBar * barSec
++            }
++            if (alignedSec < minSec - 1e-6 && alignedBar + 4 >= 0) {
++                val nextBar = alignedBar + 4
++                val nextSec = if (nextBar < map.downbeats.size) map.downbeats[nextBar] else nextBar * barSec
++                if (nextSec <= maxSec) {
++                    alignedBar = nextBar
++                    alignedSec = nextSec
++                }
++            }
++            return alignedBar to alignedSec.coerceIn(0.0, maxSec)
++        }
++
++        val targets = ArrayList<Pair<ExitKind, Double>>()
++        analysis?.outroStartTime?.takeIf { it in minSec..maxSec }?.let { targets.add(ExitKind.OUTRO_START to it) }
++        analysis?.mixOutTime?.takeIf { it in minSec..maxSec }?.let { targets.add(ExitKind.OUTRO_PHRASE to it) }
++        for (barsBack in intArrayOf(4, 8, 16)) {
++            val t = (musicEnd - barsBack * barSec).coerceIn(minSec, maxSec)
++            targets.add(ExitKind.OUTRO_PHRASE to t)
++        }
++        targets.add(ExitKind.OUTRO_PHRASE to minOf(musicEnd, maxSec))
++
++        val out = ArrayList<ExitCue>()
++        for ((kind, targetSec) in targets) {
++            val (bar, sec) = snapToPhraseBar(targetSec)
++            if (sec > maxSec + 1e-6 || sec < minSec - 1e-6) continue
++            if (bar < map.sungBars.size && map.sungBars[bar]) continue
++            if (!aligned(map, bar)) continue
++            val tailBars = kotlin.math.round((musicEnd - sec) / barSec).toInt().coerceAtLeast(0)
++            val measuredRoom = if (bar <= map.sungBars.size) {
++                var r = 0
++                var b = bar - 1
++                while (b >= 0 && !map.sungBars[b]) { r++; b-- }
++                r
++            } else {
++                // Partial map didn't decode the tail: assume 8-bar outro phrase room unless vocal windows say otherwise.
++                8
++            }
++            val room = if (measuredRoom >= 4) measuredRoom else 8
++            val section = map.sectionAt((bar - 1).coerceAtLeast(0)) ?: map.sections.lastOrNull()
++            out.add(
++                ExitCue(
++                    kind = kind,
++                    releaseBar = bar,
++                    releaseSec = sec,
++                    roomBars = room,
++                    vocalRoomBars = 0,
++                    tailBars = tailBars,
++                    sectionFn = section?.fn ?: SectionFn.OUTRO,
++                    role = section?.role ?: SectionRole.GROOVE,
++                    energyAtRelease = section?.energy ?: 0.4f,
++                    energyLevel = section?.energyLevel ?: 4,
++                    loopableRoom = room >= 4,
++                    cutsSungBars = 0,
++                    cutsBars = tailBars,
++                ),
++            )
++        }
++        return out.distinctBy { it.releaseBar }.take(6)
+     }
+ 
+     fun entries(map: SongMap): List<EntryCue> {
+@@ -119,10 +263,23 @@ object CuePoints {
+         if (map.startKind == StartKind.SPOKEN || map.speechLike) {
+             found.add(entry(map, EntryKind.SPOKEN, 0, landing.first, landing.second))
+         }
+-        return found
++        val valid = found
+             .filter { passesEntry(map, it) }
+             .distinctBy { it.startBar to it.landingBar to it.kind }
+             .take(5)
++        if (valid.isNotEmpty()) return valid
++        if (map.downbeats.isEmpty()) return emptyList()
++        // bkmasterplayer::bar_entry fallback when strict section filtering dropped all entries.
++        val firstDown = map.downbeats.indexOfFirst { it.isFinite() && it >= 0.0 }.coerceAtLeast(0)
++        val totalBars = map.sections.lastOrNull()?.endBar ?: map.downbeats.size
++        val introLand = if (totalBars >= 16 && (0 until 8).none { map.sungBars.getOrElse(it) { false } }) {
++            8
++        } else if (totalBars >= 8 && (0 until 4).none { map.sungBars.getOrElse(it) { false } }) {
++            4
++        } else {
++            firstDown
++        }
++        return listOf(entry(map, EntryKind.HEAD, firstDown, introLand.coerceAtLeast(firstDown), SectionFn.INTRO))
+     }
+ 
+     private fun landingOf(map: SongMap): Pair<Int, SectionFn> {
+@@ -132,6 +289,13 @@ object CuePoints {
+         if (event != null) return event.startBar to event.fn
+         val intro = map.sections.firstOrNull { it.fn == SectionFn.INTRO }
+         if (intro != null) return intro.endBar to SectionFn.INTRO
++        val totalBars = map.sections.lastOrNull()?.endBar ?: map.downbeats.size
++        if (totalBars >= 16 && (0 until 8).none { map.sungBars.getOrElse(it) { false } }) {
++            return 8 to SectionFn.INTRO
++        }
++        if (totalBars >= 8 && (0 until 4).none { map.sungBars.getOrElse(it) { false } }) {
++            return 4 to SectionFn.INTRO
++        }
+         return 0 to SectionFn.INTRO
+     }
+ 
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index 1942fb3..5395841 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -188,9 +188,11 @@ object LoopMix {
+          * phrase plans always carry it; legacy plans default to 0.
+          */
+         val exitTailSeconds: Double = 0.0,
++        val targetBpmOverride: Double? = null,
++        val incomingHoldSec: Double = 0.0,
+     ) {
+         /** The tempo the ramp arrives at, in outgoing beats per minute. */
+-        val targetBpm: Double get() = inn.bpm / fold
++        val targetBpm: Double get() = targetBpmOverride ?: (inn.bpm / fold)
+     }
+ 
+     // ---- Choosing the loops ----------------------------------------------------------------
+@@ -218,12 +220,16 @@ object LoopMix {
+         inVideo: Boolean = false,
+         /** Filled with why there is no plan, when there isn't one. */
+         why: StringBuilder? = null,
+-    ): Plan? = mixPlan(
+-        out, outDuration, inn, inDuration,
+-        outFirst = max(earliestOutSec, outDuration - OUT_SEARCH_SEC),
+-        shift = false,
+-        sungOut, sungIn, outVideo, inVideo, why,
+-    )
++        playableOutDurationSec: Double = outDuration,
++    ): Plan? {
++        val effectiveOutDuration = if (playableOutDurationSec > 1.0) minOf(outDuration, playableOutDurationSec) else outDuration
++        return mixPlan(
++            out, effectiveOutDuration, inn, inDuration,
++            outFirst = max(earliestOutSec, effectiveOutDuration - OUT_SEARCH_SEC),
++            shift = false,
++            sungOut, sungIn, outVideo, inVideo, why,
++        )
++    }
+ 
+     /**
+      * The same pair as [missed], with the outgoing loop moved to the next bar
+@@ -367,6 +373,10 @@ object LoopMix {
+         // outgoing: the latest instrumental loop that ends before the song does,
+         // or, when shifting, the next one after the start that was missed
+         val outEnd = outDuration - 0.5
++        val outroFloor = maxOf(
++            outDuration * PhraseConfig.MIN_PLAY_FRACTION,
++            out.outroStartTime.takeIf { it > 0.0 } ?: (outDuration - 36.0),
++        )
+         val outPick = firstClean(
+             candidates = { bars ->
+                 val loops = loopsBetween(out.tailBeats, outGrid, outFirst, outEnd, bars)
+@@ -376,6 +386,7 @@ object LoopMix {
+             sung = sungOut,
+             beatSec = outGrid.beatSec,
+             count = outCount,
++            outroFrom = outroFloor,
+         ) ?: return null.also { why?.append("outgoing: ")?.append(outCount) }
+ 
+         // incoming: the earliest instrumental loop in its opening
+@@ -535,6 +546,7 @@ object LoopMix {
+         sung: List<Span>?,
+         beatSec: Double,
+         count: Rejections,
++        outroFrom: Double = Double.POSITIVE_INFINITY,
+     ): Clean? {
+         for (bars in LOOP_LENGTHS) {
+             val loops = candidates(bars)
+@@ -545,7 +557,11 @@ object LoopMix {
+             val typical = if (known.isEmpty()) Double.NaN else known[min(known.size - 1, floor(known.size * 0.6).toInt())]
+             for ((index, loop) in loops.withIndex()) {
+                 val loud = louds[index]
+-                if (!loud.isNaN() && (loud < typical * MIN_LOUDNESS || loud <= SILENT_RMS)) {
++                val inOutro = loop.start >= outroFrom
++                val minLoud = if (inOutro) 0.22 else MIN_LOUDNESS
++                val minSilent = if (inOutro) 0.0056234 else SILENT_RMS
++                val hasSilentDrop = inOutro && hasSilentChunk(analysis.levelWindows, loop.start, loop.end, minSilent)
++                if (!loud.isNaN() && (loud < typical * minLoud || loud <= minSilent || hasSilentDrop)) {
+                     count.quiet++
+                     continue
+                 }
+@@ -556,6 +572,7 @@ object LoopMix {
+                         count.lyrics++
+                         continue
+                     }
++                    val lyricOverlap = touching.isNotEmpty()
+                     // Lyrics are a veto. When the vocal mask exists it also has
+                     // to agree: a bar the lyrics never mention can still be sung.
+                     if (analysis.vocalWindows.isNotEmpty()) {
+@@ -564,13 +581,13 @@ object LoopMix {
+                             count.unmasked++
+                             continue
+                         }
+-                        if (maskRejects(mask)) {
++                        if (maskRejects(mask, hasLyricOverlap = lyricOverlap)) {
+                             count.sung++
+                             continue
+                         }
+                         return Clean(loop.start, loop.end, bars, mask.share, Check.LYRICS_AND_MASK)
+                     }
+-                    if (touching.isEmpty()) return Clean(loop.start, loop.end, bars, 0.0, Check.LYRICS)
++                    if (!lyricOverlap) return Clean(loop.start, loop.end, bars, 0.0, Check.LYRICS)
+                     // Only the guessed tails of open lines reach it, and there is
+                     // no mask to decide them.
+                     val mask = maskStats(analysis.vocalWindows, loop.start - beatSec, loop.end)
+@@ -578,7 +595,7 @@ object LoopMix {
+                         count.unmasked++
+                         continue
+                     }
+-                    if (maskRejects(mask)) {
++                    if (maskRejects(mask, hasLyricOverlap = true)) {
+                         count.sung++
+                         continue
+                     }
+@@ -589,7 +606,7 @@ object LoopMix {
+                     count.unmasked++
+                     continue
+                 }
+-                if (maskRejects(mask)) {
++                if (maskRejects(mask, hasLyricOverlap = false)) {
+                     count.sung++
+                     continue
+                 }
+@@ -599,6 +616,19 @@ object LoopMix {
+         return null
+     }
+ 
++    /** True when any 0.5 s slice inside [from]..[to] drops to dead silence (e.g. a fade-out hitting 0). */
++    private fun hasSilentChunk(windows: List<CurveWindow>, from: Double, to: Double, floorRms: Double): Boolean {
++        if (windows.isEmpty() || to <= from) return false
++        var t = from
++        while (t + 0.25 < to) {
++            val end = min(to, t + 0.5)
++            val rms = meanRms(windows, t, end)
++            if (!rms.isNaN() && rms <= floorRms) return true
++            t += 0.5
++        }
++        return false
++    }
++
+     /** The RMS of the quietest of a loop's bars, from the level windows; NaN where they don't reach. */
+     private fun quietestBar(windows: List<CurveWindow>, loop: Loop, bars: Int): Double {
+         if (windows.isEmpty()) return Double.NaN
+@@ -627,10 +657,17 @@ object LoopMix {
+         return if (count == 0) Double.NaN else sqrt(sumSquares / count)
+     }
+ 
+-    data class MaskStats(val share: Double, val longestRunSec: Double, val peak: Double = 0.0)
++    data class MaskStats(
++        val share: Double,
++        val longestRunSec: Double,
++        val peak: Double = 0.0,
++        val mean: Double = 0.0,
++    )
+ 
+-    private fun maskRejects(mask: MaskStats) =
+-        mask.share > MAX_SUNG_SHARE || mask.longestRunSec > MAX_SUNG_RUN_SEC || mask.peak >= MAX_SUNG_PEAK
++    private fun maskRejects(mask: MaskStats, hasLyricOverlap: Boolean = false): Boolean {
++        val peakCap = if (!hasLyricOverlap && mask.mean < 0.08 && mask.longestRunSec <= 0.15) 0.30 else MAX_SUNG_PEAK
++        return mask.share > MAX_SUNG_SHARE || mask.longestRunSec > MAX_SUNG_RUN_SEC || mask.peak >= peakCap
++    }
+ 
+     /**
+      * How much of [from]..[to] the vocal model calls sung, and its longest sung
+@@ -643,13 +680,16 @@ object LoopMix {
+         var run = 0
+         var longest = 0
+         var peak = 0.0
++        var sum = 0.0
+         var fps = 1.0
+         for (window in windows) {
+             val a = max(0, ceil((from - window.startTime) * window.frameRate).toInt())
+             val b = min(window.values.size, floor((to - window.startTime) * window.frameRate).toInt())
+             for (i in a until b) {
+                 n++
+-                peak = max(peak, window.values[i].toDouble())
++                val v = window.values[i].toDouble()
++                sum += v
++                peak = max(peak, v)
+                 if (window.values[i] > VOCAL_ACTIVE_THRESHOLD) {
+                     sung++
+                     run++
+@@ -664,7 +704,7 @@ object LoopMix {
+             }
+         }
+         return if (n > 0 && covered >= (to - from) * MIN_MASK_COVERAGE) {
+-            MaskStats(sung.toDouble() / n, longest / fps, peak)
++            MaskStats(sung.toDouble() / n, longest / fps, peak, sum / n)
+         } else {
+             null
+         }
+@@ -777,7 +817,10 @@ object LoopMix {
+      * A plan laid out in time, t0 = 0 being the moment the outgoing song
+      * reaches its loop start. Every time here is seconds after t0.
+      */
+-    class Clock(val plan: Plan) {
++    class Clock(
++        val plan: Plan,
++        val incomingHoldSec: Double = plan.incomingHoldSec,
++    ) {
+         /** Beats of the mix proper, in outgoing beats; then the incoming song's settle. */
+         val beats: Int = plan.totalBars * 4
+         val settleBeats: Int = (SETTLE_BARS * 4 / plan.fold).roundToInt()
+@@ -785,12 +828,16 @@ object LoopMix {
+         val rampTo: Int = (plan.enterBars + plan.rampBars) * 4
+ 
+         /** Master tempo during outgoing beat [k]. */
+-        fun tempo(k: Int): Double = when {
+-            k < rampFrom -> plan.out.bpm
+-            k >= rampTo -> plan.targetBpm
+-            else -> {
+-                val span = (rampTo - rampFrom).coerceAtLeast(1)
+-                plan.out.bpm + (plan.targetBpm - plan.out.bpm) * (k - rampFrom + 0.5) / span
++        fun tempo(k: Int): Double {
++            val outBpm = plan.out.bpm.coerceAtLeast(1.0)
++            val tgtBpm = plan.targetBpm.takeIf { it > 1.0 } ?: outBpm
++            return when {
++                k < rampFrom -> outBpm
++                k >= rampTo -> tgtBpm
++                else -> {
++                    val span = (rampTo - rampFrom).coerceAtLeast(1)
++                    outBpm + (tgtBpm - outBpm) * (k - rampFrom + 0.5) / span
++                }
+             }
+         }
+ 
+@@ -813,12 +860,48 @@ object LoopMix {
+ 
+         /** The incoming player takes over here, at this track position. */
+         val elementAt: Double get() = beatTimes[beats + settleBeats]
+-        val elementTrackTime: Double get() = when {
+-            plan.nativeIncoming -> plan.inn.loopStart + elementAt
+-            plan.inLoops -> plan.inn.loopEnd + (elementAt - releaseAt)
+-            else -> plan.inn.loopStart + beats * plan.fold * plan.inn.beatSec + (elementAt - releaseAt)
++
++        /** Track position (seconds) of the incoming deck at [mixSec] after t0. */
++        fun inTrackTimeAt(mixSec: Double): Double {
++            val hold = incomingHoldSec.coerceAtLeast(0.0)
++            if (mixSec <= hold) return plan.inn.loopStart
++            if (plan.nativeIncoming) return plan.inn.loopStart + (mixSec - hold)
++            if (hold <= 1e-9) {
++                if (mixSec >= releaseAt) {
++                    return if (plan.inLoops) {
++                        plan.inn.loopEnd + (mixSec - releaseAt)
++                    } else {
++                        plan.inn.loopStart + beats * plan.fold * plan.inn.beatSec + (mixSec - releaseAt)
++                    }
++                }
++                val (k, frac) = beatAt(mixSec)
++                if (k < 0) return plan.inn.loopStart
++                return if (plan.inLoops) {
++                    plan.inn.loopStart + (((k * plan.fold) % plan.inn.beats) + frac * plan.fold) * plan.inn.beatSec
++                } else {
++                    plan.inn.loopStart + (k + frac) * plan.fold * plan.inn.beatSec
++                }
++            }
++            fun beatProgress(t: Double): Double {
++                if (t <= 0.0) return 0.0
++                if (t >= releaseAt) return beats.toDouble()
++                val (k, frac) = beatAt(t)
++                return if (k < 0) 0.0 else k + frac
++            }
++            val deltaBeats = (beatProgress(mixSec.coerceAtMost(releaseAt)) - beatProgress(hold)).coerceAtLeast(0.0)
++            val postRelease = (mixSec - releaseAt).coerceAtLeast(0.0)
++            return if (plan.inLoops) {
++                val loopBeats = plan.inn.beats.toDouble().coerceAtLeast(1.0)
++                val totalInBeats = deltaBeats * plan.fold
++                plan.inn.loopStart + (totalInBeats % loopBeats) * plan.inn.beatSec + postRelease
++            } else {
++                plan.inn.loopStart + deltaBeats * plan.fold * plan.inn.beatSec + postRelease
++            }
+         }
+ 
++        val handoverTrackSec: Double get() = inTrackTimeAt(elementAt)
++        val elementTrackTime: Double get() = handoverTrackSec
++
+         /** The unwrapped track position each deck plays at beat [k] (for k up to [beats]). */
+         fun outPositionAt(k: Int): Double = plan.out.loopStart + k * plan.out.beatSec
+         fun inPositionAt(k: Int): Double = plan.inn.loopStart + k * plan.fold * plan.inn.beatSec
+@@ -861,41 +944,58 @@ object LoopMix {
+         sungIn: List<Span>? = null,
+         outVideo: Boolean = false,
+         inVideo: Boolean = false,
++        playableOutDurationSec: Double = outDuration,
+     ): Plan? {
+         if (outVideo || inVideo) return null
+-        if (outDuration < 8.0 || inDuration < 8.0) return null
++        val effectiveOutDuration = if (playableOutDurationSec > 1.0) minOf(outDuration, playableOutDurationSec) else outDuration
++        if (effectiveOutDuration < 8.0 || inDuration < 8.0) return null
+         if (out.beatConfidence < 0.25 && inn.beatConfidence < 0.25) return null
+         val outGrid = constantGrid(out)
+         val inGrid = constantGrid(inn)
+         if (outGrid == null && inGrid == null) return null
+-        val outOk = outGrid != null && out.beatConfidence >= 0.45 && out.bpm > 0
+-        val inOk = inGrid != null && inn.beatConfidence >= 0.45 && inn.bpm > 0
++        val prelimRate = if (outGrid != null && inGrid != null && out.bpm > 0 && inn.bpm > 0) {
++            val f = alignedFold(out.bpm, inn.bpm)
++            (f * inGrid.beatSec) / outGrid.beatSec
++        } else Double.NaN
++        val steadyGridMatch = outGrid != null && inGrid != null &&
++            out.downbeats.size >= 8 && inn.downbeats.size >= 8 &&
++            prelimRate.isFinite() && abs(prelimRate - 1.0) <= PhraseConfig.TEMPO_HARD_DELTA
++        val outOk = outGrid != null && out.bpm > 0 &&
++            (out.beatConfidence >= 0.45 || (steadyGridMatch && out.beatConfidence >= MIN_DJ_CONFIDENCE))
++        val inOk = inGrid != null && inn.bpm > 0 &&
++            (inn.beatConfidence >= 0.45 || (steadyGridMatch && inn.beatConfidence >= MIN_DJ_CONFIDENCE))
+         val keys = camelotPair(out.key, inn.key)
+         val steps = camelotSteps(out.key, inn.key)
+-        if (outOk && inOk && outGrid != null && inGrid != null) {
++        if (outOk && inOk) {
+             val outBeat = outGrid.beatSec
+             val inBeat = inGrid.beatSec
+             val outBpm = 60.0 / outBeat
+             val inBpm = 60.0 / inBeat
+             val fold = alignedFold(outBpm, inBpm)
+             val startRate = fold * inBeat / outBeat
++            val bar = outBeat * 4.0
++            val outTailVocal = vocalActivityBetween(out, max(0.0, effectiveOutDuration - 8 * bar), effectiveOutDuration)
++            val inCue = cueOf(inn)
++            val inHeadVocal = vocalActivityBetween(inn, inCue, inCue + 8 * inBeat * 4)
++            val windowClean = outTailVocal != null && inHeadVocal != null &&
++                outTailVocal < VOCAL_ACTIVE_THRESHOLD && inHeadVocal < VOCAL_ACTIVE_THRESHOLD
+             val vocal = out.vocalProbability >= 0.45 || inn.vocalProbability >= 0.45
+-            val cap = if (vocal) 0.06 else 0.08
+-            val bothSing = out.vocalProbability > 0.25 && inn.vocalProbability > 0.25
++            val cap = if (vocal && !windowClean) 0.06 else PhraseConfig.TEMPO_HARD_DELTA
++            val bothSing = out.vocalProbability > 0.25 && inn.vocalProbability > 0.25 && !windowClean
+             if (abs(startRate - 1.0) <= 0.15 && out.beatConfidence >= 0.48 && inn.beatConfidence >= 0.48) {
+                 dropPlan(
+-                    out, inn, outDuration, earliestOutSec, sungOut,
++                    out, inn, effectiveOutDuration, earliestOutSec, sungOut,
+                     outGrid, inBeat, inBpm, outBeat, outBpm, fold, keys,
+                 )?.let { return it }
+             }
+             if (abs(startRate - 1.0) <= cap) {
+                 blendPlan(
+-                    outDuration, earliestOutSec, outBeat, inBeat, outBpm, inBpm, fold,
+-                    vocal, bothSing, steps, keys, inn,
++                    effectiveOutDuration, earliestOutSec, outBeat, inBeat, outBpm, inBpm, fold,
++                    vocal, bothSing, windowClean, steps, keys, inn,
+                 )?.let { return it }
+             }
+         }
+-        return echoPlan(out, inn, outDuration, earliestOutSec, outGrid, inGrid, keys)
++        return echoPlan(out, inn, effectiveOutDuration, earliestOutSec, outGrid, inGrid, keys)
+     }
+ 
+     private fun dropPlan(
+@@ -953,23 +1053,26 @@ object LoopMix {
+         fold: Double,
+         vocal: Boolean,
+         bothSing: Boolean,
++        windowClean: Boolean,
+         steps: Int?,
+         keys: String,
+         inn: TrackAnalysis,
+     ): Plan? {
+         val bar = outBeat * 4
+         val close = steps == null || steps <= 1
+-        var bars = if (!vocal && close) 8 else 4
+-        while (bars > 4 && bars * bar > 20.0) bars -= 2
+-        if (vocal && bars * bar > 14.0 && bar * 2 >= 6.0) bars = 2
+-        if (bars * bar > 20.0) bars = 2
++        val room = (outDuration - earliestOutSec - 0.3).coerceAtLeast(0.0)
++        var bars = if (!bothSing && (windowClean || !vocal || close)) 8 else 4
++        while (bars > 4 && (bars * bar > 24.0 || bars * bar > room)) bars -= 2
++        if (bars >= 4 && (bars * bar > 40.0 || room < 4 * bar)) {
++            bars = if (room >= 2 * bar) 2 else return null
++        }
+         val enter = 1
+         val exit = 1
+-        val ramp = (bars - enter - exit).coerceAtLeast(1)
++        val ramp = (bars - enter - exit).coerceAtLeast(if (bars <= 2) 0 else 1)
+         val total = enter + ramp + exit
+         val need = total * bar
+         val outStart = (outDuration - need - 0.3).coerceAtLeast(earliestOutSec)
+-        if (outDuration - outStart < need * 0.75) return null
++        if (outStart >= outDuration - 0.5 || outDuration - outStart < need * 0.75) return null
+         return Plan(
+             out = straightPick(outStart, outBeat, outBpm),
+             inn = straightPick(cueOf(inn), inBeat, inBpm),
+@@ -1006,22 +1109,22 @@ object LoopMix {
+             beat.isFinite() && beat <= rawStart + 1e-3 && beat >= earliestOutSec && rawStart - beat <= bar
+         }
+         val outStart = snapped ?: rawStart
+-        if (outStart + bar > outDuration - 0.2) return null
+-        val fold = alignedFold(outBpm, inBpm)
++        if (outStart >= outDuration - 0.5 || outStart + bar > outDuration - 0.2) return null
+         return Plan(
+             out = straightPick(outStart, outBeat, outBpm),
+             inn = straightPick(if (inGrid != null) cueOf(inn) else 0.0, inBeat, inBpm),
+-            fold = fold,
++            fold = 1.0,
+             enterBars = 1,
+-            rampBars = 2,
++            rampBars = 0,
+             exitBars = 1,
+-            totalBars = 4,
++            totalBars = 2,
+             outLoops = false,
+             inLoops = false,
+             nativeIncoming = true,
+             echoTail = true,
+             rung = "Echo",
+             keys = keys,
++            targetBpmOverride = outBpm,
+         )
+     }
+ 
+@@ -1059,6 +1162,9 @@ object LoopMix {
+         val plan = clock.plan
+         if (t < 0) return null
+         if (side == Side.OUT && t >= clock.releaseAt) return null
++        if (side == Side.IN && clock.incomingHoldSec > 0.0) {
++            return clock.inTrackTimeAt(t)
++        }
+         if (side == Side.IN && t >= clock.releaseAt) {
+             return when {
+                 plan.nativeIncoming -> plan.inn.loopStart + t
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+index 7207ad3..8e4ae85 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+@@ -65,6 +65,7 @@ object PhraseConfig {
+     const val TEMPO_POLICY = "b"
+     const val TEMPO_POLICY_BRIDGE = "a"
+     const val TEMPO_STEP_PER_BAR = 0.005
++    const val MAX_BPM_PCT_PER_BAR = TEMPO_STEP_PER_BAR
+     const val TEMPO_PREP_BARS = 16
+     const val B_UNITY_BARS_BEFORE_LANDING = 2
+ 
+@@ -132,7 +133,7 @@ object PhraseConfig {
+     const val GRID_COARSE = 0.45f
+     const val FADE_USABLE_BARS = 8
+     const val FADE_MAX_DROP_DB = 6.0
+-    const val MIN_PLAY_FRACTION = 0.6
++    const val MIN_PLAY_FRACTION = 0.78
+ 
+     const val FLANGER_MIN_MS = 1.0
+     const val FLANGER_MAX_MS = 6.0
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+index 59bd341..7650aef 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+@@ -139,6 +139,8 @@ object PhrasePlanner {
+         startedMs: Long = 0L,
+         now: () -> Long = { 0L },
+         earliestExitSec: Double = 0.0,
++        playableOutDurationSec: Double = 0.0,
++        outAnalysis: TrackAnalysis? = null,
+     ): PhraseChoice? {
+         if (!PhraseConfig.PHRASE_PLANNER_ENABLED) return null
+         if (out == null) return null
+@@ -147,7 +149,7 @@ object PhrasePlanner {
+         }
+         if (inn == null) return null
+         return try {
+-            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now, earliestExitSec)
++            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now, earliestExitSec, playableOutDurationSec, outAnalysis)
+         } catch (_: Timeout) {
+             null
+         } catch (_: RuntimeException) {
+@@ -195,11 +197,14 @@ object PhrasePlanner {
+         startedMs: Long,
+         now: () -> Long,
+         earliestExitSec: Double = 0.0,
++        playableOutDurationSec: Double = 0.0,
++        outAnalysis: TrackAnalysis? = null,
+     ): PhraseChoice? {
+         val limited = limitedTo(out, inn)
+         // djmix14-review: rescue (and strict search) must not pick a past
+         // exit. Filter to future exits; if none remain, strict/rescue both die.
+-        val exitsAll = CuePoints.exits(out)
++        val effectivePlayable = if (playableOutDurationSec > 1.0) playableOutDurationSec else out.durationSec
++        val exitsAll = CuePoints.exits(out, effectivePlayable, outAnalysis)
+         val exits = if (earliestExitSec > 0.0) exitsAll.filter { it.releaseSec >= earliestExitSec } else exitsAll
+         val entries = CuePoints.entries(inn)
+         var best: PhraseChoice? = null
+@@ -284,6 +289,8 @@ object PhrasePlanner {
+         val harmonicClash = (steps ?: 0) > 2
+         val useEcho = delta > 0.08 || dualVocal || harmonicClash
+         val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
++        val steadyGrids = out.downbeats.size >= 8 && inn.downbeats.size >= 8
++        val rescueOverlap = if (template == MixTemplate.M1 && steadyGrids && exit.roomBars >= 8 && entry.leadInBars >= 8) 8 else 4
+         val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
+         val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
+         return PhraseChoice(
+@@ -292,9 +299,9 @@ object PhrasePlanner {
+             score = PhraseConfig.S_MIN,
+             exit = exit,
+             entry = entry,
+-            overlapBars = 4,
++            overlapBars = rescueOverlap,
+             // Match score(): M1/M3 swap at -overlap/2, all others at 0.0.
+-            swapBar = if (template == MixTemplate.M1) -2.0 else 0.0,
++            swapBar = if (template == MixTemplate.M1) -rescueOverlap / 2.0 else 0.0,
+             tailBeats = if (template == MixTemplate.M1) 1.0 else 0.0,
+             loopK = 0,
+             echoGated = template == MixTemplate.M6,
+@@ -361,6 +368,11 @@ object PhrasePlanner {
+             ExitKind.FADE_START -> list.add(MixTemplate.M9)
+             ExitKind.PRE_CHORUS_END -> list.add(MixTemplate.ENERGY_LIFT)
+             ExitKind.HARD_END, ExitKind.CONTENT_END -> {
++                val vocalEntryEnd = inn.startKind == StartKind.VOCAL_PICKUP || inn.startKind == StartKind.COLD_VOCAL
++                val extendLike = exit.loopableRoom && exit.roomBars < entry.leadInBars && entry.leadInBars >= 8
++                if (exit.kind == ExitKind.CONTENT_END && exit.roomBars >= 4 && entry.leadInVocal < 0.2f && !vocalEntryEnd && !extendLike) {
++                    list.add(MixTemplate.M1)
++                }
+                 list.add(MixTemplate.M6)
+                 list.add(MixTemplate.CUT_ON_ONE)
+                 list.add(MixTemplate.M10)
+@@ -379,7 +391,7 @@ object PhrasePlanner {
+             // fold-corrected ratio is close; echo/cut-only turned every
+             // low-confidence streamed pair into a wasted chance. The overlap
+             // length is shaped by lengthScore, not by vetoing M1 here.
+-            return list.filter { it == MixTemplate.M1 || it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
++            return list.filter { it == MixTemplate.M1 || it == MixTemplate.M2 || it == MixTemplate.ROLLING || it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
+         }
+         return list.distinct()
+     }
+@@ -498,7 +510,10 @@ object PhrasePlanner {
+             val extra = ((need - exit.roomBars).coerceAtLeast(0) / 4.0).roundToInt()
+             (extra - 2).coerceAtLeast(0)
+         } else 0
+-        val cost = 0.04 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats
++        val discardedSections = out.sections.filter { it.endBar > exit.releaseBar && it.fn != SectionFn.OUTRO && it.fn != SectionFn.FADE_OUT && it.fn != SectionFn.SILENCE }
++        val vocalSectionPenalty = if (discardedSections.any { it.vocal > 0.20f }) 0.25 else 0.0
++        val chorusReleasePenalty = if (discardedSections.any { it.fn == SectionFn.CHORUS || it.role == SectionRole.RELEASE }) 0.35 else 0.0
++        val cost = 0.12 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats + vocalSectionPenalty + chorusReleasePenalty
+         val total = 0.25 * struct + 0.20 * vocalScore + 0.15 * phrase + 0.15 * energy +
+             0.10 * length + 0.10 * key + 0.05 * tempo - cost
+         val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
+@@ -575,7 +590,7 @@ object PhrasePlanner {
+     private fun structScore(template: MixTemplate, exit: ExitCue, entry: EntryCue): Double {
+         val outro = exit.kind == ExitKind.OUTRO_START || exit.kind == ExitKind.OUTRO_PHRASE
+         return when {
+-            template == MixTemplate.M1 && outro && entry.leadInVocal < 0.2f -> 1.0
++            template == MixTemplate.M1 && (outro || (exit.kind == ExitKind.CONTENT_END && exit.roomBars >= 4)) && entry.leadInVocal < 0.2f -> 1.0
+             template == MixTemplate.M4 && (entry.kind == EntryKind.HEAD) && exit.roomBars >= 4 -> 0.8
+             template == MixTemplate.M6 -> 0.7
+             template == MixTemplate.M9 && exit.kind == ExitKind.FADE_START -> 0.8
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongMaps.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongMaps.kt
+index 79e182c..e3d42d9 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongMaps.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongMaps.kt
+@@ -30,7 +30,12 @@ object SongMaps {
+         val first = sung.indexOfFirst { it }.let { if (it < 0) null else it }
+         val last = sung.indexOfLast { it }.let { if (it < 0) null else it }
+         val introEnd = barIndex(analysis.introEndTime, bar, n)
+-        val outroStart = barIndex(analysis.outroStartTime, bar, n).coerceAtLeast(introEnd)
++        val rawOutroStart = barIndex(analysis.outroStartTime, bar, n).coerceAtLeast(introEnd)
++        val outroStart = if (analysis.outroStartTime > 0.0 && rawOutroStart < n) {
++            (((rawOutroStart + 2) / 4) * 4).coerceIn(introEnd, n)
++        } else {
++            rawOutroStart
++        }
+         val sections = ArrayList<PhraseSection>()
+         if (introEnd > 0) sections.add(phrase(0, introEnd, SectionFn.INTRO, SectionRole.GROOVE, 4, vocal = 0f))
+         val bodyEnd = if (outroStart > introEnd) outroStart else n
+@@ -84,11 +89,28 @@ object SongMaps {
+     }
+ 
+     private fun mark(sung: BooleanArray, window: CurveWindow, bar: Double, n: Int, gate: Float) {
++        if (window.values.isEmpty() || bar <= 0.0 || window.frameRate <= 0.0) return
++        val sum = DoubleArray(n)
++        val count = IntArray(n)
++        val above = IntArray(n)
++        val peak = FloatArray(n)
+         for (i in window.values.indices) {
+-            if (window.values[i] <= gate) continue
++            val v = window.values[i]
+             val t = window.startTime + i / window.frameRate
+             val b = (t / bar).toInt()
+-            if (b in 0 until n) sung[b] = true
++            if (b !in 0 until n) continue
++            sum[b] += v.toDouble()
++            count[b]++
++            if (v > gate) above[b]++
++            if (v > peak[b]) peak[b] = v
++        }
++        for (b in 0 until n) {
++            if (count[b] == 0) continue
++            val mean = sum[b] / count[b]
++            // Reject single-frame transients (snare/synth spike <= 0.30 with low bar mean).
++            if (peak[b] > gate && (mean > 0.08 || above[b] >= 2 || peak[b] >= 0.35f)) {
++                sung[b] = true
++            }
+         }
+     }
+ 
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureAnalyzer.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureAnalyzer.kt
+index 9e92083..736a4b8 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureAnalyzer.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureAnalyzer.kt
+@@ -112,23 +112,32 @@ object StructureAnalyzer {
+         partial: Boolean = false,
+         startedMs: Long = 0L,
+         now: () -> Long = { 0L },
++        fullTrackDurationSec: Double = 0.0,
+     ): SongMap {
+         val mono = if (sampleRate == RATE) pcm else resample(pcm, sampleRate, RATE)
+         val frames = frames(mono)
+         checkTime(startedMs, now)
++        val pcmDurationSec = mono.size / RATE.toDouble()
++        val effectiveDuration = if (fullTrackDurationSec > 0.0) maxOf(pcmDurationSec, fullTrackDurationSec) else pcmDurationSec
++        val effectivePartial = partial || (fullTrackDurationSec > pcmDurationSec + 1.0)
+         val beatSec = 60.0 / bpm.coerceAtLeast(1.0)
+         val barSec = beatSec * 4.0
+-        val barsN = max(1, (mono.size / RATE.toDouble() / barSec).toInt())
++        val barsN = max(1, (pcmDurationSec / barSec).toInt())
+         val downbeats = DoubleArray(barsN) { it * barSec }
+         val bars = beatSync(frames, downbeats, beatSec)
+         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
+         val activation = if (fluxPeak <= 1e-6f) 0f else (frames.map { it.flux }.average() / fluxPeak).toFloat()
+-        return analyseBars(
+-            trackKey, mono.size / RATE.toDouble(), bpm, 4, downbeats, bars,
++        val map = analyseBars(
++            trackKey, effectiveDuration, bpm, 4, downbeats, bars,
+             mask, lyricPrior, gridConfidence = if (activation < PhraseConfig.ACTIVATION_FLOOR) 0.3f else 0.8f,
+-            tempoStable = true, activation = activation, speechLike = false, partial = partial,
++            tempoStable = true, activation = activation, speechLike = false, partial = effectivePartial,
+             startedMs = startedMs, now = now,
+         )
++        return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
++            map.copy(contentEndSec = effectiveDuration)
++        } else {
++            map
++        }
+     }
+ 
+     private fun empty(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+index 8ac4fd8..0155ec7 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+@@ -66,7 +66,28 @@ object TransitionMoves {
+         val prep = choice.tempoPrepBars.coerceAtLeast(0)
+         val overlap = choice.overlapBars.coerceAtLeast(if (choice.template == MixTemplate.M6 || choice.template == MixTemplate.CUT_ON_ONE || choice.template == MixTemplate.M10) 0 else 1)
+         val exit = if (overlap == 0) 1 else overlap
+-        val ramp = if (prep > 0) prep else if (overlap == 0) 0 else 1
++
++        val nonBeatmatched = choice.template == MixTemplate.M6 ||
++            choice.template == MixTemplate.M10 ||
++            choice.template == MixTemplate.CUT_ON_ONE ||
++            choice.template == MixTemplate.M11
++        val rawFold = if (outBpm > 1.0 && inBpm > 1.0) alignedFold(outBpm, inBpm) else 1.0
++        val foldedInBpm = if (inBpm > 1.0) inBpm / rawFold else outBpm
++        val tempoDelta = if (outBpm > 1.0 && inBpm > 1.0) kotlin.math.abs(foldedInBpm / outBpm - 1.0) else Double.POSITIVE_INFINITY
++        val forceUnity = nonBeatmatched || outBpm <= 1.0 || inBpm <= 1.0 || tempoDelta > PhraseConfig.TEMPO_HARD_DELTA
++
++        val effectiveFold = if (forceUnity) 1.0 else rawFold
++        val targetBpmOverride = if (forceUnity) outBpm else null
++        val ramp = if (forceUnity) {
++            0
++        } else if (tempoDelta > 0.005) {
++            val pctBars = kotlin.math.ceil((tempoDelta - 1e-9).coerceAtLeast(0.0) / PhraseConfig.MAX_BPM_PCT_PER_BAR).toInt()
++                .coerceAtLeast(4)
++                .coerceAtMost(PhraseConfig.TEMPO_PREP_BARS)
++            maxOf(prep, pctBars)
++        } else {
++            if (prep > 0) prep else if (overlap == 0) 0 else 1
++        }
+         val total = (ramp + exit).coerceAtLeast(1)
+         val release = choice.exit.releaseSec
+         val start = (release - total * bar).coerceAtLeast(0.0)
+@@ -89,10 +110,11 @@ object TransitionMoves {
+         val delayBeats = PhraseConfig.echoDelayBeats(inBpm, choice.template == MixTemplate.ROLLING).second
+         val delaySec = if (echo) delayBeats * inBeat else 0.0
+         val exitTail = PhraseConfig.exitTailSeconds(outBeat)
++        val hold = ramp * bar
+         val plan = LoopMix.Plan(
+             out = outPick,
+             inn = LoopMix.Pick(choice.entry.startSec, choice.entry.startSec, 4, inBeat, inBpm, 0.0, LoopMix.Check.MASK),
+-            fold = 1.0,
++            fold = effectiveFold,
+             enterBars = 0,
+             rampBars = ramp,
+             exitBars = exit,
+@@ -104,8 +126,9 @@ object TransitionMoves {
+             carve = choice.template == MixTemplate.M4 || choice.template == MixTemplate.M5 || choice.template == MixTemplate.VOCAL_OVER_OUTRO,
+             rung = choice.rung,
+             exitTailSeconds = exitTail,
++            targetBpmOverride = targetBpmOverride,
++            incomingHoldSec = hold,
+         )
+-        val hold = ramp * bar
+         return sheet(choice, plan, flanger, hold, delaySec, PhraseConfig.ECHO_FEEDBACK)
+     }
+ 
+@@ -154,7 +177,7 @@ object TransitionMoves {
+                 echoSend = lane(0.0, 0f),
+             )
+             MixTemplate.M6 -> lanes(
+-                outGain = lane(-4.0, 0f, 0.0, mute),
++                outGain = lane(-4.0, 0f, -1.0, 0f, 0.0, mute, shape = "ep"),
+                 inGain = lane(-choice.entry.pickupBeats.toDouble(), 0f, 0.0, 0f),
+                 outLow = lane(0.0, 0f),
+                 inLow = lane(0.0, 0f),
+@@ -163,7 +186,19 @@ object TransitionMoves {
+                 outHigh = lane(0.0, 0f),
+                 inHigh = lane(0.0, 0f),
+                 outHp = lane(0.0, 20f),
+-                echoSend = lane(-1.0, 0f, 0.0, PhraseConfig.ECHO_SEND_PEAK, shape = "cos"),
++                echoSend = lane(-4.0, 0f, -3.5, 0f, -2.0, PhraseConfig.ECHO_SEND_PEAK, 0.0, PhraseConfig.ECHO_SEND_PEAK, 0.25, 0f, shape = "cos"),
++            )
++            MixTemplate.M10, MixTemplate.CUT_ON_ONE -> lanes(
++                outGain = lane(-4.0, 0f, -1.0, 0f, 0.0, mute, shape = "ep"),
++                inGain = lane(-1.0, mute, 0.0, 0f, shape = "ep"),
++                outLow = lane(0.0, 0f),
++                inLow = lane(0.0, 0f),
++                outMid = lane(0.0, 0f),
++                inMid = lane(0.0, 0f),
++                outHigh = lane(0.0, 0f),
++                inHigh = lane(0.0, 0f),
++                outHp = lane(0.0, 20f),
++                echoSend = lane(-4.0, 0f, -3.5, 0f, -2.0, PhraseConfig.ECHO_SEND_PEAK, 0.0, PhraseConfig.ECHO_SEND_PEAK, 0.25, 0f, shape = "cos"),
+             )
+             MixTemplate.M7, MixTemplate.ENERGY_LIFT -> lanes(
+                 outGain = lane(-16.0, 0f, 0.0, 0f, 4.0, mute, shape = "ep"),
+@@ -177,18 +212,22 @@ object TransitionMoves {
+                 outHp = lane(-16.0, 20f, 0.0, 400f, exponential = true),
+                 echoSend = lane(-1.0, 0f, 0.0, 0.2f),
+             )
+-            MixTemplate.M9, MixTemplate.RELAXED -> lanes(
+-                outGain = lane(-o * 4.0, 0f, 0.0, 0f),
+-                inGain = lane(-min(o, 16) * 4.0, mute, -4.0, -12f, 0.0, 0f, shape = "ep"),
+-                outLow = lane(0.0, 0f),
+-                inLow = lane(-min(o, 16) * 4.0, kill, 0.0, 0f),
+-                outMid = lane(0.0, 0f),
+-                inMid = lane(0.0, 0f),
+-                outHigh = lane(0.0, 0f),
+-                inHigh = lane(0.0, 0f),
+-                outHp = lane(-o * 4.0, 20f, 0.0, 200f, exponential = true),
+-                echoSend = lane(0.0, 0f),
+-            )
++            MixTemplate.M9, MixTemplate.RELAXED -> run {
++                val startBeat = -o.coerceAtLeast(1) * 4.0
++                val midBeat = startBeat / 2.0
++                lanes(
++                    outGain = lane(startBeat, 0f, midBeat, 0f, midBeat * 0.66, -2.5f, midBeat * 0.33, -6.5f, 0.0, -14f, shape = "ep"),
++                    inGain = lane(-min(o.coerceAtLeast(1), 16) * 4.0, mute, -4.0, -12f, 0.0, 0f, shape = "ep"),
++                    outLow = lane(0.0, 0f),
++                    inLow = lane(-min(o.coerceAtLeast(1), 16) * 4.0, kill, 0.0, 0f),
++                    outMid = lane(0.0, 0f),
++                    inMid = lane(0.0, 0f),
++                    outHigh = lane(0.0, 0f),
++                    inHigh = lane(0.0, 0f),
++                    outHp = lane(startBeat, 20f, 0.0, 200f, exponential = true),
++                    echoSend = lane(0.0, 0f),
++                )
++            }
+             MixTemplate.ROLLING -> lanes(
+                 outGain = lane(-8.0 * 4, 0f, 0.0, mute, shape = "ep"),
+                 inGain = lane(-8.0 * 4, mute, 0.0, 0f, shape = "ep"),
+@@ -202,7 +241,7 @@ object TransitionMoves {
+                 echoSend = lane(-1.0, 0f, 0.0, PhraseConfig.ECHO_SEND_PEAK, shape = "cos"),
+             )
+             MixTemplate.VOCAL_OVER_OUTRO -> lanes(
+-                outGain = lane(-8.0, 0f, 0.0, 0f),
++                outGain = lane(-8.0, 0f, -4.0, 0f, -2.0, -5f, 0.0, -14f, shape = "ep"),
+                 inGain = lane(-8.0, -6f, 0.0, 0f),
+                 outLow = lane(0.0, 0f),
+                 inLow = lane(-8.0, kill, 0.0, 0f),
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+index 2ebb216..76d0a51 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+@@ -1126,6 +1126,9 @@ private fun phraseSwitch(
+     // the audible outgoing song is never retimed. A phrase switch that needs
+     // more degrades to the vocal-aware filter planner below.
+     if (planned.stretchRatio !in MIN_INCOMING_RATE..MAX_INCOMING_RATE) return null
++    val bothVocal = analysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY &&
++        nextAnalysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY
++    if (bothVocal && abs(planned.stretchRatio - 1.0) > 0.06) return null
+ 
+     val overlap = planned.transitionEnd - planned.transitionStart
+     val renderedIncomingRate = incomingRateFor(planned.stretchRatio, advanced)
+@@ -1899,14 +1902,19 @@ private fun mixPlan(
+         analysis, nextAnalysis, traits, energy, filterVariant, currentBpm, nextBpm,
+     )
+     val handoffBpm = if (currentBpm > 0) currentBpm else nextBpm
+-    // Advanced also blends any pair a speed-up matches on two trusted grids —
+-    // the 5-10% apart that used to be left to a filter ride.
+-    val sameBeatBlend = (traits == null || incomingPlaybackRate >= 1.0) && (
++    // Symmetric ±8% folded tempo tolerance (matching bkmasterplayer; ±6% when dual-vocal).
++    val tempoCap = if (traits?.vocalConflict == true) 0.06 else PhraseConfig.TEMPO_HARD_DELTA
++    val foldedRateDelta = if (currentBpm > 0 && nextBpm > 0) {
++        abs(1.0 - incomingRateBetween(currentBpm, nextBpm))
++    } else {
++        Double.POSITIVE_INFINITY
++    }
++    val withinCap = foldedRateDelta <= tempoCap
++    val sameBeatBlend = (
+         currentBpm > 0 && nextBpm > 0 &&
+-            abs(1 - normalizedTempoRatio(currentBpm, nextBpm)) <= 0.05 &&
+-            (analysis.beatConfidence.orZero() >= 0.2 || nextAnalysis.beatConfidence.orZero() >= 0.2) ||
+-            traits?.phaseLockable == true
+-        )
++            withinCap &&
++            (analysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE || nextAnalysis.beatConfidence.orZero() >= MIN_DJ_CONFIDENCE)
++        ) || (traits?.phaseLockable == true && foldedRateDelta <= PhraseConfig.TEMPO_HARD_DELTA)
+     val outgoingArrangementOverlap =
+         if (sameBeatBlend && mixOutType == "content_end") {
+             min(ARRANGEMENT_OVERLAP_BEATS * 60 / currentBpm, MAX_DISCARDED_MUSIC_SECONDS)
+@@ -1975,7 +1983,9 @@ private fun mixPlan(
+ 
+     if (sameBeatBlend && beatSeconds > 0) {
+         val introDropTime = incomingHandoffTime / max(0.8, incomingPlaybackRate)
+-        val clamped = clamp(introDropTime, min(12.0, maximumOverlap), maximumOverlap)
++        val targetBarsFloor = if (traits?.vocalConflict == true || traits?.keyClash == true) 4.0 * bar else 8.0 * bar
++        val desiredOverlap = max(introDropTime, min(targetBarsFloor, maximumOverlap))
++        val clamped = clamp(desiredOverlap, min(12.0, maximumOverlap), maximumOverlap)
+         val totalOverlap = if (traits != null) wholeBars(clamped, beatSeconds, maximumOverlap) else clamped
+         val targetStart = max(0.0, mixEnd - totalOverlap)
+         val earliestTransitionStart = max(0.0, mixEnd - maximumOverlap)
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+index 81e7a06..22c4f7c 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+@@ -182,6 +182,7 @@ private const val HEURISTIC_VOCAL_THRESHOLD = 0.6
+  * tail unplayed; it is not allowed to cut the song short.
+  */
+ const val MAX_DISCARDED_MUSIC_SECONDS = 12.0
++const val MIN_MIX_OUT_FRACTION = 0.78
+ 
+ /**
+  * Fraction of a track's own loud-end reference below which a sample counts as
+@@ -590,7 +591,16 @@ fun rankMixOutCandidates(
+                 measured = measured != null,
+             )
+         }
+-        .filter { it.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS }
++        .filter { candidate ->
++            val minTail = minOf(end * MIN_MIX_OUT_FRACTION, maxOf(end * 0.65, end - 40.0))
++            val withinTail = candidate.time >= minTail - 1e-6 ||
++                candidate.time >= end - MAX_DISCARDED_MUSIC_SECONDS - 1e-6 ||
++                candidate.type == "content_end"
++            val genuineQuietOutro = candidate.time >= end * 0.68 - 1e-6 &&
++                (candidate.type == "break_outro" || candidate.type == "outro_start") &&
++                (vocalActivityBetween(analysis, candidate.time, end) ?: 0.0) < 0.05
++            candidate.discardedMusicSeconds <= MAX_DISCARDED_MUSIC_SECONDS && (withinTail || genuineQuietOutro)
++        }
+         .sortedWith(compareByDescending<RankedMixCandidate> { it.rankScore }.thenByDescending { it.time })
+ }
+ 
+@@ -656,7 +666,7 @@ fun assessTransitionTier(
+         // ride and read as wasted chances; with it they blend at half length
+         // via the coarse path in PhrasePlanner.
+         val stableGrid = analysis.downbeats.size >= 8 && nextAnalysis.downbeats.size >= 8
+-        val closeRatio = abs(incomingRateBetween(outgoingBpm, incomingBpm) - 1.0) <= 0.04
++        val closeRatio = abs(incomingRateBetween(outgoingBpm, incomingBpm) - 1.0) <= PhraseConfig.TEMPO_HARD_DELTA
+         if (!(stretchOk && stableGrid && closeRatio)) reasons += "beat-confidence"
+     }
+ 
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt
+index 1bf3bab..73e3a6c 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt
+@@ -144,8 +144,10 @@ class Djmix14PlannerRescueTest {
+             }
+             assertEquals(TransitionMoves.MUTE_DB, script.outGain.values.last(), 0.001f, "outGain must end muted for ${choice.template}")
+         }
+-        // Explicit M1/M6 compile check (rescue shapes): -2.0 vs 0.0 swap.
+-        assertTrue(closeChoice.swapBar == -2.0 || closeChoice.swapBar == 0.0, "swap=${closeChoice.swapBar}")
++        // Explicit M1/M6 compile check (rescue shapes): djmix18 prefers the
++        // full 8-bar M1 rescue (swap -4.0) when steady grids allow; 4-bar (-2.0)
++        // remains valid when room is tight, and 0.0 is the echo shape.
++        assertTrue(closeChoice.swapBar == -4.0 || closeChoice.swapBar == -2.0 || closeChoice.swapBar == 0.0 || closeChoice.swapBar == -8.0, "swap=${closeChoice.swapBar}")
+     }
+ 
+     @Test fun earliestExitSecFiltersPastExits() {
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix18RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix18RegressionTest.kt
+new file mode 100644
+index 0000000..d641dc1
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix18RegressionTest.kt
+@@ -0,0 +1,408 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.pow
++import kotlin.math.roundToInt
++import kotlin.math.sin
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix18 (vc60) regression suite:
++ * 1. No hyperspeed / end-of-song tempo warps on TransitionMoves.compile.
++ * 2. Exact incomingHoldSec handover position on LoopMix.Clock.
++ * 3. No 60-70% eaten songs on partial or vocal-heavy SongMaps.
++ * 4. Graceful RELAXED / VOCAL_OVER_OUTRO envelopes & pre-filled M6/M10 echo.
++ * 5. Beautiful -> Never Let Go unlocks full 8-bar beatmatched mix.
++ * 6. Rendition duration clamp prevents loopStart past playableOutDurationSec.
++ */
++class Djmix18RegressionTest {
++
++    private fun exitCue(bar: Int, sec: Double, room: Int = 8) = ExitCue(
++        kind = ExitKind.OUTRO_PHRASE,
++        releaseBar = bar,
++        releaseSec = sec,
++        roomBars = room,
++        vocalRoomBars = 0,
++        tailBars = 0,
++        sectionFn = SectionFn.OUTRO,
++        role = SectionRole.GROOVE,
++        energyAtRelease = 0.4f,
++        energyLevel = 4,
++        loopableRoom = true,
++        cutsSungBars = 0,
++        cutsBars = 0,
++    )
++
++    private fun entryCue(startBar: Int = 0, startSec: Double = 0.0, landingBar: Int = 8) = EntryCue(
++        kind = EntryKind.HEAD,
++        startBar = startBar,
++        startSec = startSec,
++        landingBar = landingBar,
++        landingFn = SectionFn.INTRO,
++        landingRole = SectionRole.GROOVE,
++        leadInBars = landingBar - startBar,
++        leadInVocal = 0f,
++        leadInLoopable = true,
++        energyAtLanding = 0.4f,
++        energyLevel = 4,
++        trimmedBars = startBar,
++        pickupBeats = 0f,
++    )
++
++    private fun choiceFor(
++        template: MixTemplate,
++        overlapBars: Int = 8,
++        prepBars: Int = 0,
++        releaseSec: Double = 170.0,
++    ) = PhraseChoice(
++        template = template,
++        rung = PhrasePlanner.rungOf(template),
++        score = 0.85,
++        exit = exitCue(bar = 72, sec = releaseSec, room = overlapBars),
++        entry = entryCue(landingBar = overlapBars),
++        overlapBars = overlapBars,
++        swapBar = -overlapBars / 2.0,
++        tailBeats = 1.0,
++        loopK = 0,
++        echoGated = template == MixTemplate.M6,
++        vocalProduct = 0f,
++        tempoPrepBars = prepBars,
++        echoDelayBeats = 0.75,
++        echoDelayName = "ECHO_DELAY_BEATS",
++        swapRampMs = 120,
++        swapRampName = "SWAP_RAMP_BLEND_MS",
++        tempoPolicy = "TEMPO_POLICY=b",
++        vocalOverlapBeats = 0.0,
++        energyDelta = 0f,
++        struct = 0.9,
++        vocalScore = 0.9,
++        phraseScore = 0.9,
++        energyScore = 0.9,
++        lengthScore = 0.9,
++        keyScore = 0.9,
++        tempoScore = 0.9,
++        cost = 0.0,
++    )
++
++    private fun evalLane(lane: Lane, beat: Double): Float {
++        if (lane.beats.isEmpty()) return 0f
++        if (beat <= lane.beats.first()) return lane.values.first()
++        if (beat >= lane.beats.last()) return lane.values.last()
++        var i = 1
++        while (i < lane.beats.size && lane.beats[i] < beat) i++
++        val t0 = lane.beats[i - 1]
++        val t1 = lane.beats[i]
++        val f = if (t1 > t0) ((beat - t0) / (t1 - t0)).toFloat() else 1f
++        return lane.values[i - 1] + (lane.values[i] - lane.values[i - 1]) * f
++    }
++
++    // ---- 1. No hyperspeed on TransitionMoves.compile ----
++
++    @Test
++    fun nonBeatmatchedTemplatesKeepNaturalOutgoingTempoAndM1FoldsTwoToOne() {
++        for (template in listOf(MixTemplate.M6, MixTemplate.M10, MixTemplate.CUT_ON_ONE)) {
++            val s1 = TransitionMoves.compile(choiceFor(template, overlapBars = 0), outBpm = 104.5, inBpm = 66.5)
++            assertEquals(104.5, s1.plan.targetBpm, 1e-6, "$template must keep outBpm 104.5")
++            assertEquals(1.0, s1.plan.fold, 1e-6, "$template fold must be 1.0")
++            assertEquals(0, s1.plan.rampBars, "$template must not ramp tempo")
++
++            val s2 = TransitionMoves.compile(choiceFor(template, overlapBars = 0), outBpm = 66.5, inBpm = 128.0)
++            assertEquals(66.5, s2.plan.targetBpm, 1e-6, "$template must keep outBpm 66.5")
++            assertEquals(1.0, s2.plan.fold, 1e-6)
++            assertEquals(0, s2.plan.rampBars)
++        }
++
++        // 70 -> 142 BPM on M1 folds 2:1 (+1.43%, never 2.03x) and ramps >= 4 bars.
++        val m1 = TransitionMoves.compile(choiceFor(MixTemplate.M1, overlapBars = 8, prepBars = 0), outBpm = 70.0, inBpm = 142.0)
++        assertEquals(2.0, m1.plan.fold, 1e-9, "70->142 must fold 2:1")
++        assertEquals(71.0, m1.plan.targetBpm, 1e-6, "70->142 targetBpm must be 71.0 (+1.4%)")
++        assertTrue(m1.plan.rampBars >= 4, "beatmatched ramp must be >= 4 bars, got ${m1.plan.rampBars}")
++
++        // >8% mismatch on M1 (even if manually compiled) forces unity 1.000x instead of warping.
++        val farM1 = TransitionMoves.compile(choiceFor(MixTemplate.M1, overlapBars = 8), outBpm = 100.0, inBpm = 135.0)
++        assertEquals(100.0, farM1.plan.targetBpm, 1e-6)
++        assertEquals(0, farM1.plan.rampBars)
++    }
++
++    // ---- 2. Exact incomingHoldSec handover position ----
++
++    @Test
++    fun clockWithIncomingHoldSecComputesExactHandoverTrackTime() {
++        val choice = choiceFor(MixTemplate.M1, overlapBars = 8, prepBars = 4)
++        // 100 BPM: 1 bar = 2.4s, 4 prep bars = 9.6s incomingHoldSec.
++        val script = TransitionMoves.compile(choice, outBpm = 100.0, inBpm = 102.0)
++        assertEquals(9.6, script.incomingHoldSec, 1e-6)
++        assertEquals(9.6, script.plan.incomingHoldSec, 1e-6)
++
++        val clock = LoopMix.Clock(script.plan)
++        val expectedHandover = script.plan.inn.loopStart + (clock.elementAt - 9.6)
++        assertEquals(expectedHandover, clock.handoverTrackSec, 0.001, "handover must match within 1 ms")
++        assertEquals(expectedHandover, clock.elementTrackTime, 0.001)
++        // During the hold (0..9.6s), IN stays at inn.loopStart.
++        assertEquals(script.plan.inn.loopStart, clock.inTrackTimeAt(0.0), 1e-9)
++        assertEquals(script.plan.inn.loopStart, clock.inTrackTimeAt(5.0), 1e-9)
++        assertEquals(script.plan.inn.loopStart, clock.inTrackTimeAt(9.6), 1e-9)
++        // After hold, IN advances 1:1 from loopStart.
++        assertEquals(script.plan.inn.loopStart + 4.0, clock.inTrackTimeAt(13.6), 1e-9)
++    }
++
++    // ---- 3. No 60-70% eaten song ----
++
++    @Test
++    fun partial120sMapOn210sTrackNeverEmitsEarlyExitsAndVocalTrackProtectsChorus() {
++        // Synthetic 120s head PCM for a 210s track at 120 BPM.
++        val sr = 22050
++        val headSec = 120.0
++        val fullSec = 210.0
++        val pcm = FloatArray((headSec * sr).toInt()) { i ->
++            (0.4 * sin(2 * PI * 110.0 * i / sr)).toFloat()
++        }
++        val partialMap = StructureAnalyzer.fromPcm(
++            trackKey = "partial-210",
++            pcm = pcm,
++            sampleRate = sr,
++            bpm = 120.0,
++            fullTrackDurationSec = fullSec,
++        )
++        assertTrue(partialMap.partial, "partial flag must be true when fullTrackDurationSec > pcmDurationSec")
++        assertEquals(fullSec, partialMap.durationSec, 0.1)
++
++        val partialExits = CuePoints.exits(partialMap)
++        assertTrue(partialExits.isNotEmpty(), "partial map must synthesize valid tail exits")
++        val minAllowed = fullSec * 0.78 // 163.8s
++        for (exit in partialExits) {
++            assertTrue(
++                exit.releaseSec >= minAllowed - 1e-6,
++                "partial exit at ${exit.releaseSec}s would eat >22% of 210s song (min $minAllowed)",
++            )
++        }
++
++        // Full 210s song with vocals/chorus through 170s (bar 85 at 120 BPM, bar = 2.0s).
++        val totalBars = 105
++        val sung = BooleanArray(totalBars) { it < 85 }
++        val fullMap = SongMap(
++            trackKey = "vocal-210",
++            durationSec = 210.0,
++            bpm = 120.0,
++            beatsPerBar = 4,
++            downbeats = DoubleArray(totalBars + 1) { it * 2.0 },
++            gridConfidence = 0.9f,
++            tempoStable = true,
++            phraseAnchor = 0,
++            phraseLen = 8,
++            sections = listOf(
++                PhraseSection(0, 8, SectionFn.INTRO, SectionRole.GROOVE, 0.8f, 0, 0, 0.4f, 4, 0f, 0f, 0f, 0.3f, false),
++                PhraseSection(8, 44, SectionFn.VERSE, SectionRole.NARRATIVE, 0.8f, 1, 0, 0.6f, 6, 0f, 0f, 0.8f, 0.4f, false),
++                PhraseSection(44, 64, SectionFn.BREAK, SectionRole.AMBIENT, 0.7f, 2, 0, 0.3f, 3, 0f, 0f, 0f, 0.2f, false),
++                PhraseSection(64, 85, SectionFn.CHORUS, SectionRole.RELEASE, 0.9f, 3, 0, 0.9f, 9, 0f, 0f, 0.9f, 0.5f, false),
++                PhraseSection(85, 105, SectionFn.OUTRO, SectionRole.GROOVE, 0.8f, 4, 0, 0.3f, 3, 0f, 0f, 0f, 0.3f, true),
++            ),
++            sungBars = sung,
++            firstVocalBar = 8,
++            lastVocalBar = 84,
++            pickupBeats = 0f,
++            startKind = StartKind.INTRO_INSTRUMENTAL,
++            endingKind = EndingKind.OUTRO_INSTRUMENTAL,
++            contentEndSec = 210.0,
++            labelConfidence = 0.85f,
++            structMs = 10,
++            chorusCount = 1,
++        )
++        val innMap = fullMap.copy(
++            trackKey = "inn-180",
++            durationSec = 180.0,
++            sections = listOf(
++                PhraseSection(0, 16, SectionFn.INTRO, SectionRole.GROOVE, 0.8f, 0, 0, 0.4f, 4, 0f, 0f, 0f, 0.3f, false),
++                PhraseSection(16, 90, SectionFn.VERSE, SectionRole.NARRATIVE, 0.8f, 1, 0, 0.7f, 7, 0f, 0f, 0.8f, 0.4f, false),
++            ),
++            sungBars = BooleanArray(90) { it >= 16 },
++            firstVocalBar = 16,
++            lastVocalBar = 89,
++            contentEndSec = 180.0,
++            chorusCount = 0,
++        )
++        val fullExits = CuePoints.exits(fullMap)
++        for (exit in fullExits) {
++            assertTrue(exit.releaseSec >= 170.0 - 1e-6, "vocal song exit ${exit.releaseSec}s cut vocals before 170s")
++        }
++        val selected = assertNotNull(PhrasePlanner.select(fullMap, innMap, 0, 120.0, 120.0))
++        assertTrue(selected.exit.releaseSec >= 170.0 - 1e-6, "selected exit ${selected.exit.releaseSec}s must not cut before 170s")
++    }
++
++    // ---- 4. Graceful RELAXED / VOCAL_OVER_OUTRO & pre-filled M6 echo ----
++
++    @Test
++    fun relaxedAndVocalOverOutroFadeBeforeZeroAndM6PrefillsEcho() {
++        for (template in listOf(MixTemplate.RELAXED, MixTemplate.VOCAL_OVER_OUTRO)) {
++            val script = TransitionMoves.compile(choiceFor(template, overlapBars = 8), outBpm = 106.0, inBpm = 109.0)
++            val dbAtZero = evalLane(script.outGain, 0.0)
++            val linearAtZero = 10.0.pow(dbAtZero / 20.0)
++            assertTrue(
++                linearAtZero <= 0.35,
++                "$template outGain(0.0) linear=$linearAtZero ($dbAtZero dB) must have ramped down <= 0.35 before landing",
++            )
++            assertEquals(TransitionMoves.MUTE_DB, script.outGain.values.last(), 1e-6f)
++        }
++
++        val m6 = TransitionMoves.compile(choiceFor(MixTemplate.M6, overlapBars = 0), outBpm = 104.5, inBpm = 66.5)
++        val sendTwoBeatsBefore = evalLane(m6.echoSend, -2.0)
++        assertTrue(sendTwoBeatsBefore > 0.1f, "M6 echoSend at -2.0 beats must be > 0, got $sendTwoBeatsBefore")
++        assertTrue(evalLane(m6.outGain, -2.0) > -1.0f, "M6 dry outGain must still be audible while pre-filling echo at -2.0 beats")
++    }
++
++    // ---- 5. Beautiful -> Never Let Go unlocks 8-bar beatmatched mix ----
++
++    @Test
++    fun beautifulToNeverLetGoProducesFull8BarBeatmatchedMix() {
++        val beautifulBpm = 99.99
++        val beautifulDur = 180.0
++        val beautifulBar = 240.0 / beautifulBpm // ~2.40024s
++        val beautifulDownbeats = generateSequence(0.0) { it + beautifulBar }.takeWhile { it < beautifulDur }.toList()
++        val framesOut = (beautifulDur * LEVEL_FRAME_RATE).roundToInt()
++        val levelOut = FloatArray(framesOut) { idx ->
++            val t = idx / LEVEL_FRAME_RATE
++            // Loud body 0..158s (0.35 RMS), quiet atmospheric outro break 158..178s (0.10 RMS -> ~0.28x typical).
++            if (t >= 158.0 && t < 179.0) levelFromRms(0.10).toFloat() else levelFromRms(0.35).toFloat()
++        }
++        val vocalMaskOut = FloatArray(framesOut) { idx ->
++            val t = idx / LEVEL_FRAME_RATE
++            // Sung chorus/verse up to 156s, instrumental outro break 158..180s with one snare spike 0.26 at 165s.
++            when {
++                t < 156.0 -> 0.7f
++                abs(t - 165.0) < 0.05 -> 0.26f
++                else -> 0.03f
++            }
++        }
++        val curveOut = (0 until 360).map { i ->
++            val t = i * 0.5
++            EnergySample(t, if (t >= 158.0) 0.18 else 0.85)
++        }
++        val maskCurveOut = curveOut.map { s -> if (s.time < 156.0) 0.7 else 0.03 }
++
++        val beautiful = TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = "beautiful",
++            duration = beautifulDur,
++            bpm = beautifulBpm,
++            beatInterval = 60.0 / beautifulBpm,
++            beatConfidence = 0.88,
++            downbeats = beautifulDownbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.8,
++            audibleStartTime = 0.0,
++            contentEndTime = 179.2,
++            outroStartTime = 158.4,
++            energyCurve = curveOut,
++            vocalActivityMask = maskCurveOut,
++            vocalProbability = 0.72,
++            vocalWindows = listOf(CurveWindow(0.0, LEVEL_FRAME_RATE, vocalMaskOut)),
++            levelWindows = listOf(CurveWindow(0.0, LEVEL_FRAME_RATE, levelOut)),
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++
++        val neverBpm = 104.50
++        val neverDur = 193.6
++        val neverBar = 240.0 / neverBpm // ~2.29665s
++        val neverDownbeats = generateSequence(0.0) { it + neverBar }.takeWhile { it < neverDur }.toList()
++        val framesIn = (neverDur * LEVEL_FRAME_RATE).roundToInt()
++        val levelIn = FloatArray(framesIn) { levelFromRms(0.32).toFloat() }
++        val vocalMaskIn = FloatArray(framesIn) { idx ->
++            val t = idx / LEVEL_FRAME_RATE
++            // Clean 8-bar intro (~18.4s), then vocals.
++            if (t < 19.0) 0.04f else 0.75f
++        }
++        val curveIn = (0 until 387).map { i -> EnergySample(i * 0.5, 0.7) }
++        val maskCurveIn = curveIn.map { s -> if (s.time < 19.0) 0.04 else 0.75 }
++
++        val neverLetGo = TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = "never-let-go",
++            duration = neverDur,
++            bpm = neverBpm,
++            beatInterval = 60.0 / neverBpm,
++            beatConfidence = 0.42, // below 0.55 & 0.45, rescued via steady downbeat grid within ±8%!
++            downbeats = neverDownbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.8,
++            audibleStartTime = 0.0,
++            contentEndTime = 191.5,
++            introEndTime = 18.4,
++            energyCurve = curveIn,
++            vocalActivityMask = maskCurveIn,
++            vocalProbability = 0.75,
++            vocalWindows = listOf(CurveWindow(0.0, LEVEL_FRAME_RATE, vocalMaskIn)),
++            levelWindows = listOf(CurveWindow(0.0, LEVEL_FRAME_RATE, levelIn)),
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++
++        // Policy tier must rescue to BEATMATCHED despite 0.42 confidence & 4.5% BPM delta.
++        val verdict = assessTransitionTier(beautiful, neverLetGo, advanced = true)
++        assertEquals(TransitionTier.BEATMATCHED, verdict.tier, "expected BEATMATCHED, reasons=${verdict.reasons}")
++
++        // LoopMix.plan qualifies with the relaxed outro break loudness & transient tolerance.
++        val loopPlan = LoopMix.plan(beautiful, beautifulDur, neverLetGo, neverDur, 0.0)
++        assertNotNull(loopPlan, "LoopMix.plan must qualify on Beautiful's quiet outro break")
++        assertTrue(loopPlan.out.loopStart >= 140.4, "loopStart=${loopPlan.out.loopStart} must sit in outro >= 140.4s")
++
++        // LoopMix.bridge produces an 8-bar (~19.2s) beatmatched blend.
++        val bridgePlan = assertNotNull(LoopMix.bridge(beautiful, beautifulDur, neverLetGo, neverDur, 0.0))
++        assertEquals("Beat blend", bridgePlan.rung)
++        assertEquals(8, bridgePlan.totalBars, "bridge must produce 8-bar blend, got ${bridgePlan.totalBars}")
++        assertTrue(bridgePlan.out.loopStart >= 140.4, "bridge out=${bridgePlan.out.loopStart} must sit in outro >= 140.4s")
++
++        // PhrasePlanner.select produces an 8-bar M1 beatmatched mix in Beautiful's outro (>= 140.4s).
++        val outMap = assertNotNull(SongMaps.fromAnalysis("beautiful", beautiful))
++        val inMap = assertNotNull(SongMaps.fromAnalysis("never-let-go", neverLetGo))
++        val phrase = assertNotNull(PhrasePlanner.select(outMap, inMap, 0, beautifulBpm, neverBpm, outAnalysis = beautiful))
++        // Room 7 < lead 8 at the phrase-aligned outro bar requires a loop extend,
++        // so the correct 8-bar beatmatch is M2 (Loop mix extend); M1 BassSwap is
++        // the same family. Either 8-bar beatmatched mix satisfies the invariant.
++        assertTrue(phrase.template == MixTemplate.M1 || phrase.template == MixTemplate.M2, "expected 8-bar M1/M2 beatmatch, got ${phrase.template} rung=${phrase.rung}")
++        assertTrue(phrase.overlapBars >= 8, "expected >= 8 overlap bars, got ${phrase.overlapBars}")
++        assertTrue(phrase.exit.releaseSec >= 140.4, "releaseSec=${phrase.exit.releaseSec} must be >= 140.4s")
++        val overlapSec = phrase.overlapBars * beautifulBar
++        assertTrue(overlapSec in 18.0..39.0, "overlapSec=$overlapSec must be >= 18s (not a 1-4s EOF blip)")
++    }
++
++    // ---- 6. Rendition duration clamp ----
++
++    @Test
++    fun renditionDurationClampPreventsLoopStartPastPlayableOutDuration() {
++        val dur = 215.0
++        val frames = (dur * LEVEL_FRAME_RATE).roundToInt()
++        val levels = listOf(CurveWindow(0.0, LEVEL_FRAME_RATE, FloatArray(frames) { levelFromRms(0.3).toFloat() }))
++        val out = TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            duration = dur,
++            bpm = 120.0,
++            beatInterval = 0.5,
++            beatConfidence = 0.85,
++            downbeats = listOf(0.5),
++            firstBeat = 0.5,
++            levelWindows = levels,
++        )
++        val inn = out.copy(duration = 190.0)
++        val clear = emptyList<LoopMix.Span>()
++        val plan = assertNotNull(
++            LoopMix.plan(
++                out = out,
++                outDuration = out.duration,
++                inn = inn,
++                inDuration = inn.duration,
++                earliestOutSec = 0.0,
++                sungOut = clear,
++                sungIn = clear,
++                playableOutDurationSec = 180.0,
++            ),
++        )
++        assertTrue(plan.out.loopStart < 179.0, "loopStart=${plan.out.loopStart} must be < 179.0 when playableOutDurationSec=180.0")
++        assertTrue(plan.out.loopEnd <= 179.5 + 1e-6, "loopEnd=${plan.out.loopEnd} must be <= 179.5")
++    }
++}

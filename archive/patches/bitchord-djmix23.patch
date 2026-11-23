@@ -1,0 +1,433 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index ccf615e..3703196 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -267,6 +267,17 @@ internal fun loopFinishAction(
+     else -> LoopFinishAction.EMERGENCY_TAIL
+ }
+ 
++/**
++ * Session-adoption guard (djmix23, vc65). The session may only move onto the
++ * incoming player once that player has actually started. The loop clock hold
++ * geometry can schedule inStartAt after handoffAt (vc64 06:23 freeze: the
++ * Calvin pair handed the session to the paused position-0 incoming player and
++ * left song 2 paused until a manual play). The native renderer keeps the mix
++ * audible through the wait, so holding the adoption until the start is
++ * inaudible; adopting early is the jam.
++ */
++internal fun canAdoptSessionPlayer(loopIncomingStarted: Boolean): Boolean = loopIncomingStarted
++
+ class CrossfadeController(
+     private val scope: CoroutineScope,
+     /** The player backing the session right now. Moves at every [onHandoff]. */
+@@ -1396,6 +1407,7 @@ class CrossfadeController(
+                 "changeReason" to lastPlayWhenReadyChangeReason,
+                 "msSinceHandoff" to sinceHandoff,
+                 "positionMs" to sessionPlayer.currentPosition,
++                "loopIncomingStarted" to loopIncomingStarted,
+             ),
+         )
+     }
+@@ -3480,6 +3492,8 @@ class CrossfadeController(
+     private var loopRefusal: String? = null
+     private var lastLoopVerdict = ""
+     private var loopIncomingStarted = false
++    /** djmix23: whether mix.handoff.deferred was logged for this loop session. */
++    private var deferredHandoffLogged = false
+     private var lastLoopPositionMs = -1L
+     private var lastLoopAnnounceAt = 0L
+     private var lastLoopBeat = -1
+@@ -4354,6 +4368,7 @@ class CrossfadeController(
+         session.attach(outPort, inPort)
+         loopSession = session
+         loopIncomingStarted = false
++        deferredHandoffLogged = false
+         lastLoopPositionMs = -1L
+         lastLoopBeat = -1
+         Log.d(
+@@ -4381,6 +4396,9 @@ class CrossfadeController(
+                     "handedOff" to handedOff,
+                     "tookOver" to (loopSession?.outPort?.tookOver == true),
+                     "positionMs" to out.currentPosition,
++                    "loopIncomingStarted" to loopIncomingStarted,
++                    "inStartAtMs" to ((loopSession?.inStartAt?.times(1000))?.roundToLong() ?: -1L),
++                    "handoffAtMs" to ((loopSession?.clock?.handoffAt?.times(1000))?.roundToLong() ?: -1L),
+                 ),
+             )
+             return loopBail("paused before the loop")
+@@ -4512,6 +4530,9 @@ class CrossfadeController(
+                     "handedOff" to handedOff,
+                     "tookOver" to (session.outPort?.tookOver == true),
+                     "positionMs" to sessionPlayer.currentPosition,
++                    "loopIncomingStarted" to loopIncomingStarted,
++                    "inStartAtMs" to (session.inStartAt * 1000).roundToLong(),
++                    "handoffAtMs" to (session.clock.handoffAt * 1000).roundToLong(),
+                 ),
+             )
+             return loopBail("paused", settle = true)
+@@ -4531,7 +4552,23 @@ class CrossfadeController(
+             startLoopAlignment(session)
+         }
+         if (!handedOff && m >= session.clock.handoffAt) {
+-            handOff(out, into)
++            if (canAdoptSessionPlayer(loopIncomingStarted)) {
++                handOff(out, into)
++            } else if (!deferredHandoffLogged) {
++                // djmix23: hold geometry scheduled the decoder start after
++                // this handoff (inStartAt > handoffAt). Adopting now would make
++                // the session a never-started, paused player. The renderer
++                // covers the wait, so hold the adoption until the start.
++                deferredHandoffLogged = true
++                AutomixTelemetry.event(
++                    "mix.handoff.deferred",
++                    mapOf(
++                        "mMs" to (m * 1000).roundToLong(),
++                        "inStartAtMs" to (session.inStartAt * 1000).roundToLong(),
++                        "handoffAtMs" to (session.clock.handoffAt * 1000).roundToLong(),
++                    ),
++                )
++            }
+         }
+         publishLoopBeat(session, m, now)
+         announceLoopPosition()
+@@ -4675,6 +4712,20 @@ class CrossfadeController(
+         // reach. The player was pre-positioned by setMediaItems (no cold 0 -> 19s seek at the
+         // splice); a mid-loop pre-seek would trip the inPort interrupted bail, so it is never
+         // done here. A small drift (<150ms) is left alone — seeking it would stutter.
++        // djmix23: finishLoop can be reached with the incoming player never
++        // started (tick jumped to the end before the inStartAt branch ran).
++        // Start it here first, so the session never lands on a paused player.
++        // Only while the mix was actually playing: a player already paused is
++        // the listener's pause and is never second-guessed.
++        if (!loopIncomingStarted) {
++            val outPlayer = outgoing
++            val inPlayer = incoming
++            if (outPlayer != null && inPlayer != null && outPlayer.playWhenReady) {
++                loopIncomingStarted = true
++                inPlayer.playWhenReady = true
++                if (!handedOff) handOff(outPlayer, inPlayer)
++            }
++        }
+         val sessionPlayer = if (handedOff) incoming else outgoing
+         if (sessionPlayer != null && sessionPlayer.playbackState == Player.STATE_READY) {
+             val driftMs = targetMs - sessionPlayer.currentPosition
+diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+index 7ef5579..6fc3f98 100644
+--- a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
++++ b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+@@ -7,6 +7,7 @@ import com.music.bitchord.playback.smart.RegionalLoudness
+ import java.util.concurrent.atomic.AtomicBoolean
+ import kotlin.math.abs
+ import kotlin.math.max
++import kotlin.math.min
+ import kotlin.math.pow
+ import kotlin.math.roundToLong
+ 
+@@ -77,20 +78,9 @@ class LoopMixSession private constructor(
+      * alignment inserts makes up the rest.
+      */
+     fun planIncomingStart() {
+-        val hold = clock.incomingHoldSec
+-        val element = clock.elementAt
+-        val base = if (hold > 1e-9) {
+-            minOf(max(STARTUP_LEAD, hold - 1.5), max(STARTUP_LEAD, element - 3.0))
+-        } else {
+-            STARTUP_LEAD
+-        }
+-        val tBase = handoverTrack - (element - base)
+-        inStartAt = if (hold > 1e-9 && tBase < 0.0 && handoverTrack >= 2.5) {
+-            max(base, (element - handoverTrack).coerceAtLeast(STARTUP_LEAD))
+-        } else {
+-            base
+-        }
+-        inStartTrack = max(0.0, handoverTrack - (clock.elementAt - inStartAt))
++        val (startAt, startTrack) = incomingStartFor(clock)
++        inStartAt = startAt
++        inStartTrack = startTrack
+     }
+ 
+     /**
+@@ -134,6 +124,40 @@ class LoopMixSession private constructor(
+         /** Mix seconds into the mix at which the incoming player starts, silent. */
+         const val STARTUP_LEAD = 0.5
+ 
++        /**
++         * The incoming player's start, computed from a plan clock alone:
++         * startAt into the mix, at track position startTrack. The hold
++         * branch can land the start after handoffAt (the vc64 freeze); the
++         * clamp keeps at least STARTUP_LEAD of decode head-room before
++         * elementAt so driveLoopMix cannot run out of mix before the start
++         * (djmix23, vc65). Pure JVM, no renderer needed.
++         */
++        fun incomingStartFor(clock: LoopMix.Clock): Pair<Double, Double> {
++            val hold = clock.incomingHoldSec
++            val element = clock.elementAt
++            val handoverTrack = clock.elementTrackTime
++            val base = if (hold > 1e-9) {
++                minOf(max(STARTUP_LEAD, hold - 1.5), max(STARTUP_LEAD, element - 3.0))
++            } else {
++                STARTUP_LEAD
++            }
++            val tBase = handoverTrack - (element - base)
++            var inStartAt = if (hold > 1e-9 && tBase < 0.0 && handoverTrack >= 2.5) {
++                max(base, (element - handoverTrack).coerceAtLeast(STARTUP_LEAD))
++            } else {
++                base
++            }
++            inStartAt = clampIncomingStartAt(inStartAt, element, STARTUP_LEAD)
++            val inStartTrack = max(0.0, handoverTrack - (element - inStartAt))
++            return inStartAt to inStartTrack
++        }
++
++        /** Latest cue: at least [startupLead] before elementAt when feasible. */
++        fun clampIncomingStartAt(inStartAt: Double, elementAt: Double, startupLead: Double = STARTUP_LEAD): Double {
++            val latest = (elementAt - startupLead).coerceAtLeast(startupLead)
++            return min(inStartAt, latest)
++        }
++
+         /** Seconds of each song decoded either side of what the decks play. */
+         private const val PREROLL_SECONDS = 1.0
+         private const val TAIL_SECONDS = 3.0
+diff --git a/app/src/test/java/com/music/bitchord/playback/Djmix23AppTest.kt b/app/src/test/java/com/music/bitchord/playback/Djmix23AppTest.kt
+new file mode 100644
+index 0000000..3f21ccf
+--- /dev/null
++++ b/app/src/test/java/com/music/bitchord/playback/Djmix23AppTest.kt
+@@ -0,0 +1,222 @@
++package com.music.bitchord.playback
++
++import com.music.bitchord.playback.loopmix.LoopMixSession
++import com.music.bitchord.playback.smart.EntryCue
++import com.music.bitchord.playback.smart.EntryKind
++import com.music.bitchord.playback.smart.ExitCue
++import com.music.bitchord.playback.smart.ExitKind
++import com.music.bitchord.playback.smart.LoopMix
++import com.music.bitchord.playback.smart.MixTemplate
++import com.music.bitchord.playback.smart.PhraseChoice
++import com.music.bitchord.playback.smart.PhrasePlanner
++import com.music.bitchord.playback.smart.SectionFn
++import com.music.bitchord.playback.smart.SectionRole
++import com.music.bitchord.playback.smart.TransitionMoves
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * djmix23 `:app` session-adoption discipline (vc65).
++ *
++ * Pure JVM (no ExoPlayer): the vc64 06:23 freeze (Calvin pair ->
++ * "This Is What You Came For" -> "One Kiss") left song 2 paused at 0:00 on
++ * two consecutive loop mixes. Video + `mix.pause.detected` prove the pause is
++ * reason 1 = USER_REQUEST (Media3 1.11.0), not focus loss (2): the session
++ * was adopted onto a never-started incoming player. Two guards now keep that
++ * shape out of driveLoopMix and finishLoop:
++ *
++ * 1. [canAdoptSessionPlayer]: `handOff` only once `loopIncomingStarted`.
++ *   The loop clock's hold geometry can schedule the start (inStartAt) after
++ *   the session handoff (handoffAt) — driveLoopMix holds the adoption until
++ *   the start, which the renderer makes inaudible.
++ * 2. [LoopMixSession.clampIncomingStartAt]: inStartAt is clamped strictly
++ *   before elementAt with a decode lead, so the start cannot fall off the
++ *   end of the mix entirely; finishLoop additionally starts the incoming
++ *   player first if it was somehow still unstarted. The geometry tests pin
++ *   both orderings against the real planner output.
++ */
++class Djmix23AppTest {
++
++    // ---- Adoption guard ---------------------------------------------------
++
++    @Test
++    fun `unstarted incoming player is never adopted as the session`() {
++        assertFalse(
++            "canAdoptSessionPlayer(false) must be false: adopting a never-started " +
++                "player makes the session a paused position-0 player (vc64 06:23 freeze)",
++            canAdoptSessionPlayer(loopIncomingStarted = false),
++        )
++    }
++
++    @Test
++    fun `started incoming player is adopted as the session`() {
++        assertTrue(canAdoptSessionPlayer(loopIncomingStarted = true))
++    }
++
++    // ---- Geometry helpers (copied cues; the clock math itself is the real one) ----
++
++    private fun exitCue(bar: Int, sec: Double, room: Int) = ExitCue(
++        kind = ExitKind.OUTRO_PHRASE,
++        releaseBar = bar,
++        releaseSec = sec,
++        roomBars = room,
++        vocalRoomBars = 0,
++        tailBars = 0,
++        sectionFn = SectionFn.OUTRO,
++        role = SectionRole.GROOVE,
++        energyAtRelease = 0.4f,
++        energyLevel = 4,
++        loopableRoom = true,
++        cutsSungBars = 0,
++        cutsBars = 0,
++    )
++
++    private fun entryCue(landingBar: Int) = EntryCue(
++        kind = EntryKind.HEAD,
++        startBar = 0,
++        startSec = 0.0,
++        landingBar = landingBar,
++        landingFn = SectionFn.INTRO,
++        landingRole = SectionRole.GROOVE,
++        leadInBars = landingBar,
++        leadInVocal = 0f,
++        leadInLoopable = true,
++        energyAtLanding = 0.4f,
++        energyLevel = 4,
++        trimmedBars = 0,
++        pickupBeats = 0f,
++    )
++
++    private fun choiceFor(template: MixTemplate, overlapBars: Int, prepBars: Int) = PhraseChoice(
++        template = template,
++        rung = PhrasePlanner.rungOf(template),
++        score = 0.85,
++        exit = exitCue(bar = 72, sec = 170.0, room = overlapBars),
++        entry = entryCue(landingBar = overlapBars),
++        overlapBars = overlapBars,
++        swapBar = -overlapBars / 2.0,
++        tailBeats = 1.0,
++        loopK = 0,
++        echoGated = template == MixTemplate.M6,
++        vocalProduct = 0f,
++        tempoPrepBars = prepBars,
++        echoDelayBeats = 0.75,
++        echoDelayName = "ECHO_DELAY_BEATS",
++        swapRampMs = 120,
++        swapRampName = "SWAP_RAMP_BLEND_MS",
++        tempoPolicy = "TEMPO_POLICY=b",
++        vocalOverlapBeats = 0.0,
++        energyDelta = 0f,
++        struct = 0.9,
++        vocalScore = 0.9,
++        phraseScore = 0.9,
++        energyScore = 0.9,
++        lengthScore = 0.9,
++        keyScore = 0.9,
++        tempoScore = 0.9,
++        cost = 0.0,
++    )
++
++    private fun clockFor(overlapBars: Int, prepBars: Int, outBpm: Double = 124.341, inBpm: Double = 124.250) =
++        LoopMix.Clock(
++            TransitionMoves.compile(
++                choiceFor(MixTemplate.M1, overlapBars, prepBars),
++                outBpm = outBpm,
++                inBpm = inBpm,
++            ).plan,
++        )
++
++    @Test
++    fun `calvin hold geometry reorders start after handoff but before element`() {
++        // Order (i): handoffAt < inStartAt < elementAt — the live vc64 shape.
++        // handoffAt ~0.97, hold ~1.93, elementAt ~7.73. The adoption guard
++        // holds the handoff until the start; the clamp preserves the decode
++        // lead before the element.
++        val clock = clockFor(overlapBars = 1, prepBars = 0)
++        assertTrue("hold must be > 0 (hold branch live), was ${clock.incomingHoldSec}", clock.incomingHoldSec > 0.0)
++        assertTrue(
++            "handoverTrack must be >= 2.5 (branch precondition), was ${clock.elementTrackTime}",
++            clock.elementTrackTime >= 2.5,
++        )
++        val (inStartAt, inStartTrack) = LoopMixSession.incomingStartFor(clock)
++        assertTrue(
++            "inStartAt $inStartAt must be AFTER handoffAt ${clock.handoffAt}: " +
++                "that reorder is why vc64 adopted the session paused",
++            inStartAt > clock.handoffAt + 0.5,
++        )
++        assertTrue(
++            "inStartAt $inStartAt must stay a decode lead before elementAt " +
++                "${clock.elementAt} (clamped), not fall off the end of the mix",
++            inStartAt < clock.elementAt - LoopMixSession.STARTUP_LEAD + 1e-9,
++        )
++        assertTrue("inStartTrack must sit at track start (video frozen 0:00), was $inStartTrack", inStartTrack < 0.5)
++        assertEquals(0.5, LoopMixSession.STARTUP_LEAD, 1e-9)
++    }
++
++    @Test
++    fun `start past elementAt is clamped strictly before the end`() {
++        // Order (ii): elementAt <= pre-clamp inStartAt — the clamp keeps the
++        // start inside the mix with exactly the decode lead, so the start
++        // still fires and the mix completes onto a started player instead of
++        // an unstarted one.
++        val clamped = LoopMixSession.clampIncomingStartAt(inStartAt = 8.0, elementAt = 8.0)
++        assertEquals("a start at elementAt must clamp to a lead before it", 7.5, clamped, 1e-9)
++        val alsoClamped = LoopMixSession.clampIncomingStartAt(inStartAt = 9.0, elementAt = 8.0)
++        assertEquals("a start past elementAt must clamp to a lead before it", 7.5, alsoClamped, 1e-9)
++        val untouched = LoopMixSession.clampIncomingStartAt(inStartAt = 1.93, elementAt = 7.73)
++        assertEquals("an in-mix start must be untouched", 1.93, untouched, 1e-9)
++    }
++
++    @Test
++    fun `element past start never lands on a never-started player`() {
++        // Sweep the real planner grid used by the probe: every plan's
++        // incoming start must satisfy handoffAt-agnostic invariants the
++        // handoff guard and finishLoop pre-start rely on: start strictly
++        // inside the mix with decode head-room, track position at the start.
++        for (ov in 1..16) {
++            for (prep in 0..12) {
++                val clock = clockFor(overlapBars = ov, prepBars = prep)
++                val (inStartAt, inStartTrack) = LoopMixSession.incomingStartFor(clock)
++                assertTrue(
++                    "ov=$ov prep=$prep: inStartAt $inStartAt must be < elementAt ${clock.elementAt}",
++                    inStartAt < clock.elementAt,
++                )
++                assertTrue(
++                    "ov=$ov prep=$prep: inStartAt $inStartAt must keep a decode lead before " +
++                        "elementAt ${clock.elementAt}",
++                    inStartAt <= clock.elementAt - LoopMixSession.STARTUP_LEAD + 1e-9,
++                )
++                assertTrue("ov=$ov prep=$prep: inStartTrack $inStartTrack must be >= 0", inStartTrack >= 0.0)
++                assertTrue(
++                    "ov=$ov prep=$prep: inStartTrack $inStartTrack must be <= handoverTrack " +
++                        "${clock.elementTrackTime}",
++                    inStartTrack <= clock.elementTrackTime + 1e-9,
++                )
++            }
++        }
++    }
++
++    // ---- User-pause-never-resumed invariant (vc65) ------------------------
++
++    @Test
++    fun `user pause is never auto-resumed by the handoff guard`() {
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(wasPlaying = true, userPaused = true, focusHeld = true),
++        )
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(wasPlaying = true, userPaused = true, focusHeld = false),
++        )
++    }
++
++    @Test
++    fun `playing through a handoff still restores only when focus is held`() {
++        assertTrue(
++            shouldRestorePlayAfterFocusSwap(wasPlaying = true, userPaused = false, focusHeld = true),
++        )
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(wasPlaying = true, userPaused = false, focusHeld = false),
++        )
++    }
++}
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 0ac1a35..51b9c98 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 64
+-extra["bitchordVersionName"] = "2.2.3-djmix22"
++extra["bitchordVersionCode"] = 65
++extra["bitchordVersionName"] = "2.2.3-djmix23"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",

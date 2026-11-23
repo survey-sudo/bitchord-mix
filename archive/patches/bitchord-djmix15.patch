@@ -1,0 +1,855 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 0550a8a..ebcc993 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -939,13 +939,23 @@ class CrossfadeController(
+             null
+         }
+         val expected = plannedNextId ?: loopInItem?.mediaId
+-        if (expected != null && nextId != expected) {
++        // djmix15: after the handoff the session player IS the incoming
++        // track (i+1), so its "next" is i+2 by definition. Comparing that
++        // to the armed expected (i+1) is a certain false queueEdit 1.7-6.9s
++        // after every classic startFade (phone PIN-locked). Only the
++        // pre-handoff window can judge next against the plan; the active
++        // current-index check above still catches a user removing or
++        // replacing the audible incoming track. See [SeekAction.isNextEdit].
++        if (SeekAction.isNextEdit(handedOff, nextId, expected)) {
+             dropForQueueEdit("next is $nextId, plan wanted $expected")
+             return
+         }
+         val out = outgoing
+         val into = incoming
+-        if (out != null && into != null && phase != Phase.IDLE && !reconcileQueue(out, into)) {
++        // Same reason: after the handoff the standby snapshot is obsolete
++        // (the retiring player may have been truncated at handOff), so a
++        // diverged snapshot is not a user edit.
++        if (!handedOff && out != null && into != null && phase != Phase.IDLE && !reconcileQueue(out, into)) {
+             dropForQueueEdit("standby snapshot diverged")
+         }
+     }
+@@ -1590,10 +1600,24 @@ class CrossfadeController(
+             rememberLoopPair(currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration)
+             // djmix14: prime as soon as the pair is within 40 s (was 12-20 s
+             // effective via LOOP_ARM_LEAD). Farther out, wait to save decode.
+-            if (nextStreamReady(nextItem) && loopStartMs - player.currentPosition <= LOOP_PRIME_LEAD_MS) {
++            // djmix15: NEVER gate warming on nextStreamReady. The DirectSource
++            // gate is true only after a prefetch/decode, but a DB-cached
++            // TrackAnalysis (quality=full, status=ready) means TrackAnalyzer
++            // never downloaded the next file — a chicken-and-egg deadlock
++            // (Never Let Go -> S.A.D: 6 mix.plan, 0 mix.fire/arm/exit).
++            // primeLoopDecks itself streams via copyToRead, so priming IS
++            // the warm. Classic begin() likewise prepares the standby over
++            // HTTP. Gating either on the gate stalls the very I/O that could
++            // satisfy it.
++            if (loopStartMs - player.currentPosition <= LOOP_PRIME_LEAD_MS) {
+                 primeLoopDecks(player, loop, currentItem, nextItem, duration, nextDuration)
+             }
+-            if (markerOnly || !nextStreamReady(nextItem)) return
++            // djmix15: no early return on !nextStreamReady. In particular if
++            // loopStartMs - pos < 4500L (or the cold-lead gate above just
++            // nulled loop) and loop cannot arm because the stream isn't
++            // cached, fall through to classic begin() below so the standby
++            // arms and blends instead of playing dry to EOF.
++            if (markerOnly) return
+             plannedTransition = currentItem.mediaId to loopStartMs
+             holdAhead(player, duration)
+             if (loopStartMs - player.currentPosition > blendArmLeadMs) return
+@@ -1695,9 +1719,25 @@ class CrossfadeController(
+         // Plus, when the outgoing track is the one sped up, the beats that
+         // ramp takes: it has to be at the incoming tempo by the fade, so it
+         // starts that much earlier, from arming.
++        //
++        // djmix15-pilot: classic never stalls to EOF waiting on nextStreamReady.
++        // That lambda (PlaybackService:2025: !MusicOnlyPlayback.wants &&
++        // (!DirectSourceGate.isActive || isStreamReady 512KB prefix)) is
++        // window-only at markable (1663) by documented intent; begin() below
++        // prepares the standby over HTTP via AudioCache.playbackFactory /
++        // DirectSourceGate.awaitOpen safely regardless (the window opens at
++        // DirectSourceGate.WINDOW_MS=25s off plannedTransition published at
++        // 1696). When not ready, arm on that 25 s window instead of the
++        // shorter learned lead (20-35 s) so the standby gets the full window
++        // to cache before ARM_TIMEOUT (12 s + grace). Earlier arm only
++        // buffers longer — driveArming still waits for the fade point.
+         val beatMs = (plan.beatSeconds * 1000).roundToLong()
+         val rampMs = if (beatMs > 0L) rampStepsFor(plan.outgoingPlaybackRate) * beatMs else 0L
+-        if (remaining > blendArmLeadMs + rampMs) return
++        val effectiveLeadMs = maxOf(
++            blendArmLeadMs,
++            if (!nextStreamReady(nextItem)) 25_000L else 0L,
++        )
++        if (remaining > effectiveLeadMs + rampMs) return
+ 
+         begin(
+             fade,
+@@ -3612,7 +3652,10 @@ class CrossfadeController(
+             Log.d(TAG, "loop decks still building ${loopTargetStartMs - out.currentPosition}ms ahead")
+             return
+         }
+-          deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
++        // djmix15: fresh build — drop any stale spans/deadline from a prior
++        // pair before installing this build's wall deadline.
++        deckTiming.clear()
++        deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+         startLoopBuild(key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = true)
+     }
+ 
+@@ -3738,6 +3781,10 @@ class CrossfadeController(
+         primeRetryAt = 0L
+         primedSession?.close()
+         primedSession = null
++        // djmix15: a stale deckTiming from a prior track/build can never be
++        // this build's deadlines — reset on every prime/scrub/discard so
++        // lateStepReason cannot subtract a dead wall epoch.
++        deckTiming.clear()
+     }
+ 
+     /**
+@@ -3924,6 +3971,8 @@ class CrossfadeController(
+                     "plannedStartMs" to loopTargetStartMs,
+                     "actualStartMs" to out.currentPosition,
+                     "deltaMs" to (out.currentPosition - loopTargetStartMs),
++                    "prerollSec" to 1.0,
++                    "spliceTargetMs" to loopTargetStartMs,
+                     "trackIndex" to outgoingItemIndex,
+                 ),
+             )
+@@ -4070,6 +4119,17 @@ class CrossfadeController(
+     private fun finishLoop() {
+         lastCompleteReason = "loop-complete"
+         val session = loopSession
++        // djmix15: loop BPMs live in session.plan, not in
++        // outgoingAnalysis/incomingAnalysis (blank 0.0). Record them before
++        // finish() so mix.complete reports real tempos even if the retire
++        // guard diverts to a TAIL and finish() is re-entered after
++        // loopSession is gone. Scalars only.
++        val plan = session?.plan
++        if (plan != null) {
++            if (outgoingAnalysis.bpm <= 0) outgoingAnalysis = outgoingAnalysis.copy(bpm = plan.out.bpm)
++            if (incomingAnalysis.bpm <= 0) incomingAnalysis = incomingAnalysis.copy(bpm = plan.inn.bpm)
++            tailDurationMs = RetireGuard.loopTailMs(plan.exitTailSeconds)
++        }
+         Log.d(
+             TAG,
+             "loop mix done: incoming ${"%+.2f".format(Locale.ROOT, session?.alignedErrorMs ?: Double.NaN)}ms " +
+@@ -4082,13 +4142,26 @@ class CrossfadeController(
+         }
+         loopAlignJob?.cancel()
+         loopAlignJob = null
+-        loopSession = null
++        // djmix15: the native renderer already brought the outgoing deck
++        // <= -60 dB (mix.exit.gate violations=0), but LoopMixPort splices PCM
++        // without touching ExoPlayer.volume, so RetireGuard.audible(spare.volume)
++        // falsely diverts to a 350ms Phase.TAIL and overwrites reason to
++        // "emergency-retire-guard". Mute the retiring player NOW, while the
++        // port still holds silence, so zero dry sample can ever leak, then
++        // disarm. Only when the renderer provably finished — genuine audible
++        // audio still takes the guard below.
++        val violations = session?.renderer?.exitGateViolations() ?: -1
++        if (session != null && violations == 0) {
++            val retiring = if (handedOff) outgoing else incoming
++            retiring?.volume = 0f
++        }
+         session?.outPort?.disarm()
+         session?.inPort?.disarm()
++        loopSession = null
+         // The player is now the only source. The first seconds of that song
+         // are where a starved decoder underruns, so analysis waits again
+         // from this instant, not from the earlier mid-mix handoff.
+-        AutomixTelemetry.event("mix.exit.gate", mapOf("violations" to (session?.renderer?.exitGateViolations() ?: -1)))
++        AutomixTelemetry.event("mix.exit.gate", mapOf("violations" to violations))
+         yieldAnalysis()
+         finish()
+         session?.renderer?.let(::closeLater)
+@@ -4103,6 +4176,15 @@ class CrossfadeController(
+     private fun loopBail(reason: String, settle: Boolean = true, preserveSeek: Boolean = false) {
+         lastCompleteReason = reason
+         val session = loopSession
++        // djmix15: loop BPMs live in the plan, not in the (blank) analyses.
++        // Record them so finish() reports real tempos even after a
++        // RetireGuard tail re-enters finish() post-null. No mute here:
++        // RetireGuard stays 100% active for genuine audible audio.
++        val bailPlan = session?.plan
++        if (bailPlan != null) {
++            if (outgoingAnalysis.bpm <= 0) outgoingAnalysis = outgoingAnalysis.copy(bpm = bailPlan.out.bpm)
++            if (incomingAnalysis.bpm <= 0) incomingAnalysis = incomingAnalysis.copy(bpm = bailPlan.inn.bpm)
++        }
+         if (loopRefusal.isNullOrBlank()) loopRefusal = reason
+         Log.d(TAG, "loop mix stops ($phase): $reason")
+         discardPrime()
+@@ -4110,7 +4192,6 @@ class CrossfadeController(
+         loopBuildJob = null
+         loopAlignJob?.cancel()
+         loopAlignJob = null
+-        loopSession = null
+         val out = outgoing
+         val into = incoming
+         val wasHandedOff = handedOff
+@@ -4126,7 +4207,10 @@ class CrossfadeController(
+                 ?: session.plan.out.loopStart).let { (it * 1000).roundToLong() }
+             else -> null
+         }
++        // loopSession stays non-null through finish() so finish() can fall
++        // back to loopSession?.plan for BPMs; nulled after, like finishLoop.
+         finish()
++        loopSession = null
+         session?.renderer?.let(::closeLater)
+         // The session player, after [finish]: idle by then, so the seek's own
+         // discontinuity can't come back here as another bail.
+@@ -4466,11 +4550,17 @@ class CrossfadeController(
+ 
+     private fun finish() {
+         // djmix14: capture the real completion values BEFORE clearing.
++        // djmix15: loop mixes store BPMs in loopSession.plan, not
++        // outgoingAnalysis/incomingAnalysis (which stay blank 0.0). Fall
++        // back to the plan so loop completions never report 0.0. loopSession
++        // is deliberately kept non-null through finish() by finishLoop() and
++        // loopBail() for exactly this capture.
+         val endPhase = phase.name
+         val didHandoff = handedOff
+-        val outBpm = outgoingAnalysis.bpm
+-        val inBpm = incomingAnalysis.bpm
+-        val tailMs = tailDurationMs
++        val loopPlan = loopSession?.plan
++        val outBpm = RetireGuard.loopOutBpm(outgoingAnalysis.bpm, loopPlan?.out?.bpm ?: 0.0)
++        val inBpm = RetireGuard.loopInBpm(incomingAnalysis.bpm, loopPlan?.inn?.bpm ?: 0.0)
++        val tailMs = tailDurationMs.takeIf { it > 0 } ?: (loopPlan?.let { RetireGuard.loopTailMs(it.exitTailSeconds) } ?: tailDurationMs)
+         val completeReason = lastCompleteReason ?: "finish"
+         // djmix12 retire guard: an audible spare may not be retired
+         // here. Convert to an emergency TAIL (350 ms) first; driveTail
+@@ -5962,7 +6052,9 @@ class CrossfadeController(
+         private val spans = ArrayList<LoopMix.PrepSpan>()
+         private var openStep: String? = null
+         private var openStarted = 0L
+-        var deadlineMs: Long = 0L
++        // djmix15: NO_DEADLINE (paused/none), never 0L. 0L would subtract as
++        // the boot uptime (~374000 ms on device) in lateStepReason.
++        var deadlineMs: Long = DeckBudget.NO_DEADLINE_MS
+ 
+         fun begin(step: String) = synchronized(lock) {
+             val now = SystemClock.elapsedRealtime()
+@@ -5984,6 +6076,10 @@ class CrossfadeController(
+         fun clear() = synchronized(lock) {
+             spans.clear()
+             openStep = null
++            // djmix15: drop the prior build's wall deadline too, so a stale
++            // nowMs - deadlineMs can never read as this build's lateness
++            // (374320 ms over, growing 1:1 with wall time).
++            deadlineMs = DeckBudget.NO_DEADLINE_MS
+         }
+ 
+         fun snapshot(now: Long): List<LoopMix.PrepSpan> = synchronized(lock) {
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 3fd1376..74fc33f 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 56
+-extra["bitchordVersionName"] = "2.2.0-djmix14"
++extra["bitchordVersionCode"] = 57
++extra["bitchordVersionName"] = "2.2.1-djmix15"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+index 4c1ebda..f6c2870 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+@@ -18,10 +18,17 @@ object CatchUpPlanner {
+      * catch-up applies (not late, blocked, or too little left to mix).
+      *
+      * Lead is 0.9-1.5 s snapped to the next beat/downbeat after
+-     * current+0.8 s when a grid exists. Overlap shape:
++     * current+0.8 s when a grid exists (0.6 s when only 2.0-2.5 s remain,
++     * preserving room for a quick dissolve). Overlap shape:
+      * - >=7.0 s and tempo delta <=8%: 4-bar DJ_BLEND (bass swap + mid carve)
+      * - >=3.5 s or tempo >8%: 2-bar DJ_FILTER/ECHO_RIDE (filter + echo tail)
+-     * - 1.6-3.5 s: 1-bar quick blend/filter at full available overlap
++     * - 1.2-3.5 s (djmix15, was 1.6): 1-bar quick blend/filter at full
++     *   available overlap — 0.6 s lead + 1.2-1.6 s DJ filter dissolve where
++     *   a 2.5 s floor would have played dry to EOF.
++     *
++     * Below 2.0 s of effective room (contentEnd-aware) there is no lead +
++     * dissolve that can breathe: return null so the planner blocks
++     * ("too-late-near-eof") instead of firing a stale micro-fade.
+      */
+     fun reanchor(
+         plan: TransitionPlan,
+@@ -43,7 +50,7 @@ object CatchUpPlanner {
+         }
+         val effectiveEndSec = rawEnd.coerceAtMost(durationSec)
+         val remainingSec = effectiveEndSec - currentPositionSec
+-        if (remainingSec < 2.5) return null
++        if (remainingSec < 2.0) return null
+ 
+         val outBpm = outAnalysis.bpm
+         val inBpm = inAnalysis.bpm
+@@ -51,15 +58,18 @@ object CatchUpPlanner {
+         val beatSec = if (bpmForBar > 0) 60.0 / bpmForBar else 0.5
+         val barSec = if (bpmForBar > 0) 4.0 * beatSec else 2.0
+ 
+-        val leadSec = snappedLeadSec(outAnalysis, currentPositionSec)
++        // Near-EOF quick blend: a snapped 0.9-1.5 s lead would leave <1.2 s
++        // to dissolve in. A fixed 0.6 s lead preserves 1.2-1.6 s of it.
++        val snapped = snappedLeadSec(outAnalysis, currentPositionSec)
++        val leadSec = if (remainingSec < 2.5) 0.6 else snapped
+         val catchUpStartSec = currentPositionSec + leadSec
+         // Guard-band 0.4 s keeps the tail off the file edge.
+-        var availableOverlapSec = (effectiveEndSec - catchUpStartSec - 0.4).coerceAtLeast(1.6)
++        var availableOverlapSec = (effectiveEndSec - catchUpStartSec - 0.4).coerceAtLeast(1.2)
+         // Never let the overlap run past the track end.
+         val roomLeft = effectiveEndSec - catchUpStartSec
+-        if (roomLeft < 1.6) return null
++        if (roomLeft < 1.2) return null
+         if (availableOverlapSec > roomLeft) availableOverlapSec = roomLeft
+-        if (availableOverlapSec < 1.6) return null
++        if (availableOverlapSec < 1.2) return null
+ 
+         val tempoDelta = if (outBpm > 0 && inBpm > 0) {
+             val fold = alignedFold(outBpm, inBpm)
+@@ -90,7 +100,7 @@ object CatchUpPlanner {
+         }
+         val endSec = catchUpStartSec + fadeSec
+         if (endSec > durationSec + 1e-6) return null
+-        if (fadeSec < 1.6 || !fadeSec.isFinite()) return null
++        if (fadeSec < 1.2 || !fadeSec.isFinite()) return null
+         // Keep the original blend character where it fits; only the timing moves.
+         val baseReason = plan.reason.ifBlank { "smart-duration" }
+         return plan.copy(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DeckBudget.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DeckBudget.kt
+index 74742db..da068d4 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DeckBudget.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DeckBudget.kt
+@@ -38,8 +38,11 @@ object DeckBudget {
+     }
+ 
+     /** Proven media-time lateness of a span, in ms (0 when satisfied or paused). */
++    // djmix15: deadlineMs == 0L is the uninitialized DeckTiming sentinel
++    // (never a valid wall instant). It must never subtract as a wall epoch
++    // (elapsedRealtime - 0 is the whole boot uptime, ~374000 ms on device).
+     fun provenOverrunMs(endedMs: Long, deadlineMs: Long): Long =
+-        if (deadlineMs == NO_DEADLINE_MS) 0L else (endedMs - deadlineMs).coerceAtLeast(0L)
++        if (deadlineMs == NO_DEADLINE_MS || deadlineMs <= 0L) 0L else (endedMs - deadlineMs).coerceAtLeast(0L)
+ 
+     /** True when [span] provably ran past an in-force deadline. */
+     fun isProvablyLate(span: LoopMix.PrepSpan): Boolean = provenOverrunMs(span.endedMs, span.deadlineMs) > 0L
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+index 893519a..e0bda21 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+@@ -177,6 +177,11 @@ object DjMix {
+         outSections: List<Section>,
+         inSections: List<Section>,
+     ): TransitionPlan {
++        // djmix15-pilot: catch-up timing is playhead-anchored (0.6-1.5 s lead
++        // sized to the room left). Never snap it onto lyrics/sections — that
++        // would move transitionEnd/fade/cue off the anchor. Metadata helpers
++        // (vocalHandoff, phraseExtend, colour, tempoGap, summary) still run.
++        if (plan.reason.endsWith(":catch-up")) return plan
+         var end = plan.transitionEnd
+         var start = plan.transitionStart
+         var cue = plan.incomingCueTime
+@@ -239,6 +244,10 @@ object DjMix {
+         analysis: TrackAnalysis,
+         nextAnalysis: TrackAnalysis,
+     ): TransitionPlan {
++        // djmix15-pilot: catch-up timing is playhead-anchored; clashFilter
++        // would re-anchor a DJ_BLEND catch-up to a key-clash filter window
++        // (transitionStart/fade), destroying the re-anchor. No re-timing.
++        if (plan.reason.endsWith(":catch-up")) return plan
+         if (plan.transitionStyle != TransitionStyle.DJ_BLEND) return plan
+         if (plan.reason.contains("phrase")) return plan
+         val left = camelotCode(analysis.key)
+@@ -267,6 +276,11 @@ object DjMix {
+      * that much music left before [TransitionPlan.transitionEnd].
+      */
+     private fun ensureOverlap(plan: TransitionPlan, analysis: TrackAnalysis): TransitionPlan {
++        // djmix15: catch-up quick dissolves (1.2-3.5 s in <2.5 s of room)
++        // are intentionally shorter than the 4-bar club minimum. Lengthening
++        // them moves the start behind the playhead and recreates the dead
++        // stale window. Never re-size a catch-up.
++        if (plan.reason.endsWith(":catch-up")) return plan
+         if (plan.transitionStyle != TransitionStyle.DJ_BLEND && plan.transitionStyle != TransitionStyle.DJ_FILTER) {
+             return plan
+         }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index 86ed8d0..17efa08 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -273,6 +273,11 @@ object LoopMix {
+      * media clock is not running there is no deadline, so the reason is
+      * the honest "paused" rather than a bogus overrun number. When nothing
+      * provably overran, the longest step is reported with its wall duration.
++     *
++     * djmix15: wall and media clocks can never subtract, and a stale wall
++     * deadline from a prior track can never report as lateness. deadlineMs
++     * must be THIS build's wall instant: 0, NO_DEADLINE, or older than the
++     * 2-minute horizon (loop lead is <40 s) means no budget in force.
+      */
+     fun lateStepReason(spans: List<PrepSpan>, nowMs: Long, deadlineMs: Long): String {
+         val late = spans.maxByOrNull { DeckBudget.provenOverrunMs(it.endedMs, it.deadlineMs) }
+@@ -280,7 +285,8 @@ object LoopMix {
+             val over = DeckBudget.provenOverrunMs(late.endedMs, late.deadlineMs)
+             if (over > 0L) return "${late.step} $over ms over"
+         }
+-        if (deadlineMs == DeckBudget.NO_DEADLINE_MS) return "paused (no budget)"
++        if (deadlineMs == DeckBudget.NO_DEADLINE_MS || deadlineMs <= 0L) return "paused (no budget)"
++        if (nowMs - deadlineMs > 120_000L) return "paused (no budget)"
+         val over = (nowMs - deadlineMs).coerceAtLeast(0L)
+         val slowest = spans.maxByOrNull { it.endedMs - it.startedMs }
+         return if (slowest != null) "${slowest.step} $over ms over" else "deck build $over ms over"
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt
+index 82e9697..8f36804 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt
+@@ -1,6 +1,7 @@
+ package com.music.bitchord.playback.smart
+ 
+ import kotlin.math.log10
++import kotlin.math.roundToLong
+ 
+ /**
+  * Retire gate (djmix12): every classic/native handoff must pass through
+@@ -27,4 +28,22 @@ object RetireGuard {
+ 
+     /** True when [volume] may be retired without a tail (silent or forced). */
+     fun canRetire(volume: Float, force: Boolean = false): Boolean = force || !audible(volume)
++
++    /**
++     * djmix15 loop-completion scalars. Loop mixes store BPMs/tail in
++     * [LoopMix.Plan], not in the (blank) TrackAnalysis pair, so a completed
++     * loop would otherwise report 0.0 BPM and a stale tail:
++     * - [loopOutBpm]/[loopInBpm]: prefer the analysed BPM, fall back to
++     *   the armed plan's pick (never 0.0 when the plan is known).
++     * - [loopTailMs]: the plan's graceful-exit dissolve in ms.
++     * Scalars only; no audio crosses.
++     */
++    fun loopOutBpm(analysedBpm: Double, planOutBpm: Double): Double =
++        analysedBpm.takeIf { it > 0 } ?: planOutBpm.takeIf { it > 0 } ?: 0.0
++
++    fun loopInBpm(analysedBpm: Double, planInBpm: Double): Double =
++        analysedBpm.takeIf { it > 0 } ?: planInBpm.takeIf { it > 0 } ?: 0.0
++
++    fun loopTailMs(exitTailSeconds: Double): Long =
++        (exitTailSeconds * 1000.0).roundToLong()
+ }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
+index 1bdb289..ccea115 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
+@@ -33,4 +33,15 @@ object SeekAction {
+      * mix-start since it was shown. Returns true when it may still fire.
+      */
+     fun planStillValid(planStartMs: Long, positionMs: Long): Boolean = positionMs <= planStartMs
++
++    /**
++     * djmix15 queue-edit decision for the "next vs plan wanted" check.
++     * After the handoff the session IS the incoming track (i+1), so its
++     * "next" is i+2 by definition — comparing that to the armed expected
++     * (i+1) is a certain false queueEdit ~1.7-6.9 s after every classic
++     * startFade. Only the pre-handoff window treats a mismatch as a user
++     * edit; the current-index check still catches an active-track removal.
++     */
++    fun isNextEdit(handedOff: Boolean, nextId: String?, expected: String?): Boolean =
++        !handedOff && expected != null && nextId != expected
+ }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+index 8c030dd..2ebb216 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+@@ -1438,6 +1438,44 @@ private fun standardTransition(
+     )
+ }
+ 
++/**
++ * djmix15 universal late-scrub handling for [standardTransition] plans.
++ * Before, these early returns bypassed [CatchUpPlanner.reanchor] entirely,
++ * so a scrub 22 s past the stale start (S.A.D -> LAST GOODBYE: 200696 ms
++ * vs planned 178046 ms) emitted the dead window verbatim. Re-anchor whenever
++ * length > 0 and the playhead is past start+0.25; block near EOF below.
++ */
++private fun standardWithCatchUpOrBlock(
++    base: TransitionPlan,
++    analysis: TrackAnalysis,
++    nextAnalysis: TrackAnalysis,
++    nextLength: Double,
++    playbackTime: Double,
++    length: Double,
++): TransitionPlan {
++    if (length > 0.0 && playbackTime > base.transitionStart + 0.25) {
++        CatchUpPlanner.reanchor(base, analysis, nextAnalysis, playbackTime, length)?.let { caught ->
++            return capIncomingSkip(caught, nextAnalysis, nextLength)
++        }
++        // djmix15 near-EOF: past start+0.5 with <2.0 s of effective room
++        // (contentEnd-aware) leaves no lead + dissolve that can breathe.
++        // Block so ExoPlayer advances cleanly at EOF instead of firing a
++        // stale micro-fade (protocol 0.322 s at EOF, delta +20090).
++        if (playbackTime > base.transitionStart + 0.5) {
++            val contentEnd = analysis.contentEndTime
++            val effectiveEnd = if (contentEnd.isFinite() && contentEnd > playbackTime + 2.0 && contentEnd > 0.0) {
++                contentEnd.coerceAtMost(length)
++            } else {
++                length
++            }
++            if (effectiveEnd - playbackTime < 2.0) {
++                return blocked("too-late-near-eof", transitionStart = base.transitionStart, transitionEnd = base.transitionEnd)
++            }
++        }
++    }
++    return base
++}
++
+ /** A stale analysis paired with the wrong track is worse than no analysis at all. */
+ private fun analysisReadyForTrack(
+     analysis: TrackAnalysis,
+@@ -1546,6 +1584,11 @@ fun planTransition(
+         playbackTime = max(0.0, currentTime.orZero()),
+     )
+     if (mode != CrossfadeMode.SMART) return windowed
++    // djmix15-pilot: DjMix.annotate ALWAYS runs (also on :catch-up) so
++    // catch-up keeps its DJ metadata (djEffect, vocalHandoff, buildup,
++    // sections, mixSummary for renderFor/describeAutomix). Timing mutation
++    // is guarded inside DjMix helpers (placeOnStructure / clashFilter /
++    // ensureOverlap) — never here.
+     return DjMix.annotate(
+         windowed,
+         analysis,
+@@ -1603,7 +1646,11 @@ private fun planTransitionInner(
+ 
+     val standardFade = clamp(fadeSeconds, minFadeSeconds, 12.0)
+     if (mode != CrossfadeMode.SMART) {
+-        return standardTransition(length, playbackTime, standardFade, minFadeSeconds)
++        val nextLengthEarly = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
++        return standardWithCatchUpOrBlock(
++            standardTransition(length, playbackTime, standardFade, minFadeSeconds),
++            analysis, nextAnalysis, nextLengthEarly, playbackTime, length,
++        )
+     }
+ 
+     if (length < MIN_SMART_DURATION_SECONDS) {
+@@ -1645,13 +1692,18 @@ private fun planTransitionInner(
+     if (!analysisReadyForTrack(analysis, currentTrack, requireFull = true, durationSec = length, currentSec = playbackTime) ||
+         !analysisReadyForTrack(nextAnalysis, nextTrack)
+     ) {
+-        return standardTransition(
++        // djmix15: standard fallback gets the same universal catch-up and
++        // near-EOF block as the primary plan — S.A.D's 22 s stale window
++        // came through this early return.
++        val base = standardTransition(
+             length,
+             playbackTime,
+             max(standardFade, 8.0),
+             minFadeSeconds,
+             "smart-analysis-fallback",
+         )
++        val nextLengthFallback = max(nextAnalysis.duration.orZero(), trackDurationSeconds(nextTrack))
++        return standardWithCatchUpOrBlock(base, analysis, nextAnalysis, nextLengthFallback, playbackTime, length)
+     }
+ 
+     val preferredMixAnchor = min(length, mixOutAnchor.time)
+@@ -1784,6 +1836,23 @@ private fun planTransitionInner(
+     CatchUpPlanner.reanchor(plan, analysis, nextAnalysis, playbackTime, length)?.let { caught ->
+         return capIncomingSkip(caught, nextAnalysis, nextLength)
+     }
++    // djmix15: too-late near EOF. reanchor returned null (no room for a
++    // lead + dissolve) but the playhead is 20 s past a stale start — the
++    // `started` fallthrough below would fire a truncated micro-fade
++    // (LAST GOODBYE: 0.18 s before EOF, 0.322 s fade, delta +20090).
++    // With <2.0 s of effective room and >0.5 s past the start, block so
++    // ExoPlayer advances cleanly at EOF instead.
++    if (playbackTime > plan.transitionStart + 0.5) {
++        val contentEndEq = analysis.contentEndTime
++        val effectiveEndEq = if (contentEndEq.isFinite() && contentEndEq > playbackTime + 2.0 && contentEndEq > 0.0) {
++            contentEndEq.coerceAtMost(length)
++        } else {
++            length
++        }
++        if (effectiveEndEq - playbackTime < 2.0) {
++            return blocked("too-late-near-eof", transitionStart = plan.transitionStart, transitionEnd = plan.transitionEnd)
++        }
++    }
+     val started = playbackTime >= plan.transitionStart
+     return capIncomingSkip(
+         plan.copy(
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix15RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix15RegressionTest.kt
+new file mode 100644
+index 0000000..0e49a65
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix15RegressionTest.kt
+@@ -0,0 +1,273 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix15 regression: the five vc56 live-device faults.
++ *
++ * Scalars only: BPM, Camelot, LUFS, vocal counts, deadlines and positions.
++ * No audio tensors cross decks.
++ */
++class Djmix15RegressionTest {
++
++    private fun analysis(bpm: Double, id: String, durationSec: Double = 179.0, contentEnd: Double = 0.0): TrackAnalysis {
++        val beatSec = 60.0 / bpm
++        val barSec = 4.0 * beatSec
++        val downbeats = buildList<Double> {
++            var t = 0.0
++            while (t <= 220.0) { add(t); t += barSec }
++        }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id,
++            duration = durationSec,
++            bpm = bpm,
++            beatInterval = beatSec,
++            beatConfidence = 0.8,
++            downbeats = downbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.8,
++            contentEndTime = contentEnd,
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    // ---- Bug 3: lateStepReason can never report wall-minus-media epochs ----
++
++    @Test fun lateStepReasonNeverReportsWallMinusMedia374320() {
++        // Device: "outgoing splice 374320 ms over" / "388005 ms over"
++        // growing 1:1 with wall clock. The deadline was 0 (uninitialized
++        // DeckTiming) or stale from a prior track — a wall epoch subtracted
++        // from zero/a dead deadline, not build lateness.
++        val now = 374_320L
++        // Uninitialized 0 deadline with a bogus span ending at wall now.
++        val zeroSpan = LoopMix.PrepSpan("outgoing splice", 0L, now, 0L)
++        assertEquals(0L, DeckBudget.provenOverrunMs(zeroSpan.endedMs, zeroSpan.deadlineMs))
++        assertFalse(DeckBudget.isProvablyLate(zeroSpan))
++        val zeroReason = LoopMix.lateStepReason(listOf(zeroSpan), now, 0L)
++        assertFalse(zeroReason.contains("374320"), "reason=$zeroReason must not subtract boot uptime")
++
++        // Stale wall deadline from a prior track: 374320 ms behind now.
++        val staleDeadline = now - 374_320L
++        val staleReason = LoopMix.lateStepReason(emptyList(), now, staleDeadline)
++        assertFalse(staleReason.contains("374320"), "reason=$staleReason must not report stale wall")
++        assertTrue(staleReason.contains("paused"), "reason=$staleReason")
++
++        // Media deadline passed as wall (loopTargetStartMs 170120 vs wall
++        // 500000): the media epoch is ~330000 behind wall, beyond the budget
++        // horizon — also no budget, never a wall-minus-media number.
++        val mediaAsWall = 170_120L
++        val mediaReason = LoopMix.lateStepReason(emptyList(), 500_000L, mediaAsWall)
++        assertFalse(mediaReason.contains("329880"), "reason=$mediaReason")
++        assertTrue(mediaReason.contains("paused"), "reason=$mediaReason")
++
++        // Genuine, bounded lateness still reports (17 ms over, DeckBudgetTest).
++        val genuineDeadline = DeckBudget.deadlineMs(0L, true, 1_000L, 0L)
++        val genuineSpan = LoopMix.PrepSpan("outgoing splice", 0L, genuineDeadline + 17L, genuineDeadline)
++        assertEquals("outgoing splice 17 ms over", LoopMix.lateStepReason(listOf(genuineSpan), genuineDeadline + 17L, genuineDeadline))
++
++        // Paused/no-deadline stays paused.
++        assertTrue(LoopMix.lateStepReason(listOf(LoopMix.PrepSpan("x", 0L, now, DeckBudget.NO_DEADLINE_MS)), now, DeckBudget.NO_DEADLINE_MS).contains("paused"))
++    }
++
++    @Test fun provenOverrunTreatsZeroDeadlineAsNoBudget() {
++        assertEquals(0L, DeckBudget.provenOverrunMs(999_999L, 0L))
++        assertEquals(0L, DeckBudget.provenOverrunMs(999_999L, DeckBudget.NO_DEADLINE_MS))
++        // A real deadline still measures.
++        assertEquals(100L, DeckBudget.provenOverrunMs(1_100L, 1_000L))
++    }
++
++    // ---- Bug 5a: CatchUpPlanner quick-blend floor lowered to 2.0 / 1.2 ----
++
++    @Test fun catchUpQuickBlendAt2Point2Seconds() {
++        val plan = TransitionPlan(
++            shouldStart = true,
++            markerVisible = true,
++            blocked = false,
++            reason = "smart-duration",
++            transitionStart = 150.0,
++            transitionEnd = 172.18,
++            fadeSeconds = 22.18,
++            transitionStyle = TransitionStyle.DJ_BLEND,
++            incomingCueTime = 5.0,
++            beatSeconds = 60.0 / 99.99,
++        )
++        val out = analysis(99.99, "a", 180.0)
++        val inn = analysis(104.50, "b", 180.0)
++        // 2.2 s remain (current 177.8 / 180): before djmix15 this returned
++        // null (<2.5) and played dry; now 0.6 s lead + 1.2-1.6 s dissolve.
++        val caught = CatchUpPlanner.reanchor(plan, out, inn, 177.8, 180.0)
++        assertNotNull(caught, "2.2 s room must catch up")
++        assertTrue(caught.transitionStart > 177.8, "start=${caught.transitionStart}")
++        val lead = caught.transitionStart - 177.8
++        assertEquals(0.6, lead, 0.01, "near-EOF lead is 0.6, was ${lead}")
++        assertTrue(caught.fadeSeconds in 1.2..1.6, "fade=${caught.fadeSeconds} quick dissolve")
++        assertTrue(caught.transitionStart + caught.fadeSeconds <= 180.0 + 1e-6)
++        assertFalse(caught.shouldStart)
++        assertTrue(caught.reason.endsWith(":catch-up"))
++    }
++
++    @Test fun catchUpRefusesBelow2Point0() {
++        val plan = TransitionPlan(
++            shouldStart = true, markerVisible = true, blocked = false, reason = "smart-duration",
++            transitionStart = 140.0, transitionEnd = 148.021, fadeSeconds = 8.021,
++            transitionStyle = TransitionStyle.DJ_FILTER, incomingCueTime = 2.0, beatSeconds = 0.6,
++        )
++        val out = analysis(100.0, "a", 148.021)
++        val inn = analysis(104.0, "b", 148.021)
++        // 1.9 s remain: no lead + dissolve can breathe — null so planner blocks.
++        assertNull(CatchUpPlanner.reanchor(plan, out, inn, 146.121, 148.021))
++        // 0.18 s before EOF (seq169): also null.
++        assertNull(CatchUpPlanner.reanchor(plan, out, inn, 147.841, 148.021))
++    }
++
++    // ---- Bug 5b: planTransition applies catch-up to standard plans ----
++
++    @Test fun standardLateScrubReanchorsInsteadOfDeadWindow() {
++        // S.A.D shape: stale start 178046 ms, playhead 22.7 s past it. Force
++        // the standard early return (blank analysis → smart-analysis-fallback)
++        // and require a re-anchored start ahead of the playhead — never the
++        // 22.563 s stale window with deltaMs=+22717.
++        val out = analysis(104.495, "out", 200.609)
++        val inn = analysis(66.484, "inn", 200.609)
++        // Blank analyses force standardTransition; BPMs on the tracks above
++        // still give reanchor a grid via out/in analyses passed to reanchor?
++        // planTransitionInner passes the blank TrackAnalysis pair to
++        // reanchor, which falls back to 120 BPM — still must re-anchor.
++        // Use blank directly to mirror the device's qualityB=none fallback.
++        val blankOut = TrackAnalysis()
++        val blankIn = TrackAnalysis()
++        val plan = planTransition(
++            analysis = blankOut, nextAnalysis = blankIn,
++            currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
++            currentTime = 176.5, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = false,
++        )
++        // Standard start was length-fade = 172.0; playhead 176.5 is 4.5 s late
++        // with 3.5 s left — must be re-anchored ahead, not the dead window.
++        assertFalse(plan.blocked)
++        assertTrue(plan.transitionStart > 176.5, "start=${plan.transitionStart} must re-anchor ahead of 176.5 (stale was 172.0)")
++        assertTrue(plan.reason.endsWith(":catch-up"), "reason=${plan.reason}")
++        assertTrue(plan.transitionStart + plan.fadeSeconds <= 180.0 + 1e-6)
++        // Direct stale-standard replica: a base window starting at 178.046
++        // with the playhead 22.7 s past it (device: 200.696) must re-anchor
++        // ahead instead of emitting the dead 22.563 s window verbatim.
++        val staleBase = TransitionPlan(
++            shouldStart = true, markerVisible = true, blocked = false, reason = "smart-analysis-fallback",
++            transitionStart = 178.046, transitionEnd = 200.609, fadeSeconds = 22.563,
++            transitionStyle = TransitionStyle.EQUAL_POWER, incomingCueTime = 0.0,
++        )
++        val staleOut = analysis(104.495, "out", 222.6)
++        val staleIn = analysis(66.484, "inn", 222.6)
++        val staleCaught = CatchUpPlanner.reanchor(staleBase, staleOut, staleIn, 200.696, 222.6)
++        assertNotNull(staleCaught, "stale 22.7 s window must re-anchor when room allows")
++        assertTrue(staleCaught.transitionStart > 200.696, "start=${staleCaught.transitionStart}")
++        assertTrue(staleCaught.reason.endsWith(":catch-up"), "reason=${staleCaught.reason}")
++        // The companion analyses mirror the device BPMs; the planner's
++        // scalars do not cross (patent) — this asserts the helper kept them.
++        assertEquals(104.495, out.bpm, 1e-9)
++        assertEquals(66.484, inn.bpm, 1e-9)
++    }
++
++    @Test fun catchUpViaPlanTransitionPreservesDjAnnotation() {
++        // Pilot Check 2: skipping DjMix.annotate would strip :catch-up plans
++        // of DJ metadata (djEffect / vocalHandoff / buildup / Camelot /
++        // mixSummary for renderFor + describeAutomix). annotate MUST run,
++        // with timing guarded inside DjMix (placeOnStructure / clashFilter /
++        // ensureOverlap), never by skipping annotate.
++        val blankOut = TrackAnalysis()
++        val blankIn = TrackAnalysis()
++        val plan = planTransition(
++            analysis = blankOut, nextAnalysis = blankIn,
++            currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
++            currentTime = 176.5, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = false,
++        )
++        // Timing preserved: still re-anchored ahead, not inflated back to 171.6.
++        assertFalse(plan.blocked)
++        assertTrue(plan.transitionStart > 176.5, "start=${plan.transitionStart} must stay re-anchored")
++        assertTrue(plan.reason.endsWith(":catch-up"), "reason=${plan.reason}")
++        assertTrue(plan.transitionStart + plan.fadeSeconds <= 180.0 + 1e-6)
++        // DjMix annotation preserved: mixSummary is the display line for
++        // describeAutomix; blank-key pair annotates to the style alone (e.g.
++        // "filter mix...") rather than "" (un-annotated volume fade).
++        assertTrue(plan.mixSummary.isNotBlank(), "mixSummary='${plan.mixSummary}' must be DjMix-annotated, not stripped")
++        assertTrue(plan.mixSummary.contains("filter", ignoreCase = true) || plan.mixSummary.contains("crossfade", ignoreCase = true) || plan.mixSummary.contains("mix", ignoreCase = true), "mixSummary='${plan.mixSummary}'")
++    }
++
++    // ---- Bug 5c: planTransition blocks <2.0 s near-EOF instead of micro-fade ----
++
++    @Test fun planTransitionBlocksTooLateNearEof() {
++        // LAST GOODBYE shape: seek to 147.841 / 148.021 (0.18 s left), stale
++        // transitionStart ~20 s earlier. Before: shouldStart=true fired a
++        // 0.322 s micro-fade. Now: blocked("too-late-near-eof").
++        val out = analysis(100.0, "out", 148.021)
++        val inn = analysis(104.0, "inn", 148.021)
++        val plan = planTransition(
++            analysis = out, nextAnalysis = inn,
++            currentTrack = TransitionTrackInfo("out", 148_021L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 148_021L, "t2", "a2", "al"),
++            currentTime = 147.841, duration = 148.021, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = true,
++        )
++        assertTrue(plan.blocked, "reason=${plan.reason} start=${plan.transitionStart} fade=${plan.fadeSeconds}")
++        assertEquals("too-late-near-eof", plan.reason)
++        assertFalse(plan.shouldStart, "must not fire a stale micro-fade at EOF")
++    }
++
++    @Test fun planTransitionStillFiresWhenCatchUpHasRoom() {
++        // Same pair with room (current 140.0, >8 s left): must NOT block —
++        // either a normal future plan or a catch-up 2-4 bar blend.
++        val out = analysis(100.0, "out", 148.021)
++        val inn = analysis(104.0, "inn", 148.021)
++        val plan = planTransition(
++            analysis = out, nextAnalysis = inn,
++            currentTrack = TransitionTrackInfo("out", 148_021L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 148_021L, "t2", "a2", "al"),
++            currentTime = 140.0, duration = 148.021, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = true,
++        )
++        assertFalse(plan.blocked, "reason=${plan.reason}")
++    }
++
++    // ---- Bugs 2 & 4 invariants (pure halves) ----
++
++    @Test fun retireGuardLoopScalarsNeverReportZeroWhenPlanKnown() {
++        // finishLoop: outgoing volume 1.0 but renderer at -60 dB
++        // (violations=0) is silenced before finish(), so RetireGuard does
++        // not trigger; BPMs fall back to the plan.
++        assertTrue(RetireGuard.audible(1.0f))
++        assertFalse(RetireGuard.audible(0.0f))
++        assertTrue(RetireGuard.canRetire(0.0f))
++        assertFalse(RetireGuard.canRetire(1.0f))
++        // Plan fallback: blank analyses (0.0) never report 0.0 when known.
++        assertEquals(104.495, RetireGuard.loopOutBpm(0.0, 104.495), 1e-9)
++        assertEquals(66.484, RetireGuard.loopInBpm(0.0, 66.484), 1e-9)
++        // Analysed wins when present.
++        assertEquals(120.0, RetireGuard.loopOutBpm(120.0, 104.495), 1e-9)
++        // Tail follows the plan's graceful-exit seconds.
++        assertEquals(2500L, RetireGuard.loopTailMs(2.5))
++        assertEquals(800L, RetireGuard.loopTailMs(0.8))
++        // Emergency 350 ms floor is unchanged for genuine audible audio.
++        assertEquals(350L, RetireGuard.dissolveMs(planned = false))
++    }
++
++    @Test fun queueEditAfterHandoffIsNeverAnEdit() {
++        // Bug 4: after handoff the session IS track i+1, so next=i+2 must not
++        // be judged against armed expected=i+1 (PIN-locked false positive).
++        assertFalse(SeekAction.isNextEdit(handedOff = true, nextId = "i+2", expected = "i+1"))
++        assertFalse(SeekAction.isNextEdit(handedOff = true, nextId = null, expected = "i+1"))
++        // Before handoff a changed upcoming track is still a genuine edit.
++        assertTrue(SeekAction.isNextEdit(handedOff = false, nextId = "i+2", expected = "i+1"))
++        assertTrue(SeekAction.isNextEdit(handedOff = false, nextId = null, expected = "i+1"))
++        // Unchanged next is never an edit either side.
++        assertFalse(SeekAction.isNextEdit(handedOff = false, nextId = "i+1", expected = "i+1"))
++        assertFalse(SeekAction.isNextEdit(handedOff = true, nextId = "i+1", expected = "i+1"))
++        // No expectation, no edit verdict.
++        assertFalse(SeekAction.isNextEdit(handedOff = false, nextId = "i+2", expected = null))
++    }
++}

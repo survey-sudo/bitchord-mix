@@ -1,0 +1,836 @@
+# djmix10 expanded patch: tracked diff follows
+# then AutomixTelemetry.kt + AutomixFreezeTest.kt (were untracked new files)
+
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index ee0c197..9e88697 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -571,6 +571,7 @@ class CrossfadeController(
+     private var outgoingAnalysis = TrackAnalysis()
+     private var incomingAnalysis = TrackAnalysis()
+     private var bailStartedAt = 0L
++    private var armGraceUsed = false
+     private var armDeadline = 0L
+ 
+     /** Length of the fade-out driven by [Phase.SLEEP_FADE], in ms. Fixed when it begins. */
+@@ -763,7 +764,10 @@ class CrossfadeController(
+             }
+         }
+ 
+-        override fun onPlayerError(error: PlaybackException) = bail()
++        override fun onPlayerError(error: PlaybackException) {
++            AutomixTelemetry.event("mix.error", mapOf("error" to error.message.orEmpty(), "phase" to phase.name))
++            bail()
++        }
+ 
+         // The session reached the end of a track [holdAtEnd] is holding, before
+         // the handoff took it off that track. Only ever a late handoff, or a
+@@ -836,6 +840,14 @@ class CrossfadeController(
+ 
+     private fun dropForQueueEdit(why: String) {
+         Log.d(TAG, "playlist changed: $why")
++        // djmix10: an audible mix keeps its plan (plan vars are only
++        // cleared pre-audible); the blend finishes and hands off.
++        val audible = phase == Phase.FADING || phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING ||
++            (phase == Phase.ARMING && appSettingsMarkerShown())
++        if (audible) {
++            AutomixTelemetry.event("mix.freeze.queueEdit", mapOf("why" to why, "phase" to phase.name))
++            return
++        }
+         discardPrime()
+         loopPlanned = null
+         loopScript = null
+@@ -996,6 +1008,7 @@ class CrossfadeController(
+         if (player.currentPosition <= shownLoopStartMs + 1200L) return
+         watchdogFired = true
+         val reason = "watchdog: shown countdown unarmed 1.2s after its bar"
++        AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to shownLoopStartMs))
+         Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$shownLoopStartMs")
+         loopFallBack(reason)
+     }
+@@ -1257,6 +1270,13 @@ class CrossfadeController(
+             )
+         }
+ 
++        if (plan.reason.contains("fallback") || plan.reason.contains("plain") || plan.reason.contains("unmixable")) {
++            AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "classic-fallback", "reason" to plan.reason,
++                "qualityA" to currentAnalysis.quality, "qualityB" to nextAnalysis.quality,
++                "statusA" to currentAnalysis.status, "statusB" to nextAnalysis.status,
++                "bpmA" to currentAnalysis.bpm, "bpmB" to nextAnalysis.bpm,
++                "confA" to currentAnalysis.beatConfidence, "confB" to nextAnalysis.beatConfidence))
++        }
+         lastSmartPlan = plan
+         lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
+         publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
+@@ -1606,6 +1626,7 @@ class CrossfadeController(
+         render = renderStyle
+         planInFlight = plan
+         armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS + rampSteps * beatMs
++        armGraceUsed = false
+         handedOff = false
+         outgoing = out
+         incoming = into
+@@ -1797,8 +1818,19 @@ class CrossfadeController(
+ 
+         // A standby that never got the incoming track ready has nothing to fade
+         // up. Give up and let the queue move on plainly rather than fading into
+-        // silence.
+-        if (expired && !ready) return bail()
++        // silence. djmix10: streamed Opus routinely needs one grace window
++        // past the deadline (quality-upgrade rebuffer, BT jitter) — extend
++        // once instead of bailing straight to a plain advance.
++        if (expired && !ready) {
++            if (!armGraceUsed) {
++                armGraceUsed = true
++                armDeadline = SystemClock.elapsedRealtime() + ARM_TIMEOUT_MS
++                AutomixTelemetry.event("mix.arm.grace", mapOf("phase" to phase.name))
++                return
++            }
++            AutomixTelemetry.event("mix.arm.expired", mapOf("phase" to phase.name))
++            return bail()
++        }
+ 
+         // Both sinks write seconds ahead of the speaker. The standby fills its
+         // whole buffer while it waits here, so its filter has to be at the
+@@ -2963,6 +2995,9 @@ class CrossfadeController(
+         val fresh = runCatching {
+             PhrasePlanner.select(outMap, inMap, camelotSteps(out.key, inn.key), out.bpm, inn.bpm)
+         }.getOrNull()
++        if (fresh == null) {
++            AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "phrase-null", "detail" to PhrasePlanner.lastVetoSummary))
++        }
+         if (!phraseLock.locked && (lyricsPending(current.mediaId, out) || lyricsPending(next.mediaId, inn))) {
+             return null
+         }
+@@ -2985,6 +3020,7 @@ class CrossfadeController(
+         val logKey = "${choice.template}|${phraseLock.locked}|${phraseLock.slides}|${choice.exit.releaseBar}"
+         if (logKey != phraseLogKey) {
+             phraseLogKey = logKey
++            AutomixTelemetry.event("mix.plan", mapOf("template" to choice.template, "locked" to phraseLock.locked, "slides" to phraseLock.slides, "bpmA" to out.bpm, "bpmB" to inn.bpm, "statusA" to out.status, "statusB" to inn.status, "qualityA" to out.quality, "qualityB" to inn.quality))
+             val counts = MixDebug.counts()
+             val json = TransitionMoves.scriptJson(
+                 script, counts[0], counts[1], counts[2],
+@@ -3627,6 +3663,7 @@ class CrossfadeController(
+ 
+     /** The loop mix isn't happening after all: the pair takes the planner's blend instead. */
+     private fun loopFallBack(reason: String) {
++        AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
+         Log.d(TAG, "loop mix falls back to a blend: $reason")
+         loopPlanned = null
+         loopScript = null
+@@ -3742,7 +3779,11 @@ class CrossfadeController(
+                 detail = "${planned.rung} in ${seconds}s. ${describeLoop(planned)}.$phrase$late",
+                 style = planned.rung.lowercase(),
+                 progress = countdownProgress(inSeconds),
+-                state = "planned",
++                state = when {
++                    phase == Phase.LOOP_RUNNING || phase == Phase.FADING -> "mixing"
++                    lockedNow -> "ready"
++                    else -> "preparing"
++                },
+                 planType = planned.rung,
+                 bars = planned.totalBars,
+                 tempoPct = tempoPct(planned.out.bpm, planned.targetBpm),
+@@ -3780,7 +3821,11 @@ class CrossfadeController(
+                 detail = "$summary. $length.$why$late".replace("  ", " "),
+                 style = style,
+                 progress = if (inSeconds > 0) countdownProgress(inSeconds) else 1f,
+-                state = if (inSeconds > 0) "planned" else "mixing",
++                state = when {
++                    inSeconds > 0 && lockedNow -> "ready"
++                    inSeconds > 0 -> "preparing"
++                    else -> "mixing"
++                },
+                 planType = style.replaceFirstChar { it.uppercase() },
+                 bars = bars,
+                 tempoPct = tempoPct(outBpm, inBpm),
+@@ -3854,8 +3899,23 @@ class CrossfadeController(
+      * has been announced), so the only thing left is to take the outgoing track
+      * away gracefully.
+      */
++    private fun appSettingsMarkerShown(): Boolean =
++        runCatching { com.music.bitchord.data.settings.AppSettings.smartTransitionWindow.value != null }.getOrDefault(false)
++
+     private fun bail() {
+         if (phase == Phase.IDLE || phase == Phase.BAILING) return
++        // djmix10 freeze-once-armed: once the blend is audible (FADING,
++        // or a live loop session), a load/queue/seek/error must not
++        // destroy it. The mix is already paid for (decks decoded,
++        // gains ramped); finishing it is always more graceful than
++        // aborting it. Pre-arm phases may still bail (costs only the
++        // standby decoder).
++        val shownMarker = appSettingsMarkerShown()
++        if (phase == Phase.FADING || phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING ||
++            (phase == Phase.ARMING && shownMarker)) {
++            AutomixTelemetry.event("mix.freeze.onInterruption", mapOf("phase" to phase.name, "reason" to "interrupted-while-armed"))
++            return
++        }
+         if (phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING) {
+             loopBail("interrupted", settle = false)
+             return
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index d73895e..5cc4ed1 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -1871,6 +1871,7 @@ class PlaybackService : MediaLibraryService() {
+         reportProgress()
+         watchDirectWindow()
+ 
++        AutomixTelemetry.init(this)
+         val controller = createCrossfadeController()
+         crossfade = controller
+         QueueShuffle.isCrossfadeTransitioning = { crossfade?.isTransitioning() == true }
+diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+index 4e4c541..73b3728 100644
+--- a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
++++ b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+@@ -189,7 +189,9 @@ class LoopMixSession private constructor(
+                 inTo = samplesOf(inRegion, inEndSec).toInt(),
+                 sampleRate = sampleRate,
+             )
+-            val level = (matched ?: inLevel).coerceIn(0.4467f, 1.7783f)
++            // djmix10: symmetric +-3 dB (was -7..+5 on the old line; the
++            // djmix9 RegionalLoudness clamp was undone here).
++            val level = (matched ?: inLevel).coerceIn(0.708f, 1.413f)
+ 
+             val echoHold = if (plan.echoTail) plan.out.beatSec * 8 else 0.0
+             // Outgoing: its loop, knot by knot, looping forever (it stops at the release).
+@@ -258,19 +260,42 @@ class LoopMixSession private constructor(
+                 )
+             }
+ 
+-            // Gains: the outgoing deck takes over from its song, the incoming loop
+-            // rises over the entry and the ramp, the outgoing one falls away.
++            // Gains (djmix10): equal-power sin/cos across the overlap so
++            // the sum stays flat instead of the old plateaus (1.55 then
++            // 1.6) that the limiter had to crush. Outgoing attacks in
++            // h seconds, holds through the swap, falls cos to 0 at
++            // releaseAt; incoming rises sin to 1 at rampEnd and holds.
++            // sin^2+cos^2 = 1, so the power sum is flat by law.
+             val h = LoopMix.HANDOVER_SEC
+-            renderer.setEnvelope(
+-                LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
+-                doubleArrayOf(-h, 0.0, clock.enterEnd, clock.rampEnd, clock.releaseAt),
+-                floatArrayOf(0f, 1f, 1f, 0.6f, 0f),
+-            )
+-            renderer.setEnvelope(
+-                LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN,
+-                doubleArrayOf(0.0, clock.enterEnd, clock.rampEnd),
+-                floatArrayOf(0f, 0.55f, 1f),
+-            )
++            val mixDe = clock.rampEnd - clock.enterEnd
++            if (mixDe > 1e-6) {
++                val outFall = com.music.bitchord.playback.smart.MixGain.fallPoints(clock.rampEnd, clock.releaseAt)
++                renderer.setEnvelope(
++                    LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
++                    doubleArrayOf(-h, 0.0, clock.enterEnd, *outFall.first.sliceArray(1 until outFall.first.size)),
++                    floatArrayOf(0f, 1f, 1f, *outFall.second.sliceArray(1 until outFall.second.size)),
++                )
++                val inRise = com.music.bitchord.playback.smart.MixGain.risePoints(0.0, clock.rampEnd)
++                // Hold 1.0 after the rise: append releaseAt at 1.0.
++                renderer.setEnvelope(
++                    LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN,
++                    doubleArrayOf(*inRise.first, clock.releaseAt),
++                    floatArrayOf(*inRise.second, 1f),
++                )
++            } else {
++                // Degenerate overlap: keep the old shape rather than emit
++                // a zero-length envelope.
++                renderer.setEnvelope(
++                    LoopMixRenderer.OUT, LoopMixRenderer.KIND_GAIN,
++                    doubleArrayOf(-h, 0.0, clock.enterEnd, clock.rampEnd, clock.releaseAt),
++                    floatArrayOf(0f, 1f, 1f, 0.6f, 0f),
++                )
++                renderer.setEnvelope(
++                    LoopMixRenderer.IN, LoopMixRenderer.KIND_GAIN,
++                    doubleArrayOf(0.0, clock.enterEnd, clock.rampEnd),
++                    floatArrayOf(0f, 0.55f, 1f),
++                )
++            }
+             // Bass: the incoming loop comes in without it; they swap over one bar mid-ramp.
+             val swapFrom = clock.handoffAt - clock.swapBar / 2
+             val swapTo = clock.handoffAt + clock.swapBar / 2
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+index 099ea9d..90498e9 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+@@ -799,6 +799,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+             status = TrackAnalysis.STATUS_READY,
+             trackId = trackId,
+             duration = durationSeconds,
++            quality = TrackAnalysis.QUALITY_HEAD,
+             bpm = grid?.bpm ?: entry?.bpm ?: 0.0,
+             beatInterval = grid?.beatInterval ?: entry?.beatInterval ?: 0.0,
+             beatConfidence = grid?.beatConfidence ?: entry?.beatConfidence ?: 0.0,
+@@ -1246,6 +1247,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+                     status = TrackAnalysis.STATUS_READY,
+                     trackId = trackId,
+                     duration = effectiveDuration,
++                    quality = TrackAnalysis.QUALITY_FULL,
+                     contentEndTime = features.contentEndTime.takeIf { it > 0 } ?: effectiveDuration,
+                     bpm = leading?.bpm ?: features.bpm,
+                 beatInterval = leading?.beatInterval ?: features.beatInterval,
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 2e8935f..fdcc6bd 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 51
+-extra["bitchordVersionName"] = "1.9.1-djmix9"
++extra["bitchordVersionCode"] = 52
++extra["bitchordVersionName"] = "2.0.0-djmix10"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/MixGain.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/MixGain.kt
+index 0a7d92d..f23ed1f 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/MixGain.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/MixGain.kt
+@@ -36,4 +36,25 @@ object MixGain {
+ 
+     /** A filter ride. The low-pass is doing the tonal work; the fader just leaves. */
+     fun filterFall(progress: Float): Float = fall(progress.coerceIn(0f, 1f).pow(1.6f))
++
++    /**
++     * Sampled equal-power envelope points for [rise] over [from]..[to]
++     * (mix-clock seconds). The native renderer ramps gains per sample from
++     * these knots; sampling the sin/cos law keeps the blend power-flat
++     * instead of the old linear plateaus that overshoot then dip.
++     */
++    fun risePoints(from: Double, to: Double, steps: Int = 16): Pair<DoubleArray, FloatArray> {
++        val n = steps.coerceAtLeast(1)
++        val times = DoubleArray(n + 1) { from + (to - from) * it / n }
++        val values = FloatArray(n + 1) { rise((it.toFloat() / n).coerceIn(0f, 1f)) }
++        return times to values
++    }
++
++    /** Sampled equal-power [fall] points over [from]..[to]. See [risePoints]. */
++    fun fallPoints(from: Double, to: Double, steps: Int = 16): Pair<DoubleArray, FloatArray> {
++        val n = steps.coerceAtLeast(1)
++        val times = DoubleArray(n + 1) { from + (to - from) * it / n }
++        val values = FloatArray(n + 1) { fall((it.toFloat() / n).coerceIn(0f, 1f)) }
++        return times to values
++    }
+ }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+index cedfec3..8a190a0 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+@@ -61,6 +61,7 @@ data class PhraseChoice(
+  */
+ object PhrasePlanner {
+     class Timeout(message: String) : RuntimeException(message)
++    @Volatile var lastVetoSummary: String = ""
+ 
+     /**
+      * Holds a chosen template once the countdown is inside the lock window.
+@@ -197,26 +198,39 @@ object PhrasePlanner {
+         val exits = CuePoints.exits(out)
+         val entries = CuePoints.entries(inn)
+         var best: PhraseChoice? = null
++        val vetoCounts = HashMap<String, Int>()
++        var tried = 0
++        var ratioSkip = 0
+         for (exit in exits) {
+             for (entry in entries) {
+                 checkPlanTime(startedMs, now)
+                 for (template in candidates(exit, entry, out, inn, steps)) {
+                     if (limited != null && template !in limited) continue
++                    tried++
+                     val ratio = foldedRatio(outBpm, inBpm)
+                     if (abs(ratio - 1.0) > 0.12 && template !in setOf(
+                             MixTemplate.M6, MixTemplate.M10, MixTemplate.RELAXED,
+                         )
+                     ) {
++                        ratioSkip++
+                         continue
+                     }
+                     val veto = veto(template, exit, entry, out, inn, steps, outBpm, inBpm)
+-                    if (veto != null) continue
++                    if (veto != null) {
++                        vetoCounts[veto] = (vetoCounts[veto] ?: 0) + 1
++                        continue
++                    }
+                     val choice = score(template, exit, entry, out, inn, steps, outBpm, inBpm)
+                     if (best == null || choice.score > best.score + 1e-6) best = choice
+                 }
+             }
+         }
+-        if (best == null || best.score < PhraseConfig.S_MIN) return null
++        if (best == null || best.score < PhraseConfig.S_MIN) {
++            lastVetoSummary = "no-choose tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}" +
++                if (best != null) " lowScore=${"%.3f".format(best.score)}" else ""
++            return null
++        }
++        lastVetoSummary = "chose ${best.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
+         return best
+     }
+ 
+@@ -276,7 +290,11 @@ object PhrasePlanner {
+         list.add(MixTemplate.M6)
+         list.add(MixTemplate.M11)
+         if (out.coarse || inn.coarse) {
+-            return list.filter { it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
++            // djmix10: a noisy grid still earns a beat blend (M1) when the
++            // fold-corrected ratio is close; echo/cut-only turned every
++            // low-confidence streamed pair into a wasted chance. The overlap
++            // length is shaped by lengthScore, not by vetoing M1 here.
++            return list.filter { it == MixTemplate.M1 || it == MixTemplate.M6 || it == MixTemplate.M10 || it == MixTemplate.M11 || it == MixTemplate.RELAXED || it == MixTemplate.CUT_ON_ONE }
+         }
+         return list.distinct()
+     }
+@@ -359,10 +377,14 @@ object PhrasePlanner {
+ 
+     private fun foldedRatio(outBpm: Double, inBpm: Double): Double {
+         if (outBpm <= 1.0 || inBpm <= 1.0) return 1.0
+-        var ratio = inBpm / outBpm
+-        while (ratio > 1.5) ratio /= 2.0
+-        while (ratio < 0.75) ratio *= 2.0
+-        return ratio
++        var best = inBpm / outBpm
++        var bestErr = Double.MAX_VALUE
++        for (fold in doubleArrayOf(1.0, 2.0, 0.5)) {
++            val candidate = (inBpm / fold) / outBpm
++            val err = abs(kotlin.math.ln(candidate))
++            if (err < bestErr) { bestErr = err; best = candidate }
++        }
++        return best
+     }
+ 
+     private fun score(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TrackAnalysis.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TrackAnalysis.kt
+index 293cbbd..c4dccb5 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TrackAnalysis.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TrackAnalysis.kt
+@@ -41,9 +41,10 @@ import kotlin.math.pow
+  */
+ data class TrackAnalysis(
+     /**
+-     * Blank means "no status was reported", which counts as ready. Any other
+-     * value must be [STATUS_READY] for the planner to trust the rest of the
+-     * fields.
++     * Blank means "no status was reported": the planner treats blank as
++     * NOT ready (djmix10) so default fields can never authorize beat
++     * math. Any other value must be [STATUS_READY] for the planner to
++     * trust the rest of the fields.
+      */
+     val status: String = "",
+     /** Guards against a stale analysis being paired with the wrong track. */
+@@ -114,6 +115,12 @@ data class TrackAnalysis(
+      * judge one bar's loudness, which the 240-point [energyCurve] is not.
+      */
+     val levelWindows: List<CurveWindow> = emptyList(),
++    /**
++     * How much of the track the analysis covers: none, head (provisional),
++     * or full (whole-track pass). Declared last so positional constructor
++     * sites stay valid.
++     */
++    val quality: String = QUALITY_NONE,
+ ) {
+     /**
+      * Whether this analysis actually describes a track, as opposed to standing
+@@ -130,6 +137,9 @@ data class TrackAnalysis(
+ 
+     companion object {
+         const val STATUS_READY = "ready"
++        const val QUALITY_NONE = "none"
++        const val QUALITY_HEAD = "head"
++        const val QUALITY_FULL = "full"
+     }
+ }
+ 
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+index 5a3299b..a3fc473 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+@@ -1191,7 +1191,7 @@ private data class Overlap(
+  */
+ @Suppress("UNUSED_PARAMETER")
+ private fun incomingRateFor(mediaRatio: Double, advanced: Boolean): Double =
+-    roundRate(clamp(mediaRatio, MIN_INCOMING_RATE, MAX_INCOMING_RATE))
++    roundRate(clamp(mediaRatio, AUDIBLE_MIN_RATE, AUDIBLE_MAX_RATE))
+ 
+ /** The audible outgoing deck is never tempo-shifted. */
+ private fun outgoingRateFor(mediaRatio: Double, advanced: Boolean): Double =
+@@ -1439,10 +1439,29 @@ private fun standardTransition(
+ }
+ 
+ /** A stale analysis paired with the wrong track is worse than no analysis at all. */
+-private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrackInfo?): Boolean {
+-    if (analysis.status.isBlank()) return true
++private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrackInfo?, requireFull: Boolean = false): Boolean {
++    // djmix10: blank is NOT ready. A blank status means nothing was ever
++    // measured; trusting its default BPM/grid authorizes beat math on
++    // zeros. A ready analysis with no tempo is the same.
++    if (analysis.status.isBlank()) return false
+     if (analysis.status != TrackAnalysis.STATUS_READY) return false
+-    return analysis.trackId.isBlank() || track?.id.isNullOrBlank() || analysis.trackId == track.id
++    if (analysis.bpm <= 0) return false
++    if (analysis.trackId.isNotBlank() && track?.id.isNullOrBlank().not() && analysis.trackId != track?.id) return false
++    // The outgoing exit is read from the tail: a head-only analysis
++    // (quality HEAD, or a legacy record with no energy curve and no tail)
++    // has never seen the outro, so its content-end anchor is a blind guess
++    // that later jumps backwards. The incoming entry, by contrast, is
++    // measured over the same opening window the head pass measures.
++    if (requireFull && !isFullAnalysis(analysis)) return false
++    return true
++}
++
++private fun isFullAnalysis(analysis: TrackAnalysis): Boolean {
++    if (analysis.quality == TrackAnalysis.QUALITY_HEAD) return false
++    if (analysis.quality == TrackAnalysis.QUALITY_FULL) return true
++    // Legacy persisted records predate the quality field: a full pass
++    // carries an energy curve (and usually a tail grid).
++    return analysis.energyCurve.isNotEmpty() || analysis.tailBeats != null
+ }
+ 
+ /**
+@@ -1604,7 +1623,7 @@ private fun planTransitionInner(
+         return blocked("blocked-speech-or-live")
+     }
+ 
+-    if (!analysisReadyForTrack(analysis, currentTrack) ||
++    if (!analysisReadyForTrack(analysis, currentTrack, requireFull = true) ||
+         !analysisReadyForTrack(nextAnalysis, nextTrack)
+     ) {
+         return standardTransition(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+index eee56c1..0469ab6 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+@@ -210,6 +210,7 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
+     "interior_mix_out" to 0.95,
+     "break_outro" to 0.93,
+     "outro_start" to 0.9,
++    "eof_holdback" to 0.9,
+     "content_end" to 0.75,
+ )
+ 
+@@ -227,10 +228,14 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
+  */
+ fun alignTempoOctave(outgoingBpm: Double, incomingBpm: Double): Double {
+     if (outgoingBpm <= 0 || incomingBpm <= 0) return incomingBpm
+-    var aligned = incomingBpm
+-    while (aligned / outgoingBpm > 1.5) aligned /= 2
+-    while (aligned / outgoingBpm < 0.67) aligned *= 2
+-    return aligned
++    var best = incomingBpm
++    var bestErr = Double.MAX_VALUE
++    for (fold in doubleArrayOf(1.0, 2.0, 0.5)) {
++        val candidate = incomingBpm / fold
++        val err = abs(kotlin.math.ln(candidate / outgoingBpm))
++        if (err < bestErr) { bestErr = err; best = candidate }
++    }
++    return best
+ }
+ 
+ /**
+@@ -470,6 +475,20 @@ private fun mixOutCandidatesOf(analysis: TrackAnalysis, contentEnd: Double): Lis
+     detectBreakOutro(analysis, contentEnd)?.let { candidate ->
+         if (candidates.none { abs(it.time - candidate.time) < 0.05 }) candidates += candidate
+     }
++    // djmix10 EOF holdback: with no interior/break cue the blind content_end
++    // is the only anchor and the outgoing blend rides straight into EOF.
++    // Hold back up to 8 bars (bounded by the 12s discard cap so the
++    // candidate survives ranking) so the overlap ends before the content
++    // does. Ranks above content_end (0.75+0.75) but below every real cue
++    // (energy_cliff 0.95, break_outro 0.93, outro_start 0.9).
++    val holdBar = analysis.beatInterval.takeIf { it > 0 }?.let { it * 4 }
++        ?: analysis.bpm.orZero().takeIf { it > 0 }?.let { 60.0 / it * 4 }
++    if (holdBar != null && holdBar > 0 && contentEnd > holdBar * 8) {
++        val held = contentEnd - minOf(8.0 * holdBar, MAX_DISCARDED_MUSIC_SECONDS)
++        if (held > 0.3 * contentEnd && candidates.none { abs(it.time - held) < 0.05 }) {
++            candidates += MixCandidate(held, 0.80, "eof_holdback")
++        }
++    }
+     if (candidates.none { abs(it.time - contentEnd) < 0.05 }) {
+         candidates += MixCandidate(contentEnd, 0.75, "content_end")
+     }
+@@ -620,9 +639,18 @@ fun assessTransitionTier(
+         )
+     }
+ 
+-    if (!stretchReachable(outgoingBpm, incomingBpm)) reasons += "tempo-distance"
+-    if (outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE) {
+-        reasons += "beat-confidence"
++    val stretchOk = stretchReachable(outgoingBpm, incomingBpm)
++    if (!stretchOk) reasons += "tempo-distance"
++    val lowConf = outgoingConfidence < MIN_BEATMATCH_CONFIDENCE || incomingConfidence < MIN_BEATMATCH_CONFIDENCE
++    if (lowConf) {
++        // djmix10 taste rescue: a stable grid (many downbeats) with a folded
++        // ratio inside 4% is beatmatchable even when Beat This confidence
++        // reads low on pop/rap. Without the rescue these demote to a filter
++        // ride and read as wasted chances; with it they blend at half length
++        // via the coarse path in PhrasePlanner.
++        val stableGrid = analysis.downbeats.size >= 8 && nextAnalysis.downbeats.size >= 8
++        val closeRatio = abs(incomingRateBetween(outgoingBpm, incomingBpm) - 1.0) <= 0.04
++        if (!(stretchOk && stableGrid && closeRatio)) reasons += "beat-confidence"
+     }
+ 
+     return TransitionPolicyVerdict(
+
+===== NEW FILES =====
+package com.music.bitchord.playback
+
+import android.content.Context
+import java.io.File
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Persistent Automix transition telemetry (djmix10).
+ *
+ * Release builds strip `android.util.Log` (proguard `-assumenosideeffects`),
+ * so logcat can never show a transition decision. This object appends one
+ * JSON object per line to `automix-telemetry.jsonl` in the app's external
+ * files dir — pullable WITHOUT root:
+ * `adb pull /sdcard/Android/data/com.music.bitchord.loopfix/files/automix-telemetry.jsonl`
+ * (`filesDir/automix-telemetry.jsonl` is the fallback when external storage
+ * is unavailable).
+ *
+ * Best-effort by design: every call swallows exceptions, never blocks the
+ * audio path beyond a small append, and never throws into the caller.
+ */
+object AutomixTelemetry {
+    private const val FILE_NAME = "automix-telemetry.jsonl"
+    private const val MAX_BYTES = 2_000_000L
+
+    private val counter = AtomicLong(0)
+    @Volatile private var dir: File? = null
+
+    /** Must be called once from a Context (PlaybackService). Safe to call repeatedly. */
+    fun init(context: Context) {
+        if (dir != null) return
+        try {
+            val root = context.getExternalFilesDir(null) ?: context.filesDir
+            root.mkdirs()
+            dir = root
+        } catch (_: Throwable) {
+            // Telemetry is optional; playback must not depend on it.
+        }
+    }
+
+    /** Where the JSONL lives ("" when init hasn't run). */
+    fun fileLocation(): String {
+        val d = dir ?: return ""
+        return File(d, FILE_NAME).path
+    }
+
+    /**
+     * Append one event line. [name] is dotted, e.g. "mix.plan".
+     * Field values: String (quoted), Number/Boolean (raw), null.
+     */
+    fun event(name: String, fields: Map<String, Any?> = emptyMap()) {
+        val d = dir ?: return
+        try {
+            val sb = StringBuilder()
+            sb.append('{')
+            sb.append("\"ts\":").append(System.currentTimeMillis())
+            sb.append(",\"seq\":").append(counter.incrementAndGet())
+            sb.append(",\"ev\":").append(quote(name))
+            for ((k, v) in fields) {
+                sb.append(',').append(quote(k)).append(':')
+                when (v) {
+                    null -> sb.append("null")
+                    is Number, is Boolean -> sb.append(v.toString())
+                    else -> sb.append(quote(v.toString()))
+                }
+            }
+            sb.append("}\n")
+            val file = File(d, FILE_NAME)
+            if (file.exists() && file.length() > MAX_BYTES) {
+                // Single-file ring: start over rather than grow forever.
+                file.delete()
+            }
+            file.appendText(sb.toString())
+        } catch (_: Throwable) {
+            // Ignore: telemetry must never break playback.
+        }
+    }
+
+    private fun quote(s: String): String {
+        val sb = StringBuilder(s.length + 2)
+        sb.append('"')
+        for (c in s) {
+            when (c) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> if (c.code < 0x20) sb.append(String.format("\\u%04x", c.code)) else sb.append(c)
+            }
+        }
+        sb.append('"')
+        return sb.toString()
+    }
+}
+package com.music.bitchord.playback.smart
+
+import kotlin.math.abs
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+/**
+ * djmix10 P0: frozen mixes, honest analysis trust, native equal-power
+ * gain staging, and graceful fallback selection.
+ */
+class AutomixFreezeTest {
+
+    private fun track(id: String = "t1") = TransitionTrackInfo(id = id, durationMs = 200_000L)
+
+    // ---- analysis trust (P0 #4) ----
+
+    @Test fun blankStatusIsNotReady() {
+        assertFalse(
+            analysisReadyForTrackForTest(analysis(status = "")),
+            "blank status must not authorize beat math",
+        )
+    }
+
+    @Test fun decodeFailedReadyWithZeroBpmIsNotReady() {
+        assertFalse(
+            analysisReadyForTrackForTest(analysis(status = TrackAnalysis.STATUS_READY, bpm = 0.0)),
+            "ready + bpm 0 (decode-failed default) is not usable",
+        )
+    }
+
+    @Test fun realReadyAnalysisIsReady() {
+        assertTrue(analysisReadyForTrackForTest(analysis()))
+    }
+
+    @Test fun wrongTrackIsNotReady() {
+        assertFalse(
+            analysisReadyForTrackForTest(analysis(trackId = "other")),
+        )
+    }
+
+    private fun analysisReadyForTrackForTest(a: TrackAnalysis, t: TransitionTrackInfo = track()): Boolean {
+        // Mirrors TransitionPlanner.analysisReadyForTrack (private there).
+        if (a.status.isBlank()) return false
+        if (a.status != TrackAnalysis.STATUS_READY) return false
+        if (a.bpm <= 0) return false
+        return a.trackId.isBlank() || t.id.isNullOrBlank() || a.trackId == t.id
+    }
+
+    // ---- EOF holdback anchor (P0 #5) ----
+
+    @Test fun eofAnchorHoldsBackWhenNoInteriorCue() {
+        // 120 BPM -> bar = 2.0s; 8 bars = 16s but the discard cap bounds
+        // the hold to 12s, so the anchor sits at contentEnd - 12.
+        val a = analysis(bpm = 120.0, contentEnd = 200.0)
+        val ranked = rankMixOutCandidates(a, contentEnd = 200.0, duration = 200.0)
+        val anchor = ranked.firstOrNull()
+        assertTrue(anchor != null, "a mix-out anchor must exist")
+        assertEquals(188.0, anchor.time, 0.01, message = "anchor held back before EOF, type=${anchor.type}")
+        assertEquals("eof_holdback", anchor.type)
+    }
+
+    @Test fun interiorCueBeatsHoldback() {
+        // outroStart present -> analyzer's own cue wins over holdback.
+        val a = analysis(outroStart = 190.0, mixOutStart = 190.0)
+        val ranked = rankMixOutCandidates(a, contentEnd = 200.0, duration = 200.0)
+        assertTrue(ranked.any { it.type == "outro_start" || it.type == "interior_mix_out" } || ranked.first().time <= 190.001)
+    }
+
+    private fun analysis(
+        status: String = TrackAnalysis.STATUS_READY,
+        trackId: String = "t1",
+        bpm: Double = 120.0,
+        quality: String = TrackAnalysis.QUALITY_FULL,
+        contentEnd: Double = 200.0,
+        outroStart: Double = 0.0,
+        mixOutStart: Double? = null,
+        energyCurve: List<EnergySample> = emptyList(),
+    ) = TrackAnalysis(
+        status = status,
+        trackId = trackId,
+        duration = contentEnd,
+        bpm = bpm,
+        beatInterval = 60.0 / bpm,
+        beatConfidence = 0.9,
+        downbeats = listOf(0.0, 2.0),
+        contentEndTime = contentEnd,
+        outroStartTime = outroStart,
+        mixOutTime = mixOutStart ?: outroStart,
+        mixOutCandidates = emptyList(),
+        energyCurve = energyCurve,
+        quality = quality,
+    )
+
+    // ---- djmix10 expanded: head/full trust, fold, coarse blend ----
+
+    @Test fun outgoingHeadIsNotFull_butIncomingHeadIsAccepted() {
+        val headOut = analysis(quality = TrackAnalysis.QUALITY_HEAD)
+        val headIn = analysis(quality = TrackAnalysis.QUALITY_HEAD)
+        val fullOut = analysis(quality = TrackAnalysis.QUALITY_FULL)
+        // Mirror of analysisReadyForTrack + isFullAnalysis.
+        fun ready(a: TrackAnalysis, requireFull: Boolean): Boolean {
+            if (a.status.isBlank()) return false
+            if (a.status != TrackAnalysis.STATUS_READY) return false
+            if (a.bpm <= 0) return false
+            fun isFull(x: TrackAnalysis): Boolean {
+                if (x.quality == TrackAnalysis.QUALITY_HEAD) return false
+                if (x.quality == TrackAnalysis.QUALITY_FULL) return true
+                return x.energyCurve.isNotEmpty() || x.tailBeats != null
+            }
+            if (requireFull && !isFull(a)) return false
+            return true
+        }
+        assertFalse(ready(headOut, requireFull = true))
+        assertTrue(ready(headIn, requireFull = false))
+        assertTrue(ready(fullOut, requireFull = true))
+    }
+
+    @Test fun unifiedFoldPicksClosestOctave() {
+        // 74 (half-time error) against 105 folds to 148, not 74.
+        assertEquals(148.0, alignTempoOctave(105.0, 74.0), 0.001)
+        // Plain close pair unchanged.
+        assertEquals(122.0, alignTempoOctave(120.0, 122.0), 0.001)
+        // Exact double folds down.
+        assertEquals(120.0, alignTempoOctave(120.0, 240.0), 0.001)
+        assertEquals(120.0, alignTempoOctave(120.0, 60.0), 0.001)
+    }
+
+    @Test fun stableGridLowConfidenceBeatmatches() {
+        val out = analysis(bpm = 120.0)
+        val inn = analysis(bpm = 122.0)
+        val verdict = assessTransitionTier(
+            out.copy(beatConfidence = 0.48, downbeats = List(20) { it * 2.0 }),
+            inn.copy(beatConfidence = 0.48, downbeats = List(20) { it * 2.0 }),
+        )
+        assertEquals(TransitionTier.BEATMATCHED, verdict.tier, message = "stable-grid rescue: ${verdict.reasons}")
+        val noGrid = assessTransitionTier(
+            out.copy(beatConfidence = 0.48, downbeats = listOf(0.0, 2.0)),
+            inn.copy(beatConfidence = 0.48, downbeats = listOf(0.0, 2.0)),
+        )
+        assertEquals(TransitionTier.DJ_ASSISTED, noGrid.tier, message = "no-grid stays assisted")
+    }
+
+    // ---- native equal-power staging (P0 #1) ----
+
+    @Test fun sampledEqualPowerSumsFlat() {
+        val rise = MixGain.risePoints(0.0, 10.0)
+        val fall = MixGain.fallPoints(0.0, 10.0)
+        for (i in rise.first.indices) {
+            val p = i.toFloat() / (rise.first.size - 1)
+            val sum = rise.second[i] * rise.second[i] + fall.second[i] * fall.second[i]
+            assertEquals(1.0f, sum, 0.01f, message = "power sum at $p")
+            assertEquals(i.toFloat() / (rise.first.size - 1), p, 1e-6f)
+        }
+        assertEquals(0f, rise.second.first(), 1e-6f)
+        assertEquals(1f, rise.second.last(), 1e-6f)
+        assertEquals(1f, fall.second.first(), 1e-6f)
+        assertEquals(0f, fall.second.last(), 1e-6f)
+    }
+
+    @Test fun headroomFloorHoldsWithNativeCurves() {
+        // sin+cos peak 1.414 -> trim 0.707 uncapped, floored at 0.85.
+        val trim = MixGain.headroomTrim(1f, 1f)
+        assertEquals(0.85f, trim, 1e-6f)
+    }
+}

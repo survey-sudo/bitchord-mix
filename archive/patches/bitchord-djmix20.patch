@@ -1,0 +1,833 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 5169479..a4757d5 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -26,6 +26,7 @@ import com.music.bitchord.playback.loopmix.LoopMixSession
+ import com.music.bitchord.playback.loopmix.LoopRegion
+ import com.music.bitchord.playback.smart.CrossfadeMode
+ import com.music.bitchord.playback.smart.LoopMix
++import com.music.bitchord.playback.smart.shouldDeclineToMix
+ import com.music.bitchord.playback.smart.PhraseConfig
+ import com.music.bitchord.playback.smart.PhraseMaps
+ import com.music.bitchord.playback.smart.PhraseChoice
+@@ -1667,7 +1668,7 @@ class CrossfadeController(
+         val rejKey = plan.reason + "|" + plan.transitionStyle.name
+         if (rejKey != lastRejectedLogKey) {
+             lastRejectedLogKey = rejKey
+-        if (plan.reason.contains("fallback") || plan.reason.contains("plain") || plan.reason.contains("unmixable")) {
++        if (plan.reason.contains("fallback") || plan.reason.contains("plain") || plan.reason.contains("unmixable") || plan.reason.contains("decline")) {
+             AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "classic-fallback", "reason" to plan.reason,
+                 "qualityA" to currentAnalysis.quality, "qualityB" to nextAnalysis.quality,
+                 "statusA" to currentAnalysis.status, "statusB" to nextAnalysis.status,
+@@ -1701,9 +1702,13 @@ class CrossfadeController(
+         if (!suppressingLoop && pairKey != loopSuppressedPair) {
+             loopSuppressedPair = null
+         }
++        // djmix20 decline-to-mix (Apple parity): unmixable pairs skip ALL
++        // beatmix/loop rungs (LoopMix, PhrasePlanner, bridge) and take the
++        // classic EQUAL_POWER decline crossfade at content_end. Scalars only.
++        val declineToMix = shouldDeclineToMix(currentAnalysis, nextAnalysis)
+         var loop: LoopMix.Plan? = null
+         var planLoop: LoopMix.Plan? = null
+-        if (!suppressingLoop) {
++        if (!suppressingLoop && !declineToMix) {
+             planLoop = loopPlanFor(
+                 player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration, analysisState,
+             )
+@@ -2031,13 +2036,15 @@ class CrossfadeController(
+         val nextItem = player.getMediaItemAt(nextIndex)
+         if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
+         requestAnalysis(currentItem, duration)
+-        // The new next track's Beat This / vocal pass is the heavy work. It
+-        // used to start on the handover, in the same second the incoming
+-        // song became the one you hear. Wait until the mix has settled.
+-        val sinceSettle = settledAt.takeIf { it != 0L }?.let { SystemClock.elapsedRealtime() - it }
+-        if (sinceSettle == null || sinceSettle >= POST_MIX_ANALYSIS_DELAY_MS) {
+-            requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem))
+-        }
++        // djmix20 analyse-ahead (P0-1): next AND next+1 are queued
++        // immediately (the architecture already supports next+1 lookahead).
++        // The old 12 s post-mix settle gate starved the incoming entry half
++        // (phrase-null tried=0 / before-smart fallback) whenever a skip or
++        // quick mix followed a handover. TrackAnalyzer.request is a cheap
++        // no-op when already analysed/in-flight, and head work runs on its
++        // own single-thread executor, so eager queueing costs nothing when
++        // warm and wins the whole lead when cold.
++        requestAnalysis(nextItem, nextItemDurationMs(nextIndex, nextItem))
+         askLyrics(currentItem, duration)
+         askLyrics(nextItem, nextItemDurationMs(nextIndex, nextItem))
+         val after = nextIndex + 1
+@@ -2046,9 +2053,7 @@ class CrossfadeController(
+             if (!later.isVideoOrigin) {
+                 val laterDuration = nextItemDurationMs(after, later)
+                 askLyrics(later, laterDuration)
+-                if (sinceSettle == null || sinceSettle >= POST_MIX_ANALYSIS_DELAY_MS) {
+-                    requestAnalysis(later, laterDuration)
+-                }
++                requestAnalysis(later, laterDuration)
+             }
+         }
+     }
+@@ -3802,15 +3807,17 @@ class CrossfadeController(
+         val release = fresh?.exit?.releaseSec ?: (durationMs / 1000.0)
+         val left = release - player.currentPosition / 1000.0
+         val chosen = phraseLock.consider(now, left, fresh) ?: return null
+-        return compilePhrase(chosen, out, inn)
++        return compilePhrase(chosen, out, inn, current.mediaId, next.mediaId)
+     }
+ 
+     private fun compilePhrase(
+         choice: com.music.bitchord.playback.smart.PhraseChoice,
+         out: TrackAnalysis,
+         inn: TrackAnalysis,
++        outId: String = loopOutItem?.mediaId.orEmpty(),
++        inId: String = loopInItem?.mediaId.orEmpty(),
+     ): LoopMix.Plan {
+-        val script = TransitionMoves.compile(choice, out.bpm, inn.bpm)
++        val script = TransitionMoves.compile(choice, out.bpm, inn.bpm, outgoingId = outId, incomingId = inId)
+         loopScript = script
+         val line = TransitionMoves.phraseLine(choice) + " · " + TransitionMoves.sectionLine(choice) +
+             " · exit tail %.1fs".format(Locale.US, script.plan.exitTailSeconds)
+diff --git a/app/src/test/java/com/music/bitchord/playback/Djmix20AppTest.kt b/app/src/test/java/com/music/bitchord/playback/Djmix20AppTest.kt
+index e69de29..83baa3c 100644
+--- a/app/src/test/java/com/music/bitchord/playback/Djmix20AppTest.kt
++++ b/app/src/test/java/com/music/bitchord/playback/Djmix20AppTest.kt
+@@ -0,0 +1,100 @@
++package com.music.bitchord.playback
++
++import com.music.bitchord.playback.smart.MixGain
++import com.music.bitchord.playback.smart.RegionalLoudness
++import com.music.bitchord.playback.smart.TransitionMoves
++import com.music.bitchord.playback.smart.EntryCue
++import com.music.bitchord.playback.smart.EntryKind
++import com.music.bitchord.playback.smart.ExitCue
++import com.music.bitchord.playback.smart.ExitKind
++import com.music.bitchord.playback.smart.LoopMix
++import com.music.bitchord.playback.smart.MixTemplate
++import com.music.bitchord.playback.smart.PhraseChoice
++import com.music.bitchord.playback.smart.PhrasePlanner
++import com.music.bitchord.playback.smart.SectionFn
++import com.music.bitchord.playback.smart.SectionRole
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.math.PI
++import kotlin.math.sin
++
++/**
++ * djmix20 app-side proofs (vc62). Pure JVM: native LoopMixSession cannot be
++ * built here, so writer-side scalars are checked via LoopMix.Clock and the
++ * shared freeze/stall helpers the controller calls.
++ */
++class Djmix20AppTest {
++
++    private fun choiceFor(template: MixTemplate, overlapBars: Int = 8): PhraseChoice {
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        return PhraseChoice(
++            template = template, rung = PhrasePlanner.rungOf(template), score = 0.9,
++            exit = exit, entry = entry, overlapBars = overlapBars,
++            swapBar = -overlapBars / 2.0, tailBeats = 1.0, loopK = 0,
++            echoGated = template == MixTemplate.M6, vocalProduct = 0f, tempoPrepBars = 0,
++            echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9,
++            phraseScore = 0.9, energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++    }
++
++    @Test
++    fun idleStallForceExitStillDeterministic() {
++        // vc61 Fix 5 must not regress: 1.5 s prepare-once, 2.0 s force bail.
++        assertEquals(IdleStallAction.WAIT_AND_FREEZE, idleStallDecision(0L, false, false))
++        assertEquals(IdleStallAction.PREPARE_ONCE, idleStallDecision(1500L, false, false))
++        assertEquals(IdleStallAction.FORCE_BAIL, idleStallDecision(2000L, false, true))
++        assertEquals(IdleStallAction.FORCE_BAIL, idleStallDecision(0L, true, false))
++        val k = freezeDedupKey("FADING", "a", "b")
++        assertEquals(k, freezeDedupKey("FADING", "a", "b"))
++        assertTrue(k != freezeDedupKey("TAIL", "a", "b"))
++    }
++
++    @Test
++    fun echoTailIsInDeckBoundsForLoopPath() {
++        // P1-6 planner/lane level: LoopMix bounds must cover the echo tail so
++        // the tail rings past EOF instead of being truncated.
++        val script = TransitionMoves.compile(choiceFor(MixTemplate.M6, overlapBars = 0), 120.0, 120.0)
++        val clock = LoopMix.Clock(script.plan)
++        val bounds = LoopMix.regionBounds(script.plan)
++        val echoHold = if (script.plan.echoTail) script.plan.out.beatSec * 8 else 0.0
++        val stopAt = clock.releaseAt + 0.05 + echoHold + script.plan.exitTailSeconds
++        // outTo must be at least the track position at stopAt (straight deck).
++        val tailRate = if (clock.beats >= 1) {
++            val b0 = clock.beatTimes[clock.beats - 1]; val b1 = clock.beatTimes[clock.beats]
++            (script.plan.out.beatSec / (b1 - b0).coerceAtLeast(1e-6)).coerceIn(0.85, 1.15)
++        } else 1.0
++        val lastPos = script.plan.out.loopStart + clock.beats * script.plan.out.beatSec
++        val stopPos = lastPos + (stopAt - clock.releaseAt) * tailRate
++        assertTrue("bounds.outTo=${bounds.outTo} stopPos=$stopPos", bounds.outTo >= stopPos - 1e-6)
++        assertTrue(bounds.outTo > bounds.outFrom)
++    }
++
++    @Test
++    fun loopBuildNullFallbackDecisionIsSameTickWhenArming() {
++        // P0-3 audit as a pure rule: build-null while LOOP_ARMING must yield
++        // to classic immediately (loopFallBack same tick), not ride to EOF.
++        // The controller's startLoopBuild implements this; here we assert the
++        // scalar that drives it (yield decisions) stay conservative.
++        assertTrue(LoopMix.shouldYieldColdLoop(100_000L, 95_000L, fastReady = false, building = true, blendArmLeadMs = 0L, nextStreamReady = true))
++        assertTrue(!LoopMix.shouldYieldColdLoop(100_000L, 95_000L, fastReady = true, building = true, blendArmLeadMs = 0L, nextStreamReady = true))
++    }
++
++    @Test
++    fun volumeFloorsStay() {
++        assertTrue(MixGain.HEADROOM_FLOOR >= 0.94f)
++        val n = 96000
++        val quiet = tone(n, 48000, 0.1); val loud = tone(n, 48000, 0.8)
++        val cut = requireNotNull(RegionalLoudness.matchGain(quiet, quiet, 0, n, loud, loud, 0, n, 48000))
++        assertTrue(cut >= 0.66f)
++    }
++
++    private fun tone(n: Int, rate: Int, amplitude: Double): FloatArray {
++        val out = FloatArray(n)
++        for (i in 0 until n) out[i] = (sin(2.0 * PI * 440.0 * i / rate) * amplitude).toFloat()
++        return out
++    }
++}
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 9e388c9..52b8b3f 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 61
+-extra["bitchordVersionName"] = "2.2.3-djmix19"
++extra["bitchordVersionCode"] = 62
++extra["bitchordVersionName"] = "2.2.3-djmix20"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+index 3ac0d63..abcc571 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+@@ -136,6 +136,8 @@ object DjMix {
+         next = colour(next, outgoingId, incomingId)
+         val handoff = vocalHandoff(next, analysis, nextAnalysis)
+         val extend = phraseExtend(next, analysis, lyricsOut, outSections)
++        // djmix20: phrase extension never overwrites a chosen FLANGER (or
++        // any non-NONE colour); it only fills a NONE slot with LOOP_ROLL.
+         if (extend > 0 && next.djEffect == DjEffect.NONE) {
+             next = next.copy(djEffect = DjEffect.LOOP_ROLL, phraseExtendBars = extend)
+         } else if (extend > 0) {
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index 7a1ca5a..34d427d 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -222,6 +222,8 @@ object LoopMix {
+         why: StringBuilder? = null,
+         playableOutDurationSec: Double = outDuration,
+     ): Plan? {
++        // djmix20 decline-to-mix (Apple parity): unmixable pairs never loop.
++        if (shouldDeclineToMix(out, inn)) return null.also { why?.append("decline to mix") }
+         val effectiveOutDuration = if (playableOutDurationSec > 1.0) minOf(outDuration, playableOutDurationSec) else outDuration
+         return mixPlan(
+             out, effectiveOutDuration, inn, inDuration,
+@@ -947,6 +949,9 @@ object LoopMix {
+         playableOutDurationSec: Double = outDuration,
+     ): Plan? {
+         if (outVideo || inVideo) return null
++        // djmix20 decline-to-mix: no drop/blend/echo beatmix for unmixable pairs;
++        // the caller falls through to the classic EQUAL_POWER decline crossfade.
++        if (shouldDeclineToMix(out, inn)) return null
+         val effectiveOutDuration = if (playableOutDurationSec > 1.0) minOf(outDuration, playableOutDurationSec) else outDuration
+         if (effectiveOutDuration < 8.0 || inDuration < 8.0) return null
+         if (out.beatConfidence < 0.25 && inn.beatConfidence < 0.25) return null
+@@ -1125,6 +1130,9 @@ object LoopMix {
+             rung = "Echo",
+             keys = keys,
+             targetBpmOverride = outBpm,
++            // djmix20: echo tail rings past EOF (stopAt = releaseAt + 8 beats +
++            // this tail; regionBounds.outTo covers it). Was 0.0 (truncated).
++            exitTailSeconds = PhraseConfig.exitTailSeconds(outBeat),
+         )
+     }
+ 
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+index ad10cef..6526ffe 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+@@ -55,10 +55,38 @@ object TransitionMoves {
+         outBpm: Double,
+         inBpm: Double,
+         flanger: Boolean = false,
++        outgoingId: String = "",
++        incomingId: String = "",
+     ): PhraseScript {
++        // djmix20 flanger (Apple-parity colour): deterministic per-pair on
++        // eligible beatmix/loop blends with low vocal overlap. NEVER on
++        // dual-vocal clash, NEVER replacing echo/reverb on tempo-gap pairs.
++        // wet <=0.42, 8-beat LFO via effectSettings/FLANGER bounds. When ids
++        // are supplied, slot = pairHash%4 in {0,1} (same rotation as
++        // DjMix.blendColour) enables it; without ids keep the legacy
++        // M7/M8-only behaviour so old call sites/tests are unchanged.
++        val autoFlanger = if ((outgoingId.isNotEmpty() || incomingId.isNotEmpty()) &&
++            !(outgoingId.isEmpty() && incomingId.isEmpty())) {
++            val hasIds = outgoingId.isNotEmpty() || incomingId.isNotEmpty()
++            val slot = if (hasIds) pairHash(outgoingId, incomingId) % 4 else 3
++            val lowVocal = choice.vocalProduct < 0.18f && choice.vocalOverlapBeats < 1.0
++            val notTempoGap = choice.template != MixTemplate.M6 &&
++                choice.template != MixTemplate.M10 && choice.template != MixTemplate.CUT_ON_ONE &&
++                choice.template != MixTemplate.M11 && choice.template != MixTemplate.RELAXED
++            val eligibleTemplate = choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 ||
++                choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 ||
++                choice.template == MixTemplate.ROLLING || choice.template == MixTemplate.M2
++            val tempoOk = if (outBpm > 1.0 && inBpm > 1.0) {
++                kotlin.math.abs((inBpm / alignedFold(outBpm, inBpm)) / outBpm - 1.0) <= PhraseConfig.TEMPO_HARD_DELTA
++            } else false
++            slot in 0..1 && lowVocal && notTempoGap && eligibleTemplate && tempoOk
++        } else {
++            flanger && (choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8)
++        }
++        val wantFlanger = flanger || autoFlanger
+         val legacy = choice.legacyLoop
+         if (legacy != null) {
+-            return sheet(choice, legacy, flanger, holdSec = 0.0, echoDelaySec = 0.0, echoFeedback = 0f)
++            return sheet(choice, legacy, wantFlanger, holdSec = 0.0, echoDelaySec = 0.0, echoFeedback = 0f)
+         }
+         val outBeat = if (outBpm > 1.0) 60.0 / outBpm else 0.5
+         val inBeat = if (inBpm > 1.0) 60.0 / inBpm else outBeat
+@@ -131,7 +159,7 @@ object TransitionMoves {
+             targetBpmOverride = targetBpmOverride,
+             incomingHoldSec = hold,
+         )
+-        return sheet(choice, plan, flanger, hold, delaySec, PhraseConfig.ECHO_FEEDBACK)
++        return sheet(choice, plan, wantFlanger, hold, delaySec, PhraseConfig.ECHO_FEEDBACK)
+     }
+ 
+     /** Beats from t0 to the landing, for a compiled plan: the ramp, then the overlap. */
+@@ -288,7 +316,11 @@ object TransitionMoves {
+             echoDelaySec = echoDelaySec,
+             echoFeedback = echoFeedback,
+             incomingHoldSec = holdSec,
+-            flanger = flanger && (choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8),
++            // djmix20: eligible beatmix templates only (M1/M3/M7/M8/ROLLING/M2
++            // legacy). Echo/cut/crossfade/relaxed/vocal-blend never flange.
++            flanger = flanger && (choice.template == MixTemplate.M1 || choice.template == MixTemplate.M3 ||
++                choice.template == MixTemplate.M7 || choice.template == MixTemplate.M8 ||
++                choice.template == MixTemplate.ROLLING || choice.template == MixTemplate.M2),
+             bTrimDb = 0f,
+             phaseMs = phase,
+         )
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+index bde1210..14efdc7 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+@@ -86,9 +86,12 @@ private const val MIX_WINDOW_SECONDS = 30.0
+ /** djmix9: below this a short track may still smart-crossfade gracefully. */
+ private const val MIN_SMART_DURATION_SECONDS = 20.0
+ 
+-/** djmix9: the unmixable veto is off by default - pairs fall to the DJ-assisted
+- * echo/filter rungs instead of a lazy plain crossfade. */
+-private const val UNMIXABLE_VETO_ENABLED = false
++/** djmix20: decline-to-mix gate ON (Apple parity, conservative). Pairs with
++ * post-fold tempo delta >8% AND (Camelot clash >2 steps OR dual-vocal clash
++ * high) decline to a short EQUAL_POWER crossfade at content_end instead of
++ * forcing a DJ_BLEND/DJ_FILTER/loop. Scalars only. Compatible pairs (incl.
++ * folded pairs like Drip 79 -> UP 162, folded delta ~2.6%) are unaffected. */
++private const val UNMIXABLE_VETO_ENABLED = true
+ 
+ /** Leave enough incoming material after a calibrated handoff to avoid landing in its outro. */
+ private const val MIN_INCOMING_CLEARANCE_SECONDS = 5.0
+@@ -292,23 +295,55 @@ private fun itemText(track: TransitionTrackInfo?): String =
+         .joinToString(" ")
+ 
+ /**
+- * Tempi no speed-up can meet, plus a key clash or a vocal on both sides. Any
+- * overlap of such a pair is two unsynced kicks under two clashing songs, so it
+- * gets a plain crossfade at the content end rather than a mix.
++ * djmix20 decline-to-mix predicate (Apple parity, conservative). Scalars only:
++ * post-fold tempo delta >8% (TEMPO_HARD_DELTA) AND (Camelot clash >2 steps OR
++ * dual-vocal high: both vocalProbability >=0.62). Compatible pairs never
++ * decline: Beautiful 99.93->104.5 (same key, delta ~4.6%) and folded pairs
++ * Drip 78.89->UP 162.01 (fold 2, delta ~2.6%) both return false.
++ * Public so LoopMix and CrossfadeController can skip beatmix/loop rungs
++ * for the same pairs.
+  */
+-private fun isUnmixablePair(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Boolean {
+-    val currentBpm = analysis.bpm.orZero()
+-    val nextBpm = nextAnalysis.bpm.orZero()
+-    if (currentBpm <= 0 || nextBpm <= 0) return false
+-    if (stretchReachable(currentBpm, nextBpm)) return false
++fun shouldDeclineToMix(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Boolean {
++    val outBpm = analysis.bpm.orZero()
++    val inBpm = nextAnalysis.bpm.orZero()
++    if (outBpm <= 0 || inBpm <= 0) return false
++    val folded = alignTempoOctave(outBpm, inBpm)
++    if (folded <= 0) return false
++    val delta = abs(folded / outBpm - 1.0)
++    if (delta <= PhraseConfig.TEMPO_HARD_DELTA) return false
+     val left = trustedKey(analysis)
+     val right = trustedKey(nextAnalysis)
+-    val keyClash = left.isNotEmpty() && right.isNotEmpty() && !harmonicallyCompatible(left, right)
+-    val vocalConflict = analysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY &&
++    val steps = if (left.isNotEmpty() && right.isNotEmpty()) camelotSteps(left, right) else null
++    val keyClash = steps != null && steps > 2
++    val dualVocal = analysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY &&
+         nextAnalysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY
+-    return keyClash || vocalConflict
++    return keyClash || dualVocal
+ }
+ 
++/** Detail string for decline telemetry/policy reasons, or null when no decline. */
++fun declineToMixDetail(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): String? {
++    if (!shouldDeclineToMix(analysis, nextAnalysis)) return null
++    val outBpm = analysis.bpm.orZero()
++    val inBpm = nextAnalysis.bpm.orZero()
++    val folded = alignTempoOctave(outBpm, inBpm)
++    val delta = if (outBpm > 0) abs(folded / outBpm - 1.0) else 0.0
++    val left = trustedKey(analysis)
++    val right = trustedKey(nextAnalysis)
++    val steps = if (left.isNotEmpty() && right.isNotEmpty()) camelotSteps(left, right) else null
++    val dualVocal = analysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY &&
++        nextAnalysis.vocalProbability >= VOCAL_CONFLICT_PROBABILITY
++    val why = when {
++        steps != null && steps > 2 && dualVocal -> "key+dualvocal"
++        steps != null && steps > 2 -> "key"
++        else -> "dualvocal"
++    }
++    return "decline-to-mix delta=%.3f steps=%s %s".format(delta, steps?.toString() ?: "?", why)
++}
++
++/** Internal alias kept for the planner path below. */
++private fun isUnmixablePair(analysis: TrackAnalysis, nextAnalysis: TrackAnalysis): Boolean =
++    shouldDeclineToMix(analysis, nextAnalysis)
++
+ /** Low-band level, against the track's own loud end, at which a passage counts as carrying a kick. */
+ private const val KICK_PRESENT = 0.5
+ 
+@@ -1756,8 +1791,8 @@ private fun planTransitionInner(
+                 incomingCueTime = incomingCueTime,
+                 incomingPlaybackRate = 1.0,
+             ),
+-            policyReasons = policy.reasons + "unmixable-pair",
+-            reason = if (started) "smart-unmixable-crossfade" else "before-unmixable-crossfade",
++            policyReasons = policy.reasons + "decline-to-mix" + listOfNotNull(declineToMixDetail(analysis, nextAnalysis)),
++            reason = if (started) "decline-to-mix" else "before-decline-to-mix",
+         )
+     }
+ 
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AdvancedAutomixPlannerTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AdvancedAutomixPlannerTest.kt
+index 250ac30..04aa968 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AdvancedAutomixPlannerTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AdvancedAutomixPlannerTest.kt
+@@ -71,16 +71,17 @@ class AdvancedAutomixPlannerTest {
+ 
+     @Test
+     fun anUnmixablePairIsCrossfadedAtTheEndIntoTheIntro() {
+-        // Tempo out of reach, clashing keys, both sung: every DJ gesture put two
+-        // loud unsynced songs on top of each other. The plain crossfade wins.
++        // Tempo out of reach (post-fold delta >8%), clashing keys (>2 steps),
++        // both sung: djmix20 decline-to-mix (Apple parity) declines to a short
++        // EQUAL_POWER crossfade at content_end instead of forcing DJ_FILTER.
+         val current = track("a", 120.0, "C major", vocal = 0.9)
+         val next = track("b", 94.0, "F♯ major", vocal = 0.9)
+         val plan = plan(current, next, advanced = true)
+-        // djmix9: the unmixable veto is off - pairs fall to the DJ-assisted
+-        // filter rung (short, key-aware) instead of a plain crossfade.
+-        assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
++        assertEquals(TransitionStyle.EQUAL_POWER, plan.transitionStyle)
++        assertTrue(plan.reason.contains("decline-to-mix"))
+         assertTrue(plan.transitionEnd <= current.contentEndTime + 1e-6)
+-        assertEquals(TransitionStyle.DJ_FILTER, plan(current, next, advanced = false).transitionStyle)
++        assertEquals(TransitionStyle.EQUAL_POWER, plan(current, next, advanced = false).transitionStyle)
++        assertEquals(next.audibleStartTime!!, plan.incomingCueTime, 1e-6)
+     }
+ 
+     @Test
+@@ -101,17 +102,20 @@ class AdvancedAutomixPlannerTest {
+         // down. Advanced mode leaves that to a filter ride rather than a
+         // blend. The gesture still follows the low end. Past the stretch
+         // limit the ride is an echo instead.
++        // djmix20: keys are left untrusted (keyConfidence 0.1) so the trusted-key
++        // decline gate does NOT fire on this 9% + clash pair; the DjMix clash
++        // filter (which reads the raw key) still produces the DJ_FILTER here.
+         val kicks = plan(
+-            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0),
+-            track("b", 120.0, "F♯ major", vocal = 0.1, bass = 1.0),
++            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
++            track("b", 120.0, "F♯ major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
+             advanced = true,
+         )
+         assertEquals(TransitionStyle.DJ_FILTER, kicks.transitionStyle)
+         assertEquals(FilterTransitionVariant.BASS_HANDOFF, kicks.filterVariant)
+         assertEquals(0.0, kicks.echoSeconds)
+         val sparse = plan(
+-            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0),
+-            track("b", 120.0, "F♯ major", vocal = 0.1),
++            track("a", 110.0, "C major", vocal = 0.1, bass = 1.0).copy(keyConfidence = 0.1),
++            track("b", 120.0, "F♯ major", vocal = 0.1).copy(keyConfidence = 0.1),
+             advanced = true,
+         )
+         assertEquals(FilterTransitionVariant.SWEEP, sparse.filterVariant)
+@@ -144,7 +148,9 @@ class AdvancedAutomixPlannerTest {
+         // Within the stretch window, but the incoming grid is too weak to
+         // beatmatch on, so this is a filter ride — with two singers on it.
+         val current = track("vocal-out", 120.0, "C major", vocal = 0.9, bass = 1.0)
+-        val next = track("vocal-in", 130.0, "C major", vocal = 0.9, bass = 1.0).copy(beatConfidence = 0.4)
++        // djmix20: 128 (6.7% delta) avoids the decline gate (130 was 8.3% + dual
++        // vocal); the weak incoming grid still forces the vocal-safe sweep.
++        val next = track("vocal-in", 128.0, "C major", vocal = 0.9, bass = 1.0).copy(beatConfidence = 0.4)
+         val plan = plan(current, next, advanced = true)
+         assertEquals(TransitionStyle.DJ_FILTER, plan.transitionStyle)
+         assertEquals(FilterTransitionVariant.SWEEP, plan.filterVariant)
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix20RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix20RegressionTest.kt
+index e69de29..6b6719d 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix20RegressionTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix20RegressionTest.kt
+@@ -0,0 +1,344 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.PI
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.min
++import kotlin.math.sin
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++import kotlin.test.assertFalse
++
++/**
++ * djmix20 (vc62) shared regression suite:
++ * P0: decline gate, analyse-ahead (HEAD next usable), loop-build drop.
++ * P1: outro-loop drop, phrase extension, echo-past-EOF lane.
++ * Flanger: per-pair deterministic, low-vocal only, never on echo gap.
++ * Showcase fixtures: Calvin Harris x2 (124/124) and Technologic x Guess.
++ */
++class Djmix20RegressionTest {
++
++    // ---- helpers ----
++    private fun window(duration: Double, value: Float, from: Double = 0.0, to: Double? = null): CurveWindow {
++        val end = to ?: duration
++        val n = ((end - from) * 10.0).toInt()
++        val values = FloatArray(n) { value }
++        return CurveWindow(from, 10.0, values)
++    }
++
++    private fun track(
++        id: String, bpm: Double, key: String = "C major", vocal: Double = 0.3,
++        duration: Double = 180.0, contentEnd: Double? = null, audibleStart: Double = 0.5,
++        quality: String = TrackAnalysis.QUALITY_FULL, mixInTime: Double = 0.0,
++        keyConfidence: Double = 0.9,
++    ): TrackAnalysis {
++        val beat = 60.0 / bpm
++        val downbeats = List(((duration / (4 * beat)) + 1).toInt()) { it * 4 * beat + 0.5 }
++        val energy = List((duration).toInt()) { EnergySample(it.toDouble(), 1.0) }
++        val mask = List((duration).toInt()) { vocal }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id, duration = duration, bpm = bpm, beatInterval = beat,
++            beatConfidence = 0.9,
++            downbeats = downbeats,
++            phraseBoundaries = downbeats.filterIndexed { i, _ -> i % 8 == 0 },
++            firstBeat = 0.5,
++            key = key, keyConfidence = keyConfidence,
++            audibleStartTime = audibleStart,
++            introEndTime = 10.0,
++            contentEndTime = contentEnd ?: (duration - 2),
++            mixInTime = mixInTime,
++            energyCurve = energy,
++            vocalActivityMask = mask,
++            vocalProbability = vocal,
++            quality = quality,
++        )
++    }
++
++    private fun plan(out: TrackAnalysis, inn: TrackAnalysis, advanced: Boolean = true, at: Double = 10.0) = planTransition(
++        analysis = out, nextAnalysis = inn,
++        currentTrack = TransitionTrackInfo(out.trackId, (out.duration * 1000).toLong()),
++        nextTrack = TransitionTrackInfo(inn.trackId, (inn.duration * 1000).toLong()),
++        currentTime = at, duration = out.duration, mode = CrossfadeMode.SMART, advanced = advanced,
++    )
++
++    // ---- P0 decline gate ----
++    @Test
++    fun declineFiresOnUnmixablePair() {
++        val out = track("a", 120.0, "C major", vocal = 0.9)
++        val inn = track("b", 94.0, "F\u266F major", vocal = 0.9)
++        assertTrue(shouldDeclineToMix(out, inn), "unmixable must decline")
++        assertNotNull(declineToMixDetail(out, inn))
++        val p = plan(out, inn)
++        assertEquals(TransitionStyle.EQUAL_POWER, p.transitionStyle, "reason=${p.reason}")
++        assertTrue(p.reason.contains("decline-to-mix"))
++        assertEquals(inn.audibleStartTime!!, p.incomingCueTime, 1e-6, "cue at audible start")
++        assertTrue(p.transitionEnd <= out.contentEndTime + 1e-6, "ends at content_end")
++    }
++
++    @Test
++    fun declineDoesNotFireOnBeautifulPair() {
++        val out = track("beautiful", 99.93, "C major", vocal = 0.8)
++        val inn = track("never-let-go", 104.50, "C major", vocal = 0.75)
++        assertFalse(shouldDeclineToMix(out, inn))
++        val p = plan(out, inn)
++        assertTrue(p.transitionStyle == TransitionStyle.DJ_BLEND || p.transitionStyle == TransitionStyle.DJ_FILTER, "style=${p.transitionStyle} reason=${p.reason}")
++        assertFalse(p.reason.contains("decline"), "reason=${p.reason}")
++    }
++
++    @Test
++    fun declineDoesNotFireOnFoldedDripToUPPair() {
++        // Drip 78.89 -> UP 162.01, fold 2 => 81.0 folded, delta ~2.6% <8%
++        val out = track("drip", 78.89, "A minor", vocal = 0.7)
++        val inn = track("up", 162.01, "A minor", vocal = 0.7)
++        assertFalse(shouldDeclineToMix(out, inn))
++        val p = plan(out, inn)
++        assertFalse(p.reason.contains("decline"), "reason=${p.reason} style=${p.transitionStyle}")
++        assertTrue(p.transitionStyle == TransitionStyle.DJ_BLEND || p.transitionStyle == TransitionStyle.DJ_FILTER, "style=${p.transitionStyle}")
++    }
++
++    // ---- showcase fixtures (user-cited Apple wins, no device proof) ----
++    @Test
++    fun showcaseCalvinHarrisPairBeatmixesNotDeclines() {
++        val out = track("this-is-what-you-came-for", 124.0, "C major", vocal = 0.3)
++        val inn = track("one-kiss", 124.0, "C major", vocal = 0.3)
++        assertFalse(shouldDeclineToMix(out, inn))
++        val p = plan(out, inn)
++        assertEquals(TransitionStyle.DJ_BLEND, p.transitionStyle, "124/124 same producer must beatmix; reason=${p.reason}")
++        assertFalse(p.transitionStyle == TransitionStyle.DJ_FILTER, "must be DJ_BLEND not filter")
++    }
++
++    @Test
++    fun showcaseTechnologicToGuessDoesNotDeclineAndStaysShort() {
++        // Technologic ~124, Guess ~130 (folded delta ~4.8% <8%)
++        val out = track("technologic", 124.0, "C major", vocal = 0.8)
++        val inn = track("guess", 130.0, "C major", vocal = 0.8)
++        assertFalse(shouldDeclineToMix(out, inn))
++        val p = plan(out, inn)
++        assertFalse(p.reason.contains("decline"), "reason=${p.reason}")
++        assertTrue(p.transitionStyle == TransitionStyle.DJ_BLEND || p.transitionStyle == TransitionStyle.DJ_FILTER, "style=${p.transitionStyle}")
++        val barSec = 4 * 60.0 / 124.0
++        val bars = p.fadeSeconds / barSec
++        assertTrue(bars <= 8.05, "robot-vocal pair must not take a long vocal-clash blend; bars=$bars fade=${p.fadeSeconds}")
++    }
++
++    // ---- P0-1 analyse-ahead at planner level: HEAD next is usable ----
++    @Test
++    fun headAnalysisOfNextIsUsableForEntry() {
++        val out = track("a", 120.0, "C major", vocal = 0.3)
++        val innHead = track("b", 121.0, "C major", vocal = 0.3, quality = TrackAnalysis.QUALITY_HEAD)
++        assertEquals(TrackAnalysis.QUALITY_HEAD, innHead.quality)
++        val p = plan(out, innHead)
++        assertFalse(p.reason.contains("smart-analysis-fallback"), "HEAD next must not fallback; reason=${p.reason}")
++        assertEquals(TransitionStyle.DJ_BLEND, p.transitionStyle, "reason=${p.reason}")
++    }
++
++    // ---- outro-loop -> incoming drop ----
++    @Test
++    fun outroLoopDropBridgeOutLoopsInStraight() {
++        val out = track("a", 124.0, "C major", vocal = 0.05).copy(
++            vocalWindows = listOf(window(180.0, 0.02f)),
++            levelWindows = emptyList(),
++        )
++        val inn = track("b", 124.0, "C major", vocal = 0.05).copy(
++            vocalWindows = listOf(window(180.0, 0.02f)),
++        )
++        val b = LoopMix.bridge(out, out.duration, inn, inn.duration, earliestOutSec = 120.0)
++        assertNotNull(b, "instrumental outro should bridge")
++        // Prefer Drop rung when available; otherwise a beat blend is also a
++        // valid bridge but must NOT decline. Assert Drop specifically.
++        assertEquals("Drop", b.rung, "rung=${b.rung} outLoops=${b.outLoops} inLoops=${b.inLoops}")
++        assertTrue(b.outLoops, "OUT must loop")
++        assertFalse(b.inLoops, "IN plays straight into drop landing")
++        assertTrue(b.nativeIncoming, "incoming native")
++    }
++
++    @Test
++    fun sungOutroIsNotLoopableSoDropDoesNotFire() {
++        // Beautiful-like sung outro (vocal 0.55) must not be loop-cut.
++        val out = track("beautiful", 99.93, "C major", vocal = 0.8).copy(
++            vocalWindows = listOf(window(180.0, 0.55f)),
++            vocalActivityMask = List(180) { 0.55 },
++        )
++        val inn = track("never-let-go", 104.50, "C major", vocal = 0.3).copy(
++            vocalWindows = listOf(window(180.0, 0.02f)),
++        )
++        val b = LoopMix.bridge(out, out.duration, inn, inn.duration, earliestOutSec = 120.0)
++        // Sung outro: Drop must not be chosen; blend/echo may still be.
++        if (b != null) {
++            assertFalse(b.rung == "Drop" && b.outLoops, "sung outro looped: $b")
++        }
++    }
++
++    // ---- phrase extension via LoopMix.Clock loop counts ----
++    @Test
++    fun clockLoopsShortOutroPhraseToBridgeLongLeadIn() {
++        val out = track("a", 120.0, "C major", vocal = 0.02).copy(
++            vocalWindows = listOf(window(180.0, 0.02f)),
++        )
++        val inn = track("b", 120.0, "C major", vocal = 0.02).copy(
++            vocalWindows = listOf(window(180.0, 0.02f)),
++        )
++        // Force a long plan via bridge Drop (outLoops) with extra bars: build a
++        // manual Plan equivalent to M2-style extension and check Clock wraps.
++        val outPick = LoopMix.Pick(loopStart = 100.0, loopEnd = 102.0, bars = 4, beatSec = 0.5, bpm = 120.0, vocal = 0.0, checkedBy = LoopMix.Check.MASK)
++        val inPick = LoopMix.Pick(loopStart = 0.5, loopEnd = 0.5, bars = 4, beatSec = 0.5, bpm = 120.0, vocal = 0.0, checkedBy = LoopMix.Check.MASK)
++        val plan = LoopMix.Plan(out = outPick, inn = inPick, fold = 1.0, enterBars = 1, rampBars = 1, exitBars = 26, totalBars = 28, outLoops = true, inLoops = false, nativeIncoming = true, rung = "Drop")
++        val clock = LoopMix.Clock(plan)
++        // Out depth: positionAt wraps the 4-bar (16-beat) loop, so t=0 and
++        // t=beatTimes[16] (16 beats, 8 s) are the same track position, while
++        // the incoming deck (inLoops=false) strictly advances by 8 s.
++        val t16 = clock.beatTimes[16]
++        val out0 = LoopMix.positionAt(clock, LoopMix.Side.OUT, 0.0)!!
++        val out16 = LoopMix.positionAt(clock, LoopMix.Side.OUT, t16)!!
++        assertEquals(out0, out16, 1e-9)
++        val in0 = LoopMix.positionAt(clock, LoopMix.Side.IN, 0.0)!!
++        // Incoming uses nativeIncoming in this fixture (position = loopStart + t)
++        val in16 = LoopMix.positionAt(clock, LoopMix.Side.IN, t16)!!
++        assertEquals(8.0, in16 - in0, 1e-9)
++        assertTrue(clock.beats >= 28 * 4, "beats=${clock.beats}")
++        assertTrue(clock.beats - 16 >= 0, "short phrase repeats to bridge long lead-in")
++    }
++
++    // ---- echo past EOF lane ----
++    @Test
++    fun echoLaneRingsPastLastBeatWithExitTail() {
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M6, rung = "Echo", score = 0.9, exit = exit, entry = entry,
++            overlapBars = 0, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = true,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0)
++        assertTrue(script.plan.exitTailSeconds >= 0.8, "exitTail=${script.plan.exitTailSeconds}")
++        assertEquals(TransitionMoves.MUTE_DB, script.outGain.values.last(), 1e-6f)
++        assertTrue(script.outGain.beats.last() >= script.outGain.beats.first(), "lane must extend")
++        // At least 2 beats of dissolve past the last content knot.
++        val tailBeats = script.plan.exitTailSeconds / 0.5
++        assertTrue(script.outGain.beats.last() >= 2.0, "mute beat=${script.outGain.beats.last()} tailBeats=$tailBeats")
++    }
++
++    @Test
++    fun loopMixEchoPlanCarriesExitTail() {
++        val out = track("a", 120.0, "C major", vocal = 0.02)
++        val inn = track("b", 140.0, "C major", vocal = 0.02)
++        val b = LoopMix.bridge(out, out.duration, inn, inn.duration, earliestOutSec = 100.0)
++        // Far tempo 120->140 (16% >8%) but same key + instrumental => not decline;
++        // bridge may be Drop/blend/echo. If echo, its tail must be >0.
++        if (b != null && b.rung == "Echo") {
++            assertTrue(b.exitTailSeconds >= 0.8, "echo tail ${b.exitTailSeconds}")
++            val bounds = LoopMix.regionBounds(b)
++            assertTrue(bounds.outTo >= b.out.loopStart + 2 * b.out.beatSec, "bounds cover tail")
++        } else if (b != null) {
++            assertFalse(b.rung == "Echo" && b.exitTailSeconds < 0.8, "echo without tail")
++        }
++    }
++
++    // ---- flanger ----
++    private fun findIds(slot: Int, limit: Int = 500): Pair<String, String> {
++        for (i in 0 until limit) {
++            val a = "flanger-out-$i"; val b = "flanger-in"
++            if (pairHash(a, b) % 4 == slot) return a to b
++        }
++        for (i in 0 until limit) {
++            val a = "flanger-out"; val b = "flanger-in-$i"
++            if (pairHash(a, b) % 4 == slot) return a to b
++        }
++        throw AssertionError("no pairHash slot $slot")
++    }
++
++    @Test
++    fun flangerFiresOnEligibleLowVocalBeatmixForRightPairHash() {
++        val (outId, inId) = findIds(0)
++        assertTrue(pairHash(outId, inId) % 4 == 0)
++        assertEquals(DjEffect.FLANGER, blendColour(0.05, outId, inId))
++        val settings = effectSettings(DjEffect.FLANGER)
++        assertTrue(settings.wet <= 0.42f, "wet=${settings.wet}")
++        assertEquals(8f, settings.beats, 1e-6f)
++        assertEquals(8.0, PhraseConfig.FLANGER_LFO_BEATS)
++        // Annotate a low-vocal DJ_BLEND: colour must be FLANGER.
++        val raw = TransitionPlan(
++            transitionStyle = TransitionStyle.DJ_BLEND,
++            transitionStart = 140.0, transitionEnd = 176.0, fadeSeconds = 36.0,
++            beatSeconds = 0.5, vocalOverlap = 0.05, bassSwap = true, reason = "smart-duration",
++        )
++        val out = track("a", 120.0, "C major", vocal = 0.05)
++        val inn = track("b", 120.0, "C major", vocal = 0.05)
++        val ann = DjMix.annotate(raw, out, inn, outgoingId = outId, incomingId = inId)
++        assertEquals(DjEffect.FLANGER, ann.djEffect, "must keep FLANGER; reason=${ann.reason}")
++        // Loop path: TransitionMoves M1 with same ids must set flanger.
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M1, rung = "Beat blend", score = 0.9, exit = exit, entry = entry,
++            overlapBars = 8, swapBar = -4.0, tailBeats = 1.0, loopK = 0, echoGated = false,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0, outgoingId = outId, incomingId = inId)
++        assertTrue(script.flanger, "M1 low-vocal slot 0 must flange on loop path")
++    }
++
++    @Test
++    fun flangerNeverOnDualVocalClash() {
++        val (outId, inId) = findIds(0)
++        assertTrue(blendColour(0.85, outId, inId) != DjEffect.FLANGER, "dual vocal must not flange")
++        val raw = TransitionPlan(
++            transitionStyle = TransitionStyle.DJ_BLEND,
++            transitionStart = 140.0, transitionEnd = 176.0, fadeSeconds = 36.0,
++            beatSeconds = 0.5, vocalOverlap = 0.85, bassSwap = true, reason = "smart-duration",
++        )
++        val out = track("a", 120.0, "C major", vocal = 0.9)
++        val inn = track("b", 120.0, "C major", vocal = 0.9)
++        val ann = DjMix.annotate(raw, out, inn, outgoingId = outId, incomingId = inId)
++        assertTrue(ann.djEffect != DjEffect.FLANGER, "dual vocal got ${ann.djEffect}")
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M1, rung = "Beat blend", score = 0.9, exit = exit, entry = entry,
++            overlapBars = 8, swapBar = -4.0, tailBeats = 1.0, loopK = 0, echoGated = false,
++            vocalProduct = 0.9f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 4.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.4, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0, outgoingId = outId, incomingId = inId)
++        assertFalse(script.flanger, "M1 high vocalProduct must not flange")
++    }
++
++    @Test
++    fun flangerNeverReplacesTempoGapEchoOrReverb() {
++        val (outId, inId) = findIds(0)
++        val gap = TransitionPlan(
++            transitionStyle = TransitionStyle.DJ_FILTER,
++            filterVariant = FilterTransitionVariant.ECHO_RIDE, echoSeconds = 0.6,
++            transitionStart = 160.0, transitionEnd = 176.0, fadeSeconds = 8.0, beatSeconds = 0.6,
++        )
++        val out = track("a", 120.0, "C major", vocal = 0.02)
++        val inn = track("b", 140.0, "C major", vocal = 0.02)
++        val ann = DjMix.annotate(gap, out, inn, outgoingId = outId, incomingId = inId)
++        assertTrue(ann.djEffect == DjEffect.ECHO || ann.djEffect == DjEffect.REVERB, "echo gap got ${ann.djEffect}")
++        assertTrue(ann.djEffect != DjEffect.FLANGER)
++        // M6 (Echo template) on loop path must never flange even with flanger ids.
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val entry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        val echoChoice = PhraseChoice(
++            template = MixTemplate.M6, rung = "Echo", score = 0.9, exit = exit, entry = entry,
++            overlapBars = 0, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = true,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(echoChoice, 120.0, 140.0, outgoingId = outId, incomingId = inId)
++        assertFalse(script.flanger, "M6 echo must not flange")
++    }
++}

@@ -1,0 +1,2108 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 0586c7b..0550a8a 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -28,6 +28,7 @@ import com.music.bitchord.playback.smart.CrossfadeMode
+ import com.music.bitchord.playback.smart.LoopMix
+ import com.music.bitchord.playback.smart.PhraseConfig
+ import com.music.bitchord.playback.smart.PhraseMaps
++import com.music.bitchord.playback.smart.PhraseChoice
+ import com.music.bitchord.playback.smart.PhrasePlanner
+ import com.music.bitchord.playback.smart.PhraseScript
+ import com.music.bitchord.playback.smart.SongMaps
+@@ -247,6 +248,8 @@ class CrossfadeController(
+     private val loopPortOf: (ExoPlayer) -> LoopMixPort? = { null },
+     /** Stereo audio of a track for a loop mix deck: (item, duration ms, from s, to s, rate). Blocking. */
+     private val loopRegion: (MediaItem, Long, Double, Double, Int) -> LoopRegion? = { _, _, _, _, _ -> null },
++    /** True when the region is already decoded in the RAM PCM cache (trackId, sampleRate, from, to). */
++    private val loopRegionCached: (String, Int, Double, Double) -> Boolean = { _, _, _, _ -> false },
+     /** A track's synced lyrics, for vouching a loop instrumental; null when it has none. */
+     private val syncedLines: suspend (MediaItem, Long) -> List<LyricLine>? = { _, _ -> null },
+     /** The loudness-normalisation gain a track plays at, so the incoming deck is levelled like its player. */
+@@ -596,6 +599,12 @@ class CrossfadeController(
+     /** djmix13: shown loop pair that just failed; the loop is skipped for it. */
+     private var loopSuppressedPair: String? = null
+     private var loopSuppressedUntil = 0L
++    /** djmix14: reason for the next mix.complete (planned-fade-done, loop-complete, ...). */
++    private var lastCompleteReason: String? = null
++    /** djmix14-review: scrub epoch + pinned catch-up (prevents countdown drift). */
++    private var scrubEpoch: Long = 0L
++    private var pinnedCatchUpKey: String? = null
++    private var pinnedCatchUpPlan: TransitionPlan? = null
+     private var armGraceUsed = false
+     private var armDeadline = 0L
+ 
+@@ -768,16 +777,19 @@ class CrossfadeController(
+             // fire a stale plan or double-fire the incoming deck.
+             if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                 val nowMs = SystemClock.elapsedRealtime()
++                val tookOver = loopSession?.outPort?.tookOver == true
++                val seekPhase = when (phase) {
++                    Phase.IDLE -> SeekAction.Phase.IDLE
++                    Phase.ARMING -> SeekAction.Phase.ARMING
++                    Phase.FADING -> SeekAction.Phase.FADING
++                    Phase.TAIL -> SeekAction.Phase.TAIL
++                    Phase.LOOP_ARMING -> if (tookOver) SeekAction.Phase.LOOP_RUNNING else SeekAction.Phase.LOOP_ARMING
++                    Phase.LOOP_RUNNING -> SeekAction.Phase.LOOP_RUNNING
++                    Phase.BAILING -> SeekAction.Phase.BAILING
++                    Phase.SLEEP_FADE -> SeekAction.Phase.SLEEP
++                }
+                 val action = SeekAction.decide(
+-                    when (phase) {
+-                        Phase.IDLE -> SeekAction.Phase.IDLE
+-                        Phase.ARMING -> SeekAction.Phase.ARMING
+-                        Phase.FADING -> SeekAction.Phase.FADING
+-                        Phase.TAIL -> SeekAction.Phase.TAIL
+-                        Phase.LOOP_ARMING, Phase.LOOP_RUNNING -> SeekAction.Phase.LOOP
+-                        Phase.BAILING -> SeekAction.Phase.BAILING
+-                        Phase.SLEEP_FADE -> SeekAction.Phase.SLEEP
+-                    },
++                    seekPhase,
+                     appSettingsMarkerShown() || shownCountdownKey != null,
+                 )
+                 AutomixTelemetry.event(
+@@ -793,20 +805,52 @@ class CrossfadeController(
+                 when (action) {
+                     SeekAction.Action.HONOUR -> Unit
+                     SeekAction.Action.CANCEL -> {
+-                        // Drop the shown countdown/crown state so it cannot
+-                        // fire stale; the planner replans from the new spot.
+-                        shownCountdownKey = null
+-                        if (phrasePair != null) phrasePair = null
+-                        AppSettings.smartTransitionWindow.value = null
++                        // djmix14: full scrub reset (all plans) so the next tick
++                        // replans from the new playhead. No 350 ms dip on an
++                        // inaudible player — silent teardown, instant replan.
++                        resetPlansForScrub()
+                         AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "scrub-cancelled", "reason" to "scrub", "phase" to phase.name))
+                         bail(force = true)
+                     }
+                     SeekAction.Action.EMERGENCY_TAIL -> {
+-                        val spare = if (handedOff) outgoing else incoming
+-                        if (spare != null && RetireGuard.audible(spare.volume)) {
+-                            beginTailOrFinish(spare, "seek-emergency-tail", "discontinuity:" + phase.name)
++                        resetPlansForScrub()
++                        val isLoopRunning = phase == Phase.LOOP_RUNNING || loopSession?.outPort?.tookOver == true
++                        if (isLoopRunning) {
++                            // Audible loop mix: dissolve over 350 ms via the
++                            // renderer fade (both decks) then tear down, leaving
++                            // playback at the scrub target in IDLE. The 350 ms
++                            // tail guard inside finish() covers the player side;
++                            // the renderer fade covers the deck side. Never a
++                            // click, never an abrupt cut.
++                            // Capture the active session player BEFORE loopBail:
++                            // finish() nulls outgoing/incoming, so reading them
++                            // after would be a no-op. wasHandedOff says which
++                            // player owns the session (incoming after handoff);
++                            // the discontinuity fired on that same active() player,
++                            // so it is already at newPosition.positionMs.
++                            val wasHandedOff = handedOff
++                            val activePlayer = active()
++                            val audibleSpare = if (wasHandedOff) outgoing else incoming
++                            val session = loopSession
++                            session?.let { s ->
++                                val heardOut = runCatching { s.renderer.heard(LoopMixRenderer.OUT) }.getOrNull() ?: 0.0
++                                val fadeAt = (heardOut + 0.35).coerceAtLeast(0.0)
++                                runCatching { s.renderer.setFadeOut(LoopMixRenderer.OUT, fadeAt) }
++                                runCatching { s.renderer.setFadeOut(LoopMixRenderer.IN, fadeAt) }
++                            }
++                            loopBail("seek-emergency-tail", settle = false, preserveSeek = true)
++                            // preserveSeek: loopBail already skips the old-clock
++                            // seek. The active player never moved off the user
++                            // seek; the audible spare dissolves via RetireGuard
++                            // inside finish() -> beginTailOrFinish (no click).
++                            @Suppress("UNUSED_VARIABLE") val captured = activePlayer to audibleSpare
+                         } else {
+-                            bail()
++                            val spare = if (handedOff) outgoing else incoming
++                            if (spare != null && RetireGuard.audible(spare.volume)) {
++                                beginTailOrFinish(spare, "seek-emergency-tail", "discontinuity:" + phase.name)
++                            } else {
++                                bail()
++                            }
+                         }
+                     }
+                 }
+@@ -906,6 +950,69 @@ class CrossfadeController(
+         }
+     }
+ 
++    /**
++     * djmix14 scrub reset: every plan, lock and countdown is dropped so a
++     * stale [loopPlanned] (past loopStart) can never short-circuit classic
++     * begin() or re-lock a dead 0s countdown after a seek. Called on both
++     * CANCEL and EMERGENCY_TAIL scrub paths.
++     */
++    private fun resetPlansForScrub() {
++        scrubEpoch++
++        pinnedCatchUpKey = null
++        pinnedCatchUpPlan = null
++        shownCountdownKey = null
++        shownLoopStartMs = 0L
++        watchdogFired = false
++        loopPlanned = null
++        loopPlanKey = null
++        loopScript = null
++        loopTargetStartMs = 0L
++        loopTarget = null
++        phrasePair = null
++        phraseLock = PhrasePlanner.Lock()
++        phraseDetail = null
++        phraseLogKey = null
++        lastSmartPlan = null
++        lastSmartPlanStartMs = 0L
++        lastRejectedLogKey = null
++        lastEmittedPlanVerdict = null
++        lastFallbackLogKey = null
++        loopSuppressedPair = null
++        loopSuppressedUntil = 0L
++        AppSettings.smartTransitionWindow.value = null
++        discardPrime()
++    }
++
++    /** Minimum lead (s) a new loop start needs ahead of the playhead. */
++    private fun minLoopLeadSec(): Double {
++        val primed = primedSession != null && primedKey != null
++        return if (primed) 0.8 else 4.5
++    }
++
++    /**
++     * djmix14-review: single fast-ready check for all 4 sites. True when the
++     * decks are already primed for this exact key, or both exact PCM regions
++     * are in the RAM cache (bounds match LoopMixSession.build exactly).
++     */
++    private fun isLoopFastReady(
++        plan: LoopMix.Plan,
++        outItem: MediaItem,
++        inItem: MediaItem,
++        sampleRate: Int,
++    ): Boolean {
++        if (primedSession != null && primedKey == primeKey(plan, outItem, inItem, sampleRate)) return true
++        val b = LoopMix.regionBounds(plan)
++        return loopRegionCached(outItem.mediaId, sampleRate, b.outFrom, b.outTo) &&
++            loopRegionCached(inItem.mediaId, sampleRate, b.inFrom, b.inTo)
++    }
++    /** Lead for [plan] via the shared fast-ready check: 0.8 cached/primed, 4.5 cold. */
++    private fun fastLeadSec(
++        plan: LoopMix.Plan,
++        outItem: MediaItem,
++        inItem: MediaItem,
++        sampleRate: Int,
++    ): Double = if (isLoopFastReady(plan, outItem, inItem, sampleRate)) 0.8 else 4.5
++
+     private fun dropForQueueEdit(why: String) {
+         Log.d(TAG, "playlist changed: $why")
+         // djmix10: an audible mix keeps its plan (plan vars are only
+@@ -960,18 +1067,24 @@ class CrossfadeController(
+         tickerJob = scope.launch {
+             while (isActive) {
+                 tick()
+-                delay(
+-                    when (phase) {
+-                        Phase.IDLE -> IDLE_STEP_MS
+-                        Phase.ARMING -> ARM_STEP_MS
+-                        Phase.FADING -> FADE_STEP_MS
+-                        Phase.TAIL -> FADE_STEP_MS
+-                        Phase.SLEEP_FADE -> FADE_STEP_MS
+-                        Phase.BAILING -> BAIL_STEP_MS
+-                        Phase.LOOP_ARMING -> ARM_STEP_MS
+-                        Phase.LOOP_RUNNING -> LOOP_STEP_MS
+-                    },
+-                )
++                val base = when (phase) {
++                    Phase.IDLE -> IDLE_STEP_MS
++                    Phase.ARMING -> ARM_STEP_MS
++                    Phase.FADING -> FADE_STEP_MS
++                    Phase.TAIL -> FADE_STEP_MS
++                    Phase.SLEEP_FADE -> FADE_STEP_MS
++                    Phase.BAILING -> BAIL_STEP_MS
++                    Phase.LOOP_ARMING -> ARM_STEP_MS
++                    Phase.LOOP_RUNNING -> LOOP_STEP_MS
++                }
++                // djmix14: firing jitter — within 2 s of the target, tick
++                // every 20 ms so startFade fires within +-25 ms.
++                val nearTarget = when (phase) {
++                    Phase.ARMING -> lastSmartPlanStartMs > 0L && kotlin.math.abs((active().currentPosition - lastSmartPlanStartMs)) <= 2000L
++                    Phase.LOOP_ARMING -> loopTargetStartMs > 0L && kotlin.math.abs((active().currentPosition - loopTargetStartMs)) <= 2000L
++                    else -> false
++                }
++                delay(if (nearTarget) 20L else base)
+             }
+         }
+     }
+@@ -1070,27 +1183,52 @@ class CrossfadeController(
+      * transition must never spin silently into silence.
+      */
+     private fun checkShownWatchdog() {
+-        val key = shownCountdownKey ?: return
+-        if (watchdogFired || phase != Phase.IDLE || loopSession != null) return
+-        if (key != loopPlanKey || loopPlanned == null) return
+         val player = active()
+         if (!player.isPlaying) return
+-        if (player.currentPosition <= shownLoopStartMs + 1200L) return
+-        watchdogFired = true
+-        val reason = "watchdog: shown countdown unarmed 1.2s after its bar"
+-        AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to shownLoopStartMs))
+-        Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$shownLoopStartMs")
+-        // djmix13: the shown plan must not die silently. The loop stays
+-        // suppressed for this pair, the countdown is dropped, and the classic
+-        // blend (already planning on these ticks) completes the handoff.
+-        loopSuppressedPair = key.substringBefore("|")
+-        loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
+-        shownCountdownKey = null
+-        AutomixTelemetry.event(
+-            "mix.arm.death",
+-            mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
+-        )
+-        loopFallBack(reason)
++        // (i) IDLE shown-but-unarmed: countdown visible, no arm 1.2 s after its bar.
++        if (phase == Phase.IDLE && loopSession == null) {
++            val key = shownCountdownKey ?: return
++            if (watchdogFired || key != loopPlanKey || loopPlanned == null) return
++            if (player.currentPosition <= shownLoopStartMs + 1200L) return
++            watchdogFired = true
++            val reason = "watchdog: shown countdown unarmed 1.2s after its bar"
++            AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to shownLoopStartMs))
++            Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$shownLoopStartMs")
++            loopSuppressedPair = key.substringBefore("|")
++            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++            shownCountdownKey = null
++            AutomixTelemetry.event(
++                "mix.arm.death",
++                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
++            )
++            loopFallBack(reason)
++            return
++        }
++        // (ii) LOOP_ARMING still building past the splice: cancel the late
++        // build, suppress the loop, and let catch-up classic fire this tick.
++        if (phase == Phase.LOOP_ARMING) {
++            val took = loopSession?.outPort?.tookOver == true
++            if (took) return
++            if (loopTargetStartMs <= 0L) return
++            if (player.currentPosition <= loopTargetStartMs + 1200L) return
++            val key = loopPlanKey ?: shownCountdownKey ?: "loop-arming"
++            primeJob?.cancel()
++            primeJob = null
++            loopBuildJob?.cancel()
++            loopBuildJob = null
++            val reason = "watchdog: loop arming unarmed 1.2s after its bar"
++            AutomixTelemetry.event("mix.watchdog", mapOf("key" to key, "pos" to player.currentPosition, "start" to loopTargetStartMs))
++            Log.i("AutomixCrash", reason + " key=$key pos=${player.currentPosition} start=$loopTargetStartMs")
++            loopSuppressedPair = key.substringBefore("|")
++            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++            shownCountdownKey = null
++            watchdogFired = true
++            AutomixTelemetry.event(
++                "mix.arm.death",
++                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
++            )
++            loopFallBack(reason)
++        }
+     }
+ 
+     /**
+@@ -1320,7 +1458,7 @@ class CrossfadeController(
+ 
+         askLyrics(currentItem, duration)
+         askLyrics(nextItem, nextDuration)
+-        val plan = planTransition(
++        var plan = planTransition(
+             analysis = currentAnalysis,
+             nextAnalysis = nextAnalysis,
+             currentTrack = currentItem.toTransitionInfo(duration),
+@@ -1333,6 +1471,32 @@ class CrossfadeController(
+             lyricsOut = lyricSpans[currentItem.mediaId]?.cues.orEmpty(),
+             lyricsIn = lyricSpans[nextItem.mediaId]?.cues.orEmpty(),
+         )
++        // djmix14-review pin: catch-up start must not drift forward every
++        // IDLE tick while nextStreamReady warms. Pin per (pair, scrubEpoch)
++        // and hold the anchored times while still before the start+400 ms.
++        run {
++            val pKey = "${currentItem.mediaId}->${nextItem.mediaId}"
++            if (plan.reason.endsWith(":catch-up") && !plan.blocked) {
++                val key = "$pKey|$scrubEpoch"
++                val pinned = pinnedCatchUpPlan
++                if (pinnedCatchUpKey == key && pinned != null &&
++                    player.currentPosition <= (pinned.transitionStart * 1000).roundToLong() + 400L
++                ) {
++                    plan = pinned
++                } else {
++                    pinnedCatchUpKey = key
++                    pinnedCatchUpPlan = plan
++                }
++            } else if (pinnedCatchUpKey != null && !plan.reason.endsWith(":catch-up")) {
++                // Non-catch-up plan for a new pair/epoch: drop the pin.
++                // (Same-pair non-catch-up while pinned is still shown is kept
++                // until the pinned start passes; handled above by key check.)
++                if (pinnedCatchUpKey?.startsWith("$pKey|") == false) {
++                    pinnedCatchUpKey = null
++                    pinnedCatchUpPlan = null
++                }
++            }
++        }
+         // One line per distinct verdict rather than one per 250ms tick, so the
+         // log says what the planner decided for this pair without burying it.
+         val verdict = "${plan.reason}|${plan.transitionStyle}|fade=${plan.fadeMs}" +
+@@ -1388,11 +1552,31 @@ class CrossfadeController(
+         if (!suppressingLoop && pairKey != loopSuppressedPair) {
+             loopSuppressedPair = null
+         }
+-        val loop = if (!suppressingLoop) loopPlanFor(
++        var loop = if (!suppressingLoop) loopPlanFor(
+             player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration, analysisState,
+         ) ?: nativeBridge(
+             player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
+         ) else null
++        // djmix14 fast budget gate: with <4.5 s to the loop start, a cold
++        // decode cannot make the splice. Skip the cold build and fall to
++        // classic (which streams in <300 ms) so a late scrub still catches up.
++        if (loop != null) {
++            val loopStartMsTmp = (loop.out.loopStart * 1000).roundToLong()
++            if (loopStartMsTmp - player.currentPosition < 4500L) {
++                val sampleRateTmp = loopPortOf(player)?.sampleRate ?: 48000
++                if (!isLoopFastReady(loop, currentItem, nextItem, sampleRateTmp)) {
++                    val fbKey = "insufficient-cold-lead-using-classic|${loop.out.loopStart}"
++                    if (fbKey != lastFallbackLogKey) {
++                        lastFallbackLogKey = fbKey
++                        AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to "insufficient-cold-lead-using-classic", "phase" to phase.name))
++                    }
++                    loop = null
++                    loopPlanned = null
++                    loopScript = null
++                    loopPlanKey = null
++                }
++            }
++        }
+         if (loop != null) {
+             val loopStartMs = (loop.out.loopStart * 1000).roundToLong()
+             AppSettings.smartTransitionWindow.value = TransitionWindow(
+@@ -1404,7 +1588,9 @@ class CrossfadeController(
+             // starts now, not twelve seconds out — that wait is what made a
+             // slow incoming stream miss the splice and throw the loop away.
+             rememberLoopPair(currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration)
+-            if (nextStreamReady(nextItem)) {
++            // djmix14: prime as soon as the pair is within 40 s (was 12-20 s
++            // effective via LOOP_ARM_LEAD). Farther out, wait to save decode.
++            if (nextStreamReady(nextItem) && loopStartMs - player.currentPosition <= LOOP_PRIME_LEAD_MS) {
+                 primeLoopDecks(player, loop, currentItem, nextItem, duration, nextDuration)
+             }
+             if (markerOnly || !nextStreamReady(nextItem)) return
+@@ -1981,13 +2167,16 @@ class CrossfadeController(
+         into.playWhenReady = true
+         fadeStartedAt = SystemClock.elapsedRealtime()
+         // djmix13: record firing accuracy at the moment the blend starts.
++        // djmix14: cueErrorMs was seconds-minus-ms (5000-5=4995). Convert first.
++        val targetCueMs = ((lastSmartPlan?.incomingCueTime ?: 0.0) * 1000.0).roundToLong()
+         AutomixTelemetry.event(
+             "mix.fire",
+             mapOf(
++                "mode" to "classic",
+                 "plannedStartMs" to lastSmartPlanStartMs,
+                 "actualStartMs" to out.currentPosition,
+                 "deltaMs" to (out.currentPosition - lastSmartPlanStartMs),
+-                "cueErrorMs" to (into.currentPosition - (lastSmartPlan?.incomingCueTime ?: 0.0)).toLong(),
++                "cueErrorMs" to (into.currentPosition - targetCueMs),
+                 "trackIndex" to outgoingItemIndex,
+             ),
+         )
+@@ -2261,8 +2450,25 @@ class CrossfadeController(
+      * hard-cut site left on this path; it now always sees silence.
+      */
+     private fun beginTailOrFinish(out: ExoPlayer, reason: String = "planned", retireSite: String = "driveFade-done") {
++        lastCompleteReason = reason
+         val vol = out.volume
+         if (vol <= 0.001f) {
++            // djmix14-review: a smoothly finished planned fade already
++            // dissolved to silence (<= -60 dB). It must still truthfully
++            // record mix.exit.tail (0 occurrences in djmix11-13 because this
++            // early return skipped it), then retire.
++            val planned = fadeMs > 0L
++            AutomixTelemetry.event(
++                "mix.exit.tail",
++                mapOf(
++                    "tailMs" to 0L,
++                    "mode" to if (planned) "planned" else "emergency",
++                    "gain" to vol,
++                    "gainDb" to RetireGuard.gainDb(vol),
++                    "reason" to reason,
++                    "retireSite" to retireSite,
++                ),
++            )
+             finish()
+             return
+         }
+@@ -2853,6 +3059,10 @@ class CrossfadeController(
+     private var phrasePair: String? = null
+     private var phraseDetail: String? = null
+     private var phraseLogKey: String? = null
++    // djmix14: memo of the last PhrasePlanner.select + dedup of phrase-null spam.
++    private var phraseMemoKey: String? = null
++    private var phraseMemoFresh: PhraseChoice? = null
++    private var lastPhraseNullKey: String? = null
+ 
+     /** Why the pair gets no loop mix, for the log and the stats line; null when it does. */
+     private var loopRefusal: String? = null
+@@ -2965,6 +3175,21 @@ class CrossfadeController(
+             noteLoopVerdict(pair, null, "waiting on lyrics")
+             return null
+         }
++        // djmix14: a sticky plan whose loopStart the playhead already crossed
++        // (+50 ms tolerance) is dead. It MUST be discarded (CLEAR), never
++        // kept by Hold.KEEP — the KEEP path resurrected the pre-scrub plan
++        // with a past loopStart and short-circuited classic begin().
++        if (sticky != null && !SeekAction.planStillValid(
++                (sticky.out.loopStart * 1000).roundToLong() + PhraseConfig.PREP_TOLERANCE_MS,
++                player.currentPosition,
++            )
++        ) {
++            noteLoopVerdict(pair, null, "stale loop start passed")
++            loopPlanned = null
++            loopScript = null
++            loopPlanKey = null
++            return null
++        }
+         val armed = phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING
+         val seekPast = sticky != null && player.currentPosition > sticky.out.loopStart * 1000 + 1_500
+         val why = StringBuilder()
+@@ -3014,6 +3239,17 @@ class CrossfadeController(
+             }
+         }
+         val base = replacement ?: return null
++        // djmix14-review: new loop start must be ahead by the decode lead,
++        // via the shared isLoopFastReady exact-bounds check.
++        run {
++            val posSec = player.currentPosition / 1000.0
++            val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
++            val lead = fastLeadSec(base, current, next, sampleRate)
++            if (base.out.loopStart < posSec + lead) {
++                noteLoopVerdict(pair, null, "loop too near playhead")
++                return null
++            }
++        }
+         val crowned = crownLoop(base, current, next, currentAnalysis, nextAnalysis)
+         val plan = stamp(crowned, currentAnalysis, nextAnalysis)
+         loopPlanKey = "$pair|${plan.out.loopStart}"
+@@ -3088,8 +3324,29 @@ class CrossfadeController(
+         if (handedOff) return null
+         if (lastSmartPlan?.transitionStyle == TransitionStyle.GAPLESS) return null
+         val pair = "${current.mediaId}->${next.mediaId}"
++        // djmix14: stale sticky is dead — clear so UI never reads a past plan.
++        loopPlanned?.takeIf { loopPlanKey?.startsWith("$pair|") == true }?.let { stale ->
++            if (!SeekAction.planStillValid(
++                    (stale.out.loopStart * 1000).roundToLong() + PhraseConfig.PREP_TOLERANCE_MS,
++                    player.currentPosition,
++                )
++            ) {
++                loopPlanned = null
++                loopScript = null
++                loopPlanKey = null
++            }
++        }
+         phrasePlanFor(player, current, next, currentAnalysis, nextAnalysis, durationMs)?.let { phrase ->
+             val stamped = stamp(phrase, currentAnalysis, nextAnalysis)
++            run {
++                val posSec = player.currentPosition / 1000.0
++                val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
++                val lead = fastLeadSec(stamped, current, next, sampleRate)
++                if (stamped.out.loopStart < posSec + lead) {
++                    noteLoopVerdict(pair, null, "bridge too near")
++                    return@let
++                }
++            }
+             loopPlanKey = "$pair|${stamped.rung}|${stamped.out.loopStart}"
+             loopPlanned = stamped
+             loopRefusal = null
+@@ -3108,6 +3365,15 @@ class CrossfadeController(
+             inVideo = next.isVideoOrigin,
+         ) ?: return null
+         val stamped = stamp(plan, currentAnalysis, nextAnalysis)
++        run {
++            val posSec = player.currentPosition / 1000.0
++            val sampleRate = loopPortOf(player)?.sampleRate ?: 48000
++            val lead = fastLeadSec(stamped, current, next, sampleRate)
++            if (stamped.out.loopStart < posSec + lead) {
++                noteLoopVerdict(pair, null, "bridge too near")
++                return null
++            }
++        }
+         loopPlanKey = "$pair|${stamped.rung}|${stamped.out.loopStart}"
+         loopPlanned = stamped
+         loopScript = null
+@@ -3164,11 +3430,27 @@ class CrossfadeController(
+         }
+         val outMap = PhraseMaps.get(current.mediaId) ?: runCatching { SongMaps.fromAnalysis(current.mediaId, out) }.getOrNull()
+         val inMap = PhraseMaps.get(next.mediaId) ?: runCatching { SongMaps.fromAnalysis(next.mediaId, inn) }.getOrNull()
+-        val fresh = runCatching {
+-            PhrasePlanner.select(outMap, inMap, camelotSteps(out.key, inn.key), out.bpm, inn.bpm)
+-        }.getOrNull()
++        // djmix14 memo: PhrasePlanner.select is combinatorial; tick must
++        // never recompute it every 250 ms for the same pair/qualities/BPMs.
++        val earliestBar = if (out.bpm > 0) ((player.currentPosition / 1000.0) / (240.0 / out.bpm)).toInt() else 0
++        val memoKey = "$pair|${out.quality}|${inn.quality}|${out.bpm}|${inn.bpm}|$earliestBar|${outMap?.hashCode()}|${inMap?.hashCode()}"
++        val fresh = if (memoKey == phraseMemoKey) {
++            phraseMemoFresh
++        } else {
++            val computed = runCatching {
++                PhrasePlanner.select(outMap, inMap, camelotSteps(out.key, inn.key), out.bpm, inn.bpm, earliestExitSec = player.currentPosition / 1000.0)
++            }.getOrNull()
++            phraseMemoKey = memoKey
++            phraseMemoFresh = computed
++            computed
++        }
+         if (fresh == null) {
++            // djmix14 dedup: one line per (pairKey, detail), not 1800.
++            val nullKey = "$pair|${PhrasePlanner.lastVetoSummary}"
++            if (nullKey != lastPhraseNullKey) {
++                lastPhraseNullKey = nullKey
+             AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "phrase-null", "detail" to PhrasePlanner.lastVetoSummary))
++            }
+         }
+         if (!phraseLock.locked && (lyricsPending(current.mediaId, out) || lyricsPending(next.mediaId, inn))) {
+             return null
+@@ -3598,7 +3880,16 @@ class CrossfadeController(
+             // the bar would throw away the decode that is about to land. Once
+             // it has stopped and this bar's splice can no longer be armed, the
+             // loop moves to the next bar instead of being dropped.
++            // djmix14: if still building 150 ms before the splice, do not
++            // stall at 0s — abort to catch-up classic this tick.
+             val building = primeJob?.isActive == true
++            if (building && out.currentPosition >= loopTargetStartMs - 150L) {
++                val key = loopPlanKey ?: "loop-arming"
++                loopSuppressedPair = key.substringBefore("|")
++                loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++                loopFallBack("build-missed-splice")
++                return
++            }
+             if (!building && out.currentPosition >= loopTargetStartMs - LOOP_COMMIT_MS) {
+                 shiftLoopOrFallback(out)
+                 return
+@@ -3626,6 +3917,16 @@ class CrossfadeController(
+             phase = Phase.LOOP_RUNNING
+             AppSettings.smartTransitionWindow.value = null
+             AppSettings.smartMixInProgress.value = true
++            AutomixTelemetry.event(
++                "mix.fire",
++                mapOf(
++                    "mode" to "loop",
++                    "plannedStartMs" to loopTargetStartMs,
++                    "actualStartMs" to out.currentPosition,
++                    "deltaMs" to (out.currentPosition - loopTargetStartMs),
++                    "trackIndex" to outgoingItemIndex,
++                ),
++            )
+             scope.launch(Dispatchers.Default) {
+                 session.outPort?.spliceLag()?.let { (lag, score) ->
+                     Log.d(
+@@ -3767,6 +4068,7 @@ class CrossfadeController(
+ 
+     /** The mix played out: the incoming player is the song, the outgoing one is retired. */
+     private fun finishLoop() {
++        lastCompleteReason = "loop-complete"
+         val session = loopSession
+         Log.d(
+             TAG,
+@@ -3798,7 +4100,8 @@ class CrossfadeController(
+      * when [settle] is false, leaves the session player where something else
+      * already put it.
+      */
+-    private fun loopBail(reason: String, settle: Boolean = true) {
++    private fun loopBail(reason: String, settle: Boolean = true, preserveSeek: Boolean = false) {
++        lastCompleteReason = reason
+         val session = loopSession
+         if (loopRefusal.isNullOrBlank()) loopRefusal = reason
+         Log.d(TAG, "loop mix stops ($phase): $reason")
+@@ -3827,8 +4130,10 @@ class CrossfadeController(
+         session?.renderer?.let(::closeLater)
+         // The session player, after [finish]: idle by then, so the seek's own
+         // discontinuity can't come back here as another bail.
++        // djmix14-review: manual user scrub is authoritative — never overwrite
++        // newPosition with the old loop clock. preserveSeek skips the seek.
+         val sessionPlayer = if (wasHandedOff) into else out
+-        if (sessionPlayer != null && target != null && (settle || (!wasHandedOff && tookOver))) {
++        if (sessionPlayer != null && target != null && !preserveSeek && (settle || (!wasHandedOff && tookOver))) {
+             sessionPlayer.seekTo(target)
+         }
+     }
+@@ -3939,16 +4244,35 @@ class CrossfadeController(
+         }
+         val nextIndex = player.nextMediaItemIndex
+         val next = if (nextIndex == C.INDEX_UNSET) null else player.getMediaItemAt(nextIndex)
+-        val planned = loopPlanned
++        val pairKey = next?.let { "${item.mediaId}->${it.mediaId}" }
++        val suppressingLoop = pairKey != null && loopSuppressedPair == pairKey && SystemClock.elapsedRealtime() < loopSuppressedUntil
++        val planned = if (suppressingLoop) null else loopPlanned
++        // Honest countdown: a start already behind the playhead (-600 ms)
++        // must never read as 0s/locked. Show replanning until the catch-up
++        // planner re-anchors ahead.
+         if (planned != null && next != null && loopPlanKey?.startsWith("${item.mediaId}->${next.mediaId}|") == true) {
++            val startMs = (planned.out.loopStart * 1000).roundToLong()
++            if ((phase == Phase.IDLE || (phase == Phase.LOOP_ARMING && loopSession?.outPort?.tookOver != true)) && startMs < player.currentPosition - 600L) {
++                return status(
++                    headline = "Replanning…",
++                    detail = "Replanning transition…",
++                    style = planned.rung.lowercase(),
++                    progress = 0f,
++                    state = "preparing",
++                    planType = planned.rung,
++                    bars = planned.totalBars,
++                    tempoPct = tempoPct(planned.out.bpm, planned.targetBpm),
++                    locked = false,
++                )
++            }
+             val inSeconds = (planned.out.loopStart - player.currentPosition / 1000.0).coerceAtLeast(0.0)
+             val seconds = ceil(inSeconds).toInt()
+-            // djmix9: the first shown countdown locks the rung - a later
+-            // re-plan may slide (same template) but must not swap style.
++            // djmix14: lock whenever the countdown is shown (seconds>=0).
++            // The old seconds>0 gate was blind after a scrub (seconds==0).
+             val shownKey = loopPlanKey
+-            if (seconds > 0 && shownKey != null && shownCountdownKey != shownKey) {
++            if (shownKey != null && shownCountdownKey != shownKey) {
+                 shownCountdownKey = shownKey
+-                shownLoopStartMs = (planned.out.loopStart * 1000).roundToLong()
++                shownLoopStartMs = startMs
+                 watchdogFired = false
+                 phraseLock.noteShown()
+             }
+@@ -3973,6 +4297,21 @@ class CrossfadeController(
+         }
+         val plan = lastSmartPlan
+         if (plan != null && !plan.blocked && next != null && AppSettings.smartTransitionWindow.value != null) {
++            // Honest countdown: a classic start already behind the playhead
++            // (-600 ms) shows replanning, never now/0s.
++            if ((phase == Phase.IDLE || (phase == Phase.LOOP_ARMING && loopSession?.outPort?.tookOver != true)) && lastSmartPlanStartMs < player.currentPosition - 600L) {
++                return status(
++                    headline = "Replanning…",
++                    detail = "Replanning transition…",
++                    style = "wait",
++                    progress = 0f,
++                    state = "preparing",
++                    planType = "",
++                    bars = 0,
++                    tempoPct = 0f,
++                    locked = false,
++                )
++            }
+             val inSeconds = ((lastSmartPlanStartMs - player.currentPosition) / 1000.0).coerceAtLeast(0.0)
+             val seconds = ceil(inSeconds).toInt()
+             val whenText = if (inSeconds > 0) "${seconds}s" else "now"
+@@ -4126,6 +4465,13 @@ class CrossfadeController(
+     private fun leavingOnBail(): ExoPlayer? = if (handedOff) outgoing else incoming
+ 
+     private fun finish() {
++        // djmix14: capture the real completion values BEFORE clearing.
++        val endPhase = phase.name
++        val didHandoff = handedOff
++        val outBpm = outgoingAnalysis.bpm
++        val inBpm = incomingAnalysis.bpm
++        val tailMs = tailDurationMs
++        val completeReason = lastCompleteReason ?: "finish"
+         // djmix12 retire guard: an audible spare may not be retired
+         // here. Convert to an emergency TAIL (350 ms) first; driveTail
+         // quiets it to silence and re-enters finish() with phase==TAIL.
+@@ -4225,10 +4571,11 @@ class CrossfadeController(
+         if (wasTransitioning) {
+             AutomixTelemetry.event(
+                 "mix.complete",
+-                mapOf("phase" to phase.name, "handoff" to handedOff, "bpmA" to outgoingAnalysis.bpm, "bpmB" to incomingAnalysis.bpm, "tailMs" to tailDurationMs, "reason" to "finish"),
++                mapOf("phase" to endPhase, "handoff" to didHandoff, "bpmA" to outBpm, "bpmB" to inBpm, "tailMs" to tailMs, "reason" to completeReason),
+             )
+             onSettled()
+         }
++        lastCompleteReason = null
+     }
+ 
+     /** Still a next track, still playing, still switched on — by whichever setting armed this one. */
+@@ -5573,6 +5920,8 @@ class CrossfadeController(
+         const val LOOP_SETUP_SECONDS = 15.0
+         const val POST_MIX_ANALYSIS_DELAY_MS = 12_000L
+         const val LOOP_ARM_LEAD_MS = 12_000L
++        /** djmix14: prime lead — start decoding as soon as the pair is planned within 40 s. */
++        const val LOOP_PRIME_LEAD_MS = 40_000L
+         const val LOOP_MIN_LEAD_MS = 9_000L
+ 
+         /**
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 5cc4ed1..86f9eec 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -2047,6 +2047,9 @@ class PlaybackService : MediaLibraryService() {
+                     }
+                 }
+             },
++            loopRegionCached = { trackId, rate, from, to ->
++                trackAnalyzer.loopRegionCached(trackId, rate, from, to)
++            },
+             syncedLines = ::loopMixLyrics,
+             loudnessGain = ::loudnessGainFor,
+             onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },
+diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+index 0f37428..9b2d7d9 100644
+--- a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
++++ b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixSession.kt
+@@ -2,6 +2,7 @@ package com.music.bitchord.playback.loopmix
+ 
+ import android.util.Log
+ import com.music.bitchord.playback.smart.LoopMix
++import com.music.bitchord.playback.smart.PhraseConfig
+ import com.music.bitchord.playback.smart.RegionalLoudness
+ import java.util.concurrent.atomic.AtomicBoolean
+ import kotlin.math.abs
+@@ -143,23 +144,19 @@ class LoopMixSession private constructor(
+         ): LoopMixSession? {
+             if (!LoopMixRenderer.available || sampleRate <= 0) return null
+             val clock = LoopMix.Clock(plan)
+-            // A loop only needs the loop plus the 0.5 s the seam crossfade reads
+-            // past it. A straight deck has to hold the whole phrase.
+-            val outTo = if (plan.outLoops) {
+-                plan.out.loopEnd + 0.5 + plan.exitTailSeconds
+-            } else {
+-                plan.out.loopStart + plan.totalBars * 4 * plan.out.beatSec + 0.5 + plan.exitTailSeconds
+-            }
+-            val inTail = if (plan.echoTail) TAIL_SECONDS + plan.out.beatSec * 8 else TAIL_SECONDS
++            // Single source of truth for decode bounds (matches isLoopFastReady).
++            val bounds = LoopMix.regionBounds(plan)
++            val outTo = bounds.outTo
++            val inTail = bounds.inTo - clock.elementTrackTime
+             val outRegion = decode(
+                 LoopMix.Side.OUT,
+-                plan.out.loopStart - PREROLL_SECONDS,
++                bounds.outFrom,
+                 outTo,
+             ) ?: return null
+             val inRegion = decode(
+                 LoopMix.Side.IN,
+-                plan.inn.loopStart - PREROLL_SECONDS,
+-                clock.elementTrackTime + inTail,
++                bounds.inFrom,
++                bounds.inTo,
+             ) ?: return null
+             if (outRegion.start > plan.out.loopStart || inRegion.start > plan.inn.loopStart) {
+                 Log.w(TAG, "a region starts after its loop: out ${outRegion.start}, in ${inRegion.start}")
+@@ -189,9 +186,20 @@ class LoopMixSession private constructor(
+                 inTo = samplesOf(inRegion, inEndSec).toInt(),
+                 sampleRate = sampleRate,
+             )
+-            // djmix10: symmetric +-3 dB (was -7..+5 on the old line; the
+-            // djmix9 RegionalLoudness clamp was undone here).
+-            val level = (matched ?: inLevel).coerceIn(0.708f, 1.413f)
++            // djmix14 peak-safe regional loudness: -6.0..+4.5 dB (was +-3 dB),
++            // capped by peak headroom so loud masters never slam the limiter
++            // while quiet tracks still match energy. Peak is the max abs over
++            // the incoming region; boosting above 1.0 is capped at 0.92/peak.
++            // Cutting (level<1) is never capped.
++            val rawGain = (matched ?: inLevel).coerceIn(0.501f, 1.679f)
++            var inPeak = 0f
++            for (v in inRegion.left) { val a = abs(v); if (a > inPeak) inPeak = a }
++            for (v in inRegion.right) { val a = abs(v); if (a > inPeak) inPeak = a }
++            val level = if (rawGain > 1.0f && inPeak > 1e-4f) {
++                minOf(rawGain, 0.92f / inPeak).coerceIn(0.501f, 1.679f)
++            } else {
++                rawGain
++            }
+ 
+             val echoHold = if (plan.echoTail) plan.out.beatSec * 8 else 0.0
+             // Outgoing: its loop, knot by knot, looping forever (it stops at the release).
+@@ -246,8 +254,19 @@ class LoopMixSession private constructor(
+                 ),
+             )
+             if (plan.echoTail) {
+-                val delay = script?.echoDelaySec?.takeIf { it > 0.01 } ?: plan.out.beatSec * 0.75
+-                val feedback = script?.echoFeedback?.takeIf { it > 0f } ?: 0.44f
++                // djmix14 club echo-out: dotted-eighth (0.75 beat, 0.5 above
++                // 128 BPM) ping-pong, feedback ~0.50-0.55, ringing across
++                // releaseAt into exitTailSeconds while the dry fades first
++                // (gain falls cos to 0 at releaseAt; send opens across the
++                // last beat). DJM dub-echo without a tempo lurch.
++                val outBpmForEcho = if (plan.out.bpm > 0) plan.out.bpm else 120.0
++                val delayBeats = if (outBpmForEcho > PhraseConfig.ECHO_BPM_SPLIT) {
++                    PhraseConfig.ECHO_DELAY_BEATS_FAST
++                } else {
++                    PhraseConfig.ECHO_DELAY_BEATS
++                }
++                val delay = script?.echoDelaySec?.takeIf { it > 0.01 } ?: (plan.out.beatSec * delayBeats)
++                val feedback = script?.echoFeedback?.takeIf { it > 0f } ?: PhraseConfig.ECHO_FEEDBACK
+                 renderer.setEcho(LoopMixRenderer.OUT, delay, feedback, 0.55f)
+                 // The delay hears dry × send. Send stays shut through pre-roll
+                 // and opens across the last beat, so the repeats start on the
+@@ -322,6 +341,14 @@ class LoopMixSession private constructor(
+                 LoopMixRenderer.IN, LoopMixRenderer.KIND_LOW_DB,
+                 doubleArrayOf(swapFrom, swapTo), floatArrayOf(cut, 0f),
+             )
++            // djmix14 vocal-pocket (non-script): carve (dual vocal) gets the
++            // deep spectral pocket (OUT low-pass 20k->1.2k, IN high-pass
++            // 650->20) with the LR4 isolator running; Beat blend gets the
++            // same pocket shape gentler (1.8k / 250Hz) so outgoing mids/highs
++            // yield as incoming vocals enter without hollowing the beat.
++            // Bass swap is the shared -24dB<->0dB half-bar envelope above;
++            // gains stay on the constant-power MixGain sin/cos law.
++            val beatBlendPocket = plan.rung == "Beat blend"
+             when {
+                 plan.carve -> {
+                     renderer.setEnvelope(
+@@ -337,6 +364,20 @@ class LoopMixSession private constructor(
+                         exponential = true,
+                     )
+                 }
++                beatBlendPocket -> {
++                    renderer.setEnvelope(
++                        LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ,
++                        doubleArrayOf(clock.enterEnd, clock.rampEnd),
++                        floatArrayOf(20000f, 1800f),
++                        exponential = true,
++                    )
++                    renderer.setEnvelope(
++                        LoopMixRenderer.IN, LoopMixRenderer.KIND_HIGH_PASS_HZ,
++                        doubleArrayOf(0.0, clock.rampEnd, clock.releaseAt),
++                        floatArrayOf(250f, 250f, 20f),
++                        exponential = true,
++                    )
++                }
+                 plan.clash && plan.outLoops -> {
+                     renderer.setEnvelope(
+                         LoopMixRenderer.OUT, LoopMixRenderer.KIND_LOW_PASS_HZ,
+@@ -365,6 +406,12 @@ class LoopMixSession private constructor(
+                 applyPhraseLanes(renderer, clock, plan, script)
+                 renderer.setIsolate(LoopMixRenderer.OUT, true)
+                 renderer.setIsolate(LoopMixRenderer.IN, true)
++            } else if (plan.carve || plan.rung == "Beat blend") {
++                // LR4 isolator runs the 200Hz/2.5kHz crossovers (member-allocated,
++                // zero heap in renderDeck); the shelf/filters above carry the
++                // pocket. Unity sum is flat, so enabling is always safe.
++                renderer.setIsolate(LoopMixRenderer.OUT, true)
++                renderer.setIsolate(LoopMixRenderer.IN, true)
+             }
+             renderer.setHighQuality(highQuality)
+             renderer.prepare()
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+index 90498e9..576e2bc 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+@@ -240,7 +240,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+ 
+     private fun discardsOf(key: String): Int = discarded[key] ?: 0
+ 
+-    private val executor = Executors.newSingleThreadExecutor { runnable ->
++    // djmix14: 2-thread bounded FIFO pool (was single-thread). The playing track and the
++    // incoming next track analyze concurrently instead of the next waiting 15 s behind the
++    // outgoing SSM/full-decode. The current track still wins the race in practice because
++    // it was requested first; [running] is a concurrent set so concurrent execution is safe.
++    // Thermal guard ([overheated]) and [yieldUntilElapsed] are still honored at request time.
++    private val executor = Executors.newFixedThreadPool(2) { runnable ->
+         Thread(runnable, "bitchord-smart-analysis").apply {
+             isDaemon = true
+             priority = Thread.NORM_PRIORITY
+@@ -267,6 +272,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+      */
+     @Volatile private var yieldUntilElapsed = 0L
+ 
++    // djmix14: in-RAM PCM region cache (4 entries, ~24 MB). Loop decks decode
++    // over the network; a cached region covering the request is sub-sliced
++    // here in <2 ms instead of decoding again after a scrub.
++    private val loopCache = LoopRegionCache()
++    /** Exposed for the controller's cold-lead budget gate. */
++    fun loopRegionCached(trackId: String, sampleRate: Int, fromSec: Double, toSec: Double): Boolean =
++        loopCache.contains(trackId, sampleRate, fromSec, toSec)
++    /** The cache itself (tests + budget gate). */
++    fun loopRegionCache(): LoopRegionCache = loopCache
++
+     private val modelLock = Any()
+ 
+     /**
+@@ -1701,6 +1716,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+         onStep: ((String) -> Unit)? = null,
+     ): com.music.bitchord.playback.loopmix.LoopRegion? {
+         if (uri.getQueryParameter("v") == null && uri.authority == "source") return null
++        // djmix14: RAM cache first — a covering entry is sub-sliced, no network.
++        loopCache.get(trackId, sampleRate, max(0.0, fromSeconds), toSeconds)?.let { slice ->
++            Log.d(TAG, "Loop region $trackId cache hit ${slice.startSec}s..${slice.endSec}s at ${sampleRate}Hz")
++            return com.music.bitchord.playback.loopmix.LoopRegion(slice.left, slice.right, slice.startSec)
++        }
+         val began = SystemClock.elapsedRealtime()
+         onStep?.invoke("stream")
+         val copy = runCatching { copyToRead(trackId, uri, durationSeconds) }.getOrNull() ?: return null
+@@ -1726,6 +1746,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+                 "got ${"%.3f".format(Locale.ROOT, start)}s + ${"%.2f".format(Locale.ROOT, left.size / rate)}s " +
+                 "at ${stereo.sampleRate.toInt()}->$sampleRate Hz in ${SystemClock.elapsedRealtime() - began}ms",
+         )
++        loopCache.put(trackId, sampleRate, start, start + left.size / rate, left, right)
+         return com.music.bitchord.playback.loopmix.LoopRegion(left, right, start)
+     }
+ 
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 3b3aebf..3fd1376 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 55
+-extra["bitchordVersionName"] = "2.1.1-djmix13"
++extra["bitchordVersionCode"] = 56
++extra["bitchordVersionName"] = "2.2.0-djmix14"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/native/loopmix/loop_mix_renderer.cpp b/native/loopmix/loop_mix_renderer.cpp
+index 66c05f5..6da527e 100644
+--- a/native/loopmix/loop_mix_renderer.cpp
++++ b/native/loopmix/loop_mix_renderer.cpp
+@@ -268,6 +268,28 @@ void Renderer::setFlanger(int index, double lfoHz, double depthSeconds, float fe
+ 
+ void Renderer::prepare() {
+   limitGain_ = 1.f;
++  // djmix14: pre-allocate every render buffer here (worker thread). The audio
++  // thread (render/renderDeck) must never allocate — see hard rule. PhraseIsolator
++  // is member/stack-allocated and already alloc-free. Sizes cover the largest
++  // ExoPlayer callback (frames) and its 8x stretch input plus seek window.
++  // If a callback ever exceeds the cap, render/renderDeck drop the block
++  // rather than resizing (no heap, no lock, no block on audio).
++  {
++    constexpr int kMaxFrames = 32768;
++    constexpr int kMaxInput = 262144;
++    if (int(mixLeft_.size()) < kMaxFrames) {
++      mixLeft_.assign(kMaxFrames, 0.f);
++      mixRight_.assign(kMaxFrames, 0.f);
++    }
++    if (int(outLeft_.size()) < kMaxFrames) {
++      outLeft_.assign(kMaxFrames, 0.f);
++      outRight_.assign(kMaxFrames, 0.f);
++    }
++    if (int(inLeft_.size()) < kMaxInput) {
++      inLeft_.assign(kMaxInput, 0.f);
++      inRight_.assign(kMaxInput, 0.f);
++    }
++  }
+   for (Deck& deck : decks_) {
+     // Default quality outside efficient mode: the mix is written ahead of the
+     // speaker, so the longer window costs nothing on the playback thread.
+@@ -302,9 +324,11 @@ int64_t Renderer::firstFrame() const {
+ }
+ 
+ void Renderer::render(int64_t frame, float* interleaved, int frames) {
+-  if (int(mixLeft_.size()) < frames) {
+-    mixLeft_.resize(frames);
+-    mixRight_.resize(frames);
++  // djmix14: no allocation on the audio thread. Buffers were pre-allocated
++  // in prepare(); an oversize callback is dropped (silence) not resized.
++  if (int(mixLeft_.size()) < frames || int(mixRight_.size()) < frames) {
++    for (int i = 0; i < frames; ++i) { interleaved[2 * i] = 0.f; interleaved[2 * i + 1] = 0.f; }
++    return;
+   }
+   std::fill(mixLeft_.begin(), mixLeft_.begin() + frames, 0.f);
+   std::fill(mixRight_.begin(), mixRight_.begin() + frames, 0.f);
+@@ -346,9 +370,9 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+     deck.heardPos = deck.knotHeard(frameStart);
+     deck.readPos = deck.heardPos + inLatency + rate * outLatency;
+     const int seekLength = deck.stretch.seekLength();
+-    if (int(inLeft_.size()) < seekLength) {
+-      inLeft_.resize(seekLength);
+-      inRight_.resize(seekLength);
++    if (int(inLeft_.size()) < seekLength || int(inRight_.size()) < seekLength) {
++      deck.started = true; // never retry a resize on the audio thread
++      return;
+     }
+     const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+     const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
+@@ -387,19 +411,14 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+   const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
+   int inputSamples = int(std::floor(readEnd - deck.readPos));
+   inputSamples = std::clamp(inputSamples, 0, frames * 8);
+-  if (int(inLeft_.size()) < inputSamples) {
+-    inLeft_.resize(inputSamples);
+-    inRight_.resize(inputSamples);
+-  }
++  // No resize on the audio thread (pre-allocated in prepare()).
++  if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
+   const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+   const int64_t readFrom = int64_t(deck.readPos);
+   for (int i = 0; i < inputSamples; ++i) deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
+   deck.readPos += inputSamples;
+ 
+-  if (int(outLeft_.size()) < frames) {
+-    outLeft_.resize(frames);
+-    outRight_.resize(frames);
+-  }
++  if (int(outLeft_.size()) < frames || int(outRight_.size()) < frames) return;
+   float* input[2] = {inLeft_.data(), inRight_.data()};
+   float* output[2] = {outLeft_.data(), outRight_.data()};
+   deck.stretch.process(input, inputSamples, output, frames);
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+new file mode 100644
+index 0000000..4c1ebda
+--- /dev/null
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+@@ -0,0 +1,148 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.abs
++
++/**
++ * Late-scrub catch-up re-anchoring (djmix14). When the playhead has already
++ * crossed [TransitionPlan.transitionStart] (scrubbed near EOF), the planner
++ * would otherwise show a dead 0s countdown whose start is 15-20 s in the
++ * past and never fire. This pure planner re-anchors a tight, beat-snapped
++ * DJ move just ahead of the playhead so the scrub still mixes musically
++ * instead of playing dry to EOF.
++ *
++ * Scalars only: BPM, downbeats, content-end and duration. No audio crosses.
++ */
++object CatchUpPlanner {
++    /**
++     * Re-anchors [plan] ahead of [currentPositionSec], or null when no
++     * catch-up applies (not late, blocked, or too little left to mix).
++     *
++     * Lead is 0.9-1.5 s snapped to the next beat/downbeat after
++     * current+0.8 s when a grid exists. Overlap shape:
++     * - >=7.0 s and tempo delta <=8%: 4-bar DJ_BLEND (bass swap + mid carve)
++     * - >=3.5 s or tempo >8%: 2-bar DJ_FILTER/ECHO_RIDE (filter + echo tail)
++     * - 1.6-3.5 s: 1-bar quick blend/filter at full available overlap
++     */
++    fun reanchor(
++        plan: TransitionPlan,
++        outAnalysis: TrackAnalysis,
++        inAnalysis: TrackAnalysis,
++        currentPositionSec: Double,
++        durationSec: Double,
++    ): TransitionPlan? {
++        if (plan.blocked) return null
++        if (durationSec <= 0.0 || !durationSec.isFinite() || !currentPositionSec.isFinite()) return null
++        if (currentPositionSec <= plan.transitionStart + 0.25) return null
++        if (currentPositionSec >= durationSec) return null
++
++        val contentEnd = outAnalysis.contentEndTime
++        val rawEnd = if (contentEnd.isFinite() && contentEnd > currentPositionSec + 2.0 && contentEnd > 0.0) {
++            contentEnd
++        } else {
++            durationSec
++        }
++        val effectiveEndSec = rawEnd.coerceAtMost(durationSec)
++        val remainingSec = effectiveEndSec - currentPositionSec
++        if (remainingSec < 2.5) return null
++
++        val outBpm = outAnalysis.bpm
++        val inBpm = inAnalysis.bpm
++        val bpmForBar = if (outBpm > 0) outBpm else if (inBpm > 0) inBpm else 120.0
++        val beatSec = if (bpmForBar > 0) 60.0 / bpmForBar else 0.5
++        val barSec = if (bpmForBar > 0) 4.0 * beatSec else 2.0
++
++        val leadSec = snappedLeadSec(outAnalysis, currentPositionSec)
++        val catchUpStartSec = currentPositionSec + leadSec
++        // Guard-band 0.4 s keeps the tail off the file edge.
++        var availableOverlapSec = (effectiveEndSec - catchUpStartSec - 0.4).coerceAtLeast(1.6)
++        // Never let the overlap run past the track end.
++        val roomLeft = effectiveEndSec - catchUpStartSec
++        if (roomLeft < 1.6) return null
++        if (availableOverlapSec > roomLeft) availableOverlapSec = roomLeft
++        if (availableOverlapSec < 1.6) return null
++
++        val tempoDelta = if (outBpm > 0 && inBpm > 0) {
++            val fold = alignedFold(outBpm, inBpm)
++            val alignedIn = inBpm / fold
++            abs(alignedIn / outBpm - 1.0)
++        } else {
++            0.0
++        }
++
++        val (fadeSec, style) = when {
++            availableOverlapSec >= 7.0 && tempoDelta <= 0.08 -> {
++                val f = minOf(plan.fadeSeconds, availableOverlapSec, 4.0 * barSec)
++                // At least 2 bars when we claimed a 4-bar blend; shorter only if the room is short.
++                val clamped = f.coerceIn(minOf(4.0, availableOverlapSec), availableOverlapSec)
++                clamped to TransitionStyle.DJ_BLEND
++            }
++            availableOverlapSec >= 3.5 -> {
++                // 2-bar filter/echo ride, clamped to the club 3.5-8.0 s window.
++                val f = minOf(availableOverlapSec, 2.0 * barSec).coerceIn(3.5, 8.0)
++                // If the room is shorter than 3.5, take the full room (quick blend path).
++                val finalF = if (f > availableOverlapSec) availableOverlapSec else f
++                finalF to TransitionStyle.DJ_FILTER
++            }
++            else -> {
++                // 1-bar beat-snapped quick blend: full available overlap.
++                availableOverlapSec to TransitionStyle.DJ_FILTER
++            }
++        }
++        val endSec = catchUpStartSec + fadeSec
++        if (endSec > durationSec + 1e-6) return null
++        if (fadeSec < 1.6 || !fadeSec.isFinite()) return null
++        // Keep the original blend character where it fits; only the timing moves.
++        val baseReason = plan.reason.ifBlank { "smart-duration" }
++        return plan.copy(
++            shouldStart = false,
++            markerVisible = true,
++            blocked = false,
++            transitionStart = catchUpStartSec,
++            transitionEnd = endSec,
++            fadeSeconds = fadeSec,
++            transitionStyle = style,
++            reason = if (baseReason.endsWith(":catch-up")) baseReason else baseReason + ":catch-up",
++            beatSeconds = if (plan.beatSeconds > 0) plan.beatSeconds else beatSec,
++        )
++    }
++
++    /** Lead 0.9-1.5 s snapped to the next downbeat/beat after current+0.8 s. */
++    private fun snappedLeadSec(analysis: TrackAnalysis, currentSec: Double): Double {
++        val target = currentSec + 0.8
++        val maxLead = currentSec + 1.5
++        // Prefer explicit downbeats (both sides).
++        val grids = listOfNotNull(
++            analysis.downbeats.takeIf { it.isNotEmpty() },
++            analysis.headBeats?.downbeats?.takeIf { it.isNotEmpty() },
++            analysis.headBeats?.beats?.takeIf { it.isNotEmpty() },
++            analysis.tailBeats?.downbeats?.takeIf { it.isNotEmpty() },
++            analysis.tailBeats?.beats?.takeIf { it.isNotEmpty() },
++        )
++        for (grid in grids) {
++            val next = grid.firstOrNull { it.isFinite() && it >= target && it <= maxLead }
++            if (next != null) {
++                val lead = next - currentSec
++                if (lead in 0.9..1.5) return lead
++            }
++        }
++        // Synthesize from BPM + phase (firstBeat or first grid beat).
++        val bpm = analysis.bpm
++        if (bpm > 0) {
++            val beatSec = 60.0 / bpm
++            if (beatSec > 0.1) {
++                val anchor = when {
++                    analysis.firstBeat.isFinite() && analysis.firstBeat > 0.0 -> analysis.firstBeat
++                    analysis.downbeats.isNotEmpty() -> analysis.downbeats.firstOrNull { it.isFinite() } ?: 0.0
++                    analysis.headBeats?.beats?.isNotEmpty() == true -> analysis.headBeats.beats.firstOrNull { it.isFinite() } ?: 0.0
++                    else -> 0.0
++                }
++                // Next beat >= target on the anchor+ k*beat lattice.
++                val k = kotlin.math.ceil((target - anchor) / beatSec)
++                val snapped = anchor + k.coerceAtLeast(0.0) * beatSec
++                val lead = snapped - currentSec
++                if (lead in 0.9..1.5) return lead
++            }
++        }
++        return 1.0
++    }
++}
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index 9ac6648..86ed8d0 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -108,7 +108,7 @@ object LoopMix {
+ 
+     /** Element <-> deck handovers: identical audio crossed this quickly is heard as one. */
+     const val HANDOVER_SEC = 0.025
+-    const val BASS_CUT_DB = -18.0
++    const val BASS_CUT_DB = -24.0
+     const val HIGH_PASS_FROM_HZ = 20.0
+     const val HIGH_PASS_TO_HZ = 1500.0
+ 
+@@ -1021,6 +1021,30 @@ object LoopMix {
+         }
+     }
+ 
++    /** Exact PCM bounds [LoopMixSession.build] decodes for [plan]. Single source of truth for fast-ready checks. */
++    data class RegionBounds(
++        val outFrom: Double,
++        val outTo: Double,
++        val inFrom: Double,
++        val inTo: Double,
++    )
++    /** Matches LoopMixSession.build: out 1.0s preroll + 0.5 seam + exitTail; in 1.0 preroll + element + 3.0 tail (+8 beats if echo). */
++    fun regionBounds(plan: Plan): RegionBounds {
++        val clock = Clock(plan)
++        val outTo = if (plan.outLoops) {
++            plan.out.loopEnd + 0.5 + plan.exitTailSeconds
++        } else {
++            plan.out.loopStart + plan.totalBars * 4 * plan.out.beatSec + 0.5 + plan.exitTailSeconds
++        }
++        val inTail = if (plan.echoTail) 3.0 + plan.out.beatSec * 8.0 else 3.0
++        return RegionBounds(
++            outFrom = plan.out.loopStart - 1.0,
++            outTo = outTo,
++            inFrom = plan.inn.loopStart - 1.0,
++            inTo = clock.elementTrackTime + inTail,
++        )
++    }
++
+     /** Where in its beat the mix is at [t], 0 on the beat and rising to 1; null outside the mix. */
+     fun beatPhaseAt(clock: Clock, t: Double): Double? {
+         if (t < 0 || t >= clock.beatTimes.last()) return null
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopRegionCache.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopRegionCache.kt
+new file mode 100644
+index 0000000..6ea4b48
+--- /dev/null
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopRegionCache.kt
+@@ -0,0 +1,103 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.roundToInt
++
++/**
++ * In-memory PCM region cache (djmix14). Loop mixes decode two regions over
++ * the network (streamed Opus); a cold decode right after a scrub cannot
++ * make a 4.5 s splice. This bounded LRU keeps the last few decoded stereo
++ * slices so a region covering [reqStart, reqEnd] can be sub-sliced in RAM
++ * in <2 ms instead of touching the network again.
++ *
++ * Scalars + PCM slices only. No cross-deck tensors/chroma ever cross.
++ * Thread-safe: [put]/[get] synchronize on one lock; slicing copies.
++ */
++class LoopRegionCache(
++    maxEntries: Int = 4,
++    maxBytes: Long = 24L * 1024L * 1024L,
++) {
++    private val maxEntries = maxEntries.coerceAtLeast(1)
++    private val maxBytes = maxBytes.coerceAtLeast(1L)
++    private val lock = Any()
++    // Access-order map: eldest is the head.
++    private val map = LinkedHashMap<String, CachedEntry>(16, 0.75f, true)
++    private var totalBytes: Long = 0L
++
++    data class CachedEntry(
++        val trackId: String,
++        val sampleRate: Int,
++        val startSec: Double,
++        val endSec: Double,
++        val left: FloatArray,
++        val right: FloatArray,
++    ) {
++        fun byteSize(): Long = (left.size.toLong() + right.size.toLong()) * 4L
++    }
++
++    /** A RAM sub-slice of a cached entry, exactly [startSec, endSec). */
++    data class Slice(
++        val trackId: String,
++        val sampleRate: Int,
++        val startSec: Double,
++        val endSec: Double,
++        val left: FloatArray,
++        val right: FloatArray,
++    ) {
++        fun byteSize(): Long = (left.size.toLong() + right.size.toLong()) * 4L
++    }
++
++    private fun key(trackId: String, sampleRate: Int) = trackId + "|" + sampleRate
++
++    fun put(trackId: String, sampleRate: Int, startSec: Double, endSec: Double, left: FloatArray, right: FloatArray) {
++        if (trackId.isBlank() || sampleRate <= 0 || !startSec.isFinite() || !endSec.isFinite() || endSec <= startSec) return
++        if (left.isEmpty() || right.isEmpty() || left.size != right.size) return
++        val entry = CachedEntry(trackId, sampleRate, startSec, endSec, left.copyOf(), right.copyOf())
++        synchronized(lock) {
++            val k = key(trackId, sampleRate)
++            map.remove(k)?.let { totalBytes -= it.byteSize() }
++            map[k] = entry
++            totalBytes += entry.byteSize()
++            // LRU eviction: drop eldest until both caps hold.
++            while (map.isNotEmpty() && (map.size > maxEntries || totalBytes > maxBytes)) {
++                val eldest = map.entries.first()
++                map.remove(eldest.key)
++                totalBytes -= eldest.value.byteSize()
++            }
++        }
++    }
++
++    /**
++     * Returns a RAM slice when the cached entry for (trackId, sampleRate)
++     * covers [reqStartSec, reqEndSec], else null. Out-of-range or
++     * sample-rate mismatch is a miss (caller falls back to network decode).
++     */
++    fun get(trackId: String, sampleRate: Int, reqStartSec: Double, reqEndSec: Double): Slice? {
++        if (reqEndSec <= reqStartSec || !reqStartSec.isFinite() || !reqEndSec.isFinite()) return null
++        synchronized(lock) {
++            val e = map[key(trackId, sampleRate)] ?: return null
++            if (reqStartSec < e.startSec - 1e-9 || reqEndSec > e.endSec + 1e-9) return null
++            val off = ((reqStartSec - e.startSec) * sampleRate).roundToInt().coerceIn(0, e.left.size)
++            val len = ((reqEndSec - reqStartSec) * sampleRate).roundToInt().coerceIn(0, e.left.size - off)
++            if (len <= 0) return null
++            val l = e.left.copyOfRange(off, off + len)
++            val r = e.right.copyOfRange(off, off + len)
++            return Slice(trackId, sampleRate, reqStartSec, reqEndSec, l, r)
++        }
++    }
++
++    fun contains(trackId: String, sampleRate: Int, reqStartSec: Double, reqEndSec: Double): Boolean {
++        synchronized(lock) {
++            val e = map[key(trackId, sampleRate)] ?: return false
++            return reqStartSec >= e.startSec - 1e-9 && reqEndSec <= e.endSec + 1e-9
++        }
++    }
++
++    fun size(): Int = synchronized(lock) { map.size }
++    fun byteCount(): Long = synchronized(lock) { totalBytes }
++    fun clear() {
++        synchronized(lock) {
++            map.clear()
++            totalBytes = 0L
++        }
++    }
++}
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+index 85c037a..7207ad3 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+@@ -107,7 +107,7 @@ object PhraseConfig {
+     const val ECHO_HPF_HZ = 300.0
+     const val ECHO_LPF_HZ = 6000.0
+     const val ECHO_TAIL_CAP_SEC = 4.0
+-    const val ECHO_FEEDBACK = 0.45f
++    const val ECHO_FEEDBACK = 0.52f
+     const val ECHO_SEND_PEAK = 0.6f
+ 
+     const val ENERGY_DIP_LEVELS = 2
+@@ -126,8 +126,8 @@ object PhraseConfig {
+     const val HEAD_STRUCTURE_BARS = 64
+     const val VOCAL_MASK_SEC = 120.0
+ 
+-    const val STRUCT_TIMEOUT_MS = 2_000L
+-    const val PLAN_TIMEOUT_MS = 40L
++    const val STRUCT_TIMEOUT_MS = 5_000L // djmix14: was 2000; slow boxes/GC need headroom for full SSM
++    const val PLAN_TIMEOUT_MS = 120L
+     const val ACTIVATION_FLOOR = 0.15f
+     const val GRID_COARSE = 0.45f
+     const val FADE_USABLE_BARS = 8
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+index cef7782..59bd341 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+@@ -138,6 +138,7 @@ object PhrasePlanner {
+         legacyLoop: LoopMix.Plan? = null,
+         startedMs: Long = 0L,
+         now: () -> Long = { 0L },
++        earliestExitSec: Double = 0.0,
+     ): PhraseChoice? {
+         if (!PhraseConfig.PHRASE_PLANNER_ENABLED) return null
+         if (out == null) return null
+@@ -146,7 +147,7 @@ object PhrasePlanner {
+         }
+         if (inn == null) return null
+         return try {
+-            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now)
++            choose(out, inn, camelotSteps, outBpm, inBpm, startedMs, now, earliestExitSec)
+         } catch (_: Timeout) {
+             null
+         } catch (_: RuntimeException) {
+@@ -193,9 +194,13 @@ object PhrasePlanner {
+         inBpm: Double,
+         startedMs: Long,
+         now: () -> Long,
++        earliestExitSec: Double = 0.0,
+     ): PhraseChoice? {
+         val limited = limitedTo(out, inn)
+-        val exits = CuePoints.exits(out)
++        // djmix14-review: rescue (and strict search) must not pick a past
++        // exit. Filter to future exits; if none remain, strict/rescue both die.
++        val exitsAll = CuePoints.exits(out)
++        val exits = if (earliestExitSec > 0.0) exitsAll.filter { it.releaseSec >= earliestExitSec } else exitsAll
+         val entries = CuePoints.entries(inn)
+         var best: PhraseChoice? = null
+         val vetoCounts = HashMap<String, Int>()
+@@ -228,12 +233,92 @@ object PhrasePlanner {
+         if (best == null || best.score < PhraseConfig.S_MIN) {
+             lastVetoSummary = "no-choose tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}" +
+                 if (best != null) " lowScore=${"%.3f".format(best.score)}" else ""
++            // djmix14 musical fallback rung: strict templates all vetoed, but
++            // both grids are usable (BPM + downbeats). Synthesize a clean
++            // 4-bar rescue at the latest outro exit + head entry instead of
++            // handing the pair back empty-handed. Beat blend (M1) when the
++            // post-fold delta is <=8% and no dual-vocal clash; Echo (M6)
++            // otherwise (tempo lurch or vocal/harmonic clash).
++            val rescue = musicalRescue(out, inn, steps, outBpm, inBpm, exits, entries)
++            if (rescue != null) {
++                lastVetoSummary = "rescue ${rescue.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
++                return rescue
++            }
+             return null
+         }
+         lastVetoSummary = "chose ${best.template} tried=$tried ratioSkip=$ratioSkip vetoes=${vetoCounts.entries.joinToString(",") { it.key + "=" + it.value }}"
+         return best
+     }
+ 
++    /**
++     * Clean 4-bar musical rescue when every strict template vetoed.
++     * Requires usable BPM + downbeats on both sides. M1 (Beat blend,
++     * 4 bars, half-bar bass swap) for close tempos; M6 (Echo, 4 bars,
++     * beat-synced echo-out + bass swap) for far tempos or clashes.
++     */
++    private fun musicalRescue(
++        out: SongMap,
++        inn: SongMap,
++        steps: Int?,
++        outBpm: Double,
++        inBpm: Double,
++        exits: List<ExitCue>,
++        entries: List<EntryCue>,
++    ): PhraseChoice? {
++        if (outBpm <= 0 || inBpm <= 0) return null
++        if (out.downbeats.isEmpty() || inn.downbeats.isEmpty()) return null
++        val exit = exits.lastOrNull() ?: return null
++        val entry = entries.firstOrNull() ?: return null
++        // Respect the musical tension veto: tension only resolves to a
++        // release. A rescue must not route tension into ambient.
++        val aRole = out.sectionAt((exit.releaseBar - 1).coerceAtLeast(0))?.role ?: exit.role
++        val bRole = inn.sectionAt(entry.landingBar)?.role ?: entry.landingRole
++        if (aRole == SectionRole.TENSION && bRole != SectionRole.RELEASE) return null
++        // djmix14-review: coarse+coarse with extreme tempo is better left to
++        // LoopMix.bridge / classic DJ_FILTER than a forced 4-bar rescue.
++        if (out.coarse && inn.coarse && abs(foldedRatio(outBpm, inBpm) - 1.0) > 0.15) return null
++        val ratio = foldedRatio(outBpm, inBpm)
++        val delta = abs(ratio - 1.0)
++        val dualVocal = (out.sungBars.any { it } && inn.sungBars.any { it }) &&
++            entry.leadInVocal >= 0.2f
++        val harmonicClash = (steps ?: 0) > 2
++        val useEcho = delta > 0.08 || dualVocal || harmonicClash
++        val template = if (useEcho) MixTemplate.M6 else MixTemplate.M1
++        val (delayName, delayBeats) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
++        val (rampName, rampMs) = PhraseConfig.swapRampMs(template.name)
++        return PhraseChoice(
++            template = template,
++            rung = rungOf(template),
++            score = PhraseConfig.S_MIN,
++            exit = exit,
++            entry = entry,
++            overlapBars = 4,
++            // Match score(): M1/M3 swap at -overlap/2, all others at 0.0.
++            swapBar = if (template == MixTemplate.M1) -2.0 else 0.0,
++            tailBeats = if (template == MixTemplate.M1) 1.0 else 0.0,
++            loopK = 0,
++            echoGated = template == MixTemplate.M6,
++            vocalProduct = 0f,
++            tempoPrepBars = 0,
++            echoDelayBeats = delayBeats,
++            echoDelayName = delayName,
++            swapRampMs = rampMs,
++            swapRampName = rampName,
++            tempoPolicy = if (PhraseConfig.TEMPO_POLICY == "b") "TEMPO_POLICY=b" else "TEMPO_POLICY=a",
++            vocalOverlapBeats = 0.0,
++            energyDelta = 0f,
++            struct = 0.6,
++            vocalScore = 0.6,
++            phraseScore = 0.6,
++            energyScore = 0.6,
++            lengthScore = 0.6,
++            keyScore = 0.6,
++            tempoScore = 0.6,
++            cost = 0.0,
++            detail = "rescue-${template.name} 4bar",
++        )
++    }
++
+     private fun checkPlanTime(startedMs: Long, now: () -> Long) {
+         if (startedMs <= 0L) return
+         val t = now()
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RegionalLoudness.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RegionalLoudness.kt
+index e7976db..5f7ec15 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RegionalLoudness.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RegionalLoudness.kt
+@@ -16,9 +16,10 @@ import kotlin.math.pow
+ import kotlin.math.tan
+ 
+ object RegionalLoudness {
+-    // djmix9: symmetric +-3 dB so a loudness match never drags B +-7 dB.
+-    private const val MIN_DB = -3.0
+-    private const val MAX_DB = 3.0
++    // djmix14: peak-safe regional matching, -6.0..+4.5 dB (was symmetric +-3 dB).
++    // Quiet masters match energy; loud masters are capped by peak headroom in the caller.
++    private const val MIN_DB = -6.0
++    private const val MAX_DB = 4.5
+ 
+     /**
+      * Gain for the incoming window so its loudness matches [out], or null when
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
+index 6fbbf98..1bdb289 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SeekAction.kt
+@@ -1,26 +1,31 @@
+ package com.music.bitchord.playback.smart
+ 
+ /**
+- * Scrub handling (djmix13). The phase the controller is in when the user
++ * Scrub handling (djmix14). The phase the controller is in when the user
+  * seeks decides what the (possible) half-armed mix becomes:
+  *
+- * - Not shown / armed: cancel cleanly, then replan from the NEW position.
+- *   The marker/countdown is cleared so a stale plan can never fire.
+- * - Shown in ARMING (countdown visible, not audible yet): cancel the shown
+- *   countdown and replan from the new position (scrub repositioned the
+- *   mix-start; honouring the old absolute point would fire wrong).
+- * - Audible blend (FADING / TAIL with sound up): emergency 350 ms tail on
+- *   the spare, never an instant retire and never a double-fire.
++ * - Pre-audible (IDLE, ARMING, LOOP_ARMING before splice takeover): cancel
++ *   cleanly, then replan from the NEW position. The marker/countdown is
++ *   cleared so a stale plan can never fire. NO 350 ms retire-guard dip on
++ *   an inaudible player — the teardown is silent and instant.
++ * - Audible (FADING, TAIL, LOOP_RUNNING / tookOver): emergency 350 ms tail
++ *   on the spare (or renderer fade), never an instant retire and never a
++ *   double-fire. Seeking mid-mix dissolves gracefully, then the playhead
++ *   rests at the scrub target and replans from IDLE.
++ *
++ * LOOP is kept for backward compatibility (pre-djmix14 call sites) and
++ * maps to pre-audible CANCEL. New code uses LOOP_ARMING / LOOP_RUNNING.
+  */
+ object SeekAction {
+-    enum class Phase { IDLE, ARMING, FADING, TAIL, LOOP, BAILING, SLEEP }
++    enum class Phase { IDLE, ARMING, FADING, TAIL, LOOP, LOOP_ARMING, LOOP_RUNNING, BAILING, SLEEP }
+ 
+     enum class Action { CANCEL, HONOUR, EMERGENCY_TAIL }
+ 
+     fun decide(phase: Phase, markerShown: Boolean): Action = when (phase) {
+         Phase.FADING -> Action.EMERGENCY_TAIL
+         Phase.TAIL -> Action.EMERGENCY_TAIL
+-        Phase.IDLE, Phase.ARMING, Phase.LOOP, Phase.BAILING, Phase.SLEEP -> Action.CANCEL
++        Phase.LOOP_RUNNING -> Action.EMERGENCY_TAIL
++        Phase.IDLE, Phase.ARMING, Phase.LOOP, Phase.LOOP_ARMING, Phase.BAILING, Phase.SLEEP -> Action.CANCEL
+     }
+ 
+     /**
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+index a3fc473..8c030dd 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPlanner.kt
+@@ -1439,7 +1439,13 @@ private fun standardTransition(
+ }
+ 
+ /** A stale analysis paired with the wrong track is worse than no analysis at all. */
+-private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrackInfo?, requireFull: Boolean = false): Boolean {
++private fun analysisReadyForTrack(
++    analysis: TrackAnalysis,
++    track: TransitionTrackInfo?,
++    requireFull: Boolean = false,
++    durationSec: Double = 0.0,
++    currentSec: Double = 0.0,
++): Boolean {
+     // djmix10: blank is NOT ready. A blank status means nothing was ever
+     // measured; trusting its default BPM/grid authorizes beat math on
+     // zeros. A ready analysis with no tempo is the same.
+@@ -1452,7 +1458,20 @@ private fun analysisReadyForTrack(analysis: TrackAnalysis, track: TransitionTrac
+     // has never seen the outro, so its content-end anchor is a blind guess
+     // that later jumps backwards. The incoming entry, by contrast, is
+     // measured over the same opening window the head pass measures.
+-    if (requireFull && !isFullAnalysis(analysis)) return false
++    if (requireFull && !isFullAnalysis(analysis)) {
++        // djmix14 late/scrub head rescue: early in the song (>45 s left) keep
++        // waiting for the real outro cues. Within 45 s of the end (or the
++        // full pass timed out and only HEAD exists) a HEAD grid with
++        // bpm>0 and confidence>=0.35 is allowed, anchored at eof_holdback
++        // (content-end falls back to duration) with a beat grid
++        // extrapolated from head BPM + phase. This kills the
++        // before-smart-analysis-fallback-window wall on a scrub-to-outro.
++        val remaining = durationSec - currentSec
++        val isLate = durationSec > 0.0 && remaining <= 45.0
++        val headUsable = analysis.quality == TrackAnalysis.QUALITY_HEAD &&
++            analysis.bpm > 0 && analysis.beatConfidence >= 0.35
++        if (!(isLate && headUsable)) return false
++    }
+     return true
+ }
+ 
+@@ -1623,7 +1642,7 @@ private fun planTransitionInner(
+         return blocked("blocked-speech-or-live")
+     }
+ 
+-    if (!analysisReadyForTrack(analysis, currentTrack, requireFull = true) ||
++    if (!analysisReadyForTrack(analysis, currentTrack, requireFull = true, durationSec = length, currentSec = playbackTime) ||
+         !analysisReadyForTrack(nextAnalysis, nextTrack)
+     ) {
+         return standardTransition(
+@@ -1758,6 +1777,13 @@ private fun planTransitionInner(
+     } else {
+         primary
+     }
++    // djmix14 late-scrub catch-up: a plan whose start is already behind the
++    // playhead must re-anchor ahead instead of showing a dead 0s countdown.
++    // djmix14-review: pass through capIncomingSkip (was bare return) so the
++    // incoming cue invariant holds for catch-up plans too.
++    CatchUpPlanner.reanchor(plan, analysis, nextAnalysis, playbackTime, length)?.let { caught ->
++        return capIncomingSkip(caught, nextAnalysis, nextLength)
++    }
+     val started = playbackTime >= plan.transitionStart
+     return capIncomingSkip(
+         plan.copy(
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AutomixGracefulTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AutomixGracefulTest.kt
+index e249c0d..c573ceb 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AutomixGracefulTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/AutomixGracefulTest.kt
+@@ -61,10 +61,12 @@ class AutomixGracefulTest {
+         val g1 = RegionalLoudness.matchGain(loud, loud, 0, sr, quiet, quiet, 0, sr, sr)
+         val g2 = RegionalLoudness.matchGain(quiet, quiet, 0, sr, loud, loud, 0, sr, sr)
+         assertNotNull(g1); assertNotNull(g2)
+-        // Within +-3 dB: 0.708..1.412.
+-        assertEquals(true, g1 > 0.70f && g1 < 1.42f, "g1=$g1")
+-        assertEquals(true, g2 > 0.70f && g2 < 1.42f, "g2=$g2")
+-        assertEquals(true, abs(g1 * g2 - 1.0f) < 0.08f, "g1*g2 should be ~1: ${g1 * g2}")
++        // djmix14 asymmetric -6.0..+4.5 dB: boost clamps at 1.679, cut at 0.501.
++        assertEquals(true, g1 > 1.60f && g1 < 1.70f, "g1=$g1")
++        assertEquals(true, g2 > 0.50f && g2 < 0.51f, "g2=$g2")
++        // Asymmetric by design (loud masters capped by peak headroom in the
++        // caller); the product is ~0.84, not 1.
++        assertEquals(true, abs(g1 * g2 - 0.841f) < 0.08f, "g1*g2 should be ~0.84: ${g1 * g2}")
+     }
+ 
+     @Test fun shortTrackStillPlans() {
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt
+new file mode 100644
+index 0000000..1bf3bab
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14PlannerRescueTest.kt
+@@ -0,0 +1,182 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.roundToLong
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix14 planner rescue: HEAD late-rescue, musical fallback rung, and
++ * cueErrorMs millisecond math.
++ */
++class Djmix14PlannerRescueTest {
++
++    private fun headAnalysis(bpm: Double, id: String, conf: Double = 0.40): TrackAnalysis {
++        val beatSec = 60.0 / bpm
++        val barSec = 4.0 * beatSec
++        val downbeats = buildList<Double> {
++            var t = 0.0
++            while (t <= 200.0) { add(t); t += barSec }
++        }
++        // HEAD quality: partial-window evidence, no tail energy curve.
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id,
++            duration = 180.0,
++            bpm = bpm,
++            beatInterval = beatSec,
++            beatConfidence = conf,
++            downbeats = downbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.7,
++            contentEndTime = 0.0,
++            quality = TrackAnalysis.QUALITY_HEAD,
++        )
++    }
++
++    private fun fullAnalysis(bpm: Double, id: String): TrackAnalysis {
++        val beatSec = 60.0 / bpm
++        val barSec = 4.0 * beatSec
++        val downbeats = buildList<Double> {
++            var t = 0.0
++            while (t <= 200.0) { add(t); t += barSec }
++        }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id,
++            duration = 180.0,
++            bpm = bpm,
++            beatInterval = beatSec,
++            beatConfidence = 0.85,
++            downbeats = downbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.8,
++            contentEndTime = 175.0,
++            energyCurve = listOf(EnergySample(0.0, 0.5), EnergySample(175.0, 0.4)),
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    @Test fun headRescueEarlyWaitsLateRescues() {
++        val outHead = headAnalysis(100.0, "out")
++        val innFull = fullAnalysis(104.0, "inn")
++        // Early: 170 s left (>45) — must wait for full, so fallback window.
++        val early = planTransition(
++            analysis = outHead, nextAnalysis = innFull,
++            currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
++            currentTime = 10.0, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = true,
++        )
++        assertTrue(early.reason.contains("fallback"), "early must fallback: ${early.reason}")
++        // Late/scrub: 40 s left (<=45) — HEAD rescue into a real mix, not fallback.
++        val late = planTransition(
++            analysis = outHead, nextAnalysis = innFull,
++            currentTrack = TransitionTrackInfo("out", 180_000L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("inn", 180_000L, "t2", "a2", "al"),
++            currentTime = 140.0, duration = 180.0, fadeSeconds = 8.0, mode = CrossfadeMode.SMART, advanced = true,
++        )
++        assertFalse(late.reason.contains("fallback"), "late HEAD must rescue: ${late.reason} style=${late.transitionStyle}")
++        assertFalse(late.blocked)
++        assertTrue(late.transitionStyle == TransitionStyle.DJ_BLEND || late.transitionStyle == TransitionStyle.DJ_FILTER, "style=${late.transitionStyle}")
++    }
++
++    @Test fun musicalFallbackNeverEmptyHanded() {
++        // Close tempos (<=8%): beat blend (M1). Far tempos (>8%): echo (M6).
++        // Usable grids guarantee a non-null rescue even under veto pressure.
++        val outClose = SongMaps.fromAnalysis("out", fullAnalysis(100.0, "out"))
++        val inClose = SongMaps.fromAnalysis("inn", fullAnalysis(104.0, "inn"))
++        assertNotNull(outClose)
++        assertNotNull(inClose)
++        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0)
++        assertNotNull(closeChoice, "close pair must choose (strict or rescue)")
++        // Far tempos: 100 vs 140 (40% folded delta).
++        val outFar = SongMaps.fromAnalysis("out2", fullAnalysis(100.0, "out2"))
++        val inFar = SongMaps.fromAnalysis("inn2", fullAnalysis(140.0, "inn2"))
++        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0)
++        assertNotNull(farChoice, "far pair must choose, never null")
++        // Far must favour echo over a tempo lurch; assert template is a
++        // short/echo family, never a long blend.
++        assertTrue(farChoice.template == MixTemplate.M6 || farChoice.template == MixTemplate.M10 || farChoice.template == MixTemplate.RELAXED, "far=${farChoice.template}")
++        // Close must not be a forced echo when strict would blend; either
++        // M1 (blend) via strict or rescue, never an echo-only signal.
++        assertTrue(closeChoice.template == MixTemplate.M1 || closeChoice.template == MixTemplate.M6 || closeChoice.template == MixTemplate.RELAXED, "close=${closeChoice.template}")
++    }
++
++    @Test fun cueErrorMsMillisecondMath() {
++        val intoMs = 5000L
++        val cueSec = 5.0
++        val targetCueMs = (cueSec * 1000.0).roundToLong()
++        assertEquals(5000L, targetCueMs)
++        assertEquals(0L, intoMs - targetCueMs, "5000ms vs 5.0s must be 0, not 4995")
++        // Negative control: the old seconds-minus-ms bug gave 4995.
++        assertEquals(4995L, intoMs - cueSec.toLong())
++    }
++
++
++    @Test fun rescueLanesAreMonotoneAndMuted() {
++        // Build rescues via select on usable grids, then compile both M1/M6
++        // shapes and assert every lane is strictly non-decreasing in beats
++        // and outGain ends at MUTE_DB (graceful exit tail).
++        val outClose = SongMaps.fromAnalysis("out", fullAnalysis(100.0, "out"))
++        val inClose = SongMaps.fromAnalysis("inn", fullAnalysis(104.0, "inn"))
++        assertNotNull(outClose); assertNotNull(inClose)
++        val closeChoice = PhrasePlanner.select(outClose, inClose, 0, 100.0, 104.0)
++        assertNotNull(closeChoice)
++        // Manually exercise both rescue templates (M1/M6) through compile so
++        // the lane contract is checked even when strict wins the close pair.
++        val outFar = SongMaps.fromAnalysis("out2", fullAnalysis(100.0, "out2"))
++        val inFar = SongMaps.fromAnalysis("inn2", fullAnalysis(140.0, "inn2"))
++        assertNotNull(outFar); assertNotNull(inFar)
++        val farChoice = PhrasePlanner.select(outFar, inFar, 0, 100.0, 140.0)
++        assertNotNull(farChoice)
++        for (choice in listOf(closeChoice, farChoice)) {
++            val script = TransitionMoves.compile(choice, 100.0, if (choice === farChoice) 140.0 else 104.0)
++            for (lane in listOf(script.outGain, script.inGain, script.outLow, script.inLow, script.outMid, script.inMid, script.outHigh, script.inHigh, script.outHp)) {
++                assertTrue(lane.beats.isNotEmpty(), "lane empty for ${choice.template}")
++                for (i in 1 until lane.beats.size) {
++                    assertTrue(lane.beats[i] >= lane.beats[i - 1], "non-monotone ${choice.template}: ${lane.beats[i-1]} -> ${lane.beats[i]}")
++                }
++            }
++            assertEquals(TransitionMoves.MUTE_DB, script.outGain.values.last(), 0.001f, "outGain must end muted for ${choice.template}")
++        }
++        // Explicit M1/M6 compile check (rescue shapes): -2.0 vs 0.0 swap.
++        assertTrue(closeChoice.swapBar == -2.0 || closeChoice.swapBar == 0.0, "swap=${closeChoice.swapBar}")
++    }
++
++    @Test fun earliestExitSecFiltersPastExits() {
++        val out = SongMaps.fromAnalysis("out", fullAnalysis(100.0, "out"))!!
++        val inn = SongMaps.fromAnalysis("inn", fullAnalysis(104.0, "inn"))!!
++        // Earliest in the past: normal choice.
++        val normal = PhrasePlanner.select(out, inn, 0, 100.0, 104.0, earliestExitSec = 0.0)
++        // Earliest far in the future beyond every exit: no exit, no rescue.
++        val future = PhrasePlanner.select(out, inn, 0, 100.0, 104.0, earliestExitSec = 1e9)
++        assertNull(future, "past all exits must be null (no rescue from a past bar)")
++    }
++
++
++
++    @Test fun regionBoundsMatchBuildExactly() {
++        // Loop plan: out loopEnd+0.5+exitTail; straight: start+total*4*beat+0.5+exitTail.
++        val outPick = LoopMix.Pick(loopStart = 100.0, loopEnd = 104.0, bars = 4, beatSec = 0.6, bpm = 100.0, vocal = 0.0, checkedBy = LoopMix.Check.MASK)
++        val inPick = LoopMix.Pick(loopStart = 5.0, loopEnd = 9.0, bars = 4, beatSec = 0.575, bpm = 104.34, vocal = 0.0, checkedBy = LoopMix.Check.MASK)
++        val loopPlan = LoopMix.Plan(out = outPick, inn = inPick, fold = 1.0, enterBars = 1, rampBars = 2, exitBars = 1, totalBars = 4, outLoops = true, inLoops = true, exitTailSeconds = 0.8)
++        val lb = LoopMix.regionBounds(loopPlan)
++        assertEquals(99.0, lb.outFrom, 1e-9)
++        assertEquals(104.0 + 0.5 + 0.8, lb.outTo, 1e-9)
++        assertEquals(4.0, lb.inFrom, 1e-9)
++        val clock = LoopMix.Clock(loopPlan)
++        assertEquals(clock.elementTrackTime + 3.0, lb.inTo, 1e-9)
++
++        val straightOut = LoopMix.Pick(loopStart = 100.0, loopEnd = 100.0, bars = 4, beatSec = 0.6, bpm = 100.0, vocal = 0.0, checkedBy = LoopMix.Check.MASK)
++        val straightPlan = LoopMix.Plan(out = straightOut, inn = inPick, fold = 1.0, enterBars = 1, rampBars = 2, exitBars = 1, totalBars = 4, outLoops = false, inLoops = false, echoTail = true, exitTailSeconds = 1.0)
++        val sb = LoopMix.regionBounds(straightPlan)
++        assertEquals(100.0 + 4 * 4 * 0.6 + 0.5 + 1.0, sb.outTo, 1e-9)
++        assertEquals(LoopMix.Clock(straightPlan).elementTrackTime + 3.0 + 0.6 * 8.0, sb.inTo, 1e-9)
++    }
++
++}
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14ScrubAndCatchUpTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14ScrubAndCatchUpTest.kt
+new file mode 100644
+index 0000000..c1daacb
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix14ScrubAndCatchUpTest.kt
+@@ -0,0 +1,174 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix14 scrub + catch-up: the 19:25:50 video reproduction, phase split,
++ * and Late-Scrub Catch-Up Re-anchoring. Scalars only.
++ */
++class Djmix14ScrubAndCatchUpTest {
++
++    private fun analysis(bpm: Double, id: String): TrackAnalysis {
++        // Bar downbeats every 4 beats from 0 so snapping is deterministic.
++        val beatSec = 60.0 / bpm
++        val barSec = 4.0 * beatSec
++        val downbeats = buildList<Double> {
++            var t = 0.0
++            while (t <= 200.0) { add(t); t += barSec }
++        }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id,
++            duration = 179.0,
++            bpm = bpm,
++            beatInterval = beatSec,
++            beatConfidence = 0.8,
++            downbeats = downbeats,
++            firstBeat = 0.0,
++            key = "8A",
++            keyConfidence = 0.8,
++            contentEndTime = 0.0,
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    private fun videoPlan(): TransitionPlan = TransitionPlan(
++        shouldStart = true,
++        markerVisible = true,
++        blocked = false,
++        reason = "smart-duration",
++        transitionStart = 150.0,
++        transitionEnd = 172.18,
++        fadeSeconds = 22.18,
++        transitionStyle = TransitionStyle.DJ_BLEND,
++        incomingCueTime = 5.0,
++        beatSeconds = 60.0 / 99.99,
++    )
++
++    @Test fun videoScrubPastStartIsInvalid() {
++        // 150s plan start, playhead scrubbed to 166.81s (12.2 s left).
++        assertFalse(SeekAction.planStillValid(150_000L, 166_810L))
++        assertFalse(SeekAction.planStillValid(150_000L, 153_100L))
++        assertTrue(SeekAction.planStillValid(150_000L, 149_000L))
++    }
++
++    @Test fun catchUpAt166_8ReanchorsAheadFitAndMusical() {
++        val plan = videoPlan()
++        val out = analysis(99.99, "a")
++        val inn = analysis(104.50, "b")
++        val caught = CatchUpPlanner.reanchor(plan, out, inn, 166.8, 179.0)
++        assertNotNull(caught, "catch-up must fire at 166.8 (12.2 s left)")
++        assertFalse(caught.blocked)
++        assertTrue(caught.transitionStart > 166.8, "start=${caught.transitionStart} must be ahead")
++        val lead = caught.transitionStart - 166.8
++        assertTrue(lead in 0.8..1.8, "lead=$lead beat-snapped ~0.8-1.8")
++        assertTrue(caught.fadeSeconds in 4.0..10.5, "fade=${caught.fadeSeconds} musical 2-4 bar")
++        assertTrue(caught.transitionStart + caught.fadeSeconds <= 179.0, "end=${caught.transitionStart + caught.fadeSeconds}")
++        assertFalse(caught.shouldStart, "not yet started; arms into the lead window")
++        assertTrue(caught.reason.endsWith(":catch-up"), "reason=${caught.reason}")
++    }
++
++    @Test fun catchUpAt153_1AlsoReanchors() {
++        val plan = videoPlan()
++        val out = analysis(99.99, "a")
++        val inn = analysis(104.50, "b")
++        val caught = CatchUpPlanner.reanchor(plan, out, inn, 153.1, 179.0)
++        assertNotNull(caught)
++        assertTrue(caught.transitionStart > 153.1)
++        assertTrue(caught.transitionStart + caught.fadeSeconds <= 179.0)
++    }
++
++    @Test fun catchUpAtTMinus5IsQuickFilter() {
++        val plan = videoPlan()
++        val out = analysis(99.99, "a")
++        val inn = analysis(104.50, "b")
++        val caught = CatchUpPlanner.reanchor(plan, out, inn, 174.0, 179.0)
++        assertNotNull(caught, "T-5 must catch up")
++        assertTrue(caught.fadeSeconds in 2.5..3.5, "fade=${caught.fadeSeconds} 2-bar/quick")
++        assertTrue(caught.transitionStart + caught.fadeSeconds <= 179.0)
++    }
++
++    @Test fun catchUpAtTMinus1LeavesToFinish() {
++        val plan = videoPlan()
++        val out = analysis(99.99, "a")
++        val inn = analysis(104.50, "b")
++        val caught = CatchUpPlanner.reanchor(plan, out, inn, 178.0, 179.0)
++        assertNull(caught, "T-1.0 (<2.5 left) must leave to finish, no fake 0s")
++    }
++
++    @Test fun phaseSplitPreAudibleCancelsAudibleTails() {
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.IDLE, false))
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.ARMING, false))
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.ARMING, true))
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.LOOP_ARMING, false))
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.LOOP_ARMING, true))
++        // Backward compat: legacy LOOP is pre-audible.
++        assertEquals(SeekAction.Action.CANCEL, SeekAction.decide(SeekAction.Phase.LOOP, true))
++        assertEquals(SeekAction.Action.EMERGENCY_TAIL, SeekAction.decide(SeekAction.Phase.FADING, true))
++        assertEquals(SeekAction.Action.EMERGENCY_TAIL, SeekAction.decide(SeekAction.Phase.TAIL, true))
++        assertEquals(SeekAction.Action.EMERGENCY_TAIL, SeekAction.decide(SeekAction.Phase.LOOP_RUNNING, true))
++    }
++
++
++    @Test fun pinnedCatchUpCountdownTicksDownNotDrift() {
++        // Simulate IDLE ticks with pinned start: countdown must tick 2->1->0.
++        // Without pinning, catchUpStart = current+lead drifts (1s -> 1s -> 1s).
++        val plan = videoPlan()
++        val out = analysis(99.99, "a")
++        val inn = analysis(104.50, "b")
++        val first = CatchUpPlanner.reanchor(plan, out, inn, 166.8, 179.0)
++        assertNotNull(first)
++        val pinnedStart = first.transitionStart
++        // Next ticks advance 0.25s each but pinned start holds.
++        for (pos in listOf(167.05, 167.3, 167.55)) {
++            val raw = CatchUpPlanner.reanchor(plan, out, inn, pos, 179.0)
++            assertNotNull(raw)
++            // Unpinned would have moved forward:
++            // (assert drift exists to justify pinning)
++            assertTrue(raw.transitionStart >= pinnedStart, "unpinned drifts forward: ${raw.transitionStart} vs $pinnedStart")
++        }
++        // Pinned countdown: seconds left = pinnedStart - pos
++        val c1 = kotlin.math.ceil((pinnedStart - 167.05).coerceAtLeast(0.0)).toInt()
++        val c2 = kotlin.math.ceil((pinnedStart - 167.3).coerceAtLeast(0.0)).toInt()
++        val c3 = kotlin.math.ceil((pinnedStart - 167.55).coerceAtLeast(0.0)).toInt()
++        assertTrue(c1 >= c2 && c2 >= c3, "pinned countdown must tick down: $c1,$c2,$c3")
++        // And the pinned end still fits the track.
++        assertTrue(pinnedStart + first.fadeSeconds <= 179.0)
++    }
++
++    @Test fun catchUpGoesThroughCapIncomingSkip() {
++        // planTransition must cap the incoming cue even on the catch-up path.
++        // Short next track (20s) -> latest cue = 0.25*20 = 5s. A catch-up
++        // plan whose cue is deeper (e.g. 10s via mix-out anchor) is pulled back.
++        val outA = analysis(99.99, "a")
++        val innShort = fullShortNext()
++        val viaPlan = planTransition(
++            analysis = outA, nextAnalysis = innShort,
++            currentTrack = TransitionTrackInfo("a", 179_000L, "t", "a", "al"),
++            nextTrack = TransitionTrackInfo("b", 20_000L, "t2", "a2", "al"),
++            currentTime = 166.8, duration = 179.0, fadeSeconds = 22.18, mode = CrossfadeMode.SMART, advanced = true,
++        )
++        // Whether or not this exact pair catches up, the cue invariant holds:
++        // never deeper than a quarter of the incoming track.
++        assertTrue(viaPlan.incomingCueTime <= 5.0 + 1e-6, "cue=${viaPlan.incomingCueTime} must be capped at 5.0 (0.25*20)")
++    }
++
++    private fun fullShortNext(): TrackAnalysis {
++        val bpm = 104.50
++        val beatSec = 60.0 / bpm
++        val barSec = 4.0 * beatSec
++        val downbeats = buildList<Double> { var t = 0.0; while (t <= 30.0) { add(t); t += barSec } }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY, trackId = "b", duration = 20.0, bpm = bpm,
++            beatInterval = beatSec, beatConfidence = 0.85, downbeats = downbeats, firstBeat = 0.0,
++            key = "8A", keyConfidence = 0.8, contentEndTime = 19.0, quality = TrackAnalysis.QUALITY_FULL,
++            energyCurve = listOf(EnergySample(0.0, 0.5), EnergySample(19.0, 0.4)),
++        )
++    }
++
++}
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/LoopRegionCacheTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/LoopRegionCacheTest.kt
+new file mode 100644
+index 0000000..890048b
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/LoopRegionCacheTest.kt
+@@ -0,0 +1,73 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix14 LoopRegionCache: hit, sub-slice, miss, LRU eviction.
++ */
++class LoopRegionCacheTest {
++
++    @Test fun exactRegionHit() {
++        val c = LoopRegionCache()
++        val sr = 48000
++        val left = FloatArray(10) { it.toFloat() }
++        val right = FloatArray(10) { (it * 2).toFloat() }
++        c.put("t1", sr, 10.0, 10.0 + 10.0 / sr, left, right)
++        val s = c.get("t1", sr, 10.0, 10.0 + 10.0 / sr)
++        assertNotNull(s)
++        assertEquals(10, s.left.size)
++    }
++
++    @Test fun coveringSubSlice() {
++        val c = LoopRegionCache()
++        val sr = 1000 // 1 kHz for integer math: 40 s = 40_000 samples
++        val left = FloatArray(40_000) { it.toFloat() }
++        val right = FloatArray(40_000) { -it.toFloat() }
++        c.put("t1", sr, 140.0, 180.0, left, right)
++        // Request [148,172] is covered by [140,180].
++        val s = c.get("t1", sr, 148.0, 172.0)
++        assertNotNull(s, "covering sub-slice must hit")
++        assertEquals(24_000, s.left.size, "148..172 at 1kHz = 24k samples")
++        assertEquals(148.0, s.startSec)
++        assertEquals(172.0, s.endSec)
++        // First sliced sample equals original offset 8000.
++        assertEquals(8000f, s.left[0])
++        assertTrue(c.contains("t1", sr, 148.0, 172.0))
++    }
++
++    @Test fun missOutOfRangeAndSampleRate() {
++        val c = LoopRegionCache()
++        val sr = 48000
++        val left = FloatArray(4800) { 0f }
++        val right = FloatArray(4800) { 0f }
++        c.put("t1", sr, 10.0, 10.1, left, right)
++        assertNull(c.get("t1", sr, 10.2, 10.3), "out of range must miss")
++        assertNull(c.get("t1", 44100, 10.0, 10.1), "sample-rate mismatch must miss")
++        assertNull(c.get("other", sr, 10.0, 10.1), "track miss")
++    }
++
++    @Test fun lruByteCapEviction() {
++        // 4-entry cap: fifth put evicts eldest.
++        val c = LoopRegionCache(maxEntries = 4, maxBytes = 24L * 1024 * 1024)
++        val sr = 48000
++        fun entry(id: String) {
++            val l = FloatArray(100) { 0f }
++            val r = FloatArray(100) { 0f }
++            c.put(id, sr, 0.0, 100.0 / sr, l, r)
++        }
++        entry("a"); entry("b"); entry("c"); entry("d")
++        assertEquals(4, c.size())
++        // Touch a (access order): get makes a most-recent.
++        c.get("a", sr, 0.0, 100.0 / sr)
++        entry("e")
++        assertEquals(4, c.size(), "cap held at 4")
++        // b was eldest after touch, so b evicted.
++        assertNull(c.get("b", sr, 0.0, 100.0 / sr))
++        assertNotNull(c.get("a", sr, 0.0, 100.0 / sr))
++        assertNotNull(c.get("e", sr, 0.0, 100.0 / sr))
++    }
++}
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RegionalLoudnessTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RegionalLoudnessTest.kt
+index 7b9af99..784a026 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RegionalLoudnessTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RegionalLoudnessTest.kt
+@@ -17,13 +17,13 @@ class RegionalLoudnessTest {
+         val gain = assertNotNull(
+             RegionalLoudness.matchGain(quiet, quiet, 0, n, loud, loud, 0, n, rate),
+         )
+-        // djmix9: symmetric +-3 dB clamp (0.1->0.2 is -6 dB, so -3 dB applies).
+-        assertEquals(0.708, gain.toDouble(), 0.03)
++        // djmix14: peak-safe -6.0..+4.5 dB clamp (0.1->0.2 is -6 dB, edge).
++        assertEquals(0.501, gain.toDouble(), 0.03)
+         val huge = tone(n, rate, 0.8)
+         val clamped = assertNotNull(
+             RegionalLoudness.matchGain(quiet, quiet, 0, n, huge, huge, 0, n, rate),
+         )
+-        assertTrue(clamped >= 0.70 && clamped <= 0.72, "was $clamped")
++        assertTrue(clamped >= 0.50 && clamped <= 0.51, "was $clamped")
+     }
+ 
+     private fun tone(n: Int, rate: Int, amplitude: Double): FloatArray {

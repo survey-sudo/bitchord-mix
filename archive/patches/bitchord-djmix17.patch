@@ -1,0 +1,681 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 351f0ac..db92d9e 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -594,6 +594,8 @@ class CrossfadeController(
+     private var lastRejectedLogKey: String? = null
+     private var lastEmittedPlanVerdict: String? = null
+     private var lastFallbackLogKey: String? = null
++    /** djmix17: dedup key for begin() arm-death telemetry. */
++    private var lastArmDeathKey: String? = null
+     /** djmix13: wall of the most recent (re)plan, for arm-death accounting. */
+     private var lastPlanStartedAtMs = 0L
+     /** djmix13: shown loop pair that just failed; the loop is skipped for it. */
+@@ -987,6 +989,7 @@ class CrossfadeController(
+         lastRejectedLogKey = null
+         lastEmittedPlanVerdict = null
+         lastFallbackLogKey = null
++        lastArmDeathKey = null
+         loopSuppressedPair = null
+         loopSuppressedUntil = 0L
+         AppSettings.smartTransitionWindow.value = null
+@@ -1502,8 +1505,12 @@ class CrossfadeController(
+                     pinnedCatchUpKey = key
+                     pinnedCatchUpPlan = plan
+                 }
+-            } else if (pinnedCatchUpKey != null && !plan.reason.endsWith(":catch-up")) {
+-                // Non-catch-up plan for a new pair/epoch: drop the pin.
++            } else if (pinnedCatchUpKey != null && !plan.reason.endsWith(":catch-up") && !plan.blocked) {
++                // djmix17: ANY valid non-catch-up plan drops the pin —
++                // new pair, same pair after an interior -> final anchor
++                // flip (Never Let Go seq368 181.6 s) or a backward seek.
++                // A blocked plan never arms anyway, so it keeps the pin
++                // until a valid plan arrives.
+                 if (com.music.bitchord.playback.smart.CatchUpPins.dropOnNonCatchUp(pinnedCatchUpKey, pKey)) {
+                     pinnedCatchUpKey = null
+                     pinnedCatchUpPlan = null
+@@ -1643,8 +1650,24 @@ class CrossfadeController(
+             plannedTransition = currentItem.mediaId to loopStartMs
+             holdAhead(player, duration)
+             if (loopStartMs - player.currentPosition > blendArmLeadMs) return
+-            beginLoop(player, loop, currentItem, nextItem, duration, nextDuration)
+-            return
++            // djmix17: beginLoop reports failure instead of being a
++            // dead end — on false, fall straight through to classic
++            // begin() below on this same tick (Never Let Go: beginLoop
++            // silently returned on inPort==null and the unconditional
++            // return below starved classic to dry EOF).
++            if (beginLoop(player, loop, currentItem, nextItem, duration, nextDuration)) return
++            // djmix17-harden: beginLoop refused this tick (guard emitted
++            // mix.loop.fallback + suppressed the pair). The loop's atom is
++            // now classic's: drop the loop cache so a stale loopPlanned /
++            // loopScript / key cannot shadow the classic plan next tick,
++            // and clear the placeholder plannedTransition that pointed at
++            // loopStartMs — classic overwrites it with its own start below
++            // (or leaves null if blocked, never a stale loop target).
++            loop = null
++            loopPlanned = null
++            loopScript = null
++            loopPlanKey = null
++            plannedTransition = null
+         }
+         if (phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING) return
+         discardPrime()
+@@ -1959,9 +1982,10 @@ class CrossfadeController(
+     ): Boolean {
+         val out = active()
+         val into = standby()
+-        if (out === into) return false
++        // djmix17: no silent arm failures — count every guard exit.
++        if (out === into) return armDeath("same-player")
+         val nextIndex = out.nextMediaItemIndex
+-        if (nextIndex == C.INDEX_UNSET || nextIndex >= out.mediaItemCount) return false
++        if (nextIndex == C.INDEX_UNSET || nextIndex >= out.mediaItemCount) return armDeath("no-next-index")
+         plannedNextId = out.getMediaItemAt(nextIndex).mediaId
+         // The last blend's stretch, if it is somehow still easing off: this
+         // player is about to be the outgoing side of a new one.
+@@ -3634,7 +3658,29 @@ class CrossfadeController(
+         startLoopBuild(key, plan, player, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = false)
+     }
+ 
+-    /** Attaches decks that were primed ahead of time, or keeps waiting on the build already running. */
++    /**
++     * djmix17: counts a classic begin() guard exit (deduped per reason so
++     * a 4 Hz retry does not spam the JSONL) and returns false.
++     */
++    private fun armDeath(reason: String): Boolean {
++        val key = "$reason|${phase.name}"
++        if (key != lastArmDeathKey) {
++            lastArmDeathKey = key
++            AutomixTelemetry.event(
++                "mix.arm.death",
++                mapOf("reason" to reason, "phase" to phase.name, "msSincePlan" to (SystemClock.elapsedRealtime() - lastPlanStartedAtMs)),
++            )
++        }
++        return false
++    }
++
++    /**
++     * Attaches decks that were primed ahead of time, or keeps waiting on
++     * the build already running. djmix17: returns true when the loop
++     * armed or is still building (LOOP_ARMING holds), false when a guard
++     * refuses — the caller then falls straight through to classic
++     * begin() on the same tick instead of returning and starving it.
++     */
+     private fun beginLoop(
+         out: ExoPlayer,
+         plan: LoopMix.Plan,
+@@ -3642,13 +3688,24 @@ class CrossfadeController(
+         inItem: MediaItem,
+         durationMs: Long,
+         nextDurationMs: Long,
+-    ) {
++    ): Boolean {
+         val into = standby()
+-        if (out === into) return
++        fun refuse(reason: String): Boolean {
++            val pairKey = "${outItem.mediaId}->${inItem.mediaId}"
++            val key = "beginLoop:$reason|$pairKey"
++            if (key != lastFallbackLogKey) {
++                lastFallbackLogKey = key
++                AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
++            }
++            loopSuppressedPair = pairKey
++            loopSuppressedUntil = SystemClock.elapsedRealtime() + LOOP_SUPPRESSION_MS
++            return false
++        }
++        if (out === into) return refuse("same-player")
+         val nextIndex = out.nextMediaItemIndex
+-        if (nextIndex == C.INDEX_UNSET) return
+-        val outPort = loopPortOf(out) ?: return
+-        val inPort = loopPortOf(into) ?: return
++        if (nextIndex == C.INDEX_UNSET) return refuse("no-next-index")
++        val outPort = loopPortOf(out) ?: return refuse("no-out-port")
++        val inPort = loopPortOf(into) ?: return refuse("no-in-port")
+         endEase(clickless = false)
+         MixDebug.reset()
+         phase = Phase.LOOP_ARMING
+@@ -3668,17 +3725,26 @@ class CrossfadeController(
+             primedKey = null
+             Log.d(TAG, "loop decks were ready ${loopTargetStartMs - out.currentPosition}ms ahead")
+             armLoop(ready, out, into, nextIndex, outPort, inPort)
+-            return
++            return true
+         }
+         if (primeJob?.isActive == true && primedKey == key) {
++            // djmix17-harden: a prime started while paused (or before any
++            // deadline existed) leaves NO_DEADLINE (or 0L); without an
++            // in-force wall deadline driveLoopArming's lateness math is
++            // blind until the watchdog. Recompute if missing so a slow
++            // hung primeJob is still judged against this loop's wall.
++            if (deckTiming.deadlineMs == DeckBudget.NO_DEADLINE_MS || deckTiming.deadlineMs <= 0L) {
++                deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
++            }
+             Log.d(TAG, "loop decks still building ${loopTargetStartMs - out.currentPosition}ms ahead")
+-            return
++            return true
+         }
+         // djmix15: fresh build — drop any stale spans/deadline from a prior
+         // pair before installing this build's wall deadline.
+         deckTiming.clear()
+         deckTiming.deadlineMs = DeckBudget.deadlineMs(SystemClock.elapsedRealtime(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+         startLoopBuild(key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = true)
++        return true
+     }
+ 
+     private fun startLoopBuild(
+@@ -3756,12 +3822,20 @@ class CrossfadeController(
+                     }
+                 }
+                 phase == Phase.LOOP_ARMING && outgoing === out -> {
+-                    primedSession = session
++                    // djmix17-harden: a prime launched with armWhenReady=
++                    // false that lands while beginLoop already holds
++                    // LOOP_ARMING must arm (or shift) NOW, not stash
++                    // primedSession for a considerSmartTransition that
++                    // never runs again (tick goes to driveLoopArming).
++                    // Mirrors the armWhenReady branch: port-less builds
++                    // shift/fall back instead of sitting stashed.
+                     val nextIndex = out.nextMediaItemIndex
+                     val outPort = loopPortOf(out)
+                     val inPort = loopPortOf(into)
+-                    if (nextIndex != C.INDEX_UNSET && outPort != null && inPort != null) {
+-                        primedSession = null
++                    if (nextIndex == C.INDEX_UNSET || outPort == null || inPort == null) {
++                        session.close()
++                        shiftLoopOrFallback(out)
++                    } else {
+                         primedKey = null
+                         armLoop(session, out, into, nextIndex, outPort, inPort)
+                     }
+@@ -3952,6 +4026,29 @@ class CrossfadeController(
+         if (!out.playWhenReady) return loopBail("paused before the loop")
+         val session = loopSession
+         if (session == null) {
++            // djmix17-harden: a build that finished while LOOP_ARMING but
++            // stashed primedSession (port race) would otherwise strand:
++            // considerSmartTransition never runs again. Pick it up here
++            // before any shift/fallback verdict.
++            if (primedSession != null && loopTarget != null && loopOutItem != null && loopInItem != null && incoming != null) {
++                val plan0 = loopTarget!!
++                val outItem0 = loopOutItem!!
++                val inItem0 = loopInItem!!
++                val into0 = incoming!!
++                val sr0 = loopPortOf(out)?.sampleRate ?: 0
++                if (sr0 > 0 && primedKey == primeKey(plan0, outItem0, inItem0, sr0)) {
++                    val ready0 = primedSession!!
++                    val outPort0 = loopPortOf(out)
++                    val inPort0 = loopPortOf(into0)
++                    val nextIdx0 = out.nextMediaItemIndex
++                    if (outPort0 != null && inPort0 != null && nextIdx0 != C.INDEX_UNSET) {
++                        primedSession = null
++                        primedKey = null
++                        armLoop(ready0, out, into0, nextIdx0, outPort0, inPort0)
++                        return
++                    }
++                }
++            }
+             // A build that is still running gets to finish: cancelling it on
+             // the bar would throw away the decode that is about to land. Once
+             // it has stopped and this bar's splice can no longer be armed, the
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 5348ef6..fc40215 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 58
+-extra["bitchordVersionName"] = "2.2.2-djmix16"
++extra["bitchordVersionCode"] = 59
++extra["bitchordVersionName"] = "2.2.3-djmix17"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+index 23302ad..40cfaba 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CatchUpPlanner.kt
+@@ -165,8 +165,8 @@ object CatchUpPlanner {
+  * pushed transitionStart forward every tick (fadeSec 4.59 -> 3.98 ->
+  * 2.26 -> 1.2 on Never Let Go -> S.A.D) and kept `remaining` at +900 ms
+  * so pos never caught the start. The caller drops the pin on pair or
+- * scrubEpoch change; the pin otherwise holds until the mix arms or a
+- * non-catch-up plan for a new pair arrives.
++ * scrubEpoch change; the pin otherwise holds until the mix arms or any
++ * valid non-catch-up plan arrives (djmix17).
+  */
+ object CatchUpPins {
+     /** Key for a pair at a scrub epoch. */
+@@ -196,7 +196,17 @@ object CatchUpPins {
+         return pinned
+     }
+ 
+-    /** True when a non-catch-up plan for a new pair drops the pin. */
++    /**
++     * True when a valid non-catch-up plan drops the pin. ANY such plan
++     * drops it — new pair, or the same pair after an interior -> final
++     * anchor flip or a backward seek. While the playhead is past the
++     * anchor, planTransition ALWAYS returns :catch-up, so a same-pair
++     * non-catch-up plan can only mean transitionStart moved AHEAD of
++     * playbackTime; keeping the old pin would resurrect a stale
++     * interior-anchor catch-up when the new anchor is later crossed
++     * (Never Let Go: seq368 final anchor 181.6 s non-catch-up, then
++     * seq369 reused the stale 164.6 s interior pin).
++     */
+     fun dropOnNonCatchUp(pinnedKey: String?, pairKey: String): Boolean =
+-        pinnedKey != null && !pinnedKey.startsWith("$pairKey|")
++        pinnedKey != null
+ }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index 756c8be..1942fb3 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -307,12 +307,13 @@ object LoopMix {
+      * 4.5 s: the old <4.5 s gate left <4 s to buffer a cold HTTP
+      * ExoPlayer standby for a 9.1 s DJ_FILTER blend. Yield when the
+      * loop start is within [max] (8.5 s decode floor, the learned arm
+-     * lead, or 25 s while the next stream warms) and the loop is cold
+-     * and not actively building. Fast-ready or actively-building loops
+-     * never yield here — the active build may still land. Never Let Go
+-     * -> S.A.D (prime requires a complete rendition that never
+-     * completes inside the 47 s window) yields at ~25-35 s before the
+-     * loop so classic gets its full arm.
++     * lead, or 25 s while the next stream warms) and the loop is cold.
++     * Fast-ready loops never yield (decks already in RAM). djmix17:
++     * actively-building loops may run while still outside the hard
++     * cold-build deadline (14 s while the next stream warms, 10 s when
++     * ready), but a slow/hung primeJob yields inside that deadline —
++     * riding it to dry EOF starved classic begin() on Never Let Go ->
++     * S.A.D.
+      */
+     fun shouldYieldColdLoop(
+         loopStartMs: Long,
+@@ -322,9 +323,26 @@ object LoopMix {
+         blendArmLeadMs: Long,
+         nextStreamReady: Boolean,
+     ): Boolean {
+-        if (fastReady || building) return false
++        // Decks already in RAM: never yield, even inside the deadline.
++        if (fastReady) return false
++        val remainingMs = loopStartMs - currentPositionMs
++        if (building) {
++            // djmix17: an active build may run during the outer prime
++            // window (> hard deadline before loopStart), but a slow or
++            // hung primeJob must not ride to dry EOF. Once within the
++            // hard cold-build deadline (14 s while the next stream warms,
++            // 10 s when ready; never below the 6.5 s floor) yield so
++            // classic begin() still has >= 6.5 s to buffer and blend.
++            // djmix17-harden: 10 s (ready) / 14 s (warming) instead of
++            // 8.5/12 — if contentEnd sits ~3 s before loopStart (silence
++            // tail), a yield at 8.5 s before loopStart leaves only 5.5 s
++            // to contentEnd, marginal for a cold classic arm. 10/14
++            // leaves 7/11 s.
++            val hardDeadlineMs = maxOf(if (nextStreamReady) 10_000L else 14_000L, 6_500L)
++            return remainingMs <= hardDeadlineMs
++        }
+         val lead = maxOf(8_500L, blendArmLeadMs, if (!nextStreamReady) 25_000L else 0L)
+-        return loopStartMs - currentPositionMs <= lead
++        return remainingMs <= lead
+     }
+ 
+     private fun mixPlan(
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix16RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix16RegressionTest.kt
+index 6aba7e7..77e83a0 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix16RegressionTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix16RegressionTest.kt
+@@ -98,10 +98,10 @@ class Djmix16RegressionTest {
+         assertNull(CatchUpPins.reuse(pinned, keyA, CatchUpPins.key("c->d", 1L)), "new pair must not reuse")
+         // Non-catch-up for a new pair drops the pin.
+         assertTrue(CatchUpPins.dropOnNonCatchUp(keyA, "c->d"))
+-        // Same-pair non-catch-up is handled by the caller's key check (kept
+-        // until the pinned start passes in djmix15); the helper only drops
+-        // across pairs.
+-        assertFalse(CatchUpPins.dropOnNonCatchUp(keyA, "a->b"))
++        // djmix17: same-pair non-catch-up ALSO drops (interior -> final
++        // anchor flip, Never Let Go seq368 181.6 s). The stale 164.6 s
++        // interior pin resurfaced when the new anchor was crossed (seq369).
++        assertTrue(CatchUpPins.dropOnNonCatchUp(keyA, "a->b"))
+         assertFalse(CatchUpPins.dropOnNonCatchUp(null, "a->b"))
+     }
+ 
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix17RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix17RegressionTest.kt
+new file mode 100644
+index 0000000..fdc209d
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix17RegressionTest.kt
+@@ -0,0 +1,192 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix17 regression: the Never Let Go skip residuals.
++ *
++ * Bug A (seq365..369): `loop` stayed non-null across 160..193.6 s
++ * while a hung primeJob (`building == true`) blocked
++ * shouldYieldColdLoop (`if (fastReady || building) return false`) —
++ * and even past the deadline, beginLoop's silent `return` pairs with
++ * the caller's unconditional `return` starved classic begin() to EOF.
++ * Bug B (seq367->368->369): interior-anchor catch-up pin (164.6 s)
++ * survived the final-anchor non-catch-up plan (181.6 s) because
++ * dropOnNonCatchUp only dropped across pairs; seq369 then reused the
++ * 18-second-stale pin instead of pinning a fresh 182.9 s catch-up.
++ * Bug C: AnalysisStore never persisted `quality`, so every track
++ * restored after a restart reported quality="none".
++ *
++ * Scalars only: positions, leads and pins. No audio crosses.
++ */
++class Djmix17RegressionTest {
++
++    // ---- Bug A: building yields inside the hard deadline ----
++
++    @Test fun buildingYieldsInsideHardDeadline() {
++        // Never Let Go -> S.A.D shape: loopStart ~193 s.
++        val loopStartMs = 193_000L
++        val blendLead = 20_000L
++        // 25 s out while building: still allowed to run (prime window).
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 168_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "building 25 s out must be allowed to run",
++        )
++        // djmix17-harden: 14 s cold (next stream warms): hard deadline, must yield.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 179_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "building 14 s out cold must yield (hard deadline 10/14)",
++        )
++        // 12 s cold: inside 14 s, must yield.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 181_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "building 12 s out cold must yield (inside 14 s)",
++        )
++        // 15 s cold: outside 14 s, still allowed.
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 178_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "building 15 s out cold must be allowed",
++        )
++        // 10 s warm (next ready): hard deadline, must yield.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 183_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = true),
++            "building 10 s out warm must yield (hard deadline 10/14)",
++        )
++        // 8.5 s warm: inside 10 s, must yield.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 184_500L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = true),
++            "building 8.5 s out warm must yield (inside 10 s)",
++        )
++        // 11 s warm: outside 10 s, still allowed.
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 182_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = true),
++            "building 11 s out warm must be allowed",
++        )
++        // Fast-ready never yields, even 0.5 s out with a build running.
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 192_500L, fastReady = true, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "fast-ready must never yield, even inside the deadline",
++        )
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 192_500L, fastReady = true, building = false, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "fast-ready must never yield",
++        )
++    }
++
++    // ---- Bug B: anchor flip drops the stale pin ----
++
++    private fun catchUp(startSec: Double, fadeSec: Double = 4.0): TransitionPlan =
++        TransitionPlan(
++            shouldStart = false,
++            markerVisible = true,
++            blocked = false,
++            reason = "smart-duration:catch-up",
++            transitionStart = startSec,
++            transitionEnd = startSec + fadeSec,
++            fadeSeconds = fadeSec,
++            transitionStyle = TransitionStyle.DJ_FILTER,
++            incomingCueTime = 0.0,
++        )
++
++    @Test fun anchorFlipDropsStaleInteriorPinThenPinsFreshFinalCatchUp() {
++        val pair = "never->sad"
++        // seq367 (163.7 s): interior-anchor catch-up pins start 164.6 s.
++        val interiorPin = catchUp(164.6, 4.5935)
++        val interiorKey = CatchUpPins.key(pair, 0L)
++        // Pin/reuse round-trip: same key returns the interior pin.
++        val reusedInterior = CatchUpPins.reuse(interiorPin, interiorKey, interiorKey)
++        assertNotNull(reusedInterior)
++        assertEquals(164.6, reusedInterior.transitionStart, 1e-9)
++
++        // seq368 (181.1 s): final-anchor plan is valid and NOT :catch-up.
++        // The helper must drop the stale interior pin on the same pair.
++        assertTrue(
++            CatchUpPins.dropOnNonCatchUp(interiorKey, pair),
++            "same-pair valid non-catch-up (interior->final flip) must drop the pin",
++        )
++        // After the drop the caller holds null: the next catch-up for the
++        // same key is NOT reused from the stale interior pin.
++        assertNull(
++            CatchUpPins.reuse(null, null, interiorKey),
++            "after the drop, reuse must miss so the fresh plan is stored",
++        )
++
++        // seq369 (182.0 s): fresh final-anchor catch-up start 182.9 s.
++        // It must pin (not resurrect 164.6) and then hold.
++        val finalCatchUp = catchUp(182.9, 4.5935)
++        val fresh = CatchUpPins.reuse(null, null, interiorKey)
++        assertNull(fresh, "fresh catch-up must not reuse a dropped interior pin")
++        // Caller stores the fresh plan under the key.
++        var pinnedKey: String? = interiorKey
++        var pinned = finalCatchUp
++        val reusedFinal = CatchUpPins.reuse(pinned, pinnedKey, interiorKey)
++        assertNotNull(reusedFinal)
++        assertEquals(182.9, reusedFinal!!.transitionStart, 1e-9, "new pin must be the 182.9 s final catch-up, not the stale 164.6 s interior pin")
++        pinned = reusedFinal // caller holds the fresh pin
++        assertEquals(182.9, pinned.transitionStart, 1e-9)
++        assertEquals(4.5935, pinned.fadeSeconds, 1e-9)
++        pinnedKey = interiorKey
++        assertEquals(interiorKey, pinnedKey) // key stable across the flip
++    }
++
++    // ---- djmix17-harden: contentEnd-tail margin ----
++    //
++    // Never Let Go: duration 193.641 s, contentEnd ~190.7 s (silence tail),
++    // loopStart a few seconds after contentEnd in the worst case. A build
++    // that yields at 10 s (ready) / 14 s (warming) before loopStart still
++    // leaves 7/11 s before contentEnd, enough for classic to arm. The
++    // 8.5/12 deadlines left only 5.5/9 s.
++
++    @Test fun buildingYieldLeavesClassicMarginBeforeContentEnd() {
++        // loopStart 193 s, contentEnd 190.7 s (2.3 s tail skew).
++        val loopStartMs = 193_000L
++        val contentEndMs = 190_700L
++        val blendLead = 20_000L
++        // Yield points: pos = loopStart - 10 s (warm) / -14 s (cold).
++        val warmYieldPos = loopStartMs - 10_000L // 183 s
++        val coldYieldPos = loopStartMs - 14_000L // 179 s
++        // Margins to contentEnd: 7.7 s warm, 11.7 s cold.
++        assertTrue(contentEndMs - warmYieldPos >= 7_000L, "warm yield must leave >=7 s to contentEnd")
++        assertTrue(contentEndMs - coldYieldPos >= 11_000L, "cold yield must leave >=11 s to contentEnd")
++        // Both yield at those positions.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, warmYieldPos, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = true),
++            "warm yield point must yield",
++        )
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, coldYieldPos, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "cold yield point must yield",
++        )
++        // Just outside each deadline the build may still run.
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, warmYieldPos - 1_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = true),
++            "11 s out warm must still run",
++        )
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, coldYieldPos - 1_000L, fastReady = false, building = true, blendArmLeadMs = blendLead, nextStreamReady = false),
++            "15 s out cold must still run",
++        )
++    }
++
++    @Test fun coldNonBuildingYieldsAtFullArmLead() {
++        // Non-building cold loops keep the full lead (blendArmLead 20 s,
++        // 25 s while the stream warms, floor 8.5 s) — strictly earlier
++        // than any building yield, so classic always gets its buffer.
++        val loopStartMs = 193_000L
++        // 20 s out cold-warming: inside 25 s lead, must yield.
++        assertTrue(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 173_000L, fastReady = false, building = false, blendArmLeadMs = 20_000L, nextStreamReady = false),
++            "non-building cold 20 s out warming must yield",
++        )
++        // 30 s out warm: outside 20 s lead, must not yield.
++        assertFalse(
++            LoopMix.shouldYieldColdLoop(loopStartMs, 163_000L, fastReady = false, building = false, blendArmLeadMs = 20_000L, nextStreamReady = true),
++            "non-building warm 30 s out must not yield",
++        )
++    }
++}
+diff --git a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/AnalysisStore.kt b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/AnalysisStore.kt
+index a4abfa6..7439707 100644
+--- a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/AnalysisStore.kt
++++ b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/AnalysisStore.kt
+@@ -203,6 +203,9 @@ class AnalysisStore(
+         val tailBeats: StoredBeats? = null,
+         val vocalWindows: List<StoredCurve> = emptyList(),
+         val levelWindows: List<StoredCurve> = emptyList(),
++        // djmix17: analysis coverage (none/head/full). Older JSON has no
++        // field; [toAnalysis] infers it from full-analysis markers.
++        val quality: String = "",
+     ) {
+         fun toAnalysis(trackId: String) = TrackAnalysis(
+             status = TrackAnalysis.STATUS_READY,
+@@ -233,8 +236,20 @@ class AnalysisStore(
+             tailBeats = tailBeats?.toSide(),
+             vocalWindows = vocalWindows.map { it.toWindow() },
+             levelWindows = levelWindows.map { it.toWindow() },
++            quality = inferredQuality(),
+         )
+ 
++        /**
++         * Stored quality when present; else infer from full-analysis
++         * markers so JSON written before djmix17 (no field) still restores
++         * quality="full" instead of the "none" default.
++         */
++        private fun inferredQuality(): String {
++            if (quality.isNotBlank()) return quality
++            if (energyCurve.isNotEmpty() || tailBeats != null) return TrackAnalysis.QUALITY_FULL
++            return TrackAnalysis.QUALITY_NONE
++        }
++
+         companion object {
+             fun of(analysis: TrackAnalysis) = Stored(
+                 duration = analysis.duration,
+@@ -263,6 +278,7 @@ class AnalysisStore(
+                 tailBeats = analysis.tailBeats?.let(StoredBeats::of),
+                 vocalWindows = analysis.vocalWindows.map(StoredCurve::of),
+                 levelWindows = analysis.levelWindows.map(StoredCurve::of),
++                quality = analysis.quality,
+             )
+         }
+     }
+diff --git a/shared/src/jvmTest/kotlin/com/music/bitchord/playback/smart/Djmix17QualityTest.kt b/shared/src/jvmTest/kotlin/com/music/bitchord/playback/smart/Djmix17QualityTest.kt
+new file mode 100644
+index 0000000..7f7fed3
+--- /dev/null
++++ b/shared/src/jvmTest/kotlin/com/music/bitchord/playback/smart/Djmix17QualityTest.kt
+@@ -0,0 +1,92 @@
++package com.music.bitchord.playback.smart
++
++import java.nio.file.Files
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix17 Bug C: AnalysisStore must persist `quality`, so an analysed
++ * track keeps quality="full" across an app restart instead of loading
++ * back as quality="none".
++ *
++ * In shared JVM tests because [AnalysisStore] is jvmSharedMain.
++ */
++class Djmix17QualityTest {
++
++    private fun tmpStore(): Pair<AnalysisStore, java.io.File> {
++        val root = Files.createTempDirectory("djmix17-quality").toFile()
++        root.deleteOnExit()
++        return AnalysisStore { root } to root
++    }
++
++    private fun fullAnalysis() = TrackAnalysis(
++        status = TrackAnalysis.STATUS_READY,
++        trackId = "never-let-go",
++        duration = 195.0,
++        bpm = 104.5,
++        beatConfidence = 0.9,
++        firstBeat = 0.5,
++        downbeats = listOf(0.5, 1.8),
++        energyCurve = listOf(EnergySample(0.0, 0.5), EnergySample(10.0, 0.7)),
++        tailBeats = BeatSide(beats = listOf(180.0, 181.0), downbeats = listOf(180.0), bpm = 104.5, confidence = 0.9),
++        quality = TrackAnalysis.QUALITY_FULL,
++    )
++
++    @Test fun qualityPersistsAcrossSaveLoad() {
++        val (store, _) = tmpStore()
++        store.save("never-let-go", fullAnalysis())
++        val loaded = store.load("never-let-go")
++        assertNotNull(loaded, "saved analysis must load")
++        assertEquals(TrackAnalysis.QUALITY_FULL, loaded.quality, "quality=full must survive the round-trip")
++        assertEquals(104.5, loaded.bpm, 1e-9)
++    }
++
++    @Test fun legacyJsonWithoutQualityInfersFull() {
++        val (store, root) = tmpStore()
++        store.save("never-let-go", fullAnalysis())
++        val dir = java.io.File(root, "smart_analysis")
++        val file = dir.listFiles()?.firstOrNull { it.name.endsWith(".json") }
++        assertNotNull(file, "save must write a JSON entry")
++        // Strip the quality field to mimic pre-djmix17 JSON.
++        val legacy = file.readText().replace("\"quality\":\"full\"", "\"quality\":\"\"", )
++        assertTrue(!legacy.contains("\"quality\":\"full\""), "legacy JSON must not carry quality=full")
++        file.writeText(legacy)
++        val loaded = store.load("never-let-go")
++        assertNotNull(loaded, "legacy JSON must still load")
++        assertEquals(
++            TrackAnalysis.QUALITY_FULL, loaded.quality,
++            "legacy entry with energyCurve/tailBeats must infer quality=full",
++        )
++    }
++
++    @Test fun legacyJsonWithoutMarkersInfersNone() {
++        val (store, root) = tmpStore()
++        store.save(
++            "head-only",
++            TrackAnalysis(
++                status = TrackAnalysis.STATUS_READY,
++                trackId = "head-only",
++                duration = 200.0,
++                bpm = 120.0,
++                beatConfidence = 0.8,
++                headBeats = BeatSide(beats = listOf(0.5), downbeats = listOf(0.5), bpm = 120.0, confidence = 0.8),
++                quality = TrackAnalysis.QUALITY_HEAD,
++            ),
++        )
++        val dir = java.io.File(root, "smart_analysis")
++        val file = dir.listFiles()?.firstOrNull { it.name.endsWith(".json") }
++        assertNotNull(file, "save must write a JSON entry")
++        // Strip quality so inference must decide from markers (none here).
++        val legacy = file.readText().replace("\"quality\":\"head\"", "\"quality\":\"\"")
++        assertTrue(!legacy.contains("\"quality\":\"head\""), "legacy JSON must not carry quality=head")
++        file.writeText(legacy)
++        val loaded = store.load("head-only")
++        assertNotNull(loaded, "legacy head-only JSON must load")
++        assertEquals(
++            TrackAnalysis.QUALITY_NONE, loaded.quality,
++            "without full markers the inference must be none, never false full",
++        )
++    }
++}

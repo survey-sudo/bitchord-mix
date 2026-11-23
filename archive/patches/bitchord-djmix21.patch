@@ -1,0 +1,977 @@
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 52b8b3f..c726210 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 62
+-extra["bitchordVersionName"] = "2.2.3-djmix20"
++extra["bitchordVersionCode"] = 63
++extra["bitchordVersionName"] = "2.2.3-djmix21"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
+index 78ebfb0..6c078d7 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/CuePoints.kt
+@@ -323,6 +323,14 @@ object CuePoints {
+             val build = map.sections.firstOrNull { it.fn == SectionFn.BUILD }
+             if (build != null) found.add(entry(map, EntryKind.BUILD, build.startBar, build.endBar, map.sectionAt(build.endBar)?.fn ?: SectionFn.CHORUS))
+         }
++        // djmix21 structure-aware: a labelled head buildup/pre-chorus is its own
++        // entry cue whatever the start kind, so the planner can play B's
++        // buildup under A's outro and land the peak at handover.
++        val headBuild = StructureMix.headBuildup(map)
++        if (headBuild != null && found.none { it.startBar == headBuild.startBar && it.kind == EntryKind.BUILD }) {
++            found.add(entry(map, EntryKind.BUILD, headBuild.startBar, headBuild.endBar,
++                map.sectionAt(headBuild.endBar)?.fn ?: SectionFn.CHORUS))
++        }
+         if (map.startKind == StartKind.ACAPELLA) {
+             val beat = map.sections.firstOrNull { it.role == SectionRole.GROOVE || it.bass >= 0.25f }
+             val land = beat?.startBar ?: landing.first
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+index abcc571..de15bdf 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/DjMix.kt
+@@ -69,7 +69,9 @@ fun buildupFits(
+         inSection == SectionKind.CHORUS ||
+         inSection == SectionKind.INST ||
+         inSection == SectionKind.INTRO ||
+-        inSection == SectionKind.PRE_CHORUS
++        inSection == SectionKind.PRE_CHORUS ||
++        inSection == SectionKind.BUILD ||
++        inSection == SectionKind.DROP
+     if (!intoLift) return false
+     if (outSection == SectionKind.PRE_CHORUS) return true
+     if (outSection == SectionKind.INST && energyRise >= 1.12) return true
+@@ -145,7 +147,7 @@ object DjMix {
+         }
+         val outAt = sectionAt(outSections, next.transitionEnd)?.kind
+         val inAt = sectionAt(inSections, next.incomingCueTime)?.kind
+-        val build = buildupFits(
++        var build = buildupFits(
+             next.transitionStyle,
+             next.vocalOverlap,
+             handoff,
+@@ -153,6 +155,17 @@ object DjMix {
+             inAt,
+             energyRise(analysis, next.transitionStart, next.transitionEnd),
+         )
++        // djmix21 buildup-aware: the incoming track's own rise counts too. A
++        // cue inside B's buildup/pre-chorus — or inside a quiet INTRO that
++        // then rises (mirrors the A-side INST branch in buildupFits) — is a
++        // buildup blend even when A's side alone would not read as one.
++        if (!build && next.transitionStyle == TransitionStyle.DJ_BLEND && !handoff &&
++            next.vocalOverlap < 0.35 &&
++            (inAt == SectionKind.PRE_CHORUS || inAt == SectionKind.BUILD || inAt == SectionKind.INTRO)
++        ) {
++            val inRise = energyRise(nextAnalysis, next.incomingCueTime, next.incomingCueTime + next.fadeSeconds)
++            if (inRise >= PhraseConfig.BUILDUP_RISE_MIN) build = true
++        }
+         if (build && next.djEffect != DjEffect.LOOP_ROLL && next.djEffect != DjEffect.REVERB) {
+             next = next.copy(djEffect = DjEffect.FLANGER)
+         }
+@@ -188,10 +201,21 @@ object DjMix {
+         var start = plan.transitionStart
+         var cue = plan.incomingCueTime
+         if (lyricsOut.isNotEmpty()) {
++            // djmix21 mid-vocal guard: never end A mid-line on a blend. Extend
++            // to the line end when it is within LYRIC_EXTENSION_MAX_SEC, else
++            // move the exit to before the line instead of amputating it.
+             val cut = lyricsOut.firstOrNull { end > it.startSec + 0.4 && end < it.endSec - 0.4 }
+-            if (cut != null && cut.endSec > start + 1.0) end = cut.endSec
++            if (cut != null) {
++                if (cut.endSec - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC && cut.endSec > start + 1.0) {
++                    end = cut.endSec
++                } else if (cut.startSec > start + 1.0 && cut.startSec >= start) {
++                    end = cut.startSec
++                }
++            }
+             val chorus = outSections.lastOrNull { it.kind == SectionKind.CHORUS && end > it.start + 1.0 && end < it.end - 1.0 }
+-            if (chorus != null && chorus.end > start + 1.0 && chorus.end <= analysis.contentEndTime + 1.0) {
++            if (chorus != null && chorus.end > start + 1.0 && chorus.end <= analysis.contentEndTime + 1.0 &&
++                chorus.end - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC
++            ) {
+                 end = chorus.end
+             }
+             // Leave at the end of the phrase we are in: a verse, a pre-chorus,
+@@ -199,7 +223,8 @@ object DjMix {
+             val here = sectionAt(outSections, end)
+             if (here != null && here.kind != SectionKind.INTRO && here.kind != SectionKind.OUTRO &&
+                 end > here.start + 0.8 && end < here.end - 0.4 &&
+-                here.end > start + 1.0 && here.end <= analysis.contentEndTime + 1.0
++                here.end > start + 1.0 && here.end <= analysis.contentEndTime + 1.0 &&
++                here.end - end <= PhraseConfig.LYRIC_EXTENSION_MAX_SEC
+             ) {
+                 end = here.end
+             }
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+index 8e4ae85..8ddab07 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+@@ -118,6 +118,15 @@ object PhraseConfig {
+     const val LIFT_MIN_ENERGY = 5
+     const val BALLAD_ENERGY = 0.3f
+ 
++    /** djmix21 vocal continuity: a seam may not play more than this many
++     * continuous no-vocal bars without trimming the entry or shortening. */
++    const val VOCAL_GAP_SOFT_BARS = 8
++    const val VOCAL_GAP_HARD_BARS = 16
++    /** djmix21 mid-line guard: extend to the line/section end by at most this. */
++    const val LYRIC_EXTENSION_MAX_SEC = 6.0
++    /** djmix21 buildup: late/early energy ratio that counts as rising. */
++    const val BUILDUP_RISE_MIN = 1.12
++
+     const val PLAN_LEAD_SEC = 60.0
+     const val REPLAN_SEC = 5.0
+     const val LOCK_LEAD_SEC = 25.0
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+index 6f6b22a..0f5d1ef 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+@@ -457,6 +457,22 @@ object PhrasePlanner {
+             return "energy jump"
+         }
+         if (template == MixTemplate.VOCAL_OVER_OUTRO && ((steps ?: 9) > 1 || inn.gridConfidence < 0.8f)) return "vocal outro fit"
++        // djmix21 vocal continuity: no long empty beatmatch across the seam.
++        // Long blends hear the gap; short rungs (echo/cut/vocal-carve) do not,
++        // so vetoing here re-routes to a trimmed entry or a short rung instead
++        // of riding an awkward no-vocal dead zone. Pure instrumental pairs
++        // (no sung-bar evidence either side) are never gapped.
++        if (template in LONG_BLENDS && (out.firstVocalBar != null || inn.firstVocalBar != null)) {
++            val overlap = overlapOf(template, exit, entry, outBpm)
++            val gap = StructureMix.vocalGap(out, inn, exit, entry, overlap).totalBars
++            if (gap > PhraseConfig.VOCAL_GAP_HARD_BARS) return "vocal gap"
++            // Quiet-part waste guard: a long blend into a >50% quiet lead-in
++            // with no buildup/drop/vocal event inside the overlap does nothing.
++            if (StructureMix.quietLeadFraction(inn, entry) > 0.5f) {
++                val eventBar = StructureMix.firstEventBarFromEntry(inn, entry)
++                if (eventBar == null || eventBar - entry.startBar > overlap) return "quiet intro"
++            }
++        }
+         // djmix12 (BK tempo discipline): the relaxed long blend is not exempt
+         // from the 8% cap. Post-fold deltas beyond it downgrade to echo/cut
+         // (M6/M10/M11/CUT_ON_ONE), never a long lurching ramp.
+@@ -469,6 +485,15 @@ object PhrasePlanner {
+     private fun carve(template: MixTemplate) = template == MixTemplate.M4 || template == MixTemplate.M5 ||
+         template == MixTemplate.ROLLING || template == MixTemplate.VOCAL_OVER_OUTRO
+ 
++    /**
++     * djmix21: long blends that hear a no-vocal seam. Echo/cuts/crossfades and
++     * the vocal-carve templates never hear it the same way.
++     */
++    private val LONG_BLENDS = setOf(
++        MixTemplate.M1, MixTemplate.M3, MixTemplate.ROLLING, MixTemplate.M2,
++        MixTemplate.M7, MixTemplate.RELAXED, MixTemplate.M9,
++    )
++
+     private fun vocalClashBeats(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Double {
+         val bars = minOf(exit.roomBars, entry.leadInBars, PhraseConfig.O_MAX_BARS)
+         var beats = 0
+@@ -515,9 +540,36 @@ object PhrasePlanner {
+         val discardedSections = out.sections.filter { it.endBar > exit.releaseBar && it.fn != SectionFn.OUTRO && it.fn != SectionFn.FADE_OUT && it.fn != SectionFn.SILENCE }
+         val vocalSectionPenalty = if (discardedSections.any { it.vocal > 0.20f }) 0.25 else 0.0
+         val chorusReleasePenalty = if (discardedSections.any { it.fn == SectionFn.CHORUS || it.role == SectionRole.RELEASE }) 0.35 else 0.0
+-        val cost = 0.12 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats + vocalSectionPenalty + chorusReleasePenalty
++        // djmix21 structure scoring (scalars only, each from its own track):
++        // - vocal gap above the soft budget costs, so a trimmable entry or a
++        //   short rung beats a long empty beatmatch;
++        // - a vocal handoff seam (A's last sung bar 1-2 before B's first) pays;
++        // - a cue at the head buildup start pays, a cue missing the buildup
++        //   (started inside it) costs, and a quiet non-spotlight landing costs.
++        // Pure instrumental pairs (no sung-bar evidence either side) are never
++        // gapped: vocal-gap costs/bonuses only apply when at least one side
++        // has sung evidence (djmix21 instrumental-evidence guard).
++        val hasVocalEvidence = out.firstVocalBar != null || inn.firstVocalBar != null
++        val gapBars = if (hasVocalEvidence) StructureMix.vocalGap(out, inn, exit, entry, overlap).totalBars else 0
++        // djmix21: gap above the soft budget is a tie-breaker only (capped at
++        // 0.05) — the hard veto above does the real work for truly long seams.
++        // Uncapped, the cost would cut A's own outro spotlight early to chase
++        // a shorter (but same-landing) overlap.
++        val gapCost = (0.02 * (gapBars - PhraseConfig.VOCAL_GAP_SOFT_BARS).coerceAtLeast(0)).coerceAtMost(0.05)
++        val seam = if (hasVocalEvidence) StructureMix.vocalSeamBars(out, inn, exit, entry) else null
++        val seamBonus = if (seam != null && seam in 1..2) 0.10 else 0.0
++        val buildup = StructureMix.headBuildup(inn)
++        val atBuildupStart = buildup != null && entry.startBar == buildup.startBar
++        val insideBuildup = buildup != null && entry.startBar > buildup.startBar && entry.startBar < buildup.endBar
++        val landingAtPeak = buildup != null && entry.landingBar in buildup.endBar..buildup.endBar + 1
++        val buildupBonus = (if (atBuildupStart) 0.08 else 0.0) + (if (landingAtPeak) 0.05 else 0.0)
++        val quietLanding = !StructureMix.isSpotlight(entry) && StructureMix.quietLeadFraction(inn, entry) > 0.5f
++        val cost = 0.12 * exit.cutsSungBars + 0.01 * exit.cutsBars + 0.015 * entry.trimmedBars + 0.05 * loopRepeats +
++            vocalSectionPenalty + chorusReleasePenalty + gapCost +
++            (if (insideBuildup && !atBuildupStart) 0.15 else 0.0) +
++            (if (quietLanding) 0.15 else 0.0)
+         val total = 0.25 * struct + 0.20 * vocalScore + 0.15 * phrase + 0.15 * energy +
+-            0.10 * length + 0.10 * key + 0.05 * tempo - cost
++            0.10 * length + 0.10 * key + 0.05 * tempo - cost + seamBonus + buildupBonus
+         val (delayName, delay) = PhraseConfig.echoDelayBeats(inBpm, template == MixTemplate.ROLLING)
+         val (rampName, ramp) = PhraseConfig.swapRampMs(template.name)
+         val swap = when (template) {
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongSections.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongSections.kt
+index cd5e445..6eb724e 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongSections.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/SongSections.kt
+@@ -16,6 +16,11 @@ enum class SectionKind {
+     BRIDGE,
+     INST,
+     OUTRO,
++    // djmix21: appended so existing ordinals (and the slot coding below)
++    // never shift. Never painted by labelSections today; the djmix21
++    // buildup logic reads them as incoming lift kinds.
++    BUILD,
++    DROP,
+ }
+ 
+ data class Section(val kind: SectionKind, val start: Double, val end: Double)
+@@ -179,6 +184,8 @@ private val PRIORITY = intArrayOf(
+     6, // BRIDGE, same rank as pre-chorus; painted later so it can sit in a gap
+     3, // INST
+     4, // OUTRO
++    6, // BUILD (djmix21, never painted)
++    7, // DROP (djmix21, never painted)
+ )
+ 
+ private data class LyricBlock(val start: Double, val end: Double, val signature: String)
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureMix.kt
+index e69de29..537bb24 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/StructureMix.kt
+@@ -0,0 +1,157 @@
++package com.music.bitchord.playback.smart
++
++/**
++ * Structure-aware blend helpers (djmix21). Everything here reads one track's
++ * own scalars (bars, sections, sung flags) and returns scalars. No frame is
++ * ever compared across tracks — the caller pairs two scalars and scores them,
++ * which is the US 8,280,539-safe shape the planner already uses.
++ *
++ * Three jobs:
++ *  - vocal-gap budget: how many continuous no-vocal bars a seam would play;
++ *  - buildup detection: the quiet rising section at the head of B;
++ *  - spotlight/energy checks: whether the landing is a real event.
++ */
++object StructureMix {
++
++    /** One track's own bars, consulted independently. */
++    data class GapResult(
++        /** Trailing no-vocal bars on A inside the exit window. */
++        val trailBars: Int,
++        /** Leading no-vocal bars on B from the entry cue. */
++        val leadBars: Int,
++    ) {
++        /** Continuous no-vocal run across the seam, in bars. */
++        val totalBars: Int get() = trailBars + leadBars
++    }
++
++    /**
++     * Trailing instrumental run on A: consecutive non-sung bars ending just
++     * before [ExitCue.releaseBar], looking back at most [overlapBars]. If A
++     * has no sung bar in the window the whole window is gap.
++     */
++    fun trailingNoVocalBars(out: SongMap, exit: ExitCue, overlapBars: Int): Int {
++        val window = overlapBars.coerceAtLeast(0)
++        // djmix21 per-side evidence: a track that never sings has no vocal
++        // gap — its outro is structure, not a dead zone after a vocal.
++        if (out.firstVocalBar == null) return 0
++        var trail = 0
++        var b = exit.releaseBar - 1
++        while (b >= 0 && trail < window) {
++            if (out.sungBars.getOrElse(b) { false }) break
++            trail++
++            b--
++        }
++        return trail
++    }
++
++    /**
++     * Leading instrumental run on B: consecutive non-sung bars from
++     * [EntryCue.startBar] toward the landing, at most [overlapBars]. A first
++     * sung bar (or a chorus/drop event, which the planner treats as landing)
++     * stops the count.
++     */
++    fun leadingNoVocalBars(inn: SongMap, entry: EntryCue, overlapBars: Int): Int {
++        val window = overlapBars.coerceAtLeast(0)
++        // djmix21 per-side evidence: a track that never sings has no intro
++        // vocal gap — its intro is structure, not dead air before a vocal.
++        if (inn.firstVocalBar == null) return 0
++        val event = firstEventBarFromEntry(inn, entry)
++        val cap = if (event != null) (event - entry.startBar).coerceAtLeast(0) else window
++        val limit = minOf(window, cap)
++        var lead = 0
++        var b = entry.startBar
++        while (b < entry.landingBar && lead < limit) {
++            if (inn.sungBars.getOrElse(b) { false }) break
++            lead++
++            b++
++        }
++        return lead
++    }
++
++    /** No-vocal run across the seam for one (exit, entry) candidate. */
++    fun vocalGap(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue, overlapBars: Int): GapResult =
++        GapResult(
++            trailBars = trailingNoVocalBars(out, exit, overlapBars),
++            leadBars = leadingNoVocalBars(inn, entry, overlapBars),
++        )
++
++    /**
++     * Bars between A's last sung bar before the release and B's first sung
++     * bar at/after the entry cue. Positive: A ends that many bars before B
++     * starts (a vocal handoff seam). Negative: the two overlap. Null when
++     * either side carries no sung-bar evidence (pure instrumental pair),
++     * so the seam logic stays out of the way entirely.
++     */
++    fun vocalSeamBars(out: SongMap, inn: SongMap, exit: ExitCue, entry: EntryCue): Int? {
++        val aLast = (0 until exit.releaseBar).lastOrNull { out.sungBars.getOrElse(it) { false } }
++        val bFirst = (entry.startBar until inn.sungBars.size).firstOrNull { inn.sungBars[it] }
++        if (aLast == null || bFirst == null) return null
++        return bFirst - (aLast + 1)
++    }
++
++    /**
++     * Fraction of B's lead-in bars sitting in a quiet section
++     * (energyLevel <= 2: near-silence or a hushed intro half). 0 when there
++     * is no lead-in or no section covers it.
++     */
++    fun quietLeadFraction(inn: SongMap, entry: EntryCue): Float {
++        val bars = entry.leadInBars
++        if (bars <= 0) return 0f
++        var quiet = 0
++        for (b in entry.startBar until entry.landingBar) {
++            val section = inn.sectionAt(b) ?: continue
++            if (section.energyLevel <= 2) quiet++
++        }
++        return quiet.toFloat() / bars
++    }
++
++    /**
++     * First meaningful event at/after the entry cue: the first sung bar, or
++     * the first chorus/drop/build section start, whichever comes first.
++     * Returns absolute bar, or null when B has neither.
++     */
++    fun firstEventBarFromEntry(inn: SongMap, entry: EntryCue): Int? {
++        val sung = (entry.startBar until inn.sungBars.size).firstOrNull { inn.sungBars[it] }
++        val event = inn.sections.firstOrNull {
++            it.startBar >= entry.startBar &&
++                (it.fn == SectionFn.CHORUS || it.fn == SectionFn.DROP || it.fn == SectionFn.BUILD)
++        }
++        return when {
++            sung != null && event != null -> minOf(sung, event.startBar)
++            sung != null -> sung
++            event != null -> event.startBar
++            else -> null
++        }
++    }
++
++    /**
++     * The head buildup on B: the first BUILD or PRE_CHORUS section within the
++     * first 64 bars (a quiet intro rising into chorus/drop/first vocal).
++     * [SongMap] sections carry per-section energy slope, so a rising energy
++     * slope counts even when the label is only INTRO.
++     */
++    fun headBuildup(inn: SongMap): PhraseSection? {
++        val labelled = inn.sections.firstOrNull {
++            it.startBar < PhraseConfig.HEAD_STRUCTURE_BARS &&
++                (it.fn == SectionFn.BUILD || it.fn == SectionFn.PRE_CHORUS)
++        }
++        if (labelled != null) return labelled
++        // Unlabelled but rising: INTRO head with a positive energy slope.
++        return inn.sections.firstOrNull {
++            it.startBar == 0 && it.fn == SectionFn.INTRO && it.energySlope >= 0.12f &&
++                inn.sections.any { s -> s.startBar >= it.endBar && (s.fn == SectionFn.CHORUS || s.fn == SectionFn.DROP) }
++        }
++    }
++
++    /**
++     * True when a landing on this [EntryCue] is a real spotlight: first
++     * vocal, chorus, drop, or a buildup peak — not a quiet non-event intro.
++     */
++    fun isSpotlight(entry: EntryCue): Boolean {
++        if (entry.leadInVocal >= 0.2f) return true
++        return entry.landingFn == SectionFn.CHORUS ||
++            entry.landingFn == SectionFn.DROP ||
++            entry.landingFn == SectionFn.BUILD ||
++            entry.landingFn == SectionFn.PRE_CHORUS
++    }
++}
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+index 6526ffe..f433484 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+@@ -181,16 +181,23 @@ object TransitionMoves {
+         val start = -o * 4.0
+         val kill = KILL_DB
+         val mute = MUTE_DB
++        // djmix21 incoming-vocal crisp rule: when B's own lead-in carries
++        // vocal (scalar presence from its own sung bars), the incoming mid/
++        // high lanes stay at unity through the landing and the separation
++        // work happens on the OUTGOING mid instead. Instrumental pairs
++        // (leadInVocal < 0.2) keep today's lanes untouched.
++        val incomingSinging = choice.entry.leadInVocal >= 0.2f
+         val (outGain, inGain, outLow, inLow, outMid, inMid, outHigh, inHigh, outHp, echoSend) = when (choice.template) {
+             MixTemplate.M1, MixTemplate.M3 -> lanes(
+                 outGain = lane(start, 0f, half, 0f, -o.toDouble(), -9f, 1.0, mute, shape = "ep"),
+                 inGain = lane(start, mute, start + o.toDouble(), -9f, half, -1.5f, -o.toDouble(), 0f, shape = "ep"),
+                 outLow = lane(start, 0f, half, 0f, half + 0.01, kill),
+                 inLow = lane(start, kill, half, kill, half + 0.01, 0f),
+-                outMid = lane(start, 0f, 0.0, 0f),
++                // Crisp incoming vocal: B mid stays 0 dB, A mid carves away.
++                outMid = if (incomingSinging) lane(start, 0f, half, -3f, 0.0, -6f) else lane(start, 0f, 0.0, 0f),
+                 inMid = lane(start, 0f, 0.0, 0f),
+                 outHigh = lane(start, 0f, 0.0, 0f),
+-                inHigh = lane(start, -2.5f, start / 2, -1.0f, half, 0f),
++                inHigh = if (incomingSinging) lane(start, -1.0f, half, 0f) else lane(start, -2.5f, start / 2, -1.0f, half, 0f),
+                 outHp = lane(half, 20f, -2.0, 180f, 0.0, 250f, exponential = true),
+                 echoSend = lane(start, 0f, 0.0, 0f),
+             )
+@@ -236,7 +243,7 @@ object TransitionMoves {
+                 outLow = lane(-2.0, 0f, 0.0, kill),
+                 inLow = lane(-8.0, kill, 0.0, 0f),
+                 outMid = lane(0.0, 0f, 4.0, mute),
+-                inMid = lane(-8.0, -8f, 0.0, 0f),
++                inMid = if (incomingSinging) lane(-8.0, -1.5f, 0.0, 0f) else lane(-8.0, -8f, 0.0, 0f),
+                 outHigh = lane(0.0, 0f, 4.0, mute),
+                 inHigh = lane(0.0, 0f),
+                 outHp = lane(-16.0, 20f, 0.0, 400f, exponential = true),
+@@ -264,7 +271,7 @@ object TransitionMoves {
+                 outLow = lane(-4.0, 0f, 0.0, kill),
+                 inLow = lane(-8.0 * 4, kill, 0.0, 0f),
+                 outMid = lane(0.0, 0f),
+-                inMid = lane(-8.0 * 4, -8f, 0.0, 0f),
++                inMid = if (incomingSinging) lane(-8.0 * 4, -1.5f, 0.0, 0f) else lane(-8.0 * 4, -8f, 0.0, 0f),
+                 outHigh = lane(0.0, 0f),
+                 inHigh = lane(0.0, 0f),
+                 outHp = lane(0.0, 20f),
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix21RegressionTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix21RegressionTest.kt
+index e69de29..c088fae 100644
+--- a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix21RegressionTest.kt
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix21RegressionTest.kt
+@@ -0,0 +1,525 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.abs
++import kotlin.math.round
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix21 (vc63) shared regression suite — structure-aware automix:
++ *  1. vocal continuity (gap budget, mid-line guard, spotlight);
++ *  2. buildup-aware blends (B-side buildup, flanger, quiet-intro guard);
++ *  3. vocal separation tier (incoming vocal stays crisp, outgoing mid
++ *     carves; vocal handoff seams pay; clash still guarded).
++ * Plus the carried regression proofs from vc61/vc62.
++ */
++class Djmix21RegressionTest {
++
++    // ---- fixture builders ----
++
++    private fun section(
++        start: Int, end: Int, fn: SectionFn, role: SectionRole = SectionRole.GROOVE,
++        energy: Int = 4, vocal: Float = 0f, slope: Float = 0f, loopable: Boolean = false,
++    ) = PhraseSection(
++        startBar = start, endBar = end, fn = fn, role = role, conf = 0.85f,
++        group = 0, repeatIndex = 0, energy = energy / 10f, energyLevel = energy,
++        energyRel = 0f, energySlope = slope, vocal = vocal, bass = 0.4f, loopable = loopable,
++    )
++
++    private fun song(
++        key: String, bpm: Double, bars: Int, sections: List<PhraseSection>,
++        sungFrom: Int = bars, sungUntil: Int = bars,
++        start: StartKind = StartKind.INTRO_INSTRUMENTAL,
++        ending: EndingKind = EndingKind.OUTRO_INSTRUMENTAL,
++        pickup: Float = 0f,
++    ): SongMap {
++        val beat = 60.0 / bpm
++        val bar = beat * 4
++        val sung = BooleanArray(bars) { it in sungFrom until sungUntil }
++        return SongMap(
++            trackKey = key, durationSec = bars * bar, bpm = bpm, beatsPerBar = 4,
++            downbeats = DoubleArray(bars + 1) { it * bar },
++            gridConfidence = 0.9f, tempoStable = true, phraseAnchor = 0, phraseLen = 8,
++            sections = sections, sungBars = sung,
++            firstVocalBar = sungFrom.takeIf { it < bars && sungUntil > sungFrom },
++            lastVocalBar = (sungUntil - 1).takeIf { sungFrom < sungUntil },
++            pickupBeats = pickup, startKind = start, endingKind = ending,
++            contentEndSec = bars * bar, labelConfidence = 0.85f, structMs = 1,
++            chorusCount = sections.count { it.fn == SectionFn.CHORUS },
++        )
++    }
++
++    private fun track(
++        id: String, bpm: Double, key: String = "C major", vocal: Double = 0.3,
++        duration: Double = 180.0, contentEnd: Double? = null, audibleStart: Double = 0.5,
++    ): TrackAnalysis {
++        val beat = 60.0 / bpm
++        val downbeats = List(((duration / (4 * beat)) + 1).toInt()) { it * 4 * beat + 0.5 }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY,
++            trackId = id, duration = duration, bpm = bpm, beatInterval = beat,
++            beatConfidence = 0.9, downbeats = downbeats,
++            phraseBoundaries = downbeats.filterIndexed { i, _ -> i % 8 == 0 },
++            firstBeat = 0.5, key = key, keyConfidence = 0.9,
++            audibleStartTime = audibleStart, introEndTime = 10.0,
++            contentEndTime = contentEnd ?: (duration - 2),
++            energyCurve = List(duration.toInt()) { EnergySample(it.toDouble(), 1.0) },
++            vocalActivityMask = List(duration.toInt()) { vocal },
++            vocalProbability = vocal, quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    private fun plan(out: TrackAnalysis, inn: TrackAnalysis, at: Double = 10.0) = planTransition(
++        analysis = out, nextAnalysis = inn,
++        currentTrack = TransitionTrackInfo(out.trackId, (out.duration * 1000).toLong()),
++        nextTrack = TransitionTrackInfo(inn.trackId, (inn.duration * 1000).toLong()),
++        currentTime = at, duration = out.duration, mode = CrossfadeMode.SMART, advanced = true,
++    )
++
++    private fun sample(lane: Lane, beat: Double): Double {
++        if (lane.beats.isEmpty()) return 0.0
++        if (beat <= lane.beats.first()) return lane.values.first().toDouble()
++        if (beat >= lane.beats.last()) return lane.values.last().toDouble()
++        for (i in 1 until lane.beats.size) {
++            if (beat <= lane.beats[i]) {
++                val t0 = lane.beats[i - 1]; val t1 = lane.beats[i]
++                val v0 = lane.values[i - 1].toDouble(); val v1 = lane.values[i].toDouble()
++                val f = if (t1 > t0) (beat - t0) / (t1 - t0) else 0.0
++                return v0 + (v1 - v0) * f
++            }
++        }
++        return lane.values.last().toDouble()
++    }
++
++    private fun findIds(slot: Int, limit: Int = 500): Pair<String, String> {
++        for (i in 0 until limit) {
++            val a = "djmix21-out-$i"; val b = "djmix21-in"
++            if (pairHash(a, b) % 4 == slot) return a to b
++        }
++        for (i in 0 until limit) {
++            val a = "djmix21-out"; val b = "djmix21-in-$i"
++            if (pairHash(a, b) % 4 == slot) return a to b
++        }
++        throw AssertionError("no pairHash slot $slot")
++    }
++
++    // ---- 1a vocal gap budget ----
++
++    @Test
++    fun longInstrumentalSeamTrimsOrShortens() {
++        // A: verse sung bars 2..11, then a long instrumental outro 12..31.
++        // B: quiet intro bars 0..23, first vocal (chorus) at bar 24.
++        // Natural seam gap = long trail + long lead >> 16 bars.
++        val out = song(
++            "a", 120.0, 32,
++            listOf(
++                section(0, 2, SectionFn.INTRO),
++                section(2, 12, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(12, 32, SectionFn.OUTRO, energy = 6, loopable = true),
++            ),
++            sungFrom = 2, sungUntil = 12,
++        )
++        val inn = song(
++            "b", 120.0, 48,
++            listOf(
++                section(0, 24, SectionFn.INTRO, energy = 2),
++                section(24, 40, SectionFn.CHORUS, SectionRole.RELEASE, energy = 7, vocal = 0.8f),
++                section(40, 48, SectionFn.OUTRO, energy = 3),
++            ),
++            sungFrom = 24, sungUntil = 40,
++        )
++        val exits = CuePoints.exits(out, analysis = null)
++        val entries = CuePoints.entries(inn)
++        val exit = exits.last()
++        val entry = entries.first()
++        val overlap = 16
++        val gap = StructureMix.vocalGap(out, inn, exit, entry, overlap)
++        assertTrue(gap.totalBars > PhraseConfig.VOCAL_GAP_HARD_BARS, "fixture gap must exceed hard budget: $gap")
++
++        // Key distance 4 costs long blends their staying power (carve rungs
++        // keep a 0.6 floor), so a short rung must win across this seam.
++        val choice = PhrasePlanner.select(out, inn, camelotSteps = 4, outBpm = 120.0, inBpm = 120.0)
++        assertNotNull(choice, "planner must still pick something: ${PhrasePlanner.lastVetoSummary}")
++        val after = StructureMix.vocalGap(out, inn, choice.exit, choice.entry, choice.overlapBars)
++        assertTrue(choice.overlapBars <= 4 || after.totalBars <= PhraseConfig.VOCAL_GAP_SOFT_BARS,
++            "long blend across huge gap must be trimmed/shortened: template=${choice.template} overlap=${choice.overlapBars} gap=$after")
++    }
++
++    // ---- 1b no mid-vocal cut (classic path: planner, not just annotate) ----
++
++    @Test
++    fun exitNeverCutsSungLineMidway() {
++        val cur = track("a", 120.0, vocal = 0.05)
++        val next = track("b", 120.0, vocal = 0.05)
++        // Long sung line 140..160; exit at 145 would amputate it. The rule must
++        // move the exit BEFORE the line (line end is >6s away), never mid-line.
++        val lyrics = listOf(LyricCue(140.0, 160.0, "one long sung line keeps going"))
++        val raw = TransitionPlan(
++            transitionStyle = TransitionStyle.DJ_BLEND,
++            transitionStart = 138.0, transitionEnd = 145.0, fadeSeconds = 7.0,
++            incomingCueTime = 10.0, beatSeconds = 0.5, vocalOverlap = 0.0,
++        )
++        val far = DjMix.annotate(raw, cur, next, lyrics, emptyList(), "out", "in")
++        assertFalse(far.transitionEnd > 140.4 && far.transitionEnd < 159.6,
++            "transitionEnd=${far.transitionEnd} left mid-line (140..160)")
++        assertTrue(far.transitionEnd <= 140.1 || far.transitionEnd >= 159.5,
++            "transitionEnd=${far.transitionEnd} must be at/after line end or before line start")
++        // Short line: extend to its end (within the 6s grace).
++        val short = listOf(LyricCue(140.0, 148.0, "verse one stays"), LyricCue(148.0, 156.0, "verse one continues"))
++        val raw2 = raw.copy(transitionEnd = 145.0)
++        val near = DjMix.annotate(raw2, cur, next, short, emptyList(), "out", "in")
++        assertTrue(near.transitionEnd >= 147.5, "exit ${near.transitionEnd} still cuts the verse")
++    }
++
++    // ---- 2a/2b buildup-aware blends + flanger ----
++
++    @Test
++    fun quietBuildupIntroAlignsDropAtHandover() {
++        // B: quiet intro, then a rising BUILD into the chorus. The BUILD entry
++        // cue must win and land the peak at handover.
++        val out = song(
++            "a", 120.0, 32,
++            listOf(
++                section(0, 4, SectionFn.INTRO),
++                section(4, 28, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(28, 32, SectionFn.OUTRO, energy = 7, loopable = true),
++            ),
++            sungFrom = 4, sungUntil = 28,
++        )
++        val inn = song(
++            "b", 120.0, 48,
++            listOf(
++                section(0, 4, SectionFn.INTRO, energy = 2),
++                section(4, 12, SectionFn.BUILD, SectionRole.TENSION, energy = 4, slope = 0.25f),
++                section(12, 24, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.8f),
++                section(24, 36, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(36, 48, SectionFn.OUTRO, energy = 3),
++            ),
++            sungFrom = 12, sungUntil = 36,
++        )
++        val buildup = StructureMix.headBuildup(inn)
++        assertNotNull(buildup)
++        assertEquals(4, buildup.startBar, "buildup must be the head BUILD section")
++        val entries = CuePoints.entries(inn)
++        assertTrue(entries.any { it.kind == EntryKind.BUILD && it.startBar == 4 && it.landingBar == 12 },
++            "BUILD entry must start at buildup start and land at its peak; entries=$entries")
++
++        val choice = PhrasePlanner.select(out, inn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
++        assertNotNull(choice, "planner must choose: ${PhrasePlanner.lastVetoSummary}")
++        // Behaviour, not label: the cue must start at or before the buildup
++        // start so the whole buildup plays under the outro (HEAD at bar 0
++        // covers it too — the BUILD label is not mandatory).
++        assertTrue(choice.entry.startBar <= 4, "cue must start at/before buildup start (bar 4); choice=${choice.template} ${choice.entry}")
++        // Peak lands at handover (within 1 bar after the buildup end).
++        assertTrue(choice.entry.landingBar in 12..13, "landing=${choice.entry.landingBar} must be the buildup peak")
++
++        // Classic annotate path: B-side rise across the cue window is a buildup.
++        val (outId, inId) = findIds(0)
++        val curve = List(180) { i ->
++            val t = i.toDouble()
++            EnergySample(t, if (t < 50.0) 0.3 + (t - 34.0).coerceIn(0.0, 16.0) * 0.04 else 0.95)
++        }
++        val cur = track("a", 120.0, vocal = 0.05).copy(energyCurve = List(180) { EnergySample(it.toDouble(), 0.9) })
++        val next = track("b", 120.0, vocal = 0.05).copy(
++            energyCurve = curve,
++            vocalActivityMask = List(180) { 0.05 },
++        )
++        // Chorus-only lyrics: no VERSE section at the head, so the pre-chorus
++        // at 34 is the first lifted section and the verse pullback stays out.
++        val lyricsIn = listOf(
++            LyricCue(40.0, 48.0, "chorus hook"),
++            LyricCue(80.0, 88.0, "chorus hook"),
++        )
++        val raw = TransitionPlan(
++            transitionStyle = TransitionStyle.DJ_BLEND,
++            transitionStart = 140.0, transitionEnd = 156.0, fadeSeconds = 16.0,
++            incomingCueTime = 34.0, bassSwap = true, beatSeconds = 0.5, vocalOverlap = 0.0,
++        )
++        val ann = DjMix.annotate(raw, cur, next, emptyList(), lyricsIn, outId, inId)
++        assertTrue(ann.buildup, "cue inside B buildup/pre-chorus with rising energy must be buildup; summary=${ann.mixSummary}")
++        assertEquals(DjEffect.FLANGER, ann.djEffect, "buildup blend rides the flanger; effect=${ann.djEffect}")
++        assertEquals(0.42f, effectSettings(DjEffect.FLANGER).wet, 1e-6f)
++        assertEquals(8f, effectSettings(DjEffect.FLANGER).beats, 1e-6f)
++    }
++
++    @Test
++    fun quietIntroWithNoEventIsNotLongBlended() {
++        // B: long quiet intro, first event (chorus vocal) far beyond any overlap.
++        val out = song(
++            "a", 120.0, 32,
++            listOf(
++                section(0, 4, SectionFn.INTRO),
++                section(4, 28, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(28, 32, SectionFn.OUTRO, energy = 6, loopable = true),
++            ),
++            sungFrom = 4, sungUntil = 28,
++        )
++        val inn = song(
++            "b", 120.0, 56,
++            listOf(
++                section(0, 40, SectionFn.INTRO, energy = 2),
++                section(40, 52, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(52, 56, SectionFn.OUTRO, energy = 3),
++            ),
++            sungFrom = 40, sungUntil = 52,
++        )
++        // Key distance 4: quiet-intro long blends decay fastest.
++        val choice = PhrasePlanner.select(out, inn, camelotSteps = 4, outBpm = 120.0, inBpm = 120.0)
++        assertNotNull(choice, "planner must still pick a short rung or trimmed blend: ${PhrasePlanner.lastVetoSummary}")
++        assertTrue(choice.overlapBars <= 4,
++            "quiet intro with no event in overlap must not be long-blended: template=${choice.template} overlap=${choice.overlapBars}")
++    }
++
++    // ---- Addendum 2: incoming vocal stays crisp ----
++
++    @Test
++    fun incomingVocalStaysCrispWhileOutgoingMidCarves() {
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val vocalEntry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0.6f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M1, rung = "Beat blend", score = 0.9, exit = exit, entry = vocalEntry,
++            overlapBars = 8, swapBar = -4.0, tailBeats = 1.0, loopK = 0, echoGated = false,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0)
++        // At the landing (beat 0) and mid-overlap the incoming mid/high must
++        // be at unity (>= -1 dB): the vocal arrives crisp, not muffled.
++        assertTrue(sample(script.inMid, 0.0) >= -1.0, "inMid@0=${sample(script.inMid, 0.0)}")
++        assertTrue(sample(script.inMid, -8.0) >= -1.0, "inMid@-8=${sample(script.inMid, -8.0)}")
++        assertTrue(sample(script.inHigh, 0.0) >= -1.0, "inHigh@0=${sample(script.inHigh, 0.0)}")
++        assertTrue(sample(script.inHigh, -16.0) >= -1.0, "inHigh@-16=${sample(script.inHigh, -16.0)}")
++        // The separation happens on the outgoing mid (vocal band), which is
++        // carved below the incoming mid during the overlap.
++        val outMid = sample(script.outMid, -8.0)
++        val inMid = sample(script.inMid, -8.0)
++        assertTrue(outMid < inMid, "outMid@-8=$outMid must sit below inMid@-8=$inMid")
++        assertTrue(sample(script.outMid, 0.0) <= -5.0, "outMid@0=${sample(script.outMid, 0.0)} must be carved at landing")
++    }
++
++    @Test
++    fun dropMixKeepsIncomingMidCrispWhenSinging() {
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val vocalEntry = EntryCue(EntryKind.HEAD, 0, 0.0, 16, SectionFn.INTRO, SectionRole.GROOVE, 16, 0.6f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M7, rung = "Drop mix", score = 0.9, exit = exit, entry = vocalEntry,
++            overlapBars = 16, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = false,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 40, swapRampName = "SWAP_RAMP_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0)
++        // Was -8 dB two bars before landing; a singing incoming mid must be
++        // near unity, so the first buildup line is not buried.
++        assertTrue(sample(script.inMid, -8.0) >= -2.0, "inMid@-8=${sample(script.inMid, -8.0)}")
++        assertTrue(sample(script.inMid, 0.0) >= -1.0, "inMid@0=${sample(script.inMid, 0.0)}")
++    }
++
++    @Test
++    fun instrumentalLanesUnaffected() {
++        val exit = ExitCue(ExitKind.OUTRO_PHRASE, 72, 170.0, 8, 0, 0, SectionFn.OUTRO, SectionRole.GROOVE, 0.4f, 4, true, 0, 0)
++        val silentEntry = EntryCue(EntryKind.HEAD, 0, 0.0, 8, SectionFn.INTRO, SectionRole.GROOVE, 8, 0f, true, 0.4f, 4, 0, 0f)
++        val choice = PhraseChoice(
++            template = MixTemplate.M1, rung = "Beat blend", score = 0.9, exit = exit, entry = silentEntry,
++            overlapBars = 8, swapBar = -4.0, tailBeats = 1.0, loopK = 0, echoGated = false,
++            vocalProduct = 0f, tempoPrepBars = 0, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++            swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "TEMPO_POLICY=b",
++            vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.9, phraseScore = 0.9,
++            energyScore = 0.9, lengthScore = 0.9, keyScore = 0.9, tempoScore = 0.9, cost = 0.0,
++        )
++        val script = TransitionMoves.compile(choice, 120.0, 120.0)
++        assertTrue(sample(script.outMid, -8.0) >= -0.01, "instrumental outMid must stay flat: ${sample(script.outMid, -8.0)}")
++        assertTrue(sample(script.inHigh, -32.0) <= -2.4, "instrumental inHigh keeps its -2.5 start: ${sample(script.inHigh, -32.0)}")
++    }
++
++    // ---- Addendum 2 item 3: vocal handoff matching ----
++
++    @Test
++    fun vocalHandoffSeamBeatsInstrumentalGap() {
++        // A sung until bar 21, outro release near bar 24: short trail, and B's
++        // first vocal lands just after — the conversation seam.
++        val out = song(
++            "a", 120.0, 32,
++            listOf(
++                section(0, 4, SectionFn.INTRO),
++                section(4, 22, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(22, 32, SectionFn.OUTRO, energy = 6, loopable = true),
++            ),
++            sungFrom = 4, sungUntil = 22,
++        )
++        // B's first sung bar lands 1-2 bars after A's last sung bar (21):
++        // seam = 23 - 22 = 1. Same B but with first vocal far away = no seam.
++        val seamInn = song(
++            "b", 120.0, 48,
++            listOf(
++                section(0, 23, SectionFn.INTRO, energy = 3),
++                section(23, 40, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.8f),
++                section(40, 48, SectionFn.OUTRO, energy = 3),
++            ),
++            sungFrom = 23, sungUntil = 40,
++        )
++        val farInn = song(
++            "b", 120.0, 48,
++            listOf(
++                section(0, 28, SectionFn.INTRO, energy = 3),
++                section(28, 40, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.8f),
++                section(40, 48, SectionFn.OUTRO, energy = 3),
++            ),
++            sungFrom = 28, sungUntil = 40,
++        )
++        val seamChoice = PhrasePlanner.select(out, seamInn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
++        val farChoice = PhrasePlanner.select(out, farInn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
++        assertNotNull(seamChoice, "seam pair must choose: ${PhrasePlanner.lastVetoSummary}")
++        // The far pair must fall to a short rung (or a much worse score).
++        if (farChoice != null) {
++            val long = farChoice.template in setOf(
++                MixTemplate.M1, MixTemplate.M3, MixTemplate.ROLLING, MixTemplate.M2,
++                MixTemplate.M7, MixTemplate.RELAXED, MixTemplate.M9,
++            )
++            assertTrue(!long || farChoice.score < seamChoice.score,
++                "far-gap pair must not outscore the vocal seam: far=${farChoice.template} ${farChoice.score} seam=${seamChoice.template} ${seamChoice.score}")
++        }
++        // Seam math: B's first sung bar follows A's last sung bar with a 1-2
++        // bar breath for the aligned candidate.
++        val exits = CuePoints.exits(out)
++        val entries = CuePoints.entries(seamInn)
++        val seams = exits.flatMap { e -> entries.mapNotNull { en -> StructureMix.vocalSeamBars(out, seamInn, e, en) } }
++        assertTrue(seams.any { it in 1..2 }, "aligned seam must exist among candidates: $seams")
++    }
++
++    @Test
++    fun vocalOnVocalOverlapIsStillNotCrispStacked() {
++        // A sung right up to its release and B sung from its entry cue: the
++        // clash veto must keep non-carve blends from running.
++        val out = song(
++            "a", 120.0, 32,
++            listOf(
++                section(0, 4, SectionFn.INTRO),
++                section(4, 30, SectionFn.VERSE, SectionRole.NARRATIVE, energy = 6, vocal = 0.7f),
++                section(30, 32, SectionFn.OUTRO, energy = 3, loopable = true),
++            ),
++            sungFrom = 4, sungUntil = 30,
++        )
++        val inn = song(
++            "b", 120.0, 48,
++            listOf(
++                section(0, 8, SectionFn.CHORUS, SectionRole.RELEASE, energy = 8, vocal = 0.9f),
++                section(8, 48, SectionFn.OUTRO, energy = 4),
++            ),
++            sungFrom = 0, sungUntil = 8,
++        )
++        val choice = PhrasePlanner.select(out, inn, camelotSteps = 0, outBpm = 120.0, inBpm = 120.0)
++        val carves = setOf(MixTemplate.M4, MixTemplate.M5, MixTemplate.ROLLING, MixTemplate.VOCAL_OVER_OUTRO,
++            MixTemplate.M6, MixTemplate.M10, MixTemplate.CUT_ON_ONE, MixTemplate.M11, MixTemplate.RELAXED)
++        assertTrue(choice == null || choice.template in carves || choice.vocalOverlapBeats <= 1.0,
++            "dual-vocal seam must be carved/short, not a crisp stack: choice=${choice?.template} overlap=${choice?.vocalOverlapBeats}")
++    }
++
++    // ---- carried regressions vc61/vc62 ----
++
++    private fun beautifulAnalysis(): TrackAnalysis {
++        val bpm = 99.93
++        val beat = 60.0 / bpm
++        val bar = beat * 4.0
++        val duration = 178.0
++        val contentEnd = 175.5
++        val downbeats = List(75) { it * bar }
++        val energyCurve = List(178) { i ->
++            val t = i.toDouble()
++            val e = if (t > contentEnd) 0.02 else if (t >= 156.0) 0.25 else 0.9
++            EnergySample(t, e)
++        }
++        val vocalMask = List(178) { i ->
++            val t = i.toDouble()
++            when {
++                t in 12.0..155.0 -> 0.55
++                t in 156.0..175.0 -> 0.35
++                else -> 0.02
++            }
++        }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY, trackId = "beautiful", duration = duration,
++            bpm = bpm, beatInterval = beat, beatConfidence = 0.92, downbeats = downbeats,
++            phraseBoundaries = downbeats.filterIndexed { i, _ -> i % 4 == 0 },
++            key = "8B", keyConfidence = 0.85, audibleStartTime = 0.2, introEndTime = 10.0,
++            contentEndTime = contentEnd, outroStartTime = 156.0, mixOutTime = 156.0,
++            energyCurve = energyCurve, vocalActivityMask = vocalMask, vocalProbability = 0.8,
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    private fun neverLetGoAnalysis(): TrackAnalysis {
++        val bpm = 104.50
++        val beat = 60.0 / bpm
++        val bar = beat * 4.0
++        val duration = 193.6
++        val downbeats = List(84) { it * bar }
++        val energyCurve = List(194) { i ->
++            val t = i.toDouble()
++            EnergySample(t, if (t < 18.37) 0.4 else 0.95)
++        }
++        val vocalMask = List(194) { i -> if (i < 18.37) 0.02 else 0.65 }
++        return TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY, trackId = "never-let-go", duration = duration,
++            bpm = bpm, beatInterval = beat, beatConfidence = 0.94, downbeats = downbeats,
++            phraseBoundaries = downbeats.filterIndexed { i, _ -> i % 4 == 0 },
++            key = "8B", keyConfidence = 0.88, audibleStartTime = 0.0, introEndTime = 18.37,
++            contentEndTime = 191.0, mixInTime = 18.37,
++            mixInCandidates = listOf(MixCandidate(time = 18.37, score = 0.92, type = "intro_drop")),
++            energyCurve = energyCurve, vocalActivityMask = vocalMask, vocalProbability = 0.75,
++            quality = TrackAnalysis.QUALITY_FULL,
++        )
++    }
++
++    @Test
++    fun beautifulToNeverLetGoStillEightBarBlend() {
++        val out = beautifulAnalysis()
++        val inn = neverLetGoAnalysis()
++        val p = plan(out, inn, at = 100.0)
++        assertEquals(TransitionStyle.DJ_BLEND, p.transitionStyle, "reason=${p.reason}")
++        val bars = round(p.fadeSeconds / (4.0 * p.beatSeconds)).toInt()
++        assertEquals(8, bars, "fadeSeconds=${p.fadeSeconds} beatSeconds=${p.beatSeconds}")
++        assertTrue(p.transitionEnd >= 172.0 && p.transitionEnd <= 175.6, "transitionEnd=${p.transitionEnd}")
++    }
++
++    @Test
++    fun calvinPair124StillBeatmixes() {
++        val out = track("this-is-what-you-came-for", 124.0, "C major", vocal = 0.3)
++        val inn = track("one-kiss", 124.0, "C major", vocal = 0.3)
++        assertFalse(shouldDeclineToMix(out, inn))
++        assertEquals(TransitionStyle.DJ_BLEND, plan(out, inn).transitionStyle)
++    }
++
++    @Test
++    fun technologicToGuessStillShort() {
++        val out = track("technologic", 124.0, "C major", vocal = 0.8)
++        val inn = track("guess", 130.0, "C major", vocal = 0.8)
++        assertFalse(shouldDeclineToMix(out, inn))
++        val p = plan(out, inn)
++        assertFalse(p.reason.contains("decline"), "reason=${p.reason}")
++    }
++
++    @Test
++    fun declineGateStillFires() {
++        val out = track("a", 120.0, "C major", vocal = 0.9)
++        val inn = track("b", 94.0, "F\u266F major", vocal = 0.9)
++        assertTrue(shouldDeclineToMix(out, inn))
++        assertEquals(TransitionStyle.EQUAL_POWER, plan(out, inn).transitionStyle)
++    }
++
++    @Test
++    fun buildupExtensionCoversBuildAndDrop() {
++        assertTrue(buildupFits(TransitionStyle.DJ_BLEND, 0.1, false, SectionKind.INST, SectionKind.BUILD, 1.2),
++            "BUILD as incoming section must count as a lift")
++        assertTrue(buildupFits(TransitionStyle.DJ_BLEND, 0.1, false, SectionKind.INST, SectionKind.DROP, 1.2),
++            "DROP as incoming section must count as a lift")
++        assertFalse(buildupFits(TransitionStyle.DJ_FILTER, 0.1, false, SectionKind.INST, SectionKind.BUILD, 1.2),
++            "non-blend styles never build")
++    }
++}

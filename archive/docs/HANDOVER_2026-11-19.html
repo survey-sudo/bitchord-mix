@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BitChord Mix — State of the Project · 19 Nov 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0c0b0d;
+    --bg-2:#111014;
+    --panel:#141317;
+    --line:rgba(255,255,255,.075);
+    --line-strong:rgba(255,255,255,.14);
+    --ink:#f2f0f3;
+    --ink-2:#b6b2bb;
+    --ink-3:#7d7986;
+    --accent:#e8455c;
+    --accent-soft:rgba(232,69,92,.14);
+    --ok:#63c39a;
+    --warn:#d8a24e;
+    --bad:#e0645f;
+    --r:18px;
+    --pad:clamp(20px,4vw,64px);
+    --maxw:1400px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Geist",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-weight:400;line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  ::selection{background:var(--accent);color:#0c0b0d}
+
+  /* ambient wash: fixed, pointer-none, never on a scroller */
+  .wash{
+    position:fixed;inset:0;z-index:0;pointer-events:none;
+    background:
+      radial-gradient(720px 480px at 82% -8%, rgba(232,69,92,.16), transparent 62%),
+      radial-gradient(900px 620px at 6% 4%, rgba(120,140,190,.07), transparent 60%);
+  }
+  .grain{
+    position:fixed;inset:0;z-index:2;pointer-events:none;opacity:.028;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/></filter><rect width='140' height='140' filter='url(%23n)'/></svg>");
+    mix-blend-mode:screen;
+  }
+  .progress{
+    position:fixed;top:0;left:0;height:2px;background:var(--accent);
+    width:0%;z-index:60;transform-origin:0 50%;
+    box-shadow:0 0 18px rgba(232,69,92,.5);
+  }
+
+  .shell{position:relative;z-index:1;max-width:var(--maxw);margin:0 auto;padding:0 var(--pad)}
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky;top:0;z-index:40;
+    backdrop-filter:blur(18px) saturate(120%);
+    -webkit-backdrop-filter:blur(18px) saturate(120%);
+    background:linear-gradient(to bottom, rgba(12,11,13,.92), rgba(12,11,13,.62));
+    border-bottom:1px solid var(--line);
+  }
+  .topbar-in{
+    max-width:var(--maxw);margin:0 auto;padding:0 var(--pad);
+    height:58px;display:flex;align-items:center;gap:18px;
+  }
+  .mark{display:flex;align-items:center;gap:11px;min-width:0}
+  .mark svg{width:22px;height:22px;flex:none}
+  .mark b{font-weight:600;font-size:14px;letter-spacing:-.01em;white-space:nowrap}
+  .mark span{font-family:"Geist Mono",monospace;font-size:10.5px;color:var(--ink-3);letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}
+  .topnav{margin-left:auto;display:flex;gap:22px;align-items:center}
+  .topnav a{
+    color:var(--ink-3);text-decoration:none;font-size:12.5px;letter-spacing:.01em;
+    transition:color .25s cubic-bezier(.16,1,.3,1);
+  }
+  .topnav a:hover{color:var(--ink)}
+  .pill-live{
+    display:inline-flex;align-items:center;gap:7px;
+    border:1px solid rgba(99,195,154,.28);background:rgba(99,195,154,.07);
+    color:#9fdcc0;font-family:"Geist Mono",monospace;font-size:10.5px;
+    padding:5px 10px;border-radius:999px;letter-spacing:.05em;white-space:nowrap;
+  }
+  .dot{width:5px;height:5px;border-radius:50%;background:var(--ok);position:relative;flex:none}
+  .dot::after{
+    content:"";position:absolute;inset:-4px;border-radius:50%;
+    border:1px solid rgba(99,195,154,.45);
+    animation:breathe 3.4s ease-in-out infinite;
+  }
+  @keyframes breathe{0%,100%{transform:scale(.7);opacity:.7}50%{transform:scale(1.25);opacity:0}}
+  @media (max-width:900px){.topnav{display:none}}
+
+  /* ---------- hero ---------- */
+  .hero{
+    display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.85fr);
+    gap:clamp(28px,5vw,72px);
+    padding:clamp(56px,9vh,120px) 0 clamp(40px,6vh,72px);
+    align-items:start;
+    border-bottom:1px solid var(--line);
+  }
+  .eyebrow{
+    font-family:"Geist Mono",monospace;font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--ink-3);margin:0 0 26px;
+    display:flex;align-items:center;gap:12px;
+  }
+  .eyebrow::before{content:"";width:34px;height:1px;background:var(--accent);flex:none}
+  h1{
+    margin:0;font-weight:500;letter-spacing:-.035em;
+    font-size:clamp(2.5rem,5.6vw,4.6rem);line-height:.98;
+  }
+  h1 em{font-style:normal;color:var(--accent)}
+  .lede{
+    margin:30px 0 0;max-width:56ch;color:var(--ink-2);font-size:clamp(15px,1.25vw,17px);
+    line-height:1.68;font-weight:300;
+  }
+  .lede strong{color:var(--ink);font-weight:500}
+
+  .installed{
+    margin-top:clamp(0px,3vw,26px);
+    border:1px solid var(--line-strong);border-radius:var(--r);
+    background:linear-gradient(160deg, rgba(255,255,255,.045), rgba(255,255,255,.012));
+    box-shadow:0 30px 60px -32px rgba(0,0,0,.9), inset 0 1px 0 rgba(255,255,255,.06);
+    padding:26px 26px 22px;
+    position:relative;overflow:hidden;
+  }
+  .installed::before{
+    content:"";position:absolute;inset:0 0 auto 0;height:1px;
+    background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.55;
+  }
+  .installed .lbl{font-family:"Geist Mono",monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--ink-3);margin:0 0 12px}
+  .installed .ver{font-family:"Geist Mono",monospace;font-size:clamp(20px,2.4vw,27px);font-weight:500;letter-spacing:-.02em;line-height:1.15}
+  .installed .ver small{display:block;font-size:11px;color:var(--ink-3);letter-spacing:.05em;margin-top:8px;font-weight:400}
+  .installed dl{margin:20px 0 0;display:grid;grid-template-columns:auto 1fr;gap:9px 16px;font-size:12px;padding-top:18px;border-top:1px solid var(--line)}
+  .installed dt{font-family:"Geist Mono",monospace;color:var(--ink-3);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;padding-top:1px}
+  .installed dd{margin:0;color:var(--ink-2);text-align:right;font-family:"Geist Mono",monospace;font-size:11.5px}
+
+  /* ---------- verdict strip ---------- */
+  .verdicts{
+    display:grid;grid-template-columns:repeat(4,1fr);
+    border-bottom:1px solid var(--line);
+  }
+  .verdict{
+    padding:26px 26px 26px 0;border-right:1px solid var(--line);
+  }
+  .verdict:last-child{border-right:none;padding-right:0}
+  .verdict .k{font-family:"Geist Mono",monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:10px}
+  .verdict .v{font-size:clamp(15px,1.5vw,18px);font-weight:500;letter-spacing:-.01em;line-height:1.3}
+  .verdict .n{display:block;margin-top:7px;font-size:12px;color:var(--ink-3);font-weight:300}
+
+  /* ---------- layout ---------- */
+  .doc{display:grid;grid-template-columns:188px minmax(0,1fr);gap:clamp(28px,5vw,80px);padding:clamp(44px,7vh,88px) 0 0;align-items:start}
+  .rail{position:sticky;top:88px;display:flex;flex-direction:column;gap:2px}
+  .rail .t{font-family:"Geist Mono",monospace;font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);padding:0 0 14px 13px}
+  .rail a{
+    display:flex;gap:10px;align-items:baseline;text-decoration:none;color:var(--ink-3);
+    font-size:12.5px;padding:7px 12px;border-left:1px solid var(--line);
+    transition:color .25s, border-color .25s, background .25s;
+  }
+  .rail a i{font-family:"Geist Mono",monospace;font-style:normal;font-size:9.5px;color:#57535f;flex:none;width:14px}
+  .rail a:hover{color:var(--ink);border-left-color:var(--line-strong);background:rgba(255,255,255,.02)}
+  .rail a.on{color:var(--ink);border-left-color:var(--accent)}
+  .rail a.on i{color:var(--accent)}
+  @media (max-width:1100px){.doc{grid-template-columns:1fr}.rail{display:none}}
+
+  /* ---------- sections ---------- */
+  section{padding-bottom:clamp(56px,9vh,104px);scroll-margin-top:84px}
+  .sec-head{display:flex;align-items:baseline;gap:16px;margin-bottom:10px}
+  .sec-head .num{font-family:"Geist Mono",monospace;font-size:11px;color:var(--accent);letter-spacing:.08em;flex:none;padding-top:6px}
+  h2{
+    margin:0;font-weight:500;letter-spacing:-.028em;
+    font-size:clamp(1.5rem,2.7vw,2.15rem);line-height:1.12;
+  }
+  .sec-sub{margin:0 0 32px;color:var(--ink-3);font-size:14px;max-width:66ch;font-weight:300;line-height:1.65;padding-left:31px}
+  h3{margin:38px 0 14px;font-size:14px;font-weight:600;letter-spacing:-.005em}
+  h3:first-of-type{margin-top:0}
+  p{margin:0 0 16px;color:var(--ink-2);max-width:70ch;font-size:14.5px;line-height:1.72;font-weight:300}
+  p b,p strong{color:var(--ink);font-weight:500}
+  a.inline{color:var(--ink);text-decoration:none;border-bottom:1px solid rgba(232,69,92,.5)}
+  code{
+    font-family:"Geist Mono",monospace;font-size:.86em;color:#e8c7cb;
+    background:rgba(232,69,92,.085);border:1px solid rgba(232,69,92,.14);
+    padding:1.5px 5px;border-radius:5px;white-space:nowrap;
+  }
+
+  /* data rows — no card boxes, just lines */
+  .rows{border-top:1px solid var(--line);margin:8px 0 0}
+  .row{
+    display:grid;grid-template-columns:minmax(140px,1.1fr) minmax(0,2.4fr) auto;
+    gap:24px;align-items:baseline;padding:15px 0;border-bottom:1px solid var(--line);
+  }
+  .row .rk{font-size:13.5px;color:var(--ink);font-weight:450}
+  .row .val{font-size:13px;color:var(--ink-2);font-weight:300;line-height:1.6}
+  .row .rq{font-family:"Geist Mono",monospace;font-size:10.5px;letter-spacing:.05em;white-space:nowrap;text-transform:uppercase}
+  .g-ok{color:var(--ok)} .g-warn{color:var(--warn)} .g-bad{color:var(--bad)} .g-mute{color:var(--ink-3)}
+  @media (max-width:760px){
+    .row{grid-template-columns:1fr;gap:6px;padding:16px 0}
+    .row .rq{grid-row:1;order:-1}
+  }
+
+  /* ---------- timeline ---------- */
+  .ladder{margin-top:6px;border-top:1px solid var(--line)}
+  .lrow{
+    display:grid;grid-template-columns:78px 1fr 88px;
+    gap:20px;align-items:center;padding:13px 0;border-bottom:1px solid var(--line);
+    position:relative;
+    transition:background .3s;
+  }
+  .lrow:hover{background:rgba(255,255,255,.018)}
+  .lrow .vc{font-family:"Geist Mono",monospace;font-size:11.5px;color:var(--ink-3);letter-spacing:.02em}
+  .lrow .desc{min-width:0}
+  .lrow .desc b{display:block;font-size:13.5px;font-weight:500;color:var(--ink);letter-spacing:-.005em}
+  .lrow .desc span{display:block;font-size:12.5px;color:var(--ink-3);font-weight:300;margin-top:2px}
+  .lrow .tag{
+    font-family:"Geist Mono",monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;
+    text-align:right;white-space:nowrap;
+  }
+  .lrow.hot{background:linear-gradient(90deg, rgba(232,69,92,.055), transparent 55%)}
+  .lrow.hot .vc{color:var(--accent)}
+  .lrow.future{opacity:.62}
+  @media (max-width:640px){
+    .lrow{grid-template-columns:64px 1fr;gap:12px}
+    .lrow .tag{grid-column:2;text-align:left;margin-top:2px}
+  }
+
+  /* ---------- telemetry panel ---------- */
+  .tele{
+    margin-top:8px;border:1px solid var(--line);border-radius:var(--r);
+    background:linear-gradient(180deg, rgba(255,255,255,.028), rgba(255,255,255,.008));
+    padding:clamp(22px,3vw,34px);
+  }
+  .tele-head{display:flex;justify-content:space-between;align-items:baseline;gap:20px;flex-wrap:wrap;margin-bottom:26px}
+  .tele-head .t{font-family:"Geist Mono",monospace;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+  .tele-head .src{font-family:"Geist Mono",monospace;font-size:10.5px;color:var(--ink-3)}
+  .bars{display:flex;flex-direction:column;gap:11px}
+  .bar{display:grid;grid-template-columns:132px 1fr 46px;gap:14px;align-items:center}
+  .bar .bl{font-family:"Geist Mono",monospace;font-size:10.5px;color:var(--ink-3);letter-spacing:.02em;text-align:right}
+  .bar .track{height:6px;background:rgba(255,255,255,.055);border-radius:99px;overflow:hidden}
+  .bar .fill{height:100%;border-radius:99px;background:var(--ink-3);transform:scaleX(0);transform-origin:0 50%;transition:transform 1s cubic-bezier(.16,1,.3,1)}
+  .bar .fill.a{background:var(--accent)}
+  .bar .fill.w{background:var(--warn)}
+  .bar .bv{font-family:"Geist Mono",monospace;font-size:11px;color:var(--ink-2);text-align:right}
+  .rv.in .bar .fill{transform:scaleX(var(--s))}
+  .tele-foot{
+    margin-top:24px;padding-top:18px;border-top:1px solid var(--line);
+    display:grid;grid-template-columns:repeat(3,1fr);gap:18px;
+  }
+  .tele-foot .f .n{font-family:"Geist Mono",monospace;font-size:22px;letter-spacing:-.02em;color:var(--ink);display:block;line-height:1}
+  .tele-foot .f .n.ac{color:var(--accent)}
+  .tele-foot .f .l{font-size:11px;color:var(--ink-3);margin-top:8px;display:block;font-weight:300}
+  @media (max-width:620px){
+    .bar{grid-template-columns:96px 1fr 40px}
+    .tele-foot{grid-template-columns:1fr;gap:14px}
+  }
+
+  /* ---------- two-col split ---------- */
+  .split{display:grid;grid-template-columns:1.15fr .85fr;gap:clamp(24px,4vw,56px);align-items:start;margin-top:10px}
+  @media (max-width:860px){.split{grid-template-columns:1fr}}
+
+  .callout{
+    border-left:2px solid var(--accent);padding:4px 0 4px 20px;margin:22px 0;
+  }
+  .callout p{margin:0;color:var(--ink-2);font-size:14.5px;line-height:1.7}
+  .callout p + p{margin-top:10px}
+  .callout b{color:var(--ink)}
+
+  .stat-list{border-top:1px solid var(--line);margin:0}
+  .stat{display:flex;justify-content:space-between;gap:16px;padding:13px 0;border-bottom:1px solid var(--line);font-size:13px}
+  .stat span{color:var(--ink-3);font-weight:300}
+  .stat b{font-family:"Geist Mono",monospace;font-weight:500;font-size:12.5px;color:var(--ink);white-space:nowrap}
+
+  /* ---------- phase machine ---------- */
+  .phases{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .ph{
+    font-family:"Geist Mono",monospace;font-size:10.5px;letter-spacing:.05em;
+    padding:6px 11px;border-radius:7px;border:1px solid var(--line);
+    color:var(--ink-3);background:rgba(255,255,255,.02);
+  }
+  .ph.key{color:var(--accent);border-color:rgba(232,69,92,.3);background:var(--accent-soft)}
+
+  /* ---------- danger list ---------- */
+  .deny{border-top:1px solid var(--line);margin-top:6px;counter-reset:d}
+  .deny .item{
+    display:grid;grid-template-columns:38px 1fr;gap:18px;padding:17px 0;border-bottom:1px solid var(--line);
+  }
+  .deny .item::before{
+    counter-increment:d;content:counter(d,decimal-leading-zero);
+    font-family:"Geist Mono",monospace;font-size:10.5px;color:var(--bad);letter-spacing:.06em;padding-top:3px;
+  }
+  .deny .item p{margin:0;font-size:13.5px;line-height:1.62;color:var(--ink-2)}
+  .deny .item p b{color:var(--ink);font-weight:500}
+
+  /* ---------- next steps ---------- */
+  .steps{margin-top:8px;border-top:1px solid var(--line)}
+  .step{
+    display:grid;grid-template-columns:auto 1fr auto;gap:20px;align-items:start;
+    padding:20px 0;border-bottom:1px solid var(--line);
+    transition:background .3s;
+  }
+  .step:hover{background:rgba(255,255,255,.016)}
+  .step .sk{
+    font-family:"Geist Mono",monospace;font-size:12px;color:var(--accent);
+    border:1px solid rgba(232,69,92,.3);background:var(--accent-soft);
+    width:28px;height:28px;border-radius:8px;display:grid;place-items:center;flex:none;
+  }
+  .step .sb b{display:block;font-size:14px;font-weight:500;color:var(--ink);letter-spacing:-.005em;margin-bottom:5px}
+  .step .sb span{display:block;font-size:13px;color:var(--ink-3);font-weight:300;line-height:1.62;max-width:62ch}
+  .step .sc{font-family:"Geist Mono",monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);white-space:nowrap;padding-top:7px}
+  @media (max-width:640px){.step{grid-template-columns:auto 1fr}.step .sc{grid-column:2;text-align:left;padding-top:0}}
+
+  /* ---------- fact table ---------- */
+  .facts{width:100%;border-collapse:collapse;margin-top:10px;font-size:13px}
+  .facts th{
+    text-align:left;font-family:"Geist Mono",monospace;font-size:9.5px;letter-spacing:.13em;
+    text-transform:uppercase;color:var(--ink-3);font-weight:400;
+    padding:0 14px 11px 0;border-bottom:1px solid var(--line-strong);
+  }
+  .facts td{padding:12px 14px 12px 0;border-bottom:1px solid var(--line);color:var(--ink-2);font-weight:300;vertical-align:top}
+  .facts td:first-child{color:var(--ink);font-weight:450;white-space:nowrap}
+  .facts td.mono{font-family:"Geist Mono",monospace;font-size:11.5px;color:var(--ink-3);word-break:break-word}
+  .facts tr:hover td{background:rgba(255,255,255,.014)}
+  @media (max-width:700px){
+    .facts td:first-child{white-space:normal}
+    .facts th:nth-child(3),.facts td:nth-child(3){display:none}
+  }
+
+  /* ---------- footer ---------- */
+  footer{
+    border-top:1px solid var(--line);margin-top:20px;padding:52px 0 72px;
+    display:flex;justify-content:space-between;gap:28px;flex-wrap:wrap;align-items:flex-end;
+  }
+  footer .fl{max-width:52ch}
+  footer p{margin:0;font-size:12.5px;color:var(--ink-3);font-weight:300;line-height:1.7}
+  footer .fr{font-family:"Geist Mono",monospace;font-size:10.5px;color:#57535f;letter-spacing:.06em;text-align:right;line-height:1.9}
+
+  /* reveal */
+  .rv{opacity:0;transform:translateY(16px);transition:opacity .75s cubic-bezier(.16,1,.3,1), transform .75s cubic-bezier(.16,1,.3,1)}
+  .rv.in{opacity:1;transform:none}
+  @media (prefers-reduced-motion:reduce){.rv{opacity:1;transform:none;transition:none}.bar .fill{transition:none}}
+
+  @media (max-width:900px){
+    .hero{grid-template-columns:1fr;gap:36px}
+    .verdicts{grid-template-columns:1fr 1fr}
+    .verdict{padding:22px 22px 22px 0;border-bottom:1px solid var(--line)}
+    .verdict:nth-child(2n){border-right:none;padding-right:0}
+    .verdict:nth-child(n+3){border-bottom:none}
+  }
+  @media (max-width:520px){
+    .verdicts{grid-template-columns:1fr}
+    .verdict{border-right:none;padding-right:0}
+    .verdict:nth-child(n+3){border-bottom:1px solid var(--line)}
+  }
+  /* ============ print / PDF ============ */
+  @page{size:A4}
+  .print-head{display:none}
+
+  @media print{
+    /* invert the palette by redefining the tokens; every rule follows */
+    :root{
+      --bg:#ffffff;
+      --bg-2:#ffffff;
+      --panel:#fbfafc;
+      --line:rgba(0,0,0,.14);
+      --line-strong:rgba(0,0,0,.30);
+      --ink:#131218;
+      --ink-2:#38353f;
+      --ink-3:#635f6b;
+      --accent:#b02a3e;
+      --accent-soft:rgba(176,42,62,.07);
+      --ok:#1c7050;
+      --warn:#83530e;
+      --bad:#9e2e28;
+    }
+    html,body{background:#fff !important;color:var(--ink)}
+    body{font-size:9.6pt;line-height:1.55}
+
+    .wash,.grain,.progress,.topbar,.rail{display:none !important}
+
+    /* everything the screen animates must already be finished on paper */
+    .rv,.rv.in{opacity:1 !important;transform:none !important;transition:none !important}
+    .bar .fill,.bar .fill.a,.bar .fill.w{
+      transform:scaleX(var(--s)) !important;transition:none !important;
+      -webkit-print-color-adjust:exact;print-color-adjust:exact;
+    }
+
+    .print-head{
+      display:flex;justify-content:space-between;align-items:baseline;gap:12mm;
+      border-bottom:1.5pt solid var(--ink);padding-bottom:2.5mm;margin-bottom:7mm;
+    }
+    .print-head b{font-size:11pt;letter-spacing:-.01em}
+    .print-head span{font-family:"Geist Mono",monospace;font-size:7pt;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+
+    .shell{max-width:none;padding:0}
+    .doc{display:block;padding:0}
+    /* keep the two-up comparisons side by side; stacking them doubles the height */
+    .split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);gap:6mm}
+    .split > div + div{margin-top:0}
+    .split > div{break-inside:avoid}
+
+    .hero{
+      display:block;padding:0 0 5mm;border-bottom:1pt solid var(--line);
+      break-after:avoid;
+    }
+    h1{font-size:24pt;line-height:1.05;letter-spacing:-.028em}
+    .eyebrow{margin-bottom:4mm;font-size:7.2pt}
+    .lede{margin-top:4mm;font-size:9.4pt;max-width:150mm}
+    .installed{margin-top:5mm;box-shadow:none;background:#fff;break-inside:avoid;padding:5mm}
+    .installed::before{display:none}
+    .installed .ver{font-size:15pt}
+    .installed dl{gap:1.2mm 6mm;margin-top:3mm;padding-top:3mm}
+    .installed dd,.installed dt{font-size:7.4pt}
+
+    .verdicts{grid-template-columns:repeat(4,1fr);break-inside:avoid}
+    .verdict{padding:3.5mm 4mm 3.5mm 0}
+    .verdict .v{font-size:9.4pt}
+    .verdict .n{font-size:7.4pt}
+    .verdict .k{margin-bottom:2mm}
+
+    section{padding-bottom:7mm;break-inside:auto}
+    /* each numbered section opens a page — a report, not a scroll */
+    section + section{break-before:page}
+    .sec-head{break-after:avoid;break-inside:avoid}
+    h2{font-size:15pt;break-after:avoid}
+    .sec-sub{padding-left:0;margin-bottom:5mm;font-size:8.6pt;break-after:avoid;break-inside:avoid}
+    h3{break-after:avoid;font-size:9.6pt;margin:6mm 0 2mm}
+    p{font-size:9.2pt;max-width:none;line-height:1.5;orphans:3;widows:3}
+
+    /* keep small units whole, let big ones flow */
+    .row,.lrow,.step,.deny .item,.stat,.bar,.callout,.tele-foot .f{break-inside:avoid}
+    /* grids were tuned for a 1400px screen; give the label columns real room on paper.
+       Fixed widths (not max-content) so every row wraps at the same measure. */
+    .lrow{grid-template-columns:14mm minmax(0,1fr) 38mm;gap:4mm;padding:2.4mm 0;align-items:baseline}
+    .lrow .tag{font-size:7.2pt;letter-spacing:.05em;white-space:nowrap;text-align:right}
+    .lrow .desc b{font-size:9.4pt}
+    .lrow .desc span{font-size:8.4pt;margin-top:0}
+    .row{grid-template-columns:50mm minmax(0,1fr) 26mm;gap:4mm;align-items:baseline}
+    .row .rk{font-size:9.4pt}
+    .row .rq{font-size:7.2pt;white-space:nowrap;letter-spacing:.05em;text-align:right}
+    /* the mobile query (max-width:760px) still matches inside a ~718px print
+       viewport, so its stacking rules must be undone explicitly */
+    .row .rq{order:0;grid-row:auto}
+    .row .rk,.row .val,.row .rq{grid-column:auto}
+    .lrow .tag{grid-column:auto;grid-row:auto;text-align:right}
+    .step{grid-template-columns:max-content minmax(0,1fr) 26mm;gap:4mm}
+    .step .sc{font-size:7.2pt;white-space:nowrap;text-align:right;grid-column:auto;grid-row:auto;padding-top:0}
+    .callout{break-inside:avoid}
+    .tele{break-inside:avoid;background:#fff;padding:5mm}
+    .tele-head{break-after:avoid}
+    .bars{break-inside:avoid}
+    .deny{break-inside:avoid}
+    .verdicts{break-inside:avoid}
+    .ladder,.rows,.steps,.stat-list{break-inside:auto}
+    .ladder{break-before:avoid}
+    .phases{break-inside:avoid}
+    /* a heading must never be the last thing on a page */
+    h2,h3{break-after:avoid-page}
+    .sec-head,.sec-sub{break-after:avoid-page}
+
+    .facts{break-inside:auto;font-size:8.6pt}
+    .facts thead{display:table-header-group}
+    .facts tr{break-inside:avoid}
+    .facts td,.facts th{padding:2mm 3mm 2mm 0}
+    .facts td.mono{font-size:7.8pt}
+
+    table{max-width:100%}
+
+    code{
+      background:rgba(176,42,62,.06);border-color:rgba(176,42,62,.18);
+      color:#7d1f2d;font-size:.88em;
+    }
+    a,a.inline{color:inherit;text-decoration:none;border-bottom:none}
+
+    footer{
+      break-inside:avoid;break-before:auto;margin-top:6mm;padding:6mm 0 0;
+      border-top:1pt solid var(--line);
+    }
+    footer p,footer .fr{font-size:7.6pt;color:var(--ink-3)}
+
+    /* neutralise hover/backdrop effects that don't belong on paper */
+    .lrow:hover,.step:hover,.facts tr:hover td{background:none}
+    .lrow.hot{background:none;border-left:2pt solid var(--accent);padding-left:3mm}
+    .lrow.future{opacity:1}
+    .lrow.future .vc,.lrow.future .desc span{color:var(--ink-3)}
+  }
+</style>
+</head>
+<body>
+<div class="wash"></div>
+<div class="grain"></div>
+<div class="progress" id="prog"></div>
+
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="mark">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <rect width="32" height="32" rx="8" fill="#e8455c"/>
+        <path d="M6.6 20.1c.5-.8 1.6-1.1 2.4-.6 6.1 3.7 15.2 4 20.1 2.2.9-.3 1.9.2 2.2 1.1.3.9-.2 1.9-1.1 2.2-5.6 2.1-15.6 1.7-22.5-2.5-.8-.5-1.1-1.6-.6-2.4Z" fill="#fff" opacity=".92"/>
+        <path d="M9.6 15.3c.4-.7 1.3-1 2-.6 4.5 2.7 11.6 3.5 16.7 1.9.8-.3 1.6.2 1.8 1 .3.8-.2 1.6-1 1.9-5.9 1.8-13.9.9-19.1-2.3-.7-.4-.9-1.3-.4-1.9Z" fill="#fff" opacity=".72"/>
+        <path d="M12.1 10.6c.3-.6 1-.8 1.6-.5 3.6 2.2 8.3 2.7 12.6 1.4.7-.2 1.3.2 1.5.8.2.7-.2 1.3-.8 1.5-4.9 1.5-10.3 1-14.4-1.5-.6-.3-.8-1-.5-1.7Z" fill="#fff" opacity=".55"/>
+      </svg>
+      <b>BitChord Mix</b>
+      <span>state of the project</span>
+    </div>
+    <nav class="topnav">
+      <a href="#now">Now</a>
+      <a href="#ladder">Builds</a>
+      <a href="#telemetry">Telemetry</a>
+      <a href="#candidate">Candidate</a>
+      <a href="#evidence">Evidence</a>
+      <a href="#next">Next</a>
+    </nav>
+    <span class="pill-live"><span class="dot"></span>vc83 installed</span>
+  </div>
+</header>
+
+<div class="shell">
+
+  <div class="print-head">
+    <b>BitChord Mix — handover and current state</b>
+    <span>19 Nov 2026 · vc83 installed · vc84 staged</span>
+  </div>
+
+  <!-- ===================== HERO ===================== -->
+  <div class="hero">
+    <div>
+      <p class="eyebrow">19 November 2026 · handover</p>
+      <h1>Ten builds, one engine,<br>and the ear is still<br>the <em>only</em> judge.</h1>
+      <p class="lede">
+        BitChord Mix is a private Android fork whose entire reason to exist is AutoMix — the transition
+        engine rebuilt from the ground up. <strong>vc83 is on the phone and running.</strong> vc84 is staged,
+        tested, and deliberately not installed. The gap between those two sentences is what this page is about.
+      </p>
+    </div>
+
+    <aside class="installed">
+      <p class="lbl">On the device right now</p>
+      <div class="ver">vc83<small>2.2.3-djmix41 · versionCode 83</small></div>
+      <dl>
+        <dt>Device</dt><dd>1439ebea · Poco F6</dd>
+        <dt>SoC</dt><dd>SM8635 · Android 16</dd>
+        <dt>Session</dt><dd>playing · 20 queued</dd>
+        <dt>Updated</dt><dd>18 Nov · 22:04</dd>
+        <dt>APK</dt><dd>67,556,661 B · v2+v3</dd>
+        <dt>SHA-256</dt><dd>eb2a3f18…4094659d4</dd>
+        <dt>Audit</dt><dd class="g-ok">PASSED</dd>
+      </dl>
+    </aside>
+  </div>
+
+  <!-- ===================== VERDICT STRIP ===================== -->
+  <div class="verdicts">
+    <div class="verdict">
+      <span class="k">Stability</span>
+      <div class="v">Accepted at vc81</div>
+      <span class="n">“way stabler” — ticker + lyric-boundary repair</span>
+    </div>
+    <div class="verdict">
+      <span class="k">Mix quality</span>
+      <div class="v g-warn">Unresolved</div>
+      <span class="n">Never accepted since vc80's dropout fix</span>
+    </div>
+    <div class="verdict">
+      <span class="k">Apple parity</span>
+      <div class="v g-mute">Not established</div>
+      <span class="n">Comparator, not a claim</span>
+    </div>
+    <div class="verdict">
+      <span class="k">NPU</span>
+      <div class="v g-bad">Dormant</div>
+      <span class="n">Beat agreement 0.805 / 0.657 vs 0.95</span>
+    </div>
+  </div>
+
+  <div class="doc">
+    <!-- ===================== RAIL ===================== -->
+    <nav class="rail" aria-label="Contents">
+      <span class="t">Contents</span>
+      <a href="#rule"><i>00</i> The one rule</a>
+      <a href="#ladder"><i>01</i> Build ladder</a>
+      <a href="#now"><i>02</i> What plays now</a>
+      <a href="#telemetry"><i>03</i> Fresh telemetry</a>
+      <a href="#candidate"><i>04</i> vc84 staged</a>
+      <a href="#arch"><i>05</i> How it works</a>
+      <a href="#evidence"><i>06</i> Evidence grades</a>
+      <a href="#deny"><i>07</i> Hard limits</a>
+      <a href="#next"><i>08</i> Next moves</a>
+      <a href="#env"><i>09</i> Environment</a>
+    </nav>
+
+    <main>
+      <!-- ===================== 00 ===================== -->
+      <section id="rule">
+        <div class="sec-head"><span class="num">00</span><h2>The rule that cost the most</h2></div>
+        <p class="sec-sub">Every rejected build in this repository's history broke the same rule. Read it once and keep it.</p>
+
+        <div class="callout">
+          <p><b>Nothing is “fixed” by tests, commits, or a green CI run.</b> The binding acceptance signal is the
+          user's ears on the target phone, corroborated by telemetry from that same session.</p>
+          <p>Synthetic renders prove a command trajectory. A test count proves the code compiles and a
+          contract holds. Neither says a human heard anything better — and this project has produced
+          “this is the worst version ever” from a fully green tree.</p>
+        </div>
+
+        <p>When documents disagree, this order decides: <b>live device state</b>, then <b>cue's retained evidence
+        directories</b> with their XML and exit codes, then this page, then <b>anything dated before today</b> —
+        which is history, often describing a design that was later reverted.</p>
+      </section>
+
+      <!-- ===================== 01 ===================== -->
+      <section id="ladder">
+        <div class="sec-head"><span class="num">01</span><h2>Ten builds, three verdicts</h2></div>
+        <p class="sec-sub">Each row is a real commit. Two were accepted in the user's words; every other row carries the strongest evidence that exists for it, which is usually not ears. The full vc51→vc84 table lives in the markdown companion.</p>
+
+        <div class="ladder rv">
+          <div class="lrow"><span class="vc">vc51</span><div class="desc"><b>Root import</b><span>Graceful automix, break-outro anchor, flat loudness</span></div><span class="tag g-mute">superseded</span></div>
+          <div class="lrow"><span class="vc">vc75</span><div class="desc"><b>Render thread priority</b><span>Raised once, from inside <code>handleBuffer</code> — the stutter root cause</span></div><span class="tag g-mute">superseded</span></div>
+          <div class="lrow"><span class="vc">vc76</span><div class="desc"><b>SongMap Pass-2</b><span>Dynamic stem duck; <code>MixWeightTuner</code> deleted</span></div><span class="tag g-bad">reproduced zap</span></div>
+          <div class="lrow"><span class="vc">vc78</span><div class="desc"><b>Reverb wet retirement</b><span>Hann release to stop, echo tail continues</span></div><span class="tag g-ok">probe-proven</span></div>
+          <div class="lrow"><span class="vc">vc79</span><div class="desc"><b>Live presentation clocks</b><span><code>finishLoop()</code> stops seeking to a frozen endpoint</span></div><span class="tag g-bad">failed · 3.76 s gap</span></div>
+          <div class="lrow"><span class="vc">vc80</span><div class="desc"><b>Loop source coverage</b><span>Finite-loop muting + physical handover mapping</span></div><span class="tag g-ok">accepted</span></div>
+          <div class="lrow"><span class="vc">vc81</span><div class="desc"><b>Planning continuity</b><span>Ticker survives exceptions; lyric-boundary crash fixed</span></div><span class="tag g-ok">accepted</span></div>
+          <div class="lrow"><span class="vc">vc82</span><div class="desc"><b>Equal-power DECLINE</b><span>+3.13 dB central RMS in renders — never heard as better</span></div><span class="tag g-warn">unconfirmed</span></div>
+          <div class="lrow hot"><span class="vc">vc83</span><div class="desc"><b>Arming readiness gate</b><span>DECLINE reverted; outgoing deck no longer muffled while waiting</span></div><span class="tag g-warn">installed · unjudged</span></div>
+          <div class="lrow future"><span class="vc">vc84</span><div class="desc"><b>Loop readiness + polish</b><span>Build budget, gated NPU, PHRASE lanes, roll body</span></div><span class="tag g-mute">staged only</span></div>
+        </div>
+
+        <div class="split">
+          <div>
+            <h3>What “accepted” is allowed to mean</h3>
+            <p><b>vc80</b> covers exactly one thing: the finite-loop dropout on <em>Touch the Sky → Higher Love</em>.
+            It is not a general stutter fix — the 64–85 ms gaps in the USB capture remain unexplained.</p>
+            <p><b>vc81</b> covers planning continuity. Force-closing and reopening no longer kills Automix after
+            one song, because the ticker now survives a recoverable exception and <code>SongSections</code>
+            no longer throws on a lyric cue inside 300 ms of the content end.</p>
+          </div>
+          <div>
+            <h3>The feedback that doesn't count</h3>
+            <p>vc82's “even better” arrived <em>before</em> the APK was confirmed installed — the device snapshot
+            still showed versionCode 81 with no running session. It cannot be attributed to vc82 audio, and it
+            is not acceptance of the overlap change.</p>
+            <p>Recording that honestly is cheaper than shipping on it.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 02 ===================== -->
+      <section id="now">
+        <div class="sec-head"><span class="num">02</span><h2>What is playing right now</h2></div>
+        <p class="sec-sub">vc83 · <code>170328b</code> · DECLINE disjoint revert, arming readiness gate, planner/FX/native fixes.</p>
+
+        <div class="split">
+          <div>
+            <h3>Four moves, one of them measured</h3>
+            <p><b>DECLINE reverted</b> to vc81's disjoint exponents. vc82's complementary faders measured
+            <span class="g-ok">+3.13 dB</span> central summed RMS in production-filter renders, but were never heard
+            as better and could not be tied to any executed complaint. Reverted rather than shipped on a theory.</p>
+            <p><b>Arming readiness gate</b> — and this one came from a real rig, not a hunch. On unchanged vc82
+            source, while the incoming deck sat in <code>STATE_BUFFERING</code> at volume 0, the controller had
+            already pulled the outgoing deck's low-pass to ~800 Hz with its gain still at 1.0. When the incoming
+            deck turned ready halfway through the plan, the fade re-anchored and reopened the filter to 7 kHz.
+            A solo deck, muffled and then un-muffled. vc83 pre-filters only when the incoming deck is actually
+            ready, and cancels the arming on disable, pause, seek and timeout.</p>
+            <p><b>Planner &amp; FX</b> — loop-length bars, dual-confidence blending, peak-aware veto floor,
+            measured-only effect eligibility, and a 4-beat roll capped at half the ring.</p>
+            <p><b>Native</b> — high-pass revisions, chunked rendering, bounded echo retirement.</p>
+          </div>
+          <div>
+            <h3>Proof, and its edge</h3>
+            <ul class="stat-list">
+              <li class="stat"><span>Full suite, cue</span><b>1934 · 0 fail · 1 skip</b></li>
+              <li class="stat"><span>Loop-domain probe</span><b>63 pairs · exit 0</b></li>
+              <li class="stat"><span>Reverb-stop probe</span><b class="g-ok">exit 0</b></li>
+              <li class="stat"><span>Signature</span><b>v2+v3</b></li>
+              <li class="stat"><span>16 KiB alignment</span><b class="g-ok">PASSED</b></li>
+            </ul>
+            <p style="margin-top:22px;font-size:13.5px">What the numbers cannot say: <b>whether the arming gate
+            removes anything the user actually hears.</b> No listening verdict for vc83 exists anywhere in this
+            repository.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 03 ===================== -->
+      <section id="telemetry">
+        <div class="sec-head"><span class="num">03</span><h2>Twelve hours of one listening session</h2></div>
+        <p class="sec-sub">Pulled live from the phone this session and parsed locally. 721 rows since the vc83 install — the engine's own account of what it did.</p>
+
+        <div class="tele rv" id="telePanel">
+          <div class="tele-head">
+            <span class="t">Event volume · since install</span>
+            <span class="src">automix-telemetry.jsonl · 4,367 rows total</span>
+          </div>
+          <div class="bars">
+            <div class="bar"><span class="bl">mix.plan</span><div class="track"><div class="fill" style="--s:.35"></div></div><span class="bv">74</span></div>
+            <div class="bar"><span class="bl">plan.rejected</span><div class="track"><div class="fill" style="--s:.25"></div></div><span class="bv">53</span></div>
+            <div class="bar"><span class="bl">mix.complete</span><div class="track"><div class="fill" style="--s:.17"></div></div><span class="bv">36</span></div>
+            <div class="bar"><span class="bl">mix.fire</span><div class="track"><div class="fill" style="--s:.15"></div></div><span class="bv">32</span></div>
+            <div class="bar"><span class="bl">mix.verify</span><div class="track"><div class="fill" style="--s:.10"></div></div><span class="bv">21</span></div>
+            <div class="bar"><span class="bl">exit.guard</span><div class="track"><div class="fill w" style="--s:.075"></div></div><span class="bv">9</span></div>
+            <div class="bar"><span class="bl">arm.death</span><div class="track"><div class="fill" style="--s:.04"></div></div><span class="bv">3</span></div>
+            <div class="bar"><span class="bl">pause.detected</span><div class="track"><div class="fill w" style="--s:.035"></div></div><span class="bv">2</span></div>
+            <div class="bar"><span class="bl">mix.error</span><div class="track"><div class="fill" style="--s:0"></div></div><span class="bv">0</span></div>
+          </div>
+          <div class="tele-foot">
+            <div class="f"><span class="n">32<span style="font-size:13px;color:var(--ink-3)"> / 36</span></span><span class="l">completions with a real handoff</span></div>
+            <div class="f"><span class="n">+54<span style="font-size:13px;color:var(--ink-3)"> ms</span></span><span class="l">median handover error · range −1 to +66</span></div>
+            <div class="f"><span class="n">21<span style="font-size:13px;color:var(--ink-3)"> / 21</span></span><span class="l">exit gates with zero violations</span></div>
+          </div>
+        </div>
+
+        <div class="split" style="margin-top:34px">
+          <div>
+            <h3>Two facts worth acting on</h3>
+            <p><b>A quarter of all mixes take the emergency branch.</b> Nine of 36 completions ended
+            <code>emergency-retire-guard</code> — every one in <code>TAIL</code>, every one at
+            <code>tailMs=350</code>, every one with no expected handover. The guard fires when
+            <code>finish()</code> finds a spare deck still audible, and dissolves it instead of cutting it.
+            That it exists is reassuring. That it fires this often is not “normal fades”.</p>
+            <p><b>Two pauses with no author.</b> Both report <code>playWhenReady=false</code> at volume 1.0
+            with <code>changeReason=1</code>; the second lands 253 ms after handoff. Media3 calls that value
+            a user request — but no command was sent, and this is how a spurious internal pause has looked in
+            earlier captures. Neither proven, neither dismissed.</p>
+          </div>
+          <div>
+            <h3>The noisy channel</h3>
+            <p>53 rejections per 74 plans sounds catastrophic and isn't. It is replanning churn: scrubs,
+            decline handoffs, fallback windows. Which means <b>“count of fires” is a bad proxy for
+            “count of good mixes.”</b></p>
+            <p>Style choice is worth a look. Since vc83 the engine picked <code>DJ_FILTER</code> 43 times,
+            <code>EQUAL_POWER</code> 12, phrase template <code>M1</code> 12, <code>DJ_BLEND</code> 4. The
+            filtered classic path dominates. Before tuning phrase templates, find out whether they are being
+            vetoed by policy or simply losing on score.</p>
+            <p style="font-size:13px;color:var(--ink-3)">Release builds strip <code>Log.*</code>. This JSONL
+            file is the only transition evidence that exists on a shipped build.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 04 ===================== -->
+      <section id="candidate">
+        <div class="sec-head"><span class="num">04</span><h2>vc84 is ready and should not ship yet</h2></div>
+        <p class="sec-sub">Three independently-developed blocks, integrated onto a vc83 base. Every test is green. That is the exact shape of change that has regressed by ear before.</p>
+
+        <div class="rows">
+          <div class="row"><span class="rk">NPU swap</span><span class="val">Gated <code>nirovi_qnn</code> adapter, pad-to-1500, EPContext fingerprint, linker preflight. Both flags compiled off — dead weight in the APK until a graph agrees with the current model.</span><span class="rq g-mute">dormant</span></div>
+          <div class="row"><span class="rk">Loop readiness</span><span class="val">A real wall-and-deadline budget shared by the builder and both decoder workers; model lock with post-acquisition recheck; bounded futures; one guarded later-bar rescue.</span><span class="rq g-ok">clean story</span></div>
+          <div class="row"><span class="rk">Sound polish</span><span class="val">Bass-handoff cap, PHRASE lane consumption, 4-beat roll body and header, native roll gate. 1,996,404 native checks pass.</span><span class="rq g-ok">r3 verified</span></div>
+        </div>
+
+        <div class="split" style="margin-top:32px">
+          <div>
+            <h3>The gate I re-ran</h3>
+            <ul class="stat-list">
+              <li class="stat"><span>shared jvmTest</span><b>537 · 67 files · 0 fail</b></li>
+              <li class="stat"><span>app unit tests</span><b>1441 · 140 files · 1 skip</b></li>
+              <li class="stat"><span>Total</span><b class="g-ok">1978 · exit 0</b></li>
+              <li class="stat"><span>Sound-polish r3</span><b>1950 · exit 0</b></li>
+              <li class="stat"><span>Source hash match</span><b class="g-ok">5 / 5 files</b></li>
+            </ul>
+          </div>
+          <div>
+            <h3>Why it still waits</h3>
+            <p><b>Three P1 reviews are open in the tree</b> — phrase takeover double-counting, M7 stop-gain,
+            straight-roll resume. Shipping past an open P1, on a build whose sibling was rejected, is how
+            this project loses a week.</p>
+            <p><b>Nothing has been heard.</b> A merge of three feature blocks is precisely the change that
+            passes every test and sounds wrong.</p>
+            <p style="font-size:13px;color:var(--ink-3)">The prior handover listed its third sound-polish run
+            as “retained but not verified — cue was offline”. Cue was up this session; the run is now read,
+            and it is green.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 05 ===================== -->
+      <section id="arch">
+        <div class="sec-head"><span class="num">05</span><h2>How the engine is put together</h2></div>
+        <p class="sec-sub">Decisions live in <code>shared/</code> as pure Kotlin. Android owns the players, the sink and the native renderer.</p>
+
+        <div class="split">
+          <div>
+            <h3>The phase machine</h3>
+            <p>Everything the controller does is a phase transition. Knowing which phase a failure happened
+            in is most of the diagnosis.</p>
+            <div class="phases">
+              <span class="ph">IDLE</span>
+              <span class="ph key">ARMING</span>
+              <span class="ph key">FADING</span>
+              <span class="ph">TAIL</span>
+              <span class="ph">LOOP</span>
+              <span class="ph">LOOP_ARMING</span>
+              <span class="ph">LOOP_RUNNING</span>
+              <span class="ph">BAILING</span>
+              <span class="ph">SLEEP</span>
+            </div>
+            <p style="margin-top:18px;font-size:13.5px">Highlighted phases are the ones this week's work touched.
+            <b>ARMING</b> is where the readiness gate lives; <b>FADING</b> is where a late-ready incoming deck
+            used to reopen the outgoing filter.</p>
+
+            <h3>Transition vocabulary</h3>
+            <p>Seven styles, four filter variants, five effects, sixteen phrase templates. The ladder below is
+            the point: ambition drops in explicit steps as certainty does, instead of one engine quietly doing
+            beat math on junk.</p>
+            <div class="phases">
+              <span class="ph">BEATMATCHED</span>
+              <span class="ph">DJ_ASSISTED</span>
+              <span class="ph">PLAIN_CROSSFADE</span>
+            </div>
+          </div>
+          <div>
+            <h3>Where the mass is</h3>
+            <ul class="stat-list">
+              <li class="stat"><span>CrossfadeController.kt</span><b>8,214 lines</b></li>
+              <li class="stat"><span>PlaybackService.kt</span><b>10,066 lines</b></li>
+              <li class="stat"><span>TransitionPlanner.kt</span><b>2,323 lines</b></li>
+              <li class="stat"><span>LoopMix.kt</span><b>2,047 lines</b></li>
+              <li class="stat"><span>Kotlin files, product</span><b>361</b></li>
+              <li class="stat"><span>Test source files</span><b>215</b></li>
+              <li class="stat"><span>Native C++ (excl. vendored)</span><b>4,503 lines</b></li>
+            </ul>
+            <p style="margin-top:20px;font-size:13.5px">The two giant files are the hot zone. Almost every
+            corrective commit of the last two weeks lands in one of them — which is why the project insists on
+            isolated worktrees and serialized Gradle runs.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== 06 ===================== -->
+      <section id="evidence">
+        <div class="sec-head"><span class="num">06</span><h2>What is actually known</h2></div>
+        <p class="sec-sub">Every claim in this project carries a grade. The grades are not decoration — they decide what may be built on top of a fact.</p>
+
+        <table class="facts">
+          <thead><tr><th>Claim</th><th>Grade</th><th>Source</th></tr></thead>
+          <tbody>
+            <tr><td>vc83 is what plays</td><td class="g-ok">verified</td><td class="mono">dumpsys package</td></tr>
+            <tr><td>Handover timing ±66 ms over 36 mixes</td><td class="g-ok">verified</td><td class="mono">telemetry join</td></tr>
+            <tr><td>Exit gate 21/21 clean</td><td class="g-ok">verified</td><td class="mono">mix.exit.gate</td></tr>
+            <tr><td>Emergency branch on 9/36 completions</td><td class="g-warn">measured</td><td class="mono">mix.complete</td></tr>
+            <tr><td>Post-handoff pause, cause unknown</td><td class="g-warn">observed</td><td class="mono">mix.pause.detected</td></tr>
+            <tr><td>vc84 JVM green</td><td class="g-ok">verified</td><td class="mono">cue XML · 06:04</td></tr>
+            <tr><td>Sound-polish native 1.99 M checks</td><td class="g-ok">verified</td><td class="mono">r3/native-sound.log</td></tr>
+            <tr><td>NPU beat agreement</td><td class="g-bad">failed</td><td class="mono">0.805 / 0.657 vs 0.95</td></tr>
+            <tr><td>HTP dispatches on SM8635</td><td class="g-mute">not collected</td><td class="mono">—</td></tr>
+            <tr><td>vc84 sounds better — or equal</td><td class="g-mute">unknown</td><td class="mono">never heard</td></tr>
+            <tr><td>Arming gate fixes an audible complaint</td><td class="g-mute">unproven</td><td class="mono">rig only</td></tr>
+            <tr><td>Original “one song then dead” exception</td><td class="g-bad">never found</td><td class="mono">log was R8-stripped</td></tr>
+            <tr><td>Download mirror</td><td class="g-bad">HTTP 530</td><td class="mono">warganet.web.id</td></tr>
+          </tbody>
+        </table>
+
+        <div class="callout" style="margin-top:32px">
+          <p><b>Six rules for stating evidence.</b> Never turn a test count into a quality claim. Never call a
+          stage passed from an invocation that exited non-zero. Never identify a song pair from duration or BPM
+          coincidence — <code>mix.dump</code> carries the ids, and without them the pair is unknown. Never report
+          a cumulative counter as a per-version rate. A synthetic render establishes a command trajectory, not
+          audibility. And a <code>mix.verify ok</code> is scoped to phase and exit gate only — it is not a verdict.</p>
+        </div>
+      </section>
+
+      <!-- ===================== 07 ===================== -->
+      <section id="deny">
+        <div class="sec-head"><span class="num">07</span><h2>Hard limits</h2></div>
+        <p class="sec-sub">Not preferences. Each of these has already cost a day, a build, or a user's trust.</p>
+
+        <div class="deny">
+          <div class="item"><p><b>Never build or promote the rejected integration branch.</b> It starved effects and dropped non-4/4 handling. It is preserved, not pending.</p></div>
+          <div class="item"><p><b>Never reset a cue checkout.</b> One preserved test diff there is the only characterisation evidence for the arming defect. <code>git clean</code> deletes it.</p></div>
+          <div class="item"><p><b>Never touch signing material.</b> No read, no copy, no print, no commit. The certificate is the sole reason in-place updates work.</p></div>
+          <div class="item"><p><b>Never run Android or Gradle builds on this workstation.</b> It cannot, and trying wastes the session.</p></div>
+          <div class="item"><p><b>Never install without a version bump.</b> <code>adb install -r</code> cannot downgrade; a failed attempt leaves the device in an unknown state.</p></div>
+          <div class="item"><p><b>Never uninstall, clear data, or replace the queue.</b> The queue and session on the device are user state and evidence at once.</p></div>
+          <div class="item"><p><b>Never enable the NPU path</b> while agreement fails and no HTP trace exists. Matching input shapes do not mean matching weights.</p></div>
+          <div class="item"><p><b>Never run <code>cue-android</code> from a newer worktree.</b> Its <code>REPO</code> is hardcoded to the preserved vc82 checkout (versionCode 82), so it would build, sign and install vc82 over a newer build. Invoke Gradle in the target tree instead.</p></div>
+          <div class="item"><p><b>Never ship past an open P1</b>, and never ship without a listening verdict.</p></div>
+          <div class="item"><p><b>Never reintroduce</b> the delayed limiter (linear interpolation cannot detect intersample overshoot), the keep-warm daemon (it never prevented a freeze), or Gradle signing (v2 only).</p></div>
+        </div>
+      </section>
+
+      <!-- ===================== 08 ===================== -->
+      <section id="next">
+        <div class="sec-head"><span class="num">08</span><h2>The next six moves</h2></div>
+        <p class="sec-sub">Ordered deliberately. Each one produces evidence for the next, and none of them is a build until step C.</p>
+
+        <div class="steps">
+          <div class="step"><span class="sk">A</span><div class="sb"><b>Explain the emergency branch</b><span>Join the nine <code>emergency-retire-guard</code> completions to their fire and dump rows. Print phase, tail length, spare volume and style for each. One page of output, no code changes.</span></div><span class="sc">analysis</span></div>
+          <div class="step"><span class="sk">B</span><div class="sb"><b>Decide vc84 on evidence</b><span>Either close the three open P1s with focused tests on the exact paths they name, or cut vc84 down to the loop-readiness commit alone — the one block with an isolated, twice-verified story.</span></div><span class="sc">decision</span></div>
+          <div class="step"><span class="sk">C</span><div class="sb"><b>Build, sign, audit, install</b><span>Unsigned build, apksigner v2+v3, audit script, 16 KiB alignment check, record the hash, install with <code>-r</code>. Launch — do not play.</span></div><span class="sc">cue only</span></div>
+          <div class="step"><span class="sk">D</span><div class="sb"><b>One marked listening session</b><span>One genre the user actually plays, with start and stop marked in wall-clock time. Pull and archive telemetry afterwards — the on-device file rotates at 2 MB.</span></div><span class="sc">user</span></div>
+          <div class="step"><span class="sk">E</span><div class="sb"><b>Tune only against a defect</b><span>Any fader, filter, template or policy change needs a failure from D attached to it. This is the lesson of vc82's theory-driven fader swap and of the whole rejected architectural pass.</span></div><span class="sc">conditional</span></div>
+          <div class="step"><span class="sk">F</span><div class="sb"><b>Leave the NPU dormant</b><span>Until a graph agrees at ≥0.95 F1 and an HTP node-assignment trace exists on the device, it is a liability, not a feature.</span></div><span class="sc">frozen</span></div>
+        </div>
+      </section>
+
+      <!-- ===================== 09 ===================== -->
+      <section id="env">
+        <div class="sec-head"><span class="num">09</span><h2>Where everything lives</h2></div>
+
+        <table class="facts">
+          <thead><tr><th>Thing</th><th>Detail</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td>Repo</td><td class="mono">~/Bitchord/work/bitchord-mix</td><td>16 worktrees + 1 stale entry</td></tr>
+            <tr><td>Active tree</td><td class="mono">.slim/worktrees/automix-vc84-integration</td><td class="g-ok">clean · b140313</td></tr>
+            <tr><td>Build host</td><td class="mono">ssh cue · 100.125.76.84</td><td class="g-ok">up · 8 vCPU · 18 G free</td></tr>
+            <tr><td>Phone</td><td class="mono">adb · 1439ebea</td><td>USB · Poco F6 · SM8635</td></tr>
+            <tr><td>Telemetry</td><td class="mono">/sdcard/Android/data/…/files/</td><td>JSONL · rotates at 2 MB</td></tr>
+            <tr><td>Evidence</td><td class="mono">/workspace/diagnostics/</td><td>4 runs retained</td></tr>
+            <tr><td>Archive</td><td class="mono">~/Bitchord/apk · patches · evidence</td><td>6.4 GB, historical only</td></tr>
+            <tr><td>Disk</td><td class="mono">/home · 91 % used</td><td class="g-warn">6.2 G free — prune first</td></tr>
+          </tbody>
+        </table>
+
+        <p style="margin-top:26px">The archive is large and mostly irrelevant to current work: eighteen legacy APKs, forty-one patches already superseded by git history, half a gigabyte of 2026-11 forensic captures. It exists so that a claim can be traced, not so that it can be read. <b>If a fact is not in git or in cue's diagnostics, treat it as history.</b></p>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <div class="fl">
+      <p>Compiled 19 November 2026 from live repository state, the live build host, and the live device.
+      Every figure on this page was read in this session — none was carried forward from an earlier handover.
+      The detailed, machine-facing companion is <code>docs/HANDOVER_2026-11-19.md</code>.</p>
+    </div>
+    <div class="fr">
+      BitChord Mix · com.music.bitchord.loopfix<br>
+      GPL-3.0-or-later · private fork<br>
+      vc83 installed · vc84 staged
+    </div>
+  </footer>
+</div>
+
+<script>
+(function(){
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* scroll progress — transform only */
+  var prog = document.getElementById('prog');
+  var ticking = false;
+  function onScroll(){
+    if(ticking) return;
+    ticking = true;
+    requestAnimationFrame(function(){
+      var h = document.documentElement;
+      var max = h.scrollHeight - h.clientHeight;
+      var p = max > 0 ? h.scrollTop / max : 0;
+      prog.style.width = (p * 100).toFixed(2) + '%';
+      ticking = false;
+    });
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+
+  /* reveal */
+  var targets = document.querySelectorAll('.rv');
+  if(reduce || !('IntersectionObserver' in window)){
+    targets.forEach(function(el){ el.classList.add('in'); });
+  } else {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, {rootMargin:'0px 0px -8% 0px', threshold:0.04});
+    targets.forEach(function(el){ io.observe(el); });
+  }
+
+  /* rail active state */
+  var links = Array.prototype.slice.call(document.querySelectorAll('.rail a'));
+  var sections = links.map(function(a){ return document.querySelector(a.getAttribute('href')); });
+  if('IntersectionObserver' in window && !reduce){
+    var setOn = function(i){
+      links.forEach(function(l,n){ l.classList.toggle('on', n === i); });
+    };
+    var so = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          var i = sections.indexOf(e.target);
+          if(i > -1) setOn(i);
+        }
+      });
+    }, {rootMargin:'-20% 0px -65% 0px'});
+    sections.forEach(function(s){ if(s) so.observe(s); });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,567 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index 986a76b..7c40e9e 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -36,6 +36,7 @@ import com.music.bitchord.playback.smart.FILTER_ECHO_AT
+ import com.music.bitchord.playback.smart.FilterTransitionVariant
+ import com.music.bitchord.playback.smart.AutomixStatus
+ import com.music.bitchord.playback.smart.MixGain
++import com.music.bitchord.playback.smart.RetireGuard
+ import com.music.bitchord.playback.smart.MixWaveform
+ import com.music.bitchord.playback.smart.TrackAnalysis
+ import com.music.bitchord.playback.smart.TransitionPlan
+@@ -582,6 +583,12 @@ class CrossfadeController(
+     private var tailFromGain = 0f
+     private var tailStartMs = 0L
+     private var tailDurationMs = 0L
++    /** djmix12: player the TAIL phase dissolves (outgoing normally, incoming when a
++     * pre-handoff audible strand is retired). */
++    private var tailTarget: ExoPlayer? = null
++    private var lastRejectedLogKey: String? = null
++    private var lastEmittedPlanVerdict: String? = null
++    private var lastFallbackLogKey: String? = null
+     private var armGraceUsed = false
+     private var armDeadline = 0L
+ 
+@@ -1283,6 +1290,10 @@ class CrossfadeController(
+             )
+         }
+ 
++        val classicTailSec = if (plan.fadeSeconds > 0.0) PhraseConfig.EXIT_TAIL_MIN_MS / 1000.0 else PhraseConfig.EXIT_TAIL_EMERGENCY_MS / 1000.0
++        val rejKey = plan.reason + "|" + plan.transitionStyle.name
++        if (rejKey != lastRejectedLogKey) {
++            lastRejectedLogKey = rejKey
+         if (plan.reason.contains("fallback") || plan.reason.contains("plain") || plan.reason.contains("unmixable")) {
+             AutomixTelemetry.event("mix.plan.rejected", mapOf("rung" to "classic-fallback", "reason" to plan.reason,
+                 "qualityA" to currentAnalysis.quality, "qualityB" to nextAnalysis.quality,
+@@ -1290,6 +1301,20 @@ class CrossfadeController(
+                 "bpmA" to currentAnalysis.bpm, "bpmB" to nextAnalysis.bpm,
+                 "confA" to currentAnalysis.beatConfidence, "confB" to nextAnalysis.beatConfidence))
+         }
++        } else if (!plan.blocked && verdict != lastEmittedPlanVerdict) {
++            lastEmittedPlanVerdict = verdict
++            AutomixTelemetry.event(
++                "mix.plan",
++                mapOf(
++                    "template" to "classic", "locked" to false, "slides" to 0,
++                    "bpmA" to currentAnalysis.bpm, "bpmB" to nextAnalysis.bpm,
++                    "statusA" to currentAnalysis.status, "statusB" to nextAnalysis.status,
++                    "qualityA" to currentAnalysis.quality, "qualityB" to nextAnalysis.quality,
++                    "exitTailSec" to classicTailSec, "fadeSec" to plan.fadeSeconds,
++                    "style" to plan.transitionStyle.name,
++                ),
++            )
++        }
+         lastSmartPlan = plan
+         lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
+         publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, plan, advanced)
+@@ -2141,7 +2166,7 @@ class CrossfadeController(
+             // A blend cut short before its midpoint still ends on the incoming
+             // track — it is the one playing on, and what [finish] keeps.
+             handOff(out, player)
+-            beginTailOrFinish(out)
++            beginTailOrFinish(out, "planned-fade-done", "driveFade-done")
+         }
+     }
+ 
+@@ -2153,7 +2178,7 @@ class CrossfadeController(
+      * one (350 ms) before [finish] retires it. The retire is the only
+      * hard-cut site left on this path; it now always sees silence.
+      */
+-    private fun beginTailOrFinish(out: ExoPlayer) {
++    private fun beginTailOrFinish(out: ExoPlayer, reason: String = "planned", retireSite: String = "driveFade-done") {
+         val vol = out.volume
+         if (vol <= 0.001f) {
+             finish()
+@@ -2161,17 +2186,25 @@ class CrossfadeController(
+         }
+         tailFromGain = vol
+         tailStartMs = SystemClock.elapsedRealtime()
++        tailTarget = out
+         val planned = fadeMs > 0L
+         tailDurationMs = if (planned) PhraseConfig.EXIT_TAIL_MIN_MS.toLong() else PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong()
+         AutomixTelemetry.event(
+             "mix.exit.tail",
+-            mapOf("tailMs" to tailDurationMs, "mode" to if (planned) "planned" else "emergency", "gain" to vol),
++            mapOf(
++                "tailMs" to tailDurationMs,
++                "mode" to if (planned) "planned" else "emergency",
++                "gain" to vol,
++                "gainDb" to RetireGuard.gainDb(vol),
++                "reason" to reason,
++                "retireSite" to retireSite,
++            ),
+         )
+         phase = Phase.TAIL
+     }
+ 
+     private fun driveTail() {
+-        val out = outgoing
++        val out = tailTarget ?: outgoing
+         if (out == null) {
+             finish()
+             return
+@@ -3363,7 +3396,7 @@ class CrossfadeController(
+             plan, outAnalysis, loopOutDurationMs / 1000.0, inAnalysis, loopInDurationMs / 1000.0,
+             loopSungOut, loopSungIn, why = why,
+         )
+-        while (candidate != null && candidate.out.loopStart <= positionSec + guardSec) {
++        while (candidate != null && candidate.out.loopStart < positionSec - PhraseConfig.PREP_TOLERANCE_MS / 1000.0) {
+             val further = LoopMix.shiftToNextBar(
+                 candidate, outAnalysis, loopOutDurationMs / 1000.0, inAnalysis, loopInDurationMs / 1000.0,
+                 loopSungOut, loopSungIn, why = why,
+@@ -3722,7 +3755,11 @@ class CrossfadeController(
+ 
+     /** The loop mix isn't happening after all: the pair takes the planner's blend instead. */
+     private fun loopFallBack(reason: String) {
+-        AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
++        val fbKey = "$reason|${phase.name}"
++        if (fbKey != lastFallbackLogKey) {
++            lastFallbackLogKey = fbKey
++            AutomixTelemetry.event("mix.loop.fallback", mapOf("reason" to reason, "phase" to phase.name))
++        }
+         Log.d(TAG, "loop mix falls back to a blend: $reason")
+         loopPlanned = null
+         loopScript = null
+@@ -3969,9 +4006,9 @@ class CrossfadeController(
+         // gains ramped); finishing it is always more graceful than
+         // aborting it. Pre-arm phases may still bail (costs only the
+         // standby decoder).
+-        val shownMarker = appSettingsMarkerShown()
++        // ARMING (marker shown or not) is now frozen once armed (djmix12 P1-4).
+         if (phase == Phase.FADING || phase == Phase.TAIL || phase == Phase.LOOP_ARMING || phase == Phase.LOOP_RUNNING ||
+-            (phase == Phase.ARMING && shownMarker)) {
++            phase == Phase.ARMING) {
+             AutomixTelemetry.event("mix.freeze.onInterruption", mapOf("phase" to phase.name, "reason" to "interrupted-while-armed"))
+             return
+         }
+@@ -4004,6 +4041,21 @@ class CrossfadeController(
+     private fun leavingOnBail(): ExoPlayer? = if (handedOff) outgoing else incoming
+ 
+     private fun finish() {
++        // djmix12 retire guard: an audible spare may not be retired
++        // here. Convert to an emergency TAIL (350 ms) first; driveTail
++        // quiets it to silence and re-enters finish() with phase==TAIL.
++        if (phase != Phase.IDLE && phase != Phase.TAIL && phase != Phase.BAILING) {
++            val spare = if (handedOff) outgoing else incoming
++            val vol = spare?.volume ?: 0f
++            if (RetireGuard.audible(vol)) {
++                AutomixTelemetry.event(
++                    "mix.exit.guard",
++                    mapOf("site" to "finish", "phase" to phase.name, "gainDb" to RetireGuard.gainDb(vol)),
++                )
++                beginTailOrFinish(spare!!, "emergency-retire-guard", "finish:" + phase.name)
++                return
++            }
++        }
+         discardPrime()
+         val wasTransitioning = phase != Phase.IDLE
+         if (phase != Phase.IDLE) {
+@@ -4085,7 +4137,13 @@ class CrossfadeController(
+         outgoingAnalysis = TrackAnalysis()
+         incomingAnalysis = TrackAnalysis()
+         phase = Phase.IDLE
+-        if (wasTransitioning) onSettled()
++        if (wasTransitioning) {
++            AutomixTelemetry.event(
++                "mix.complete",
++                mapOf("phase" to phase.name, "handoff" to handedOff, "bpmA" to outgoingAnalysis.bpm, "bpmB" to incomingAnalysis.bpm, "tailMs" to tailDurationMs, "reason" to "finish"),
++            )
++            onSettled()
++        }
+     }
+ 
+     /** Still a next track, still playing, still switched on — by whichever setting armed this one. */
+@@ -4104,6 +4162,10 @@ class CrossfadeController(
+      * of preparing it.
+      */
+     private fun retire(player: ExoPlayer) {
++        // djmix12 invariant: retire() must only ever see silence.
++        if (player.volume > 0.001f) {
++            AutomixTelemetry.event("mix.exit.violated", mapOf("site" to "retire", "gainDb" to RetireGuard.gainDb(player.volume)))
++        }
+         player.stop()
+         player.clearMediaItems()
+         // This is the next transition's incoming player, and from its handoff
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 0647be4..a99c85b 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 53
+-extra["bitchordVersionName"] = "2.0.1-djmix11"
++extra["bitchordVersionCode"] = 54
++extra["bitchordVersionName"] = "2.1.0-djmix12"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+index f153d73..676dc67 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/LoopMix.kt
+@@ -329,7 +329,7 @@ object LoopMix {
+         val outBpm = 60 / outBeat
+         val inBpm = 60 / inBeat
+ 
+-        val fold = doubleArrayOf(1.0, 2.0, 0.5).minBy { abs(ln(inBpm / it / outBpm)) }
++        val fold = alignedFold(outBpm, inBpm)
+         val target = inBpm / fold
+         val rampBars = ceil(abs(target - outBpm) / MAX_BPM_PER_BAR).toInt().coerceIn(MIN_RAMP_BARS, MAX_RAMP_BARS)
+         // the incoming loop lets go only at its own loop boundary: round the mix up to whole incoming loops
+@@ -813,7 +813,7 @@ object LoopMix {
+             val inBeat = inGrid.beatSec
+             val outBpm = 60.0 / outBeat
+             val inBpm = 60.0 / inBeat
+-            val fold = doubleArrayOf(1.0, 2.0, 0.5).minBy { abs(ln(inBpm / it / outBpm)) }
++            val fold = alignedFold(outBpm, inBpm)
+             val startRate = fold * inBeat / outBeat
+             val vocal = out.vocalProbability >= 0.45 || inn.vocalProbability >= 0.45
+             val cap = if (vocal) 0.06 else 0.08
+@@ -943,7 +943,7 @@ object LoopMix {
+         }
+         val outStart = snapped ?: rawStart
+         if (outStart + bar > outDuration - 0.2) return null
+-        val fold = (inBpm / outBpm).takeIf { it.isFinite() && it > 0.0 }?.coerceIn(0.25, 4.0) ?: 1.0
++        val fold = alignedFold(outBpm, inBpm)
+         return Plan(
+             out = straightPick(outStart, outBeat, outBpm),
+             inn = straightPick(if (inGrid != null) cueOf(inn) else 0.0, inBeat, inBpm),
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+index 3701f7d..85c037a 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhraseConfig.kt
+@@ -83,6 +83,14 @@ object PhraseConfig {
+     const val EXIT_TAIL_BEATS = 2.0
+     const val EXIT_TAIL_MAX_SEC = 2.0
+ 
++    /** Shared tempo discipline (djmix12, after bkmasterplayer): beyond this post-fold
++     * delta a long blend is never rampable -- downgrade to short/echo. */
++    const val TEMPO_HARD_DELTA = 0.08
++    /** Short-rung overlap cap for the downgraded rung. */
++    const val TEMPO_HARD_MAX_BARS = 4
++    /** Prep overrun tolerance (ms): a missed bar within this still arms. */
++    const val PREP_TOLERANCE_MS = 50L
++
+     /** Planned exit-dissolve length in seconds (800 ms floor, 2 s cap). */
+     fun exitTailSeconds(beatSec: Double): Double =
+         (EXIT_TAIL_BEATS * beatSec).coerceIn(EXIT_TAIL_MIN_MS / 1000.0, EXIT_TAIL_MAX_SEC)
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+index 8a190a0..cef7782 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/PhrasePlanner.kt
+@@ -358,6 +358,12 @@ object PhrasePlanner {
+             return "energy jump"
+         }
+         if (template == MixTemplate.VOCAL_OVER_OUTRO && ((steps ?: 9) > 1 || inn.gridConfidence < 0.8f)) return "vocal outro fit"
++        // djmix12 (BK tempo discipline): the relaxed long blend is not exempt
++        // from the 8% cap. Post-fold deltas beyond it downgrade to echo/cut
++        // (M6/M10/M11/CUT_ON_ONE), never a long lurching ramp.
++        if (template == MixTemplate.RELAXED && abs(ratio - 1.0) > PhraseConfig.TEMPO_HARD_DELTA) {
++            return "tempo"
++        }
+         return null
+     }
+ 
+@@ -377,14 +383,7 @@ object PhrasePlanner {
+ 
+     private fun foldedRatio(outBpm: Double, inBpm: Double): Double {
+         if (outBpm <= 1.0 || inBpm <= 1.0) return 1.0
+-        var best = inBpm / outBpm
+-        var bestErr = Double.MAX_VALUE
+-        for (fold in doubleArrayOf(1.0, 2.0, 0.5)) {
+-            val candidate = (inBpm / fold) / outBpm
+-            val err = abs(kotlin.math.ln(candidate))
+-            if (err < bestErr) { bestErr = err; best = candidate }
+-        }
+-        return best
++        return (inBpm / alignedFold(outBpm, inBpm)) / outBpm
+     }
+ 
+     private fun score(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt
+new file mode 100644
+index 0000000..82e9697
+--- /dev/null
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/RetireGuard.kt
+@@ -0,0 +1,30 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.math.log10
++
++/**
++ * Retire gate (djmix12): every classic/native handoff must pass through
++ * silence before any player is stopped. Shared so the guard is unit
++ * testable and identical on every call site (finish(), bail energy tail,
++ * loop fallbacks).
++ *
++ * [audible] uses the linear gain the sinks mix with: below 0.001 the deck
++ * is already quieter than -60 dB, so a stop cannot click. Everything else
++ * must take the dissolve first.
++ */
++object RetireGuard {
++    /** Linear -60 dB. */
++    const val AUDIBLE_EPS = 0.001f
++
++    fun audible(volume: Float): Boolean = volume > AUDIBLE_EPS
++
++    /** Dissolve length when [planned] is false: the 350 ms emergency floor. */
++    fun dissolveMs(planned: Boolean): Long =
++        if (planned) PhraseConfig.EXIT_TAIL_MIN_MS.toLong() else PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong()
++
++    /** Gain in dBFS for telemetry; -inf past silence. */
++    fun gainDb(gain: Float): Double = if (gain > 0f) 20.0 * log10(gain.toDouble()) else Double.NEGATIVE_INFINITY
++
++    /** True when [volume] may be retired without a tail (silent or forced). */
++    fun canRetire(volume: Float, force: Boolean = false): Boolean = force || !audible(volume)
++}
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+index b4032be..8ac4fd8 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionMoves.kt
+@@ -260,14 +260,32 @@ object TransitionMoves {
+      * chop at unity (RELAXED/VOCAL_OVER_OUTRO used to ride flat at 0 dB).
+      * Lanes already ending muted get flat silence — harmless.
+      */
++    /**
++     * Graceful-exit guarantee (djmix11, shaped djmix12): the outgoing deck
++     * may never end audible. Lanes already ending muted get flat silence.
++     * Otherwise 16 equal-power samples from [last] to the mute knot so the
++     * fall is monotone and no segment jumps between loud shorts.
++     */
+     private fun withExitTail(lane: Lane, tailBeats: Double): Lane {
+         if (lane.beats.isEmpty()) return lane
+         val mute = MUTE_DB
+         val tail = if (tailBeats > 0.0 && tailBeats.isFinite()) tailBeats else 0.0
+-        val beats = lane.beats + (lane.beats.last() + tail)
+         val last = lane.values.last()
+-        val values = if (last <= mute) lane.values + last else lane.values + mute
+-        return Lane(beats, values, lane.shape, lane.exponential)
++        if (last <= mute) {
++            return Lane(lane.beats + (lane.beats.last() + tail), lane.values + last, lane.shape, lane.exponential)
++        }
++        val steps = 16
++        val beats = lane.beats.toMutableList()
++        val values = lane.values.toMutableList()
++        val t0 = lane.beats.last()
++        for (i in 1..steps) {
++            val p = i.toFloat() / steps
++            val g = MixGain.fall(p).toDouble()
++            val db = (last + 20.0 * kotlin.math.log10(g.coerceAtLeast(1e-6))).toFloat().coerceAtLeast(mute - 6f)
++            beats.add(t0 + tail * p)
++            values.add(if (i == steps) mute else db)
++        }
++        return Lane(beats.toDoubleArray(), values.toFloatArray(), lane.shape, lane.exponential)
+     }
+ 
+     private data class Pack(
+diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+index 0469ab6..81e7a06 100644
+--- a/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
++++ b/shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/TransitionPolicy.kt
+@@ -222,20 +222,23 @@ private val MIX_OUT_TYPE_SCORE = mapOf(
+  fun clamp(value: Double, min: Double, max: Double): Double =
+     if (value.isFinite()) max(min, min(max, value)) else min
+ 
++/**
++ * The single shared octave fold (djmix12): the fold in {1, 2, 0.5} bringing
++ * [incomingBpm] nearest to [outgoingBpm] on the log domain. Every caller
++ * that halves or doubles tempo goes through here so thresholds agree.
++ */
++fun alignedFold(outgoingBpm: Double, incomingBpm: Double): Double {
++    if (outgoingBpm <= 0 || incomingBpm <= 0) return 1.0
++    return doubleArrayOf(1.0, 2.0, 0.5).minBy { abs(kotlin.math.ln((incomingBpm / it) / outgoingBpm)) }
++}
++
+ /**
+  * Halves or doubles [incomingBpm] until it is as close as possible to
+  * [outgoingBpm], the way a DJ counts a 63 BPM track against a 126 BPM one.
+  */
+ fun alignTempoOctave(outgoingBpm: Double, incomingBpm: Double): Double {
+     if (outgoingBpm <= 0 || incomingBpm <= 0) return incomingBpm
+-    var best = incomingBpm
+-    var bestErr = Double.MAX_VALUE
+-    for (fold in doubleArrayOf(1.0, 2.0, 0.5)) {
+-        val candidate = incomingBpm / fold
+-        val err = abs(kotlin.math.ln(candidate / outgoingBpm))
+-        if (err < bestErr) { bestErr = err; best = candidate }
+-    }
+-    return best
++    return incomingBpm / alignedFold(outgoingBpm, incomingBpm)
+ }
+ 
+ /**
+@@ -572,13 +575,17 @@ fun rankMixOutCandidates(
+     return mixOutCandidatesOf(analysis, end)
+         .map { candidate ->
+             val measured = audibleSecondsBetween(analysis, candidate.time, end)
++            // djmix12: scalar vocal adjustment on A's own curve (never
++            // cross-track): quieter overlap windows rank above louder ones.
++            val share = vocalActivityBetween(analysis, candidate.time, end) ?: 0.0
++            val adj = (0.5 - share.coerceIn(0.0, 1.0)) * 0.10
+             // With no energy curve there is no way to tell skipped music from skipped silence, so
+             // the raw gap is charged in full and the budget errs toward playing the track.
+             RankedMixCandidate(
+                 time = candidate.time,
+                 score = candidate.score,
+                 type = candidate.type,
+-                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0),
++                rankScore = candidate.score + (MIX_OUT_TYPE_SCORE[candidate.type] ?: 0.0) + adj,
+                 discardedMusicSeconds = measured ?: max(0.0, end - candidate.time),
+                 measured = measured != null,
+             )
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix12TempoTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix12TempoTest.kt
+new file mode 100644
+index 0000000..e44c897
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/Djmix12TempoTest.kt
+@@ -0,0 +1,78 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNotNull
++import kotlin.test.assertTrue
++
++/**
++ * djmix12 tempo discipline + fold unification + scalar ranking.
++ */
++class Djmix12TempoTest {
++
++    // ---- fold unification ----
++
++    @Test fun halfTimeFoldsToUnity() {
++        assertEquals(0.5, alignedFold(148.0, 74.0), 1e-9)
++        assertEquals(148.0, alignTempoOctave(148.0, 74.0), 1e-9)
++        assertEquals(2.0, alignedFold(120.0, 240.0), 1e-9)
++        assertEquals(0.5, alignedFold(120.0, 60.0), 1e-9)
++        // The filmed +42.5%: 88.93 vs 126.70 folds to 2 (63.35).
++        assertEquals(2.0, alignedFold(88.93466859973474, 126.697427976501), 1e-9)
++    }
++
++    @Test fun beyondEightPercentIsNotARelaxedRung() {
++        // 88.93 -> 126.70: post-fold 63.35/88.93 = 0.712 (28.7% off).
++        val a = song("a", 88.93466859973474, 16, listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5)))
++        val b = song("b", 126.697427976501, 16, listOf(section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5)))
++        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 88.93466859973474, 126.697427976501))
++        assertTrue(choice.template != MixTemplate.RELAXED, "long tempo-off blends never ride RELAXED, got ${choice.template}")
++    }
++
++    @Test fun closeTemposKeepTheBlend() {
++        val a = song("a", 112.0, 16, listOf(section(0, 16, SectionFn.OUTRO, SectionRole.GROOVE, energy = 5)))
++        val b = song("b", 113.5, 16, listOf(section(0, 16, SectionFn.INTRO, SectionRole.GROOVE, energy = 5)))
++        val choice = assertNotNull(PhrasePlanner.select(a, b, 0, 112.0, 113.5))
++        assertTrue(choice.template == MixTemplate.M1 || choice.template == MixTemplate.ROLLING, "close tempos blend, got ${choice.template}")
++    }
++
++    // ---- scalar ranking: quiet break beats loud content_end ----
++
++    @Test fun quietBreakOutranksLoudContentEnd() {
++        val contentEnd = 200.0
++        val curve = (0 until 240).map { i -> EnergySample(i * 0.833, 0.9) }
++        val mask = (0 until 240).map { i ->
++            val t = i * 0.833
++            if (t >= 188.0) 0.1 else 0.5
++        }
++        val a = TrackAnalysis(
++            status = TrackAnalysis.STATUS_READY, trackId = "t1", duration = contentEnd,
++            bpm = 120.0, beatInterval = 0.5, beatConfidence = 0.9,
++            contentEndTime = contentEnd,
++            mixOutCandidates = listOf(
++                MixCandidate(188.0, 0.7, "break_outro"),
++                MixCandidate(contentEnd, 0.75, "content_end"),
++            ),
++            energyCurve = curve, vocalActivityMask = mask,
++        )
++        val ranked = rankMixOutCandidates(a, contentEnd = contentEnd, duration = contentEnd)
++        assertEquals("break_outro", ranked.firstOrNull()?.type)
++    }
++
++    // ---- fixtures (mirror PhrasePlannerTest) ----
++
++    private fun section(start: Int, end: Int, fn: SectionFn, role: SectionRole, energy: Int) =
++        PhraseSection(start, end, fn, role, 0.8f, 0, 0, energy / 10f, energy, 0f, 0f, 0f, 0.4f, false)
++
++    private fun song(key: String, bpm: Double, bars: Int, sections: List<PhraseSection>): SongMap {
++        val bar = 60.0 / bpm * 4
++        return SongMap(
++            trackKey = key, durationSec = bars * bar, bpm = bpm, beatsPerBar = 4,
++            downbeats = DoubleArray(bars + 1) { it * bar }, gridConfidence = 0.9f,
++            tempoStable = true, phraseAnchor = 0, phraseLen = 8, sections = sections,
++            sungBars = BooleanArray(bars) { false }, firstVocalBar = null, lastVocalBar = null, pickupBeats = 0f,
++            startKind = StartKind.INTRO_INSTRUMENTAL, endingKind = EndingKind.OUTRO_INSTRUMENTAL,
++            contentEndSec = bars * bar, labelConfidence = 0.8f, structMs = 1, chorusCount = 0,
++        )
++    }
++}
+diff --git a/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RetireGuardTest.kt b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RetireGuardTest.kt
+new file mode 100644
+index 0000000..e8418d4
+--- /dev/null
++++ b/shared/src/commonTest/kotlin/com/music/bitchord/playback/smart/RetireGuardTest.kt
+@@ -0,0 +1,63 @@
++package com.music.bitchord.playback.smart
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++
++/**
++ * djmix12 retire guard: an audible player may never be retired without a
++ * dissolve first.
++ */
++class RetireGuardTest {
++
++    @Test fun loudPlayerNeedsATail() {
++        assertTrue(RetireGuard.audible(1f))
++        assertFalse(RetireGuard.canRetire(1f))
++        assertTrue(RetireGuard.canRetire(1f, force = true))
++    }
++
++    @Test fun silentPlayerRetiresFreely() {
++        assertFalse(RetireGuard.audible(0.001f))
++        assertFalse(RetireGuard.audible(0f))
++        assertTrue(RetireGuard.canRetire(0f))
++    }
++
++    @Test fun dissolveLengthsMatchTheSpec() {
++        assertEquals(800L, RetireGuard.dissolveMs(planned = true))
++        assertEquals(350L, RetireGuard.dissolveMs(planned = false))
++    }
++
++    @Test fun gainDbIsMinusSixtyAtTheGate() {
++        assertEquals(-60.0, RetireGuard.gainDb(0.001f), 0.001)
++    }
++
++    @Test fun relaxedLaneFallsMonotoneToMute() {
++        val script = TransitionMoves.compile(
++            PhraseChoice(
++                template = MixTemplate.RELAXED, rung = "Smooth fade", score = 0.9,
++                exit = ExitCue(ExitKind.OUTRO_START, 51, 115.5, 15, 0, 12, SectionFn.OUTRO, SectionRole.GROOVE, 0.2f, 2, true, 0, 0),
++                entry = EntryCue(EntryKind.HEAD, 0, 0.0, 4, SectionFn.INTRO, SectionRole.GROOVE, 0, 0f, true, 0.4f, 4, 0, 0f),
++                overlapBars = 15, swapBar = 0.0, tailBeats = 0.0, loopK = 0, echoGated = false,
++                vocalProduct = 0f, tempoPrepBars = 1, echoDelayBeats = 0.75, echoDelayName = "ECHO_DELAY_BEATS",
++                swapRampMs = 120, swapRampName = "SWAP_RAMP_BLEND_MS", tempoPolicy = "b",
++                vocalOverlapBeats = 0.0, energyDelta = 0f, struct = 0.9, vocalScore = 0.0,
++                phraseScore = 0.9, energyScore = 0.5, lengthScore = 0.5, keyScore = 0.5, tempoScore = 0.9, cost = 0.1,
++            ),
++            106.0, 109.0,
++        )
++        val v = script.outGain.values
++        val b = script.outGain.beats
++        assertEquals(TransitionMoves.MUTE_DB, v.last(), 1e-6f)
++        for (i in 1 until v.size) {
++            assertTrue(v[i] <= v[i - 1] + 1e-6f, "monotone at $i: ${v[i - 1]} -> ${v[i]}")
++            assertTrue(b[i] > b[i - 1], "beats advance at $i")
++            // The steep end lives only in the inaudible region: once at or
++            // below -50 dB, the remaining fall may be fast. Above that, the
++            // per-knot span covers ≥25 ms of the >=800 ms dissolve.
++            if (v[i - 1] > -50f && v[i] > -70f) {
++                assertTrue(v[i - 1] - v[i] <= 25f, "step at $i: ${v[i - 1]} -> ${v[i]}")
++            }
++        }
++    }
++}

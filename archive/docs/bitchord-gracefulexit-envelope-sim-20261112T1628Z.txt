@@ -1,0 +1,9 @@
+# Envelope simulation (python/numpy, local only), sprint SPRINT-3, 2026-11-12T16:28Z
+# BEFORE (measured from VID_20261112_151114 video, FINDINGS.md): fade -5dBFS peak @130ms -> -50dB @170ms; 27dB step in 10ms; time to -40dB ~40ms. FAIL on all criteria (<300ms, step, release-while-audible).
+# AFTER (djmix11: equal-power cos fall over tail): 
+#   planned 800ms: T=0.800s PASS; monotone True; max 50ms linear gain drop 9.8% FS
+#   2 beats @106BPM 1.132s: PASS; monotone True; max 50ms linear drop 6.9% FS
+#   emergency 350ms: PASS (>=300ms); monotone True; max 50ms linear drop 22.2% FS
+# Caveat: dB-step near digital zero is unbounded for ANY fade, so a naive dB/50ms simulation is not the operative check.
+# Operative checks: >=300ms duration (PASS), monotone fall (PASS), mute exactly at stopAt (gate PASS).
+# Knot-level "no >6dB step" is verified by ExitTailTest on cloud (passed 4/4 x3 variants, 511+1263=1774 execs, 0 failures per TRACE-DONE) - NOT reproducible locally (no base tree; patch --dry-run [CLOUD-BLOCKED]).

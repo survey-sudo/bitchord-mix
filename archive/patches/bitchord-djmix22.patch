@@ -1,0 +1,607 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+index a4757d5..ccf615e 100644
+--- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
++++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+@@ -229,6 +229,44 @@ internal fun idleStallDecision(stalledMs: Long, outExhausted: Boolean, alreadyPr
+ internal fun freezeDedupKey(phaseName: String, outgoingId: String?, incomingId: String?): String =
+     "$phaseName|${outgoingId ?: ""}->${incomingId ?: ""}"
+ 
++/**
++ * Whether a session player paused by an audio-focus swap may be auto-resumed
++ * (djmix22, vc64). True only when the player was audibly playing before the
++ * handoff, the pause was not the listener's (a user pause — reason USER_REQUEST —
++ * is sticky and never auto-resumed), and the adopting player is holding (or has
++ * atomically acquired) focus. A user-paused player is NEVER auto-resumed, and a
++ * player that was not playing before the swap is never started by it.
++ */
++internal fun shouldRestorePlayAfterFocusSwap(wasPlaying: Boolean, userPaused: Boolean, focusHeld: Boolean): Boolean =
++    wasPlaying && !userPaused && focusHeld
++
++/** What [CrossfadeController.finish] must do with an audible spare (djmix22). */
++internal enum class LoopFinishAction { FINISH_LOOP, EMERGENCY_TAIL, FINISH }
++
++/**
++ * LoopMix completion routing (djmix22, vc64): a `LOOP_RUNNING`/`LOOP_ARMING`
++ * mix that has taken over AND handed off must complete via [CrossfadeController]'s
++ * `finishLoop()` (the renderer exit-gate path), NOT via a bare `finish()` that
++ * treats the audible spare at volume 1.0 as an emergency-retire-guard. The gate
++ * (renderer `exitGateViolations`) is trivially clean mid-mix (it only counts
++ * decks that hit `stopAt`), so a took-over, handed-off session with a clean gate
++ * completes through `finishLoop`. Pre-handoff, un-took-over, and non-clean-gate
++ * cases keep the djmix12 emergency tail (the retiring plain sink can bleed),
++ * and a non-audible spare finishes at once (the classic clean path).
++ */
++internal fun loopFinishAction(
++    phaseName: String,
++    tookOver: Boolean,
++    handedOff: Boolean,
++    exitGateViolations: Int,
++    audibleSpare: Boolean,
++): LoopFinishAction = when {
++    !audibleSpare -> LoopFinishAction.FINISH
++    (phaseName == "LOOP_RUNNING" || phaseName == "LOOP_ARMING") && tookOver && handedOff &&
++        exitGateViolations == 0 -> LoopFinishAction.FINISH_LOOP
++    else -> LoopFinishAction.EMERGENCY_TAIL
++}
++
+ class CrossfadeController(
+     private val scope: CoroutineScope,
+     /** The player backing the session right now. Moves at every [onHandoff]. */
+@@ -701,6 +739,12 @@ class CrossfadeController(
+     private var loopSuppressedUntil = 0L
+     /** djmix14: reason for the next mix.complete (planned-fade-done, loop-complete, ...). */
+     private var lastCompleteReason: String? = null
++    /** djmix22 (vc64): last playWhenReady-change reason seen on the session player,
++     * logged on mix.pause.detected so a focus-loss pause is provable from telemetry. */
++    @Volatile private var lastPlayWhenReadyChangeReason: Int = 0
++    /** djmix22 (vc64): wall (SystemClock.elapsedRealtime) of the last mix.complete
++     * with handoff=true. tick() watches for a paused session player within 3s of it. */
++    private var lastHandoffCompleteAtMs: Long = 0L
+     /** djmix14-review: scrub epoch + pinned catch-up (prevents countdown drift). */
+     private var scrubEpoch: Long = 0L
+     private var pinnedCatchUpKey: String? = null
+@@ -1019,6 +1063,9 @@ class CrossfadeController(
+         // either way the hold must not leave the listener paused at the end of
+         // a song.
+         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
++            // djmix22: keep the last change reason for mix.pause.detected (do not
++            // let the END_OF_MEDIA_ITEM rescue below skip the capture).
++            lastPlayWhenReadyChangeReason = reason
+             if (playWhenReady || reason != Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM) return
+             val held = heldAtEnd ?: return
+             if (held !== listeningTo) return
+@@ -1305,6 +1352,7 @@ class CrossfadeController(
+         publishAutomixDetail()
+         checkShownWatchdog()
+         expireMixPreview()
++        checkHandoffPauseWatch()
+ 
+         if (easing != null && phase == Phase.IDLE) driveEase()
+ 
+@@ -1320,6 +1368,38 @@ class CrossfadeController(
+         }
+     }
+ 
++    /**
++     * djmix22 (vc64) pause watch: if the session player is found paused within 3 s
++     * after a mix.complete with handoff=true, record mix.pause.detected (once per
++     * handoff) so the next occurrence is provable from telemetry alone — the
++     * 70 s silent-song jam after a loop-mix focus swap left no other trace.
++     */
++    private fun checkHandoffPauseWatch() {
++        if (phase != Phase.IDLE || lastHandoffCompleteAtMs <= 0L) return
++        val now = SystemClock.elapsedRealtime()
++        if (now - lastHandoffCompleteAtMs > 3000L) {
++            lastHandoffCompleteAtMs = 0L
++            return
++        }
++        val sessionPlayer = active()
++        if (sessionPlayer.playWhenReady) return
++        val sinceHandoff = now - lastHandoffCompleteAtMs
++        lastHandoffCompleteAtMs = 0L
++        AutomixTelemetry.event(
++            "mix.pause.detected",
++            mapOf(
++                "site" to "post-handoff",
++                "playWhenReady" to sessionPlayer.playWhenReady,
++                "playbackState" to sessionPlayer.playbackState,
++                "isPlaying" to sessionPlayer.isPlaying,
++                "volume" to sessionPlayer.volume,
++                "changeReason" to lastPlayWhenReadyChangeReason,
++                "msSinceHandoff" to sinceHandoff,
++                "positionMs" to sessionPlayer.currentPosition,
++            ),
++        )
++    }
++
+     /**
+      * djmix9 watchdog: a shown countdown froze its rung. If the mix still has
+      * not armed 1.2 s after its bar, bail to the graceful blend path - a
+@@ -4287,7 +4367,24 @@ class CrossfadeController(
+     /** Waits for the outgoing sink to splice over to the renderer. */
+     private fun driveLoopArming() {
+         val out = outgoing ?: return loopBail("no outgoing player")
+-        if (!out.playWhenReady) return loopBail("paused before the loop")
++        if (!out.playWhenReady) {
++            // djmix22: same proof as driveLoopMix (pre-takeover pause watch).
++            AutomixTelemetry.event(
++                "mix.pause.detected",
++                mapOf(
++                    "site" to "driveLoopArming",
++                    "playWhenReady" to out.playWhenReady,
++                    "playbackState" to out.playbackState,
++                    "isPlaying" to out.isPlaying,
++                    "volume" to out.volume,
++                    "changeReason" to lastPlayWhenReadyChangeReason,
++                    "handedOff" to handedOff,
++                    "tookOver" to (loopSession?.outPort?.tookOver == true),
++                    "positionMs" to out.currentPosition,
++                ),
++            )
++            return loopBail("paused before the loop")
++        }
+         val session = loopSession
+         if (session == null) {
+             // djmix17-harden: a build that finished while LOOP_ARMING but
+@@ -4400,7 +4497,25 @@ class CrossfadeController(
+         if (session.outPort?.interrupted == true || (loopIncomingStarted && session.inPort?.interrupted == true)) {
+             return loopBail("a sink was flushed", settle = false)
+         }
+-        if (!sessionPlayer.playWhenReady) return loopBail("paused", settle = true)
++        if (!sessionPlayer.playWhenReady) {
++            // djmix22: prove a paused session player from telemetry (focus-loss
++            // swap pause would otherwise only show as a bare loopBail downstream).
++            AutomixTelemetry.event(
++                "mix.pause.detected",
++                mapOf(
++                    "site" to "driveLoopMix",
++                    "playWhenReady" to sessionPlayer.playWhenReady,
++                    "playbackState" to sessionPlayer.playbackState,
++                    "isPlaying" to sessionPlayer.isPlaying,
++                    "volume" to sessionPlayer.volume,
++                    "changeReason" to lastPlayWhenReadyChangeReason,
++                    "handedOff" to handedOff,
++                    "tookOver" to (session.outPort?.tookOver == true),
++                    "positionMs" to sessionPlayer.currentPosition,
++                ),
++            )
++            return loopBail("paused", settle = true)
++        }
+         val now = System.nanoTime()
+         val m = session.mixSeconds(now, out.isPlaying) ?: return
+         if (!loopIncomingStarted && m >= session.inStartAt) {
+@@ -5027,6 +5142,16 @@ class CrossfadeController(
+         // at volume 1.0 — silence it and finish at once (0 ms to IDLE)
+         // instead of an 800 ms emergency tail that blocked classic
+         // re-arming. Genuine audible (tookOver/handedOff) still tails.
++        // djmix22 (vc64): a LOOP mix that has taken over AND handed off
++        // completes via finishLoop() — the renderer exit-gate path, which
++        // mutes the retiring player while the port still holds its silence
++        // and hands the session to the incoming song at the handover
++        // position — never via this bare emergency settle, which treated the
++        // audible spare at volume 1.0 as a guard violation mid-mix (vc63:
++        // mix.fire loop -> finish-guard 1.668 s later -> 350 ms emergency
++        // tail -> seek-emergency-tail double teardown). finishLoop() nulls
++        // loopSession before calling finish(), so the re-entry below is
++        // never re-routed (violations reads -1, tookOver false).
+         if (phase != Phase.IDLE && phase != Phase.TAIL && phase != Phase.BAILING) {
+             val spare = if (handedOff) outgoing else incoming
+             val vol = spare?.volume ?: 0f
+@@ -5042,6 +5167,17 @@ class CrossfadeController(
+                 spare?.volume = 0f
+                 spare?.playWhenReady = false
+             } else if (RetireGuard.audible(vol)) {
++                val routing = loopFinishAction(
++                    phaseName = phase.name,
++                    tookOver = loopSession?.outPort?.tookOver == true,
++                    handedOff = handedOff,
++                    exitGateViolations = loopSession?.renderer?.exitGateViolations() ?: -1,
++                    audibleSpare = true,
++                )
++                if (routing == LoopFinishAction.FINISH_LOOP) {
++                    finishLoop()
++                    return
++                }
+                 AutomixTelemetry.event(
+                     "mix.exit.guard",
+                     mapOf("site" to "finish", "phase" to phase.name, "gainDb" to RetireGuard.gainDb(vol)),
+@@ -5060,6 +5196,8 @@ class CrossfadeController(
+             // just ended would keep pushing the mark forward and hold a waiting
+             // caller off for as long as the calls kept coming.
+             settledAt = SystemClock.elapsedRealtime()
++            // djmix22: arm the 3 s post-handoff pause watch (tick() clears it).
++            if (didHandoff) lastHandoffCompleteAtMs = settledAt
+         }
+         AppSettings.smartMixInProgress.value = false
+         AppSettings.smartMixBlend.value = null
+diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+index 86f9eec..29fc01f 100644
+--- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
++++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+@@ -963,6 +963,33 @@ class PlaybackService : MediaLibraryService() {
+             // pause the listener asked for from one another app imposed, and
+             // [Player] does not keep the answer around to be asked later.
+             partySync?.onPlayWhenReadyChanged(playWhenReady, reason)
++            // djmix22 (vc64): track the listener's own intent. A USER_REQUEST
++            // pause is sticky across handoffs and must NEVER be auto-resumed;
++            // any play (or non-user pause) clears it, so the focus-swap restore
++            // below only ever resurrects a player that was playing when the
++            // swap paused it.
++            if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) {
++                userPausedPlayback = true
++            } else if (playWhenReady) {
++                userPausedPlayback = false
++            }
++            // djmix22: restore a player paused solely by the focus swap
++            // (AUDIO_FOCUS_LOSS), within the armed window after adoption, only
++            // if it was playing before the swap and the listener did not pause
++            // it. Anything else (a foreign loss outside the window, a user
++            // pause) is left exactly as it was.
++            if (!playWhenReady &&
++                reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS &&
++                SystemClock.elapsedRealtime() < focusSwapArmedUntilMs &&
++                player != null && player === focusSwapPlayer &&
++                shouldRestorePlayAfterFocusSwap(
++                    wasPlaying = focusSwapWasPlaying,
++                    userPaused = userPausedPlayback,
++                    focusHeld = focusSwapFocusHeld,
++                )
++            ) {
++                player?.play()
++            }
+         }
+ 
+         /**
+@@ -3525,9 +3552,15 @@ class PlaybackService : MediaLibraryService() {
+      * incoming track on. This is the whole of the handoff: no seek, no
+      * re-buffer, and no audio rendered twice.
+      *
+-     * Order matters in one place — focus is released on the outgoing player
+-     * *before* the incoming one asks for it, so the app never holds two focus
+-     * requests at once and never briefly holds none.
++     * Focus transfer (djmix22, vc64): the outgoing player abandons focus at
++     * once, but the incoming player's acquisition is scheduled in
++     * [setSessionOwner] to land after that abandon is processed — for the same
++     * reason the app never holds two focus requests at once. The two flips are
++     * posted to different player threads, so two back-to-back flips race in
++     * Media3: the incoming player's request could land before the outgoing
++     * abandon (stealing the tail out from under the listener, or, as vc63 did
++     * live, arriving when Android had nothing to grant under and jamming the
++     * second song paused for ~70 s until a manual play).
+      */
+     private fun adoptPlayer(outgoing: ExoPlayer, incoming: ExoPlayer) {
+         setSessionOwner(outgoing, owns = false)
+@@ -3573,6 +3606,32 @@ class PlaybackService : MediaLibraryService() {
+         loadAutoplayForCurrentTrack()
+     }
+ 
++    /**
++     * The last playWhenReady-change state was a listener pause (reason
++     * USER_REQUEST). A user pause is sticky across handoffs and must NEVER be
++     * auto-resumed by the focus-swap restore; any play (or a non-user pause)
++     * clears it. Read by the armed restore in [playbackListener].
++     */
++    private var userPausedPlayback: Boolean = false
++
++    /** The adopting player was audibly playing before the focus swap (djmix22). */
++    private var focusSwapWasPlaying: Boolean = false
++
++    /** True once the delayed focus acquisition has landed and Media3 is
++     * (re)acquiring focus for the session player (djmix22). */
++    private var focusSwapFocusHeld: Boolean = false
++
++    /** Wall (SystemClock.elapsedRealtime) until which a focus-swap pause may be
++     * restored; 0 when disarmed (djmix22). */
++    private var focusSwapArmedUntilMs: Long = 0L
++
++    /** The player adopted by the last focus swap; restore must target it (djmix22). */
++    private var focusSwapPlayer: ExoPlayer? = null
++
++    /** Monotonic ownership-flip token so a stale delayed acquisition cannot
++     * grant focus to a player that a later adopt already replaced (djmix22). */
++    private var focusOwnerFlipToken: Int = 0
++
+     /**
+      * Only one player may handle audio focus at a time.
+      *
+@@ -3581,10 +3640,51 @@ class PlaybackService : MediaLibraryService() {
+      * cutting the outgoing track dead instead of fading it. Focus follows the
+      * session, and so does "becoming noisy" — unplugging headphones should pause
+      * the song you are listening to, which is whichever one the session is on.
++     *
++     * djmix22 (vc64): an abandon (owns = false) lands at once, but an
++     * acquisition (owns = true) is scheduled [FOCUS_ACQUISITION_DELAY_MS] later.
++     * Both flavours of `setAudioAttributes` are posted to the player's own
++     * playback thread, so two immediate flips race in Media3: vc63's Calvin pair
++     * proved the result — a bare abandon with no holder for ~70 s and the second
++     * song paused until the listener pressed play. Scheduling the acquisition
++     * after the abandon is processed makes the grant deterministic. A second
++     * adopt supersedes the first (token + player identity), so a stale
++     * acquisition can never re-own a retired player.
+      */
+     private fun setSessionOwner(target: ExoPlayer, owns: Boolean) {
+-        target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
+-        target.setHandleAudioBecomingNoisy(owns)
++        if (!owns) {
++            target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
++            target.setHandleAudioBecomingNoisy(owns)
++            return
++        }
++        // Snapshot play state before the swap lands (same main turn as the
++        // adoption): only a player that was audibly playing before the handoff
++        // may be restored by a swap-pause (see [userPausedPlayback]).
++        focusSwapWasPlaying = target.playWhenReady && target.playbackState == Player.STATE_READY
++        focusSwapFocusHeld = false
++        focusSwapArmedUntilMs = SystemClock.elapsedRealtime() + FOCUS_SWAP_ARM_MS
++        focusSwapPlayer = target
++        val token = ++focusOwnerFlipToken
++        scope.launch {
++            delay(FOCUS_ACQUISITION_DELAY_MS)
++            if (token != focusOwnerFlipToken) return@launch
++            if (target !== player) return@launch
++            target.setAudioAttributes(AUDIO_ATTRIBUTES, /* handleAudioFocus = */ owns)
++            target.setHandleAudioBecomingNoisy(true)
++            focusSwapFocusHeld = true
++            // If the swap already landed as a pause, restore a player that was
++            // playing through the handoff (the listener also closes this from
++            // onPlayWhenReadyChanged for the async-arriving pause).
++            if (target.playWhenReady) return@launch
++            if (shouldRestorePlayAfterFocusSwap(
++                    wasPlaying = focusSwapWasPlaying,
++                    userPaused = userPausedPlayback,
++                    focusHeld = focusSwapFocusHeld,
++                )
++            ) {
++                target.play()
++            }
++        }
+     }
+ 
+     /**
+@@ -9560,6 +9660,22 @@ class PlaybackService : MediaLibraryService() {
+             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+             .build()
+ 
++        /**
++         * djmix22 (vc64): delay before the adopting player acquires audio
++         * focus in [setSessionOwner]. The abandon it follows is a single
++         * control message on the outgoing player's thread; this margin is
++         * several renderer blocks so the grant is never denied against a
++         * still-held focus.
++         */
++        const val FOCUS_ACQUISITION_DELAY_MS = 150L
++
++        /**
++         * djmix22 (vc64): window after an adoption in which a focus-swap pause
++         * may be restored. Matches the 3 s post-handoff pause watch in
++         * CrossfadeController.
++         */
++        const val FOCUS_SWAP_ARM_MS = 3_000L
++
+         /** Length of a FLAC STREAMINFO block, which the format fixes at 34 bytes. */
+         const val STREAM_INFO_BYTES = 34
+ 
+diff --git a/app/src/test/java/com/music/bitchord/playback/Djmix22AppTest.kt b/app/src/test/java/com/music/bitchord/playback/Djmix22AppTest.kt
+new file mode 100644
+index 0000000..2dcd6b6
+--- /dev/null
++++ b/app/src/test/java/com/music/bitchord/playback/Djmix22AppTest.kt
+@@ -0,0 +1,203 @@
++package com.music.bitchord.playback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * djmix22 `:app` handoff discipline (vc64).
++ *
++ * Pure JVM (no ExoPlayer, no Media3 focus machinery needed): the two decisions
++ * are the controller-side half of the fix for vc63's Calvin-pair jam
++ * (mix.fire loop -> finish-guard 1.668 s later -> 350 ms emergency tail ->
++ * seek-emergency-tail double teardown, then the second song paused with no
++ * focus holder for ~70 s).
++ *
++ * [shouldRestorePlayAfterFocusSwap] is the guard the service consults before
++ * auto-resuming a session player paused by the focus swap: a user-paused
++ * player must NEVER be auto-resumed, and only a player that was audibly
++ * playing before the adoption may be restored. [loopFinishAction] is the
++ * completion routing inside finish(): a took-over, handed-off loop session
++ * with a clean exit gate completes via finishLoop(), never the emergency tail.
++ */
++class Djmix22AppTest {
++
++    // ---- Focus-swap restore -------------------------------------------------
++
++    @Test
++    fun `playing through a handoff is restored`() {
++        assertTrue(
++            shouldRestorePlayAfterFocusSwap(
++                wasPlaying = true,
++                userPaused = false,
++                focusHeld = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `user-paused player is never auto-resumed`() {
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(
++                wasPlaying = true,
++                userPaused = true,
++                focusHeld = true,
++            ),
++        )
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(
++                wasPlaying = true,
++                userPaused = true,
++                focusHeld = false,
++            ),
++        )
++    }
++
++    @Test
++    fun `not-playing player is never started by the swap`() {
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(
++                wasPlaying = false,
++                userPaused = false,
++                focusHeld = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `no focus held means no restore`() {
++        assertFalse(
++            shouldRestorePlayAfterFocusSwap(
++                wasPlaying = true,
++                userPaused = false,
++                focusHeld = false,
++            ),
++        )
++    }
++
++    // ---- Loop finish routing ------------------------------------------------
++
++    @Test
++    fun `took-over handed-off session completes via finishLoop not emergency tail`() {
++        assertEquals(
++            LoopFinishAction.FINISH_LOOP,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = true,
++                handedOff = true,
++                exitGateViolations = 0,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `arming past takeover and handoff also completes via finishLoop`() {
++        assertEquals(
++            LoopFinishAction.FINISH_LOOP,
++            loopFinishAction(
++                phaseName = "LOOP_ARMING",
++                tookOver = true,
++                handedOff = true,
++                exitGateViolations = 0,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `pre-handoff loop mix keeps the emergency tail for its settle seek`() {
++        assertEquals(
++            LoopFinishAction.EMERGENCY_TAIL,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = true,
++                handedOff = false,
++                exitGateViolations = 0,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `not took over means emergency tail`() {
++        assertEquals(
++            LoopFinishAction.EMERGENCY_TAIL,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = false,
++                handedOff = false,
++                exitGateViolations = 0,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `dirty exit gate keeps the emergency tail`() {
++        assertEquals(
++            LoopFinishAction.EMERGENCY_TAIL,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = true,
++                handedOff = true,
++                exitGateViolations = 2,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `unprovable gate keeps the emergency tail`() {
++        // -1: no session (the finishLoop re-entry, or a nulled renderer).
++        assertEquals(
++            LoopFinishAction.EMERGENCY_TAIL,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = false,
++                handedOff = true,
++                exitGateViolations = -1,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `classic audible spare keeps the emergency tail`() {
++        assertEquals(
++            LoopFinishAction.EMERGENCY_TAIL,
++            loopFinishAction(
++                phaseName = "FADING",
++                tookOver = false,
++                handedOff = true,
++                exitGateViolations = 0,
++                audibleSpare = true,
++            ),
++        )
++    }
++
++    @Test
++    fun `inaudible spare finishes at once even outside a mix`() {
++        assertEquals(
++            LoopFinishAction.FINISH,
++            loopFinishAction(
++                phaseName = "IDLE",
++                tookOver = false,
++                handedOff = false,
++                exitGateViolations = 0,
++                audibleSpare = false,
++            ),
++        )
++        assertEquals(
++            LoopFinishAction.FINISH,
++            loopFinishAction(
++                phaseName = "LOOP_RUNNING",
++                tookOver = true,
++                handedOff = true,
++                exitGateViolations = 0,
++                audibleSpare = false,
++            ),
++        )
++    }
++}
+diff --git a/build.gradle.kts b/build.gradle.kts
+index c726210..0ac1a35 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 63
+-extra["bitchordVersionName"] = "2.2.3-djmix21"
++extra["bitchordVersionCode"] = 64
++extra["bitchordVersionName"] = "2.2.3-djmix22"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",

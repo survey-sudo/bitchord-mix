@@ -1,0 +1,301 @@
+diff --git a/app/src/main/java/com/music/bitchord/playback/audio/PrecisionAudioSink.kt b/app/src/main/java/com/music/bitchord/playback/audio/PrecisionAudioSink.kt
+index 47a2333..f597762 100644
+--- a/app/src/main/java/com/music/bitchord/playback/audio/PrecisionAudioSink.kt
++++ b/app/src/main/java/com/music/bitchord/playback/audio/PrecisionAudioSink.kt
+@@ -1,5 +1,6 @@
+ package com.music.bitchord.playback.audio
+ 
++import android.os.Process
+ import android.util.Log
+ import androidx.media3.common.C
+ import androidx.media3.common.Format
+@@ -96,6 +97,16 @@ class PrecisionAudioSink(
+ 
+     private var processCounter: Long = 0L
+ 
++    /**
++     * Media3 creates and owns the thread that calls handleBuffer(), so its
++     * priority cannot be set from outside. Raise it from inside the first
++     * buffer instead: one boolean test in steady state. Every operation on
++     * this thread is audio (decode, DSP, PCM encode, loop render, delegate
++     * write), so URGENT_AUDIO is the correct class. Some OEMs refuse the
++     * call; a denial must not kill playback.
++     */
++    private var audioPrioritySet = false
++
+     /** Sample rate of the configured format, for timestamping split sub-blocks. */
+     private var configuredSampleRate: Int = 0
+ 
+@@ -301,6 +312,13 @@ class PrecisionAudioSink(
+         presentationTimeUs: Long,
+         encodedAccessUnitCount: Int,
+     ): Boolean {
++        // vc75: raise the render thread once, on the thread that does the
++        // work. Above the precision check on purpose - the delegate
++        // passthrough is audio work too.
++        if (!audioPrioritySet) {
++            audioPrioritySet = true
++            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
++        }
+         if (!isPrecisionActive) {
+             return delegate.handleBuffer(inputBuffer, presentationTimeUs, encodedAccessUnitCount)
+         }
+diff --git a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+index 1a5eea5..2ab1ca3 100644
+--- a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
++++ b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+@@ -37,7 +37,6 @@ import com.music.bitchord.data.listentogether.ListenTogether
+ import com.music.bitchord.data.model.SearchFilter
+ import com.music.bitchord.data.model.SearchResult
+ import com.music.bitchord.data.settings.AppSettings
+-import com.music.bitchord.data.settings.AutomixPerformanceMode
+ import com.music.bitchord.data.sources.SourceResolver
+ import com.music.bitchord.data.sources.TrackMatcher
+ import com.music.bitchord.playback.AudioCache
+@@ -530,9 +529,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+ 
+     /**
+      * Sleeps out a [yieldToPlayback] window before decode or inference.
+-     * Priority drops only while the window is open, and is put back to the
+-     * mode's normal level when it ends so the rest of the pass is not left
+-     * in the background cgroup.
++     *
++     * vc75: analysis sits in the background cgroup for the whole pass, not
++     * only while the window is open. It tolerates latency; the audio render
++     * thread does not, and a mel pass or an inference batch at default
++     * priority was landing on the same core at the instant the sink was
++     * trying to fill a buffer.
+      */
+     /** [playbackFirst], then the party's stop flag. Safe to poll from a decode loop. */
+     private fun yieldOrStopped(): Boolean {
+@@ -552,13 +554,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+                 break
+             }
+         }
+-        Process.setThreadPriority(
+-            if (AppSettings.automixPerformanceMode.value == AutomixPerformanceMode.EFFICIENT) {
+-                Process.THREAD_PRIORITY_BACKGROUND
+-            } else {
+-                Process.THREAD_PRIORITY_DEFAULT
+-            },
+-        )
++        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+     }
+ 
+     fun request(trackId: String, uri: Uri, durationSeconds: Double) {
+@@ -672,15 +668,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
+                 store.load(trackId)?.let { results.putIfAbsent(trackId, it) }
+             }
+             try {
+-                // Efficient mode yields to decoding and playback rather than
+-                // competing for a core. Thread count remains the speed knob.
+-                Process.setThreadPriority(
+-                    if (AppSettings.automixPerformanceMode.value == AutomixPerformanceMode.EFFICIENT) {
+-                        Process.THREAD_PRIORITY_BACKGROUND
+-                    } else {
+-                        Process.THREAD_PRIORITY_DEFAULT
+-                    },
+-                )
++                // vc75: every mode yields to decoding and playback rather
++                // than competing for a core. Thread count remains the speed
++                // knob.
++                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                 // [restoreOnce] queues onto this same single-threaded executor,
+                 // so a stored result for this track has landed by now if there
+                 // was one — but the decision to get here was taken a tick
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 625f49d..1d0fb02 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -41,8 +41,8 @@ buildscript {
+  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
+  * release tag's alone.
+  */
+-extra["bitchordVersionCode"] = 74
+-extra["bitchordVersionName"] = "2.2.3-djmix32"
++extra["bitchordVersionCode"] = 75
++extra["bitchordVersionName"] = "2.2.3-djmix33"
+ 
+ /*
+  * Bump this by hand before cutting each sideloaded test build ("beta2",
+diff --git a/native/analyzer/vocal_spectrogram.cpp b/native/analyzer/vocal_spectrogram.cpp
+index 0034052..079b886 100644
+--- a/native/analyzer/vocal_spectrogram.cpp
++++ b/native/analyzer/vocal_spectrogram.cpp
+@@ -156,9 +156,11 @@ bool SeparateVocalWindow(
+   if (input_length <= pad + 1) return false;
+   const auto window = HannWindow(kVocalSpectrogramFft);
+   const std::vector<float> inputs[2] = {left, right};
+-  std::vector<float> outputs[2];
+-  outputs[0].assign(input_length, 0.0f);
+-  outputs[1].assign(input_length, 0.0f);
++  // Size the two outputs after every early return and before the overlap-add
++  // loop, which writes into them by index. Leaving them empty makes the first
++  // store land on the null data() of an empty vector and takes the process down.
++  out_left.assign(input_length, 0.0f);
++  out_right.assign(input_length, 0.0f);
+   std::vector<std::vector<double>> ola(2);
+   std::vector<std::vector<double>> win_sq(2);
+   for (size_t c = 0; c < 2; ++c) {
+diff --git a/native/analyzer/vocal_spectrogram_test.cpp b/native/analyzer/vocal_spectrogram_test.cpp
+new file mode 100644
+index 0000000..7bf1906
+--- /dev/null
++++ b/native/analyzer/vocal_spectrogram_test.cpp
+@@ -0,0 +1,156 @@
++// Host checks for SeparateVocalWindow: the successful path, not just the
++// fallback. A null-write bug shipped in vc73/vc74 because nothing ever called
++// this with a valid magnitude tensor and checked the outputs came back sized.
++//
++//   g++ -O2 -std=c++17 -I native/analyzer native/analyzer/vocal_spectrogram_test.cpp \
++//       native/analyzer/vocal_spectrogram.cpp -o /tmp/vocal_spectrogram_test \
++//       && /tmp/vocal_spectrogram_test
++//
++// Exit 0 means every check passed. A segmentation fault is the failure the
++// vc74 crash presented as, so a crash here is a legible result: the test does
++// not need to catch it to report it.
++#include "vocal_spectrogram.h"
++
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++using bitchord::smart::SeparateVocalWindow;
++using bitchord::smart::kVocalSpectrogramBins;
++using bitchord::smart::kVocalSpectrogramChannels;
++using bitchord::smart::kVocalSpectrogramFft;
++using bitchord::smart::kVocalSpectrogramHop;
++using bitchord::smart::kVocalSpectrogramSampleRate;
++
++static int failures = 0;
++
++static void check(bool cond, const char* what) {
++  if (cond) {
++    std::printf("ok   %s\n", what);
++  } else {
++    std::printf("FAIL %s\n", what);
++    ++failures;
++  }
++}
++
++// Number of frames the implementation derives from a padded input of this
++// length, matching the caller's own computation so target_frames agrees.
++static size_t frames_for(size_t input_length) {
++  const size_t pad = kVocalSpectrogramFft / 2;
++  const size_t padded = input_length + 2 * pad;
++  return (padded - kVocalSpectrogramFft) / kVocalSpectrogramHop + 1;
++}
++
++static std::vector<float> sine(size_t n, double phase) {
++  std::vector<float> v(n);
++  for (size_t i = 0; i < n; ++i) {
++    v[i] = 0.3f * static_cast<float>(std::sin(i * 0.01 + phase));
++  }
++  return v;
++}
++
++static std::vector<float> magnitude(size_t frames, float value) {
++  return std::vector<float>(
++    kVocalSpectrogramChannels * kVocalSpectrogramBins * frames, value);
++}
++
++static double peak_of(const std::vector<float>& v) {
++  double peak = 0.0;
++  for (float s : v) peak = std::fmax(peak, std::fabs(static_cast<double>(s)));
++  return peak;
++}
++
++int main() {
++  // Half a second of stereo at the expected rate: the shape the app sends on a
++  // real transition window.
++  const size_t n = 22050;
++  const std::vector<float> left = sine(n, 0.0);
++  const std::vector<float> right = sine(n, 0.4);
++  const size_t frames = frames_for(n);
++  const std::vector<float> mag = magnitude(frames, 0.05f);
++
++  // 1. The success path. This is the check that did not exist in vc73/vc74:
++  //    on a true return both outputs must be exactly input_length long, because
++  //    the overlap-add loop writes them by index from 0 to input_length-1.
++  {
++    std::vector<float> out_left, out_right;
++    const bool ok = SeparateVocalWindow(
++      left, right, 44100.0, mag, frames, true, out_left, out_right);
++    check(ok, "valid input returns true");
++    check(out_left.size() == n, "out_left is input_length");
++    check(out_right.size() == n, "out_right is input_length");
++    // A zero-length output would have crashed above; a silent one would mean the
++    // mask path degenerated. The value is not pinned, only that signal exists.
++    check(peak_of(out_left) > 0.0, "out_left carries signal");
++    check(peak_of(out_right) > 0.0, "out_right carries signal");
++  }
++
++  // 2. keep_vocals == false runs the complementary mask through the same write
++  //    loop, so it must produce sized output too.
++  {
++    std::vector<float> out_left, out_right;
++    const bool ok = SeparateVocalWindow(
++      left, right, 44100.0, mag, frames, false, out_left, out_right);
++    check(ok, "keep_vocals=false returns true");
++    check(out_left.size() == n, "keep_vocals=false out_left is input_length");
++    check(out_right.size() == n, "keep_vocals=false out_right is input_length");
++  }
++
++  // 3. A shorter window than the minimum must be rejected, not crash. This is
++  //    the early return that must stay ABOVE the sizing of the outputs.
++  {
++    std::vector<float> short_in = sine(64, 0.0);
++    const size_t short_frames = frames_for(64);
++    std::vector<float> short_mag = magnitude(short_frames, 0.05f);
++    std::vector<float> out_left, out_right;
++    const bool ok = SeparateVocalWindow(
++      short_in, short_in, 44100.0, short_mag, short_frames, true, out_left, out_right);
++    check(!ok, "input at or below pad+1 returns false");
++    check(out_left.empty() && out_right.empty(), "rejected call leaves outputs empty");
++  }
++
++  // 4. Sample-rate mismatch returns false before any sizing.
++  {
++    std::vector<float> out_left, out_right;
++    const bool ok = SeparateVocalWindow(
++      left, right, 48000.0, mag, frames, true, out_left, out_right);
++    check(!ok, "sample-rate mismatch returns false");
++    check(out_left.empty() && out_right.empty(), "rate mismatch leaves outputs empty");
++  }
++
++  // 5. Magnitude length mismatch returns false rather than writing.
++  {
++    std::vector<float> out_left, out_right;
++    const std::vector<float> truncated(mag.begin(), mag.begin() + mag.size() / 2);
++    const bool ok = SeparateVocalWindow(
++      left, right, 44100.0, truncated, frames, true, out_left, out_right);
++    check(!ok, "magnitude length mismatch returns false");
++    check(out_left.empty() && out_right.empty(), "magnitude mismatch leaves outputs empty");
++  }
++
++  // 6. target_frames == 0 returns false: the JVM fallback contract, which is
++  //    the ONLY case the pre-vc75 tests covered.
++  {
++    std::vector<float> out_left, out_right;
++    const bool ok = SeparateVocalWindow(
++      left, right, 44100.0, mag, 0, true, out_left, out_right);
++    check(!ok, "target_frames=0 returns false");
++  }
++
++  // 7. Channel imbalance: a non-square stereo input must be rejected, since the
++  //    implementation assumes both channels share input_length.
++  {
++    std::vector<float> out_left, out_right;
++    const std::vector<float> shorter(n / 2);
++    const bool ok = SeparateVocalWindow(
++      left, shorter, 44100.0, mag, frames, true, out_left, out_right);
++    check(!ok, "mismatched channel lengths return false");
++  }
++
++  if (failures != 0) {
++    std::printf("%d check(s) failed\n", failures);
++    return 1;
++  }
++  std::printf("all checks passed\n");
++  return 0;
++}
