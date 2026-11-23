@@ -1,36 +1,104 @@
 #!/usr/bin/env bash
-# APK audit for vc90 (2.2.3-djmix48). Runs anywhere with unzip + python3; uses aapt2/apksigner
-# when an SDK is present, and degrades to structural checks when it is not.
+# APK audit for the current release (vc92 / 2.2.3-djmix50 at the time of writing).
+# The expected version is read from build.gradle.kts, never hardcoded here; pass
+# --code/--name to override it for a different tree or an older artifact.
 #
-#   ./audit-apk.sh path/to/app.apk
+# Runs anywhere with unzip + python3; uses aapt2/apksigner when an Android SDK
+# is present, and degrades to structural checks when it is not.
+#
+#   ./audit-apk.sh [--code N] [--name STR] path/to/app.apk
 set -uo pipefail
 
-APK="${1:?usage: audit-apk.sh <apk>}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() { echo "usage: audit-apk.sh [--code N] [--name STR] <apk>" >&2; }
+
+APK=""
+EXPECTED_CODE=""
+EXPECTED_NAME=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --code)   [ "$#" -ge 2 ] || { usage; exit 2; }; EXPECTED_CODE="$2"; shift 2 ;;
+    --code=*) EXPECTED_CODE="${1#*=}"; shift ;;
+    --name)   [ "$#" -ge 2 ] || { usage; exit 2; }; EXPECTED_NAME="$2"; shift 2 ;;
+    --name=*) EXPECTED_NAME="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)       echo "unknown option: $1" >&2; usage; exit 2 ;;
+    *)        [ -z "$APK" ] || { usage; exit 2; }; APK="$1"; shift ;;
+  esac
+done
+[ -n "$APK" ] || { usage; exit 2; }
+
 fail=0
 bad() { printf 'FAIL  %s\n' "$*"; fail=1; }
 ok()  { printf 'ok    %s\n' "$*"; }
 
 [ -f "$APK" ] || { echo "no such file: $APK"; exit 2; }
 
+# --- expected version from the single source of truth -----------------------
+GRADLE="$ROOT/build.gradle.kts"
+if [ -z "$EXPECTED_CODE" ] && [ -f "$GRADLE" ]; then
+  EXPECTED_CODE=$(sed -n 's/.*extra\["bitchordVersionCode"\][[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$GRADLE" | head -1)
+fi
+if [ -z "$EXPECTED_NAME" ] && [ -f "$GRADLE" ]; then
+  EXPECTED_NAME=$(sed -n 's/.*extra\["bitchordVersionName"\][[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$GRADLE" | head -1)
+fi
+if [ -n "$EXPECTED_CODE" ] && [ -n "$EXPECTED_NAME" ]; then
+  echo "expect: versionCode=$EXPECTED_CODE versionName=$EXPECTED_NAME (from build.gradle.kts unless overridden)"
+else
+  echo "note:  no expected version available; install-time version checks are advisory"
+fi
+
+# --- SDK / build-tools discovery --------------------------------------------
+# Accept the usual env vars first, then the known host layouts. Pick the
+# highest installed build-tools directory that actually contains the tool.
+discover_sdk() {
+  local cand
+  for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+              /home/boxes/android-sdk "${HOME:-}/android-sdk" /opt/android-sdk; do
+    [ -n "$cand" ] && [ -d "$cand/build-tools" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 0
+}
+pick_tool() { # $1 = sdk root, $2 = tool name
+  local sdk="$1" tool="$2" dir
+  [ -d "$sdk/build-tools" ] || return 0
+  while IFS= read -r dir; do
+    if [ -x "$dir/$tool" ]; then printf '%s\n' "$dir/$tool"; return 0; fi
+  done < <(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -Vr)
+  return 0
+}
+
+SDK="$(discover_sdk)"
+AAPT=""
+APKSIGNER=""
+if [ -n "$SDK" ]; then
+  AAPT="$(pick_tool "$SDK" aapt2)"
+  APKSIGNER="$(pick_tool "$SDK" apksigner)"
+  echo "sdk:   $SDK (aapt2: ${AAPT:-none}, apksigner: ${APKSIGNER:-none})"
+else
+  echo "sdk:   not found — set ANDROID_HOME/ANDROID_SDK_ROOT for badging + apksigner checks"
+fi
+
 echo "=== $(basename "$APK") ==="
 echo "size:   $(stat -c %s "$APK") bytes"
 echo "sha256: $(sha256sum "$APK" | cut -d' ' -f1)"
 
-SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/opt/android-sdk}}"
-AAPT=$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | tail -1)
-APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner 2>/dev/null | tail -1)
-
 # --- identity ---------------------------------------------------------------
-if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
+if [ -n "$AAPT" ]; then
   badging=$("$AAPT" dump badging "$APK" 2>/dev/null)
   pkg=$(printf '%s\n' "$badging" | sed -n 's/^package: name=.\([^'"'"']*\)..*versionCode=.\([^'"'"']*\)..*versionName=.\([^'"'"']*\)..*/\1 \2 \3/p' | head -1)
   set -- $pkg
-  echo "package:   ${1:-?}"
+  echo "package:     ${1:-?}"
   echo "versionCode: ${2:-?}"
   echo "versionName: ${3:-?}"
   [ "${1:-}" = "com.music.bitchord.loopfix" ] && ok "package is loopfix" || bad "package is not com.music.bitchord.loopfix"
-  [ "${2:-}" = "92" ] && ok "versionCode 92" || bad "versionCode is not 92 (got ${2:-?})"
-  [ "${3:-}" = "2.2.3-djmix50" ] && ok "versionName 2.2.3-djmix50" || bad "versionName is not 2.2.3-djmix50 (got ${3:-?})"
+  if [ -n "$EXPECTED_CODE" ]; then
+    [ "${2:-}" = "$EXPECTED_CODE" ] && ok "versionCode $EXPECTED_CODE" || bad "versionCode is not $EXPECTED_CODE (got ${2:-?})"
+  fi
+  if [ -n "$EXPECTED_NAME" ]; then
+    [ "${3:-}" = "$EXPECTED_NAME" ] && ok "versionName $EXPECTED_NAME" || bad "versionName is not $EXPECTED_NAME (got ${3:-?})"
+  fi
 else
   echo "aapt2 not found — skipping badging; set ANDROID_HOME to enable"
 fi
@@ -62,8 +130,7 @@ printf '%s\n' "$libs" | sed 's/^/        /'
 #
 # grep -q WITHOUT a pipe: `grep -q` exits on the first match, which kills the
 # writer with SIGPIPE, and under `pipefail` the whole pipeline then reports
-# failure even though the string matched. That is the same trap the workflow
-# comments about aapt2 in the audit step. Use the here-string so there is no
+# failure even though the string matched. Use the here-string so there is no
 # writer to interrupt.
 if grep -q 'lib/arm64-v8a/libbitchord_analysis\.so' <<< "$listing"; then
   ok "libbitchord_analysis.so present"
@@ -72,19 +139,28 @@ else
 fi
 
 # --- signature --------------------------------------------------------------
-if [ -n "${APKSIGNER:-}" ] && [ -x "$APKSIGNER" ]; then
-  if "$APKSIGNER" verify --print-certs "$APK" >/tmp/apksig.txt 2>&1; then
-    ok "signature verifies"
-    sed -n 's/^Signer #1 certificate DN: /        cert: /p' /tmp/apksig.txt
+if [ -n "$APKSIGNER" ]; then
+  siglog=$(mktemp "${TMPDIR:-/tmp}/apksig.XXXXXX")
+  if "$APKSIGNER" verify --print-certs "$APK" >"$siglog" 2>&1; then
+    ok "signature verifies (apksigner)"
+    sed -n 's/^Signer #1 certificate DN: /        cert: /p' "$siglog"
   else
     bad "signature does not verify (unsigned or wrong key?)"
-    sed -n '1,5p' /tmp/apksig.txt
+    sed -n '1,5p' "$siglog"
   fi
+  rm -f "$siglog"
 else
-  # An unsigned APK has no META-INF/*.RSA|DSA|EC. Worth stating loudly: an
-  # unsigned release cannot be installed over vc74.
-  if grep -qE 'META-INF/.*\.(RSA|DSA|EC)$' <<< "$listing"; then
-    ok "signature block present (apksigner unavailable to verify)"
+  # Two independent signals, because they are not equivalent:
+  #   * META-INF/*.RSA|DSA|EC is the v1 (JAR) signature.
+  #   * v2/v3 schemes live in the APK Signing Block, identified by the ASCII
+  #     magic "APK Sig Block 42", and may have NO META-INF signature at all.
+  # Checking only the first produces false "APK appears UNSIGNED" failures on
+  # a perfectly good modern APK. Binary grep is safe here (no pipeline).
+  v1=0; v2v3=0
+  grep -qE 'META-INF/.*\.(RSA|DSA|EC)$' <<< "$listing" && v1=1
+  grep -aq 'APK Sig Block 42' "$APK" && v2v3=1
+  if [ "$v1" -eq 1 ] || [ "$v2v3" -eq 1 ]; then
+    ok "signature block present (v1=$v1, v2/v3 magic=$v2v3; apksigner unavailable to verify)"
   else
     bad "APK appears UNSIGNED — cannot install over vc74"
   fi

@@ -1,0 +1,7 @@
+name = "bitchord-monochrome"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Optional: override the upstream Monochrome/HiFi instances (comma-separated).
+# [vars]
+# UPSTREAMS = "https://monochrome-api.samidy.com,https://api.monochrome.tf"

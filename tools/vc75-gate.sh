@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# Pre-build gate for vc83 (2.2.3-djmix41). File kept as vc75-gate.sh for history; it now gates vc83. Needs only g++ — no Android SDK, no JDK, no Gradle.
+# Pre-build native + version gate. Historical filename (vc75); the script now
+# gates the current tree with values read from build.gradle.kts. Needs only
+# g++ — no Android SDK, no JDK, no Gradle.
 #
 #   ./vc75-gate.sh [tree]        default tree: .
 #
-# Exit 0 = the crash fix is present, the success-path test passes, and the
-# version stamp is what we think. Anything else = do not build.
+# Exit 0 = the crash fix is present, the native self-tests pass, and the
+# version stamp is present and consistent across the Gradle files. Anything
+# else = do not build. Optional VC_GATE_EXPECTED_CODE / VC_GATE_EXPECTED_NAME
+# pin the dynamic values to a release you are about to cut.
 #
 # Two classes of check, deliberately separated:
 #
-#   HARD  A safety property. The fix is missing, or the success path is broken.
+#   HARD  A safety property. The fix is missing, or a success path is broken.
 #         No scope decision makes these acceptable: an APK built from such a
 #         tree installs over vc74 and dies exactly the way vc74 died.
 #
-#   SCOPE Reported, never fatal. Which behaviour edits are present. vc75 is
-#         allowed to ship narrowed (crash fix only) or full (crash fix plus the
-#         scheduling edits), so this cannot be a failure — it exists so the APK
-#         can be matched against the diff that was actually reviewed.
+#   SCOPE Reported, never fatal. Which behaviour edits are present. Kept for
+#         historical continuity with the vc75/vc76 handovers.
 set -uo pipefail
 
 REPO="${1:-.}"
@@ -32,7 +34,12 @@ say()  { printf '%s\n' "$*"; }
 # false failure this gate produced once and should never produce again.
 WORK="${VC75_GATE_TMP:-${HOME}/.cache/vc75-gate}"
 mkdir -p "$WORK" 2>/dev/null || WORK="${TMPDIR:-/tmp}"
-trap 'rm -f "$WORK/vst_bin" "$WORK/vst.out" "$WORK/vst.build.log" "$WORK/wc_bin" "$WORK/wc.out" "$WORK/wc.build.log" "$WORK/lm_bin" "$WORK/lm.out" "$WORK/lm.probe.out" "$WORK/lm.build.log"' EXIT
+trap 'rm -f "$WORK"/vst_bin "$WORK"/vst.out "$WORK"/vst.build.log \
+          "$WORK"/wc_bin "$WORK"/wc.out "$WORK"/wc.build.log \
+          "$WORK"/lm_bin "$WORK"/lm.out "$WORK"/lm.probe.out "$WORK"/lm.build.log \
+          "$WORK"/pi_bin "$WORK"/pi.out "$WORK"/pi.build.log \
+          "$WORK"/startup_bin "$WORK"/startup.out "$WORK"/startup.build.log \
+          "$WORK"/stretch_bin "$WORK"/stretch.out "$WORK"/stretch.build.log' EXIT
 
 say "=== tree: $(pwd) ==="
 say "HEAD: $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git tree')"
@@ -67,17 +74,47 @@ else
   fi
 fi
 
-# --- HARD: version stamp -----------------------------------------------------
-# versionCode 75 spent on a crashing build is unrecoverable on device: vc74 can
-# no longer be installed over it, and the way back is an uninstall.
-grep -q 'extra\["bitchordVersionCode"\] = 83' build.gradle.kts \
-  && ok "versionCode is 83" || bad "versionCode is not 83"
-grep -q 'extra\["bitchordVersionName"\] = "2.2.3-djmix41"' build.gradle.kts \
-  && ok "versionName is 2.2.3-djmix41" || bad "versionName is not 2.2.3-djmix41"
+# --- HARD: version stamp (read, never hardcoded) ----------------------------
+# The old check insisted on versionCode 83 / 2.2.3-djmix41 and failed every
+# later tree. Read the single source of truth instead, verify the app module
+# delegates to it, and only compare with an expected value if one is supplied.
+say ""
+ROOT_GRADLE="build.gradle.kts"
+APP_GRADLE="app/build.gradle.kts"
+CODE=$(sed -n 's/.*extra\["bitchordVersionCode"\][[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ROOT_GRADLE" 2>/dev/null | head -1)
+NAME=$(sed -n 's/.*extra\["bitchordVersionName"\][[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT_GRADLE" 2>/dev/null | head -1)
+if [ -n "${CODE:-}" ]; then
+  ok "versionCode $CODE (from $ROOT_GRADLE)"
+  if [ -n "${VC_GATE_EXPECTED_CODE:-}" ]; then
+    [ "$CODE" = "$VC_GATE_EXPECTED_CODE" ] \
+      && ok "versionCode matches VC_GATE_EXPECTED_CODE" \
+      || bad "versionCode $CODE != expected $VC_GATE_EXPECTED_CODE"
+  fi
+else
+  bad "no bitchordVersionCode in $ROOT_GRADLE"
+fi
+if [ -n "${NAME:-}" ]; then
+  ok "versionName $NAME (from $ROOT_GRADLE)"
+  if [ -n "${VC_GATE_EXPECTED_NAME:-}" ]; then
+    [ "$NAME" = "$VC_GATE_EXPECTED_NAME" ] \
+      && ok "versionName matches VC_GATE_EXPECTED_NAME" \
+      || bad "versionName $NAME != expected $VC_GATE_EXPECTED_NAME"
+  fi
+else
+  bad "no bitchordVersionName in $ROOT_GRADLE"
+fi
+if [ -f "$APP_GRADLE" ]; then
+  grep -q 'versionCode = rootProject.extra\["bitchordVersionCode"\]' "$APP_GRADLE" \
+    && ok "app versionCode delegates to root" || bad "app versionCode is not wired to the root version"
+  grep -q 'versionName = rootProject.extra\["bitchordVersionName"\]' "$APP_GRADLE" \
+    && ok "app versionName delegates to root" || bad "app versionName is not wired to the root version"
+else
+  bad "$APP_GRADLE missing"
+fi
 
 # --- SCOPE: which behaviour edits are in this tree ---------------------------
 say ""
-say "--- scope (reported, not enforced) ---"
+say "--- scope (reported, not enforced; legacy vc75/vc76 notes) ---"
 if grep -q 'THREAD_PRIORITY_DEFAULT' \
      app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt 2>/dev/null; then
   note "analysis priority left conditional — vc76 scope, absent here"
@@ -118,10 +155,9 @@ else
 fi
 
 # --- HARD: window-path calibration -----------------------------------------
-# The stem path is new working code as of vc75, so the invariants the automix
-# heuristics stand on are checked rather than assumed: the gain curve the
-# shipped code realises, the complement identity that legitimises
-# "instrumental = dry - vocals", and sample alignment.
+# The invariants the automix heuristics stand on: the gain curve the shipped
+# code realises, the complement identity behind "instrumental = dry - vocals",
+# and sample alignment.
 say ""
 CAL="native/analyzer/window_calibration.cpp"
 if [ ! -f "$CAL" ]; then
@@ -141,7 +177,7 @@ else
   fi
 fi
 
-# --- HARD: loopmix A/B selftest + reverb-stop probe (vc78 reverb-tail) --------
+# --- HARD: loopmix A/B selftest + reverb-stop probe --------------------------
 say ""
 LM_IMPL="native/loopmix/loop_mix_renderer.cpp"
 LM_MAIN="native/loopmix/loop_mix_renderer_ab_main.cpp"
@@ -157,9 +193,8 @@ else
       bad "loopmix A/B selftest FAILED (exit $rc)"
       sed -n '1,25p' "$WORK/lm.out"
     fi
-    # vc78 HARD: production-faithful reverb-stop probe (same binary).
-    # Thresholds live in the harness and are unchanged; this invocation
-    # exists so the hard-cut defect cannot silently regress.
+    # Production-faithful reverb-stop probe (same binary). Thresholds live in
+    # the harness; this invocation stops the hard-cut defect regressing.
     if "$WORK/lm_bin" --reverb-stop-probe >"$WORK/lm.probe.out" 2>&1; then
       ok "loopmix reverb-stop probe passed"
     else
@@ -177,6 +212,68 @@ else
   else
     bad "loopmix A/B selftest did not compile — see $WORK/lm.build.log"
     sed -n '1,12p' "$WORK/lm.build.log"
+  fi
+fi
+
+# --- HARD: phrase isolator + startup priming + stretch bench ----------------
+# Header-only band-split test, the standalone held-deck startup probe (note:
+# it takes NO flags — --selftest/--loop-domain-probe belong to the A/B main
+# above), and the self-contained pitch-stretch benchmark.
+say ""
+PI_TEST="native/loopmix/phrase_isolator_test.cpp"
+if [ ! -f "$PI_TEST" ]; then
+  bad "$PI_TEST missing"
+else
+  if g++ -std=c++17 -O2 "$PI_TEST" -o "$WORK/pi_bin" 2>"$WORK/pi.build.log"; then
+    if "$WORK/pi_bin" >"$WORK/pi.out" 2>&1; then
+      ok "phrase isolator test passed: $(tail -1 "$WORK/pi.out")"
+    else
+      rc=$?
+      bad "phrase isolator test FAILED (exit $rc)"
+      sed -n '1,20p' "$WORK/pi.out"
+    fi
+  else
+    bad "phrase isolator test did not compile — see $WORK/pi.build.log"
+    sed -n '1,12p' "$WORK/pi.build.log"
+  fi
+fi
+
+STARTUP="native/loopmix/loop_mix_renderer_startup_probe.cpp"
+if [ ! -f "$STARTUP" ] || [ ! -f "$LM_IMPL" ]; then
+  bad "startup probe missing — $STARTUP / $LM_IMPL not present"
+else
+  if g++ -std=c++17 -O2 -I native -I native/third_party "$LM_IMPL" "$STARTUP" \
+        -o "$WORK/startup_bin" 2>"$WORK/startup.build.log"; then
+    if "$WORK/startup_bin" >"$WORK/startup.out" 2>&1; then
+      ok "loopmix startup probe passed: $(grep -c 'PASS$' "$WORK/startup.out") cases"
+    else
+      rc=$?
+      bad "loopmix startup probe FAILED (exit $rc)"
+      sed -n '1,30p' "$WORK/startup.out"
+    fi
+  else
+    bad "startup probe did not compile — see $WORK/startup.build.log"
+    sed -n '1,12p' "$WORK/startup.build.log"
+  fi
+fi
+
+STRETCH="native/stretch/bench_main.cpp"
+STRETCH_IMPL="native/stretch/pitch_stretch.cpp"
+if [ ! -f "$STRETCH" ] || [ ! -f "$STRETCH_IMPL" ]; then
+  bad "stretch bench missing — $STRETCH / $STRETCH_IMPL not present"
+else
+  if g++ -std=c++17 -O2 -I native -I native/third_party "$STRETCH_IMPL" "$STRETCH" \
+        -o "$WORK/stretch_bin" 2>"$WORK/stretch.build.log"; then
+    if "$WORK/stretch_bin" >"$WORK/stretch.out" 2>&1; then
+      ok "stretch bench passed: $(tr '\n' ' ' < "$WORK/stretch.out")"
+    else
+      rc=$?
+      bad "stretch bench FAILED (exit $rc)"
+      sed -n '1,20p' "$WORK/stretch.out"
+    fi
+  else
+    bad "stretch bench did not compile — see $WORK/stretch.build.log"
+    sed -n '1,12p' "$WORK/stretch.build.log"
   fi
 fi
 

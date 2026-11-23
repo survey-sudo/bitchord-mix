@@ -73,6 +73,24 @@ jobs:
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi
+          echo "--- phrase isolator / bass-swap ramp test ---"
+          g++ -std=c++17 -O2 native/loopmix/phrase_isolator_test.cpp \
+              -o /tmp/phrase_isolator_test
+          /tmp/phrase_isolator_test
+          echo "--- loopmix held-deck startup probe ---"
+          # This probe's main() takes NO arguments: --selftest and
+          # --loop-domain-probe belong to loop_mix_renderer_ab_main above.
+          g++ -std=c++17 -O2 -I native -I native/third_party \
+              native/loopmix/loop_mix_renderer.cpp \
+              native/loopmix/loop_mix_renderer_startup_probe.cpp \
+              -o /tmp/loopmix_startup_probe
+          /tmp/loopmix_startup_probe
+          echo "--- pitch-stretch bench (self-contained, <1 s) ---"
+          g++ -std=c++17 -O2 -I native -I native/third_party \
+              native/stretch/pitch_stretch.cpp \
+              native/stretch/bench_main.cpp \
+              -o /tmp/stretch_bench
+          /tmp/stretch_bench
 
       # The runner image is ~14 GB free and the NDK alone is ~2 GB.
       - name: Free disk space
@@ -151,6 +169,24 @@ jobs:
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi
+          echo "--- phrase isolator / bass-swap ramp test ---"
+          g++ -std=c++17 -O2 native/loopmix/phrase_isolator_test.cpp \
+              -o /tmp/phrase_isolator_test
+          /tmp/phrase_isolator_test
+          echo "--- loopmix held-deck startup probe ---"
+          # This probe's main() takes NO arguments: --selftest and
+          # --loop-domain-probe belong to loop_mix_renderer_ab_main above.
+          g++ -std=c++17 -O2 -I native -I native/third_party \
+              native/loopmix/loop_mix_renderer.cpp \
+              native/loopmix/loop_mix_renderer_startup_probe.cpp \
+              -o /tmp/loopmix_startup_probe
+          /tmp/loopmix_startup_probe
+          echo "--- pitch-stretch bench (self-contained, <1 s) ---"
+          g++ -std=c++17 -O2 -I native -I native/third_party \
+              native/stretch/pitch_stretch.cpp \
+              native/stretch/bench_main.cpp \
+              -o /tmp/stretch_bench
+          /tmp/stretch_bench
 
       - name: Free disk space
         run: |

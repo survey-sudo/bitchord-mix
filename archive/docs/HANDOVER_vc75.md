@@ -293,7 +293,7 @@ Deferred because it changes the build target while the current APK is awaiting a
 - `bk-android` was the original build source of truth; it sits at `4e19a2a`, at least several commits behind `origin/master = dfc90d0`. When reachable: `git pull --ff-only origin master`.
 - `grok-box` is **offline** on the tailnet (`tx 780 rx 0`). Bootstrap kit is ready at `docs/tools/grokbox/` (`bootstrap.sh --check`, `migrate-repo.md`, `verify-build.md`). Migration counts as done only when the same source produces the same APK bytes.
 - The "main" box (`cb-fcfcd7a79078`) is the one with `/workspace/BitChord`, the keystore, and the working toolchain. It is currently the only ready builder.
-- Minor: `survey-sudo` is fully private (9/9 repos), but `syabkahzh` and `imamuhf` have 12 public repos between them. The user asked "make sure all private" earlier; the question about those unrelated accounts was never answered.
+- Minor: `survey-sudo` is fully private (9/9 repos), but two unrelated maintainer accounts (names redacted) have 12 public repos between them. The user asked "make sure all private" earlier; the question about those unrelated accounts was never answered.
 
 ---
 
