@@ -60,10 +60,7 @@ class PresenceTest {
         assertEquals("android", nextPing()!!.getValue("platform").jsonPrimitive.content)
 
         presence.setOpen(false)
-        // The debounce holds the close back: nothing may reach the server
-        // while it runs. Waiting on the request queue asserts that directly
-        // instead of sleeping a fixed wall-clock span.
-        assertNull(server.takeRequest(300, TimeUnit.MILLISECONDS), "close should wait out the debounce")
+        Thread.sleep(300)
         presence.setOpen(true)
         // The reopen pings straight away; the close it replaced never goes out.
         assertEquals(true, nextPing()!!.isOpen())

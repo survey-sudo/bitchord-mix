@@ -144,9 +144,9 @@ The arm64 phone release is the supported target. Native analysis and loop-mix li
 
 <h1><a id="download"></a>Download</h1>
 
-<a href="https://github.com/survey-sudo/bitchord-mix/releases" target="_blank" rel="noopener noreferrer"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/supported/android/cozy.svg" alt="Download for Android" height="55"/></a>
+<a href="https://github.com/survey-sudo/bitchord-unified/releases" target="_blank" rel="noopener noreferrer"><img src="https://cdn.jsdelivr.net/gh/JMcrafter26/badges@main/src/assets/supported/android/cozy.svg" alt="Download for Android" height="55"/></a>
 
-Grab the latest signed APK from this fork's [Releases](https://github.com/survey-sudo/bitchord-mix/releases) page. Upstream builds are at [kushagrasinghx/BitChord](https://github.com/kushagrasinghx/BitChord/releases). Sideloading requires enabling "Install unknown apps" for whichever app you download it with.
+Grab the latest signed APK from this fork's [Releases](https://github.com/survey-sudo/bitchord-unified/releases) page. Upstream builds are at [kushagrasinghx/BitChord](https://github.com/kushagrasinghx/BitChord/releases). Sideloading requires enabling "Install unknown apps" for whichever app you download it with.
 
 
 </div>

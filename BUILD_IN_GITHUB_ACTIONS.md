@@ -7,8 +7,8 @@ This repository is the unified BitChord source: the full git history and branche
 | Branch | Meaning |
 | --- | --- |
 | `vc91-djmix49` | **Shipped build.** Commit `23adab5`, versionCode 91 / `2.2.3-djmix49` — the source that produced the installed APK. This is the checked-out base branch. |
-| `vc92-djmix50` | Next version branch, pointing at the same commit; its uncommitted work on the build host is preserved here as `vc92-wip-snapshot`. |
-| `vc92-wip-snapshot` | Snapshot of the vc92 working tree from `dvb` (16 modified files + 6 new files), committed locally so nothing is lost. Not validated — no build or device run behind it. |
+| `vc92-djmix50` | **Active vc92 branch.** Holds the unified `vc92` work, descended cleanly from `vc91-djmix49` (no merge, no rewritten history). This is where vc92 changes land. |
+| `vc92-wip-snapshot` | Preserved snapshot of the vc92 working tree from `dvb` (16 modified files + 6 new files), kept for reference only as the pre-unification state. Superseded by `vc92-djmix50`; do not build from it. |
 | `master`, `vc80-*`, `automix/*`, … | Older history, kept for reference only. Do **not** use `vc80-filter-catchup` for release builds. |
 
 ## 1. Push to GitHub

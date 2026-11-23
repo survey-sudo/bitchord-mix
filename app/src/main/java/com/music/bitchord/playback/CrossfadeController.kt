@@ -8714,22 +8714,11 @@ class CrossfadeController(
     internal fun testFieldValue(name: String): Any? = when (name) {
         "phase" -> phase
         "fadeOutOriginMs" -> fadeOutOriginMs
-        "fadeInStartMs" -> fadeInStartMs
         "armDeadline" -> armDeadline
-        "plannedArmLeadMs" -> plannedArmLeadMs
-        "mixDurationMs" -> mixDurationMs
         "queuedItemCount" -> queuedItemCount
         "countdownStabilizer" -> countdownStabilizer
-        "smartTransitionWindow" -> AppSettings.smartTransitionWindow.value
-        "nextTrackPrepared" -> nextTrackPrepared
-        "advanceCommitted" -> advanceCommitted
         "tickerJob" -> tickerJob
         "lastSmartPlan" -> lastSmartPlan
-        "smartNextId" -> smartNextId
-        "smartCurrentId" -> smartCurrentId
-        "takeoverArmed" -> takeoverArmed
-        "mixEngaged" -> mixEngaged
-        "phaseBeforeHandoff" -> phaseBeforeHandoff
         "render" -> render
         "handedOff" -> handedOff
         "fadeOutBudgetMs" -> fadeOutBudgetMs
