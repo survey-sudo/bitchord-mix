@@ -28,8 +28,7 @@ kotlin {
             dependsOn(commonMain.get())
             dependencies {
                 // Compile-only: the two applications supply the runtime artifact themselves.
-                // AUTOMIX-V2(A): compile against the same Java API as the phone's runtime
-                // (onnxruntime-android-qnn 1.29.0); the jar never ships (compileOnly).
+                // FORK-HOOK(gradle-djmix): compile against ORT 1.29.0 QNN Java API
                 compileOnly("com.microsoft.onnxruntime:onnxruntime:1.29.0")
                 // The network stack the lyrics providers and the YouTube Music
                 // client run on, at the phone's versions — both applications
@@ -68,6 +67,12 @@ kotlin {
 android {
     namespace = "com.music.bitchord.shared"
     compileSdk = 36
+    // Without a minSdk the library's manifest has no <uses-sdk>, which the
+    // manifest merger reads as targetSdk < 4 and answers by granting every app
+    // that depends on it READ_PHONE_STATE — a permission nothing here uses.
+    defaultConfig {
+        minSdk = 26
+    }
 }
 
 /*
@@ -84,6 +89,7 @@ android {
  * directory from an earlier build was still on disk. The directory is therefore
  * created by a task that every bundle task depends on.
  */
+// FORK-HOOK(gradle-djmix): compileSdk=36 + AarMetadata disabled for innertubex
 tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
 
 val prepareAarMetadataCheckDirs = tasks.register("prepareAarMetadataCheckDirs") {

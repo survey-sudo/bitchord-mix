@@ -102,7 +102,7 @@ fun OnboardingScreen(
     onNameChosen: (String) -> Unit,
     /** Opens the Google sign-in. The caller finishes onboarding once it lands. */
     onSignIn: () -> Unit,
-    /** Opens the file picker for a backup exported by the official app. */
+    // FORK-HOOK(official-import): import backup from official BitChord during onboarding
     onImportOfficial: () -> Unit,
     onFinish: () -> Unit,
     modifier: Modifier = Modifier,

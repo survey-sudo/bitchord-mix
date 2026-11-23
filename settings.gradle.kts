@@ -35,7 +35,7 @@ val androidSdk: String? = file("local.properties")
 
 if (androidSdk != null && file(androidSdk).isDirectory) {
     include(":app")
-    // TV and Wear are separate products. This fork only ships the phone APK.
+    // FORK-HOOK(settings-modules): TV and Wear are separate products; fork ships phone APK only.
     // include(":tv")
     // include(":wearos")
 } else {

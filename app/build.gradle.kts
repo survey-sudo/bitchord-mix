@@ -72,9 +72,9 @@ val betaSuffix = rootProject.extra["bitchordBetaSuffix"] as String
 android {
     namespace = "com.music.bitchord"
     // InnerTubeX's AAR requires compiling against 37; targetSdk (runtime behaviour) stays 36.
+    // FORK-HOOK(gradle-djmix): keep compileSdk=36 for dvb SDK compat & bundled .onnx assets in Step 2
     compileSdk = 36
 
-    // djmix9 build compat: InnerTubeX AAR declares 37; bk-android has 36.
     defaultConfig {
         applicationId = "com.music.bitchord.loopfix"
         // 26 keeps reach wide; real-time blur (RenderEffect) kicks in on API 31+,
@@ -164,6 +164,8 @@ android {
         }
         create("prod") {
             dimension = "env"
+            // FORK-HOOK(gradle-djmix): fork launcher label for side-by-side install
+            resValue("string", "app_name", "Bitchord Mix")
             // Matches defaultConfig: com.music.bitchord.loopfix, so this build
             // installs beside the official com.music.bitchord package.
         }
@@ -248,6 +250,7 @@ android {
         // libs need 16 KB-aligned ELF LOAD segments (our libs link with
         // -Wl,-z,max-page-size=16384, see CMakeLists.txt), not 16 KB zip alignment.
         // The manifest's extractNativeLibs="true" already matches this.
+        // FORK-HOOK(gradle-djmix): legacy packaging + non-v73 QNN HTP excludes
         jniLibs {
             useLegacyPackaging = true
             // Hexagon stubs/skels for other HTP generations are dead weight on the target
@@ -279,6 +282,15 @@ android {
             excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
             // The three BouncyCastle jars (bcprov, bcutil, bcpkix) ship one licence between them.
             pickFirsts += setOf("META-INF/LICENSE.md", "META-INF/LICENSE.txt", "META-INF/NOTICE.md")
+            // BouncyCastle data nothing here reads (~1.2 MB): the Picnic
+            // post-quantum signature tables and the certificate-path
+            // reviewer's message bundles. SMBJ, libadb and the watch
+            // installer only use digests, AES/GCM, HKDF and the X.509 builder.
+            excludes += setOf(
+                "org/bouncycastle/pqc/**",
+                "org/bouncycastle/x509/CertPathReviewerMessages*.properties",
+                "org/bouncycastle/pkix/CertPathReviewerMessages*.properties",
+            )
         }
     }
     buildFeatures {
@@ -374,6 +386,9 @@ dependencies {
     implementation("androidx.media3:media3-session:1.11.0")
     implementation("androidx.media3:media3-common:1.11.0")
     implementation("androidx.media3:media3-datasource-okhttp:1.11.0")
+    // The lyrics share's video: a canvas clip, blurred, with the card laid over it.
+    implementation("androidx.media3:media3-transformer:1.11.0")
+    implementation("androidx.media3:media3-effect:1.11.0")
     // Audio is progressive, but Apple serves its motion artwork as HLS — this
     // is what lets the animated sleeve play it. See CanvasArtworkPlayer.
     implementation("androidx.media3:media3-exoplayer-hls:1.11.0")
@@ -477,17 +492,7 @@ dependencies {
     implementation("com.hierynomus:smbj:0.15.0")
 
     // ---- Automix: on-device beat/downbeat model (Beat This!, MIT-licensed) ----
-    // The full android artifact, not onnxruntime-mobile: mobile only loads .ort
-    // files, which would put an offline conversion step between the model and
-    // the app for a saving that does not matter in a self-distributed APK.
-    // AUTOMIX-V2(A): the QNN build of the full runtime REPLACES onnxruntime-android
-    // 1.31.0 (never both: exactly one libonnxruntime.so may reach the APK; CI audits it).
-    // 1.29.0 is the newest onnxruntime-android-qnn on Maven Central; its POM depends on
-    // com.qualcomm.qti:qnn-runtime 2.42.0, pinned explicitly below so a transitive bump can
-    // never silently change the QAIRT version the EP-context caches (and any offline
-    // _qdq_ctx.onnx from tools/npu) were compiled against. The Java API used here (addQnn,
-    // addConfigEntry, createSession) is identical in 1.29 and 1.31. Whether QNN is used at
-    // runtime is decided by NpuSupport.runtimeEnabled() (user switch + self-test + auto-disable).
+    // FORK-HOOK(gradle-djmix): keep ORT QNN 1.29.0 + qnn-runtime 2.42.0 for Step 2
     implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0")
     implementation("com.qualcomm.qti:qnn-runtime:2.42.0")
 
@@ -503,6 +508,12 @@ dependencies {
     // See com.music.bitchord.wear.WearBridge. Rides on the Play services base
     // the Cast framework already brings, so it adds very little.
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
+
+    // ---- Google Drive backup: the device's own Google sign-in ----
+    // See com.music.bitchord.data.backup.DriveAuth. Only the authorization
+    // client: Drive itself is three REST calls over OkHttp, which is far
+    // lighter than the google-api-services-drive client and its HTTP stack.
+    implementation("com.google.android.gms:play-services-auth:21.3.0")
     // Opens the watch app after an update, so its install prompt is on screen.
     implementation("androidx.wear:wear-remote-interactions:1.1.0")
 
@@ -632,4 +643,5 @@ if (providers.gradleProperty("bitchord.bundleWear").orNull != "false" && findPro
  * check's output directory, which AGP's bundle tasks declare as an input; without
  * that, a clean checkout fails Gradle input validation.
  */
+// FORK-HOOK(gradle-djmix): compileSdk 36 vs innertubex AAR minCompileSdk 37
 tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }

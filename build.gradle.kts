@@ -41,8 +41,10 @@ buildscript {
  * No "v" in the name — the in-app updater reads it as a number; the "v" is the
  * release tag's alone.
  */
-extra["bitchordVersionCode"] = 93
-extra["bitchordVersionName"] = "2.3.0-djmix51"
+// FORK-HOOK(version): fork monotonic versioning + upstream release base
+extra["bitchordVersionCode"] = 94
+extra["bitchordVersionName"] = "1.10-djmix52"
+extra["bitchordUpstreamBase"] = "1.10"
 
 /*
  * Bump this by hand before cutting each sideloaded test build ("beta2",

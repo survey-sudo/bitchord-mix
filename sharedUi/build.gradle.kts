@@ -127,6 +127,7 @@ compose.resources {
  * by a task they depend on. Without that, a clean checkout fails Gradle input
  * validation; a stale directory on the build box used to hide it.
  */
+// FORK-HOOK(gradle-aar-metadata): compileSdk=36 + AarMetadata disabled for innertubex
 tasks.configureEach { if (name.endsWith("AarMetadata")) enabled = false }
 
 val prepareAarMetadataCheckDirs = tasks.register("prepareAarMetadataCheckDirs") {

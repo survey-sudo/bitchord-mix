@@ -1,0 +1,21 @@
+<resources>
+    <string name="import_official_title" translatable="false">Import from official BitChord backup</string>
+    <string name="import_official_subtitle" translatable="false">Settings and listening history from the official app</string>
+    <string name="import_official_steps" translatable="false">In the official BitChord app, open Settings, then Your data, then Export data, and save the JSON file. Choose that file here.\n\nSettings, Automix, crossfade, lyrics sources, and listening history are restored. Sign-in, addon configuration, passwords, and the download checklist are not in that file, so they stay in the official app. Tracks already saved to Music/BitChord still show under Local music. If you had picked a local-music folder, pick it again so this app can read it.</string>
+    <string name="import_official_succeeded" translatable="false">Restored %1$d settings and %2$d months of listening from BitChord %3$s. Sign in again for your library.</string>
+    <string name="onboarding_import_official" translatable="false">Import from official BitChord backup</string>
+    <!-- AUTOMIX-V2(orch) -->
+    <string name="automix_dj_level" translatable="false">DJ level</string>
+    <string name="automix_dj_level_subtitle" translatable="false">How much DJ Automix plays between songs</string>
+    <string name="automix_dj_level_footer" translatable="false">Every level beat-matches on the phrase and keeps one bassline at a time. Higher levels add stem tricks and effects, and fall back to a clean fade when a pair doesn\'t suit them.</string>
+    <string name="automix_dj_subtle" translatable="false">Subtle</string>
+    <string name="automix_dj_subtle_subtitle" translatable="false">Smooth blends and bass swaps, one light effect at most</string>
+    <string name="automix_dj_club" translatable="false">Club</string>
+    <string name="automix_dj_club_subtitle" translatable="false">Stem swaps, filter washes, echo-outs, drops landed on the beat</string>
+    <string name="automix_dj_festival" translatable="false">Festival</string>
+    <string name="automix_dj_festival_subtitle" translatable="false">Builds, risers, gates, brakes and two effects per transition</string>
+    <string name="automix_stems" translatable="false">Stem mixing</string>
+    <string name="automix_stems_subtitle" translatable="false">Splits vocals, drums, bass and other on the phone for cleaner swaps</string>
+    <string name="automix_npu" translatable="false">Use the NPU</string>
+    <string name="automix_npu_subtitle" translatable="false">Runs analysis on the Snapdragon neural engine when available, with CPU fallback</string>
+</resources>
