@@ -299,6 +299,19 @@ class LoopMixSession private constructor(
                 val nominal = LoopMix.qualifyCrown(effectivePlan)
                 if (!nominal.accepted) return refuse("crown_nominal_${nominal.refusal ?: "invalid"}")
             }
+            // Feature 5 fail-closed: a plan that requires a MASK_DUCKED stem duck
+            // must never fall back to a dry, non-separated render. If W1-Planner
+            // flagged it but no separator can answer (or the window is too long
+            // for the native Wiener pass), refuse rather than ship the wrong mix.
+            if (effectivePlan.stemDuckRequired && separateVocalPair == null && separateVocalStem == null) {
+                return refuse("stem_duck_unavailable")
+            }
+            if (effectivePlan.stemDuckRequired &&
+                (outAnalysis?.duration?.takeIf { it > 0.0 } ?: 0.0) <= 0.0) {
+                // no analysis means the duck window cannot be bounded; the
+                // 21.5 s window check below still applies when regions decode.
+                Log.i(TAG, "stem_duck_required with no outAnalysis; feasibility deferred to decode window")
+            }
             val clock = LoopMix.Clock(effectivePlan)
             if (handoff != null) {
                 val qualification = qualifyMusicalHandoff(handoff, outAnalysis, inAnalysis, sungOut, sungIn)
@@ -389,8 +402,21 @@ class LoopMixSession private constructor(
                 Log.i(TAG, "loop-domain rejected: incomplete physical PCM out=${outRegion.left.size}/${outRegion.right.size} in=${inRegion.left.size}/${inRegion.right.size} requiredOut=$requiredOutEnd requiredIn=${incomingGeometry.requiredEnd}")
                 return refuse("pcm_incomplete_physical_coverage")
             }
-            if (handoff != null && !coversHandoffPcm(effectivePlan, sampleRate, knots, outRegion, inRegion)) {
-                return refuse("handoff_pcm_before_protected_event")
+            if (handoff != null) {
+                // Bug 1b: only a natural handoff whose protected dry cut sits
+                // within 120 ms of container EOF may tolerate an early decoder
+                // end (Opus/AAC decode 6-60 ms short). A measured Echo handoff
+                // is inside the file, so its cover must stay sample-exact.
+                val dryEnd = knotSourceAt(knots.outFrames, knots.outPositionsSec,
+                    handoff.outDryEnd.mixSec, sampleRate)
+                val containerEnd = outAnalysis?.duration?.takeIf { it > 0.0 } ?: Double.MAX_VALUE
+                val nearEof = naturalHandoff && dryEnd != null && dryEnd >= containerEnd - 0.12
+                val handoffTolerance = if (nearEof) 0.08 else 0.0
+                Log.i(TAG, "handoff pcm cover: natural=$naturalHandoff dryEnd=$dryEnd containerEnd=$containerEnd " +
+                    "nearEof=$nearEof endToleranceSec=$handoffTolerance")
+                if (!coversHandoffPcm(effectivePlan, sampleRate, knots, outRegion, inRegion, handoffTolerance)) {
+                    return refuse("handoff_pcm_before_protected_event")
+                }
             }
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
@@ -581,6 +607,13 @@ class LoopMixSession private constructor(
                         }
                     }
                 }
+            }
+            // Feature 5 fail-closed (post-decode): a plan requiring a
+            // MASK_DUCKED stem duck must never fall through to a dry render.
+            // If neither deck was separated (separators absent, window over
+            // 21.5 s, or separators returned nothing usable), refuse instead.
+            if (effectivePlan.stemDuckRequired && !outStemSeparated && !inStemSeparated) {
+                return refuse("stem_duck_unavailable")
             }
             val renderer = LoopMixRenderer(sampleRate)
             if (!renderer.isValid) return refuse("renderer_build_failed")
@@ -1125,14 +1158,17 @@ class LoopMixSession private constructor(
         }
 
         internal fun coversHandoffPcm(plan: LoopMix.Plan, sampleRate: Int, knots: DeckKnots,
-            out: LoopRegion, inn: LoopRegion): Boolean {
+            out: LoopRegion, inn: LoopRegion, endToleranceSec: Double = 0.0): Boolean {
             val h = plan.handoff ?: return true
             val dryEnd = knotSourceAt(knots.outFrames, knots.outPositionsSec, h.outDryEnd.mixSec, sampleRate) ?: return false
             val entry = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inAudibleStart.mixSec, sampleRate) ?: return false
             val landing = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inLanding.mixSec, sampleRate) ?: return false
             // OUT may exhaust after dry end, while the effect continues to drain.
-            return coversPhysical(out, sampleRate, h.outCaptureStart.sourceSec, dryEnd) &&
-                coversPhysical(inn, sampleRate, minOf(h.inCueSourceSec, entry), landing + 1.0 / sampleRate)
+            // Bug 1b: tolerate an early decoder EOF at the protected cut only
+            // when the caller proves the cut sits near container EOF (natural
+            // handoff). The start check stays exact; never mask a late PCM head.
+            return coversPhysical(out, sampleRate, h.outCaptureStart.sourceSec, dryEnd, endToleranceSec) &&
+                coversPhysical(inn, sampleRate, minOf(h.inCueSourceSec, entry), landing + 1.0 / sampleRate, endToleranceSec)
         }
 
         internal data class CrownKnotQualification(
@@ -1293,10 +1329,11 @@ class LoopMixSession private constructor(
             return IncomingGeometry(loops, release, handover, required)
         }
 
-        internal fun coversPhysical(region: LoopRegion, sampleRate: Int, requiredStart: Double, requiredEnd: Double): Boolean =
+        internal fun coversPhysical(region: LoopRegion, sampleRate: Int, requiredStart: Double,
+            requiredEnd: Double, endToleranceSec: Double = 0.0): Boolean =
             sampleRate > 0 && region.start.isFinite() && requiredStart.isFinite() && requiredEnd.isFinite() &&
                 region.left.isNotEmpty() && region.left.size == region.right.size && region.start <= requiredStart &&
-                region.start + region.left.size.toDouble() / sampleRate + 1.0 / sampleRate >= requiredEnd
+                region.start + region.left.size.toDouble() / sampleRate + 1.0 / sampleRate + endToleranceSec >= requiredEnd
 
         /** OUT loop completeness only; straight OUT may reach real EOF during FX drain. */
         internal fun coversOutgoingStartAndLoop(region: LoopRegion, sampleRate: Int, plan: LoopMix.Plan): Boolean =

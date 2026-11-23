@@ -83,4 +83,34 @@ class FxPolicyContractTest {
         )
         assertNull(FxPolicy.measuredVocal(uncovered, 160.0, 176.0))
     }
+
+    @Test
+    fun musicalPolicyIsDeterministicAndKeepsNONEguards() {
+        // Default lottery retained when gated off.
+        assertEquals(false, FxPolicy.MUSICAL_FX_POLICY_ENABLED)
+        // Guards: same NONE set as lottery (plus blank).
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = false, vocalClash = 0.0, speechLike = false, drifting = false, buildup = true, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = true, drifting = false, buildup = true, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = true, buildup = false, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = Double.NaN, speechLike = false, drifting = false, buildup = false, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.25, speechLike = false, drifting = false, buildup = false, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("", "b", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false))
+    }
+
+    @Test
+    fun musicalBuildupAndCleanSpaceFollowEnergyAndTempoGap() {
+        // buildup: LOOP_ROLL when rising else FLANGER (deterministic, hash-free).
+        assertEquals(DjEffect.LOOP_ROLL, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = true, cleanSpace = false, energyRising = true))
+        assertEquals(DjEffect.FLANGER, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = true, cleanSpace = false, energyRising = false))
+        // cleanSpace: ECHO when tempoGap > 0.08 else REVERB.
+        assertEquals(DjEffect.ECHO, FxPolicy.selectMusical("a", "b", rhythmic = false, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = true, tempoGap = 0.12))
+        assertEquals(DjEffect.REVERB, FxPolicy.selectMusical("a", "b", rhythmic = false, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = true, tempoGap = 0.02))
+        // vocalClash >= 0.18: ECHO only when rhythmic.
+        assertEquals(DjEffect.ECHO, FxPolicy.selectMusical("a", "b", rhythmic = true, measured = true, vocalClash = 0.19, speechLike = false, drifting = false, buildup = false, cleanSpace = false))
+        assertEquals(DjEffect.NONE, FxPolicy.selectMusical("a", "b", rhythmic = false, measured = true, vocalClash = 0.19, speechLike = false, drifting = false, buildup = false, cleanSpace = false))
+        // Deterministic: different ids, same musical evidence -> same effect.
+        val f1 = FxPolicy.selectMusical("pair-one-out", "pair-one-in", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false)
+        val f2 = FxPolicy.selectMusical("other-out", "other-in", rhythmic = true, measured = true, vocalClash = 0.0, speechLike = false, drifting = false, buildup = false, cleanSpace = false)
+        assertEquals(f1, f2)
+    }
 }

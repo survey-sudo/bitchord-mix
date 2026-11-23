@@ -34,7 +34,8 @@ class SelectiveEchoPolicyTest {
         assertEquals("natural-end", plan.alternativeKind)
         assertFalse(plan.echoTail)
         assertFalse(plan.reverbWash)
-        assertEquals(180.0, assertNotNull(plan.handoff).outDryEnd.sourceSec, 1e-8)
+        // vc92: Bug 1a clamps natural cut 60 ms inside container EOF.
+        assertEquals(179.94, assertNotNull(plan.handoff).outDryEnd.sourceSec, 1e-8)
     }
 
     @Test fun measuredLocalGridsAndPhraseExitKeepMusicalEcho() {

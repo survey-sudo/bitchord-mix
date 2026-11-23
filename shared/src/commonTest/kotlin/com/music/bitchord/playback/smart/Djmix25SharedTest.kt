@@ -278,7 +278,8 @@ class Djmix25SharedTest {
         assertFalse(plan.echoTail)
         assertFalse(plan.reverbWash)
         val h = assertNotNull(plan.handoff)
-        assertEquals(out.duration, h.outDryEnd.sourceSec)
+        // vc92: natural cut is 60 ms inside physical EOF (Bug 1a).
+        assertEquals(out.duration - 0.06, h.outDryEnd.sourceSec, 1e-8)
         assertEquals(h.outDryEnd, h.outDryFallStart)
         assertEquals(LoopMix.cueOf(inn), h.inCueSourceSec)
         assertEquals(HandoffStatus.UNKNOWN, qualifyMusicalHandoff(h, out, inn, null, null).status)

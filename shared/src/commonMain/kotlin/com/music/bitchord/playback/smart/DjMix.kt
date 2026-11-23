@@ -97,6 +97,9 @@ fun blendColour(
 
 /** Pair hash selects only among effects already justified by measured musical evidence. */
 object FxPolicy {
+    /** Musical policy gate: when false (default) [select] returns the exact existing lottery so the contract suite pins unchanged. */
+    const val MUSICAL_FX_POLICY_ENABLED = false
+
     fun fxSlot(outgoingId: String, incomingId: String): Int =
         ((pairHash(outgoingId, incomingId) % 4) + 4) % 4
 
@@ -111,6 +114,9 @@ object FxPolicy {
         buildup: Boolean,
         cleanSpace: Boolean,
     ): DjEffect {
+        if (MUSICAL_FX_POLICY_ENABLED) {
+            return selectMusical(outgoingId, incomingId, rhythmic, measured, vocalClash, speechLike, drifting, buildup, cleanSpace)
+        }
         if (outgoingId.isBlank() || incomingId.isBlank() || !measured || speechLike || drifting ||
             !vocalClash.isFinite() || vocalClash > 0.20
         ) return DjEffect.NONE
@@ -131,6 +137,45 @@ object FxPolicy {
             2 -> DjEffect.ECHO
             else -> DjEffect.NONE
         }
+    }
+
+    /**
+     * Pure deterministic musical FX policy (Feature 7). No lottery rotation:
+     * buildup -> LOOP_ROLL when energy rising else FLANGER; cleanSpace ->
+     * ECHO when tempoGap > 0.08 else REVERB; vocalClash >= 0.18 -> ECHO if
+     * rhythmic (else NONE). All NONE guards are kept: !measured, speechLike,
+     * drifting, non-finite vocalClash, or vocalClash > 0.20 (plus blank ids).
+     * pairHash is never a primary selector here; it is only a stable
+     * tie-breaker and is intentionally not used to rotate in this branch.
+     * Wired via MUSICAL_FX_POLICY_ENABLED (default false retains the lottery).
+     */
+    fun selectMusical(
+        outgoingId: String,
+        incomingId: String,
+        rhythmic: Boolean,
+        measured: Boolean,
+        vocalClash: Double,
+        speechLike: Boolean,
+        drifting: Boolean,
+        buildup: Boolean,
+        cleanSpace: Boolean,
+        energyRising: Boolean = false,
+        tempoGap: Double = 0.0,
+    ): DjEffect {
+        if (outgoingId.isBlank() || incomingId.isBlank() || !measured || speechLike || drifting ||
+            !vocalClash.isFinite() || vocalClash > 0.20
+        ) return DjEffect.NONE
+        if (buildup) {
+            return if (energyRising) DjEffect.LOOP_ROLL else DjEffect.FLANGER
+        }
+        if (cleanSpace) {
+            return if (tempoGap.isFinite() && tempoGap > 0.08) DjEffect.ECHO else DjEffect.REVERB
+        }
+        if (vocalClash >= 0.18) {
+            return if (rhythmic) DjEffect.ECHO else DjEffect.NONE
+        }
+        if (!rhythmic) return DjEffect.NONE
+        return DjEffect.FLANGER
     }
 
     internal fun measuredVocal(analysis: TrackAnalysis, from: Double, to: Double): Double? {
