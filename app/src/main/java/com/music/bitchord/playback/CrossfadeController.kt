@@ -2287,6 +2287,11 @@ class CrossfadeController(
         }
         } else if (!plan.blocked && verdict != lastEmittedPlanVerdict) {
             lastEmittedPlanVerdict = verdict
+            // vc92 Feature 6: telemetry-only planned vocal attenuation from
+            // the local-blend admission verdict (never gates admission).
+            val blendVerdict = if (LocalBlendAdmission.MARKER in plan.policyReasons) {
+                LocalBlendAdmission.evaluate(plan, currentAnalysis, nextAnalysis, outLyricCues, inLyricCues)
+            } else null
             mixEvent(
                 "mix.plan",
                 mapOf(
@@ -2318,7 +2323,9 @@ class CrossfadeController(
                     "gapless" to (plan.transitionStyle.name == "GAPLESS"),
                     "filterVariant" to plan.filterVariant.name,
                     "djEffect" to plan.djEffect.name,
-                ),
+                ) + (blendVerdict?.plannedVocalAttenuationDb?.let {
+                    mapOf("plannedVocalAttenuationDb" to it)
+                } ?: emptyMap()),
             )
             // vc69 P2 evidence dump: one structured record per armed
             // transition (Orchard ORCHARD_MIX_DUMP shape: what was chosen,
@@ -5289,6 +5296,7 @@ class CrossfadeController(
                 LoopMix.Check.LYRICS -> "lyrics"
                 LoopMix.Check.MASK -> "mask"
                 LoopMix.Check.LYRICS_AND_MASK -> "lyrics + mask"
+                LoopMix.Check.MASK_DUCKED -> "mask (stem-ducked)"
             }
             return "${pick.bars}-bar, clear by $by"
         }
@@ -6213,6 +6221,24 @@ class CrossfadeController(
         val m = outReading?.seconds?.let { it - session.plan.out.loopStart }
         val incomingNow = inReading?.seconds
         val violations = session.renderer.exitGateViolations()
+        // vc92 authority check: the surviving deck alone decides readiness.
+        // Once handed off, the outgoing player is retired by design, so its
+        // isPlaying must never gate cleanup (live vc91: handedOff+tookOver+
+        // DELEGATE_FULLY_CONSUMED bailed "loop-cleanup-incoming-unavailable"
+        // solely because the retired out was not playing). Transient
+        // STATE_BUFFERING counts as ready while the survivor isPlaying.
+        val tookOver = session.outPort?.tookOver == true
+        val survivor = if (handedOff) into else out
+        val survivorReady = survivor?.isPlaying == true &&
+            (survivor.playbackState == Player.STATE_READY || survivor.playbackState == Player.STATE_BUFFERING)
+        val delegateConsumed = session.outPort?.takeoverSpliceBufferStatus ==
+            LoopMixPort.TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED
+        // vc92: a missing incoming clock with a provably healthy handoff
+        // (handed off, took over, exit gate clean, delegate fully consumed,
+        // survivor ready) is not an abnormal bail: allow normal completion
+        // below and skip the alignment recording, which needs the clock.
+        val healthyHandoffMissingClock = wasIncomingStarted && incomingNow == null &&
+            handedOff && tookOver && violations == 0 && delegateConsumed && survivorReady
         // finish() can route here before the scheduled decoder splice. Such
         // termination is abnormal, never evidence of a healthy handover.
         val abnormal = when {
@@ -6222,9 +6248,8 @@ class CrossfadeController(
             m == null -> "loop-cleanup-clock-unavailable"
             m < session.clock.elementAt -> "loop-cleanup-before-splice"
             violations != 0 -> "loop-cleanup-exit-gate"
-            wasIncomingStarted && (!out.isPlaying || !into.isPlaying ||
-                into.playbackState != Player.STATE_READY ||
-                incomingNow == null) -> "loop-cleanup-incoming-unavailable"
+            wasIncomingStarted && !survivorReady -> "loop-cleanup-incoming-unavailable"
+            wasIncomingStarted && incomingNow == null && !healthyHandoffMissingClock -> "loop-cleanup-incoming-unavailable"
             !wasIncomingStarted && (!out.playWhenReady || !out.isPlaying) -> "loop-cleanup-outgoing-unavailable"
             else -> null
         }
@@ -6292,12 +6317,17 @@ class CrossfadeController(
             into!!.playWhenReady = true
         }
         if (!handedOff) handOff(out!!, into!!)
+        // vc92: handOff() is idempotent when already handed off (early
+        // return), so reaching here with !handedOff means reconcileQueue
+        // refused the adoption. Route cleanly to loopBail: no redundant
+        // bail, no speculative seek over a user target.
         if (!handedOff) {
             loopBail("loop-cleanup-adoption-refused", settle = false, preserveSeek = true, deferDisarm = true)
             return
         }
         // Record phase while ports are still armed. Missing phase is unknown,
-        // never a zero-error success.
+        // never a zero-error success. vc92: healthyHandoffMissingClock skips
+        // this via the incomingNow guard - no clock, no alignment claim.
         if (wasIncomingStarted && incomingNow != null) session.recordAligned(incomingNow - targetSec)
         loopAlignJob?.cancel()
         loopAlignJob = null
@@ -6390,7 +6420,10 @@ class CrossfadeController(
             session?.outPort?.disarm()
             session?.inPort?.disarm()
         }
-        if (!tookOver && !wasHandedOff) {
+        // vc92: mute whenever the incoming player never became the session
+        // (!wasHandedOff), even if the port took over - otherwise a
+        // tookOver-but-not-handed-off `into` keeps playing unmuted.
+        if (!wasHandedOff) {
             into?.volume = 0f
             into?.playWhenReady = false
         }
@@ -6401,6 +6434,20 @@ class CrossfadeController(
             tookOver -> (m?.takeIf { it >= 0 }?.let { LoopMix.positionAt(session.clock, LoopMix.Side.OUT, it) }
                 ?: session.plan.out.loopStart).let { (it * 1000).roundToLong() }
             else -> null
+        }
+        // vc92: when the handoff and takeover both happened, the splice
+        // delegate was fully consumed and the renderer exit gate is provably
+        // clean (0 violations), the retiring outgoing deck is already
+        // silent behind the port - mute it before finish() so RetireGuard
+        // cannot divert to a spurious emergency tail. The delegate-consumed
+        // gate keeps every other bail (paused, contended, before-splice,
+        // unhealthy survivor) on the bounded TAIL path: RetireGuard stays
+        // 100% intact whenever violations != 0, !tookOver, !wasHandedOff
+        // or the delegate was not fully consumed.
+        if (wasHandedOff && tookOver && session?.renderer?.exitGateViolations() == 0 &&
+            session?.outPort?.takeoverSpliceBufferStatus ==
+                LoopMixPort.TakeoverSpliceBufferStatus.DELEGATE_FULLY_CONSUMED) {
+            outgoing?.volume = 0f
         }
         // Null loopSession before finish() so finish() routes audible emergency
         // bails into Phase.TAIL (never back into finishLoop()), then disarm
@@ -7151,6 +7198,13 @@ class CrossfadeController(
         localBlendInFlight = false
         lastPairAnalysisSignature = null
         phase = Phase.IDLE
+        // vc92: clear the shown-countdown watchdog state with the terminal
+        // IDLE transition, so checkShownWatchdog() cannot fire mix.arm.death
+        // much later on this finished pair. Early returns above (TAIL /
+        // finishLoop routing) never reach here and keep their state.
+        shownCountdownKey = null
+        shownLoopStartMs = 0L
+        watchdogFired = false
         if (wasTransitioning) {
             mixEvent("mix.complete", completionFields, completionContext)
             if (isTerminal) {

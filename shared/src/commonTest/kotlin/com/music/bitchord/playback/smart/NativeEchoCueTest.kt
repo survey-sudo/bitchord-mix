@@ -112,7 +112,9 @@ class NativeEchoCueTest {
         val inn = analysis(135.0).copy(vocalWindows = emptyList())
         val plan = assertNotNull(LoopMix.bridge(out, 100.0, inn, 100.0, 80.0))
         val h = assertNotNull(plan.handoff)
-        assertEquals(100.0, h.outDryEnd.sourceSec)
+        // vc92: natural cut honours contentEndTime (98.0) when narrower than
+        // container EOF, instead of playing to 100.0.
+        assertEquals(98.0, h.outDryEnd.sourceSec)
         val clock = LoopMix.Clock(plan)
         assertTrue(clock.releaseAt + 1e-9 >= h.outDryEnd.mixSec,
             "Natural cut must be inside reserved straight playback")

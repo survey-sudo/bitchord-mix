@@ -62,6 +62,32 @@ import kotlin.math.sqrt
 import java.util.Locale
 
 /**
+ * Bug 1c: prepend zeros when a MediaCodec decode answers a few milliseconds
+ * late under SEEK_TO_PREVIOUS_SYNC, then re-anchor the PCM head to the
+ * requested source second so coversPhysical()'s exact start check passes.
+ * Pure and fail-closed: never pads an early start, never pads more than
+ * [maxLateSec], and never changes the arrays otherwise.
+ */
+internal fun padLateStart(
+    left: FloatArray,
+    right: FloatArray,
+    actualStart: Double,
+    requestedStart: Double,
+    sampleRate: Double,
+    maxLateSec: Double = 0.080,
+): Triple<FloatArray, FloatArray, Double> {
+    if (requestedStart >= 0.0 && actualStart > requestedStart &&
+        (actualStart - requestedStart) <= maxLateSec && sampleRate > 0.0
+    ) {
+        val pad = ((actualStart - requestedStart) * sampleRate).roundToInt()
+        if (pad > 0) {
+            return Triple(FloatArray(pad) + left, FloatArray(pad) + right, requestedStart)
+        }
+    }
+    return Triple(left, right, actualStart)
+}
+
+/**
  * Produces [TrackAnalysis] for tracks that are about to be mixed, and hands it
  * to [TransitionPlanner].
  *
@@ -2174,18 +2200,17 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         var rawLeft = stereo.left
         var rawRight = stereo.right
         var startOut = start
-        // handoff_pcm_before_protected_event: from-the-start asks that start up
-        // to 80 ms late are paying encoder priming. Prepend the missing zeros
-        // before resampling so the deck still starts at 0.0 (decodeRegionStereo
-        // already pads fresh decodes, so this only fires when it was not padded).
-        if (fromSeconds <= 0.05 && start > 0.0 && start <= 0.080 && stereo.sampleRate > 0.0) {
-            val pad = (start * stereo.sampleRate).roundToInt()
-            if (pad > 0) {
-                rawLeft = FloatArray(pad) + rawLeft
-                rawRight = FloatArray(pad) + rawRight
-                startOut = 0.0
-            }
-        }
+        // Bug 1c: MediaCodec (c2.android.opus.decoder) can answer a few ms
+        // late even mid-track under SEEK_TO_PREVIOUS_SYNC. Prepend the missing
+        // zeros before resampling and re-anchor to the requested source second
+        // so coversPhysical()'s exact start check still passes. Fails closed
+        // beyond 80 ms (never mask a genuinely short/wrong decode).
+        val (paddedLeft, paddedRight, anchoredStart) = padLateStart(
+            rawLeft, rawRight, start, fromSeconds, stereo.sampleRate.toDouble()
+        )
+        rawLeft = paddedLeft
+        rawRight = paddedRight
+        startOut = anchoredStart
         val rate = sampleRate.toDouble()
         val left: FloatArray
         val right: FloatArray

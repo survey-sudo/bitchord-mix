@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# vc91 / 2.2.3-djmix49 release build + audit — runs ON the dvb box.
+# vc92 / 2.2.3-djmix50 release build + audit — runs ON the dvb box.
 #
-#   bash tools/vc91-build.sh              # build + audit
-#   bash tools/vc91-build.sh --audit PATH # audit an existing APK only
+#   bash tools/vc92-build.sh              # build + audit
+#   bash tools/vc92-build.sh --audit PATH # audit an existing APK only
 #
 # Gradle signs the release itself from keystore.properties + bitchord-loopfix.jks
 # (both gitignored, both must be in the repo root). If either is missing the
@@ -12,8 +12,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-EXPECTED_CODE=91
-EXPECTED_NAME="2.2.3-djmix49"
+EXPECTED_CODE=92
+EXPECTED_NAME="2.2.3-djmix50"
 SDK="${ANDROID_HOME:-/home/boxes/android-sdk}"
 AAPT2="$SDK/build-tools/36.0.0/aapt2"
 SIGNED="app/build/outputs/apk/prod/release/app-prod-arm64-v8a-release.apk"

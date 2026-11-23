@@ -29,8 +29,8 @@ if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
   echo "versionCode: ${2:-?}"
   echo "versionName: ${3:-?}"
   [ "${1:-}" = "com.music.bitchord.loopfix" ] && ok "package is loopfix" || bad "package is not com.music.bitchord.loopfix"
-  [ "${2:-}" = "91" ] && ok "versionCode 91" || bad "versionCode is not 91 (got ${2:-?})"
-  [ "${3:-}" = "2.2.3-djmix49" ] && ok "versionName 2.2.3-djmix49" || bad "versionName is not 2.2.3-djmix49 (got ${3:-?})"
+  [ "${2:-}" = "92" ] && ok "versionCode 92" || bad "versionCode is not 92 (got ${2:-?})"
+  [ "${3:-}" = "2.2.3-djmix50" ] && ok "versionName 2.2.3-djmix50" || bad "versionName is not 2.2.3-djmix50 (got ${3:-?})"
 else
   echo "aapt2 not found — skipping badging; set ANDROID_HOME to enable"
 fi

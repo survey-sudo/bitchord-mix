@@ -14,6 +14,8 @@ object LocalBlendAdmission {
         /** Mean product of measured source vocal presence, without assumed fader attenuation. Null is unknown. */
         val weightedCollision: Double? = null,
         val simultaneousFraction: Double? = null,
+        /** Telemetry-only planned vocal attenuation (dB). Never gates admission; null is unknown/no overlap. */
+        val plannedVocalAttenuationDb: Double? = null,
     )
 
     /** The original upstream physical rate window, independent of the fork's coarse 8% preference. */
@@ -120,7 +122,13 @@ object LocalBlendAdmission {
             collision > MAX_SOURCE_COLLISION -> "weighted-vocal-collision"
             else -> null
         }
-        return Verdict(refusal == null, refusal, collision, fraction)
+        // Telemetry-only estimate: when both sides overlap vocally, record the
+        // attenuation the carve/LP path is expected to apply (-6 dB) or 0 dB
+        // otherwise. It is context for the caller, never a gate on admitted.
+        val plannedVocalAttenuationDb = if (collision > 0.0 && fraction > 0.0) {
+            if (plan.bassSwap || plan.vocalHandoff) -6.0 else 0.0
+        } else null
+        return Verdict(refusal == null, refusal, collision, fraction, plannedVocalAttenuationDb)
     }
 
     private const val MAX_SOURCE_COLLISION = 0.18

@@ -201,4 +201,37 @@ class LocalBlendAdmissionTest {
             assertEquals(0.0, annotated.echoSeconds)
         }
     }
+
+    @Test
+    fun plannedVocalAttenuationIsTelemetryOnly() {
+        // Both sides modestly sung (0.30): collision ~0.09, fraction 1.0.
+        // Telemetry records -6 dB when carve/LP applies, else 0 dB, and never
+        // changes admission (MAX_SOURCE_COLLISION stays 0.18).
+        val a = track("tele-out", 142.857142857, 0.30f)
+        val b = track("tele-in", 130.434782608, 0.30f)
+        val base = plan(a, b)
+        assertEquals(TransitionStyle.DJ_BLEND, base.transitionStyle)
+        val verdict = LocalBlendAdmission.evaluate(base, a, b)
+        assertTrue(verdict.admitted, verdict.toString())
+        assertTrue(requireNotNull(verdict.weightedCollision) > 0.0)
+        assertTrue(requireNotNull(verdict.simultaneousFraction) > 0.0)
+        // Default plan carries post-carve context -> -6 dB; clearing it -> 0 dB.
+        assertTrue(verdict.plannedVocalAttenuationDb in listOf(-6.0, 0.0), "${verdict.plannedVocalAttenuationDb}")
+        val noCarve = base.copy(bassSwap = false, vocalHandoff = false)
+        val verdictNoCarve = LocalBlendAdmission.evaluate(noCarve, a, b)
+        assertEquals(verdict.admitted, verdictNoCarve.admitted)
+        assertEquals(0.0, verdictNoCarve.plannedVocalAttenuationDb)
+        val carve = base.copy(bassSwap = true, vocalHandoff = false)
+        val verdictCarve = LocalBlendAdmission.evaluate(carve, a, b)
+        assertEquals(verdict.admitted, verdictCarve.admitted)
+        assertEquals(-6.0, verdictCarve.plannedVocalAttenuationDb)
+        // No overlap -> null (unknown), never a gate.
+        val quiet = track("tele-quiet", 130.434782608, 0.02f)
+        val quietBase = plan(a, quiet)
+        val quietVerdict = LocalBlendAdmission.evaluate(quietBase, a, quiet)
+        if (requireNotNull(quietVerdict.weightedCollision) == 0.0 || requireNotNull(quietVerdict.simultaneousFraction) == 0.0) {
+            assertNull(quietVerdict.plannedVocalAttenuationDb)
+        }
+        assertEquals(null, LocalBlendAdmission.Verdict(admitted = true).plannedVocalAttenuationDb)
+    }
 }

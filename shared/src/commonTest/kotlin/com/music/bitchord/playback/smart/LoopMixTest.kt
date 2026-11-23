@@ -575,4 +575,92 @@ class LoopMixTest {
         assertFalse(emptyReason.contains("0 ms over"), "emptyReason=$emptyReason")
         assertTrue(emptyReason.contains("early-abort"), "emptyReason=$emptyReason")
     }
+
+    private fun sparseVocal(from: Double, to: Double, sungEvery: Int, sungValue: Float = 0.30f): CurveWindow {
+        val fps = 10.0
+        val count = ((to - from) * fps).roundToInt()
+        val values = FloatArray(count) { if (it % sungEvery == 0) sungValue else 0.05f }
+        return CurveWindow(from, fps, values)
+    }
+
+    @Test
+    fun gatedMaskDuckedAdmitsModerateVocalWithStemDuck() {
+        // Strict clean fails (share ~0.14 > 0.03); gated ducked admits
+        // (0.03..0.28, peak 0.30 < 0.35, run 0.1 <= 0.6) with stem duck.
+        val out = analysis(120.0, 200.0, listOf(sparseVocal(0.0, 200.0, 7)))
+        val inn = analysis(120.0, 180.0)
+        val plan = assertNotNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, null, clear))
+        assertEquals(LoopMix.Check.MASK_DUCKED, plan.out.checkedBy)
+        assertTrue(plan.out.vocal in 0.03..0.28, "vocal=${plan.out.vocal}")
+        assertEquals(LoopMix.Check.LYRICS, plan.inn.checkedBy)
+        assertTrue(plan.stemDuckRequired)
+        assertEquals(LoopMixDuck.MIN_FLOOR, plan.duckFloor)
+    }
+
+    @Test
+    fun cleanPassPrecedesDuckedWhenCleanExists() {
+        // Share ~0.02 (every 50th) is clean: ducked must not be used.
+        val out = analysis(120.0, 200.0, listOf(sparseVocal(0.0, 200.0, 50)))
+        val inn = analysis(120.0, 180.0)
+        val plan = assertNotNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, null, clear))
+        assertTrue(plan.out.checkedBy != LoopMix.Check.MASK_DUCKED, "checkedBy=${plan.out.checkedBy}")
+        assertFalse(plan.stemDuckRequired)
+    }
+
+    @Test
+    fun dualDuckedCrownsAreRejected() {
+        // Both sides ducked at ~0.14: other side vocal > 0.10 -> no plan.
+        val out = analysis(120.0, 200.0, listOf(sparseVocal(0.0, 200.0, 7)))
+        val inn = analysis(120.0, 180.0, listOf(sparseVocal(0.0, 180.0, 7)))
+        assertNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, null, null))
+        // One ducked + clean other (0.0) is the only admitted shape.
+        val cleanIn = analysis(120.0, 180.0)
+        assertNotNull(LoopMix.plan(out, 200.0, cleanIn, 180.0, 0.0, null, clear))
+    }
+
+    @Test
+    fun longDuckedLoopExceeding21p5IsRejected() {
+        // 40 BPM: 4-bar loop = 24s > 21.5 -> ducked rejected.
+        val out = analysis(40.0, 200.0, listOf(sparseVocal(0.0, 200.0, 7)))
+        val inn = analysis(40.0, 180.0)
+        assertNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, null, clear))
+    }
+
+    @Test
+    fun lyricCertainVetoStaysAbsoluteForDucked() {
+        val out = analysis(120.0, 200.0, listOf(sparseVocal(0.0, 200.0, 7)))
+        val inn = analysis(120.0, 180.0)
+        val certain = listOf(LoopMix.Span(0.0, 200.0, certainUntil = 200.0))
+        assertNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, certain, clear))
+    }
+
+    @Test
+    fun duckedRankingPrefersLowestShare() {
+        // Earlier region share ~0.10 (every 10th), later ~0.20 (every 5th).
+        // Latest-first would pick the later region; ranking picks the earlier.
+        val fps = 10.0
+        val count = 2000
+        val values = FloatArray(count) { i ->
+            val t = i / fps
+            val every = if (t < 170.0) 10 else 5
+            if (i % every == 0) 0.30f else 0.05f
+        }
+        val out = analysis(120.0, 200.0, listOf(CurveWindow(0.0, fps, values)))
+        val inn = analysis(120.0, 180.0)
+        val plan = assertNotNull(LoopMix.plan(out, 200.0, inn, 180.0, 0.0, null, clear))
+        assertEquals(LoopMix.Check.MASK_DUCKED, plan.out.checkedBy)
+        assertTrue(plan.out.loopStart < 170.0, "expected earlier lower-share loop, got ${plan.out.loopStart}")
+    }
+
+    @Test
+    fun naturalHandoffClamps60msBeforeContainerEOF() {
+        // Bug 1a: natural cut must be outDuration - 0.06 (not raw outDuration)
+        // when effectiveEnd == outDuration, inside real decoded material.
+        val out = analysis(120.0, 200.0, listOf(vocals(0.0, 200.0, 0.8f, listOf(196.0 to 200.0)))).copy(vocalProbability = 0.8)
+        val inn = analysis(128.0, 180.0, listOf(vocals(0.0, 180.0, 0.8f))).copy(vocalProbability = 0.8)
+        val plan = assertNotNull(LoopMix.bridge(out, 200.0, inn, 180.0, 0.0))
+        assertEquals("Natural handoff", plan.rung)
+        assertEquals(199.94, assertNotNull(plan.handoff).outDryEnd.sourceSec, 1e-8)
+        assertEquals(199.94, assertNotNull(plan.handoff).outDryFallStart.sourceSec, 1e-8)
+    }
 }

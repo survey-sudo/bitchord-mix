@@ -24,6 +24,12 @@ package com.music.bitchord.playback.smart
  * device + config through [resolveProvider]; [defaultProvider] answers
  * CPU_DEFAULT and the master [QNN_ENABLED] guard stays false, so the shipped
  * build keeps running the plain CPU execution provider exactly as before.
+ *
+ * vc92 measurement: [InferenceProvider.CPU_XNNPACK] is now openable (see
+ * NpuSession.openXnnpack) but stays opt-in only. It is never returned by
+ * [resolveProvider] and never selected as a default: the on-device self-test
+ * benchmark (NpuSelfTest.benchmarkCpuVsXnnpack) must first prove lower latency
+ * and logit parity on the target Snapdragon SM8635 before anything flips.
  */
 object NpuSupport {
 
@@ -42,7 +48,8 @@ object NpuSupport {
      * Every QNN entry point checks this (shouldAttemptQnn below,
      * NpuSession.open/openQnn, TrackAnalyzer preflight, NpuNative,
      * NpuSelfTest.schedule); when false no QNN library is dlopened and
-     * no QNN session is attempted.
+     * no QNN session is attempted. The vc92 CPU-vs-XNNPACK benchmark does
+     * NOT need this flag: it runs on CPU providers only.
      */
     const val QNN_ENABLED = false
 
@@ -77,7 +84,11 @@ object NpuSupport {
     enum class InferenceProvider {
         /** Plain CPU execution provider; the production default. */
         CPU_DEFAULT,
-        /** CPU execution provider with the XNNPACK delegate (opt-in). */
+        /**
+         * CPU execution provider with the XNNPACK delegate. Opt-in only and
+         * never resolved automatically: vc92 measures it against CPU_DEFAULT
+         * on the target device before it can ever become a default.
+         */
         CPU_XNNPACK,
         /** Qualcomm QNN on the Adreno GPU backend (FP16). */
         QNN_GPU_FP16,
@@ -125,6 +136,18 @@ object NpuSupport {
         QNN_ENABLED && config.enabled && vendor == Vendor.QUALCOMM
 
     /**
+     * True for the two CPU execution-provider choices. Used by
+     * [NpuSession.open] so a CPU provider is never routed into the QNN open
+     * (the XNNPACK delegate is a CPU provider, not an NPU one).
+     */
+    fun isCpuProvider(provider: InferenceProvider): Boolean = when (provider) {
+        InferenceProvider.CPU_DEFAULT,
+        InferenceProvider.CPU_XNNPACK -> true
+        InferenceProvider.QNN_GPU_FP16,
+        InferenceProvider.QNN_HTP_QDQ -> false
+    }
+
+    /**
      * Whether [provider] may run inference right now. CPU_DEFAULT never attempts
      * (the plain CPU path runs it); CPU_XNNPACK is the opt-in delegate; the QNN
      * providers need the master switch, the per-config flag and a QNN vendor.
@@ -140,6 +163,9 @@ object NpuSupport {
      * Resolves which [InferenceProvider] runs inference for a device + config.
      * Returns CPU_DEFAULT while the master switch or the config flag are off, so
      * the shipped build keeps running the plain CPU execution provider.
+     * CPU_XNNPACK is deliberately unreachable here: it is an explicit
+     * measurement opt-in (NpuSession.open's provider argument), never a
+     * resolution result.
      */
     fun resolveProvider(config: NpuConfig, vendor: Vendor): InferenceProvider = when {
         !QNN_ENABLED -> InferenceProvider.CPU_DEFAULT

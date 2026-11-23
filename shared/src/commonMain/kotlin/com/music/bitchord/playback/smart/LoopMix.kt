@@ -168,7 +168,7 @@ object LoopMix {
     const val HIGH_PASS_TO_HZ = 1500.0
 
     /** What said a loop is instrumental: the lyrics, the vocal mask, or the lyrics with the mask past an open line. */
-    enum class Check { LYRICS, MASK, LYRICS_AND_MASK }
+    enum class Check { LYRICS, MASK, LYRICS_AND_MASK, MASK_DUCKED }
 
     /**
      * A sung stretch from the lyrics. [certainUntil] is how much of it the lyrics
@@ -288,6 +288,10 @@ object LoopMix {
         val faderSwapBeats: Double = 1.0,
         /** Explicit source/mix events for opted-in Echo handoffs. */
         val handoff: MusicalHandoff? = null,
+        /** Gated MASK_DUCKED stem duck required (Feature 5): renderer must duck vocals on the admitted loop. Defaults preserve all legacy callers. */
+        val stemDuckRequired: Boolean = false,
+        /** Attenuation floor in dB units for the stem duck, clamped at [LoopMixDuck.MIN_FLOOR]. */
+        val duckFloor: Float = LoopMixDuck.MIN_FLOOR,
     ) {
         /** The tempo the ramp arrives at, in outgoing beats per minute. */
         val targetBpm: Double get() = targetBpmOverride ?: (inn.bpm / fold)
@@ -649,6 +653,22 @@ object LoopMix {
         // its chosen crown loop. Null (safe synthetic path) when the grid does not
         // cover the loop monotonically — see [trackedAnchors]. Crown-loop
         // geometry ([loopsBetween]/[firstClean]) is untouched.
+        // Feature 5: gated stem-duck admission (mask ranking). A ducked side is
+        // only crowned when the other side stays clean (<=0.10) and the loop
+        // region is short (<=21.5s) to bound repetition. Rejection yields no
+        // plan (caller takes the next rung / bridge).
+        val ducked = outPick.checkedBy == Check.MASK_DUCKED || inPick.checkedBy == Check.MASK_DUCKED
+        var duckRequired = false
+        if (ducked) {
+            val otherVocalExceeds = (outPick.checkedBy == Check.MASK_DUCKED && inPick.vocal > 0.10) ||
+                (inPick.checkedBy == Check.MASK_DUCKED && outPick.vocal > 0.10)
+            val outLen = outPick.end - outPick.start
+            val inLen = inPick.end - inPick.start
+            if (otherVocalExceeds || outLen > 21.5 || inLen > 21.5) {
+                return null.also { why?.append("ducked stem dual-vocal crown") }
+            }
+            duckRequired = true
+        }
         val outAnchors = trackedAnchors(out.tailBeats, outPick.start, outPick.end, outPick.bars)
         val inAnchors = trackedAnchors(inn.headBeats, inPick.start, inPick.end, inPick.bars)
         val candidate = Plan(
@@ -664,6 +684,8 @@ object LoopMix {
             buildupRoll = fxRoll && outPick.bars > 0,
             reverbWash = fxReverb,
             hpSweepEndHz = if (fxRoll) BUILDUP_HP_END_HZ else 0f,
+            stemDuckRequired = duckRequired,
+            duckFloor = LoopMixDuck.MIN_FLOOR,
         )
         val qualification = qualifyCrown(candidate)
         if (!qualification.accepted) return null.also { why?.append("crown: ")?.append(qualification.refusal) }
@@ -887,6 +909,46 @@ object LoopMix {
                     continue
                 }
                 return Clean(loop.start, loop.end, bars, mask.share, Check.MASK)
+            }
+        }
+        // ---- Gated MASK_DUCKED second pass (Feature 5) ----
+        // Strict clean pass above is untouched (MAX_SUNG_SHARE = 0.03) and
+        // maskRejects is never widened. Only when it returns null, admit a
+        // boundary-consistent loop whose measured vocal share is moderate but
+        // whose renderer will duck the stem. Lyric-certain vetoes stay absolute;
+        // requirement is measured vocalWindows (mask != null). Admit only if
+        // share in 0.03..0.28, peak < 0.35, longestRunSec <= 0.6, and mean
+        // finite; rank by (share, peak, longestRunSec, seamDelta).
+        for (bars in LOOP_LENGTHS) {
+            val ducked = ArrayList<Triple<Clean, MaskStats, Double>>()
+            val duckLoops = candidates(bars)
+            for (loop in duckLoops) {
+                if (sung != null) {
+                    val from = loop.start - LYRIC_GUARD_SEC
+                    val touching = sung.filter { it.start < loop.end && it.end > from }
+                    if (touching.any { it.start < loop.end && it.certainUntil > from }) {
+                        continue
+                    }
+                }
+                if (analysis.vocalWindows.isEmpty()) continue
+                val mask = maskStats(analysis.vocalWindows, loop.start - beatSec, loop.end) ?: continue
+                if (mask.share !in 0.03..0.28) continue
+                if (mask.peak >= 0.35) continue
+                if (mask.longestRunSec > 0.6) continue
+                if (!mask.mean.isFinite()) continue
+                if (!mask.share.isFinite() || !mask.peak.isFinite() || !mask.longestRunSec.isFinite()) continue
+                ducked += Triple(Clean(loop.start, loop.end, bars, mask.share, Check.MASK_DUCKED), mask, seamDelta(analysis, loop))
+            }
+            if (ducked.isNotEmpty()) {
+                val best = ducked.sortedWith(
+                    compareBy<Triple<Clean, MaskStats, Double>>(
+                        { it.second.share },
+                        { it.second.peak },
+                        { it.second.longestRunSec },
+                        { it.third },
+                    ),
+                ).first()
+                return best.first
             }
         }
         return null
@@ -1595,8 +1657,14 @@ object LoopMix {
         }
         // If no measured musical exit exists, play through the physical end.
         // A zero-width dry end cannot amputate a word or claim unknown is clean.
-        val handoff = measured ?: outDuration.takeIf {
-            it.isFinite() && it >= earliestOutSec + bar
+        // Bug 1a: container outDuration often overshoots decoded Opus/AAC EOF
+        // by 6-60 ms, tripping handoff_pcm_before_protected_event. Clamp the
+        // natural cut inside real decoded material with a 60 ms priming margin,
+        // unless effectiveEnd (contentEnd) is already narrower, still honoring
+        // minCut = maxOf(earliestOutSec + bar, effectiveEnd - 4 * bar).
+        val naturalCut = minOf(outDuration, effectiveEnd, maxOf(earliestOutSec + bar, outDuration - 0.06))
+        val handoff = measured ?: naturalCut.takeIf {
+            it.isFinite() && it >= minCut
         }?.let { timing(it, natural = true) } ?: return null
         val outStart = handoff.outDryEnd.sourceSec - handoff.outDryEnd.mixSec
         // Reserve the straight clock through effect retirement as well as the

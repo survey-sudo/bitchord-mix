@@ -1,0 +1,195 @@
+name: NPU add-on (ORT + QNN)
+
+# Wave 2 skeleton for the QNN-capable ONNX Runtime add-on build (vc92).
+#
+# workflow_dispatch ONLY on purpose: this builds a full ONNX Runtime from source
+# (tens of minutes, several GB) and must never fire on a master push. It exists
+# so the QNN path can be reproduced deliberately, once the Wave 1 blockers are
+# cleared, without any chance of it running unattended.
+#
+# What it does:
+#   1. checks out ONNX Runtime at the pinned commit (ort_pin),
+#   2. optionally downloads and extracts the QAIRT subset (qairt_version),
+#   3. builds ORT with --use_qnn static_lib through npu-addon/build-ort.sh and
+#      NO --include_ops_by_config flag (reduced builds dropped the
+#      optimizer-introduced kernels that broke vc69/vc70 -- see
+#      npu-addon/README.md),
+#   4. uploads the resulting jniLibs as an artifact for the separate add-on APK.
+#
+# The add-on must NEVER be merged into the main APK: tools/audit-apk.sh enforces
+# exactly one libonnxruntime.so and zero QNN/HTP libraries in the shipped APK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      qairt_version:
+        description: "Qualcomm AI Runtime (QAIRT) version to bundle"
+        required: false
+        default: "2.51.0.260929"
+        type: string
+      ort_pin:
+        description: "ONNX Runtime commit to build (Orchard pin)"
+        required: false
+        default: "402979ac1bef89dcd55add41eaa7277c407599eb"
+        type: string
+      build_qairt_subset:
+        description: "Download + extract the QAIRT HTP subset before the build"
+        required: false
+        default: true
+        type: boolean
+      upload_artifacts:
+        description: "Upload the built jniLibs artifact"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Matches npu-addon/build-ort.sh: NDK 28.2.13676358, API 31, arm64-v8a.
+  ANDROID_API: "31"
+  ANDROID_ABI: "arm64-v8a"
+  ANDROID_NDK: "28.2.13676358"
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.daemon=false"
+  # Where build-ort.sh writes the stripped jniLibs (prebuilt/jniLibs/arm64-v8a).
+  NPU_JNI_DIR: "npu-addon/prebuilt/jniLibs/arm64-v8a"
+
+jobs:
+  build-ort-qnn:
+    name: Build ORT (QNN static_lib)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      # The full ORT build needs ~25 GB. The runner image ships a lot of unused
+      # toolchains; dropping them is the difference between a build and an ENOSPC.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+                      /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build toolchain
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # build-ort.sh calls `python tools/ci_build/build.py`, which needs these.
+          python -m pip install "cmake>=3.28,<4" ninja flatbuffers onnx numpy
+
+      - name: Install Android NDK ${{ env.ANDROID_NDK }}
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-$HOME/.local/share/android/sdk}"
+          mkdir -p "$SDK"
+          echo "sdk=$SDK"
+          if [ ! -d "$SDK/ndk/$ANDROID_NDK" ]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;$ANDROID_NDK"
+          fi
+          ls -d "$SDK/ndk/$ANDROID_NDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+      # The QAIRT zip is 2.8 GB; only the HTP subset is needed (README "QAIRT
+      # 2.51 library set"). Optional: the build also accepts a pre-seeded QNN_SDK.
+      - name: Download QAIRT ${{ inputs.qairt_version }} subset
+        if: ${{ inputs.build_qairt_subset }}
+        env:
+          QAIRT_VERSION: ${{ inputs.qairt_version }}
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${RUNNER_TEMP}/qairt/${QAIRT_VERSION}"
+          ZIP="${RUNNER_TEMP}/qairt-${QAIRT_VERSION}.zip"
+          mkdir -p "$SDK_ROOT"
+          # Qualcomm's software center needs no auth for the community SDK, but
+          # the URL is versioned and may move; fail loudly rather than silently
+          # building without a QNN SDK.
+          URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
+          echo "downloading $URL"
+          curl -fSL --retry 3 --retry-delay 5 -o "$ZIP" "$URL"
+          ls -lh "$ZIP"
+          unzip -q -o "$ZIP" -d "$SDK_ROOT"
+          # Normalise: find the directory that actually holds lib/ and include/QNN.
+          QAIRT_LIB_DIR=$(dirname "$(find "$SDK_ROOT" -type d -path '*/lib/aarch64-android' | head -1)")
+          if [ -z "$QAIRT_LIB_DIR" ]; then
+            echo "::error::QAIRT zip did not contain lib/aarch64-android"
+            exit 1
+          fi
+          echo "QAIRT root: $QAIRT_LIB_DIR"
+          echo "QNN_SDK=$QAIRT_LIB_DIR" >> "$GITHUB_ENV"
+
+      - name: Check out ONNX Runtime at the pin
+        env:
+          ORT_PIN: ${{ inputs.ort_pin }}
+        run: |
+          set -euo pipefail
+          ORT_SRC="${RUNNER_TEMP}/onnxruntime"
+          git clone --filter=blob:none https://github.com/microsoft/onnxruntime.git "$ORT_SRC"
+          git -C "$ORT_SRC" checkout "$ORT_PIN"
+          git -C "$ORT_SRC" submodule update --init --recursive --depth 1
+          echo "ORT_SRC=$ORT_SRC" >> "$GITHUB_ENV"
+          git -C "$ORT_SRC" log --oneline -1
+
+      # Full build, NO --include_ops_by_config: the reduced build dropped
+      # MatMulIntegerToFloat / DynamicQuantizeMatMul and broke both models on
+      # both backends (vc69/vc70). See npu-addon/README.md.
+      - name: Build ORT with QNN static_lib
+        run: |
+          set -euo pipefail
+          chmod +x npu-addon/build-ort.sh
+          OUT="${RUNNER_TEMP}/ort-qnn-build" npu-addon/build-ort.sh
+          echo "--- built jniLibs ---"
+          ls -lh "$NPU_JNI_DIR"
+
+      - name: Verify the add-on library set
+        run: |
+          set -euo pipefail
+          test -f "$NPU_JNI_DIR/libonnxruntime.so"
+          # The QNN provider must be linked into the runtime, not merely present
+          # as a side .so: the ORT build links it statically.
+          for lib in libQnnHtp.so libQnnSystem.so libQnnHtpPrepare.so; do
+            test -f "$NPU_JNI_DIR/$lib" || { echo "::error::missing $lib"; exit 1; }
+          done
+          echo "--- QNN symbols in libonnxruntime.so (expect QnnHtp) ---"
+          if command -v readelf > /dev/null; then
+            readelf -d "$NPU_JNI_DIR/libonnxruntime.so" | sed -n '1,40p' || true
+          fi
+          {
+            echo "### NPU add-on (ORT + QNN)"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| ort pin | \`${{ inputs.ort_pin }}\` |"
+            echo "| qairt | \`${{ inputs.qairt_version }}\` |"
+            echo "| abi | \`${{ env.ANDROID_ABI }}\` |"
+            echo "| bytes | $(du -sb "$NPU_JNI_DIR" | cut -f1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload jniLibs artifact
+        if: ${{ inputs.upload_artifacts }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-addon-jnilibs-${{ inputs.ort_pin }}
+          path: npu-addon/prebuilt/jniLibs/arm64-v8a/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-addon-diagnostics
+          path: |
+            npu-addon/prebuilt/
+            ${{ runner.temp }}/ort-qnn-build/*.log
+          if-no-files-found: ignore
+          retention-days: 14
