@@ -42,8 +42,9 @@ object AppUpdateChecker {
 
     private const val CACHE_SUBDIR = "updates"
 
+    // FORK-HOOK(updater): point update checks at the fork repo and rank -djmixN builds
     private const val LATEST_RELEASE_URL =
-        "https://api.github.com/repos/kushagrasinghx/BitChord/releases/latest"
+        "https://api.github.com/repos/survey-sudo/bitchord-unified/releases/latest"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -65,12 +66,8 @@ object AppUpdateChecker {
     @Volatile
     private var downloadCancelled = false
 
-    /**
-     * Off on this side-by-side loop-fix build. The check below downloads the
-     * official BitChord release and the installer would offer to put that
-     * package on the device in place of this one.
-     */
-    private const val UPDATE_CHECKS_ENABLED = false
+    /** Fork builds self-update from survey-sudo/bitchord-unified when an APK asset is attached. */
+    private const val UPDATE_CHECKS_ENABLED = true
 
     suspend fun check() = withContext(Dispatchers.IO) {
         if (!UPDATE_CHECKS_ENABLED) return@withContext
@@ -84,10 +81,25 @@ object AppUpdateChecker {
             val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
             val apkUrl = apkAssetUrl(release)
             val notes = release["body"]?.jsonPrimitive?.contentOrNull
-            val latest = tag.removePrefix("v")
-            if (isNewer(latest, BuildConfig.VERSION_NAME)) {
-                _available.value = UpdateInfo(latest, url, apkUrl, notes)
+            selectUpdate(tag, url, apkUrl, notes, BuildConfig.VERSION_NAME)?.let {
+                _available.value = it
             }
+        }
+    }
+
+    internal fun selectUpdate(
+        tag: String,
+        releaseUrl: String,
+        apkUrl: String?,
+        notes: String?,
+        currentVersion: String,
+    ): UpdateInfo? {
+        if (apkUrl == null) return null
+        val latest = tag.removePrefix("v")
+        return if (isNewer(latest, currentVersion)) {
+            UpdateInfo(latest, releaseUrl, apkUrl, notes)
+        } else {
+            null
         }
     }
 
@@ -235,24 +247,47 @@ object AppUpdateChecker {
         )
     }
 
-    /** A version split into its numeric dotted parts and whether it carries a "-suffix" (e.g. "-beta2"). */
-    private data class ParsedVersion(val parts: List<Int>, val isPreRelease: Boolean)
+    /**
+     * A version split into its numeric dotted parts, optional fork `djmix<N>`
+     * build number (which outranks a clean upstream release of the same base),
+     * and whether it carries a pre-release suffix like `-beta2`.
+     */
+    internal data class ParsedVersion(
+        val parts: List<Int>,
+        val djmix: Int,
+        val isPreRelease: Boolean,
+        val preReleaseNum: Int,
+    )
 
-    private fun parseVersion(raw: String): ParsedVersion {
-        val dash = raw.indexOf('-')
-        val base = if (dash >= 0) raw.substring(0, dash) else raw
-        return ParsedVersion(base.split(".").map { it.toIntOrNull() ?: 0 }, dash >= 0)
+    private val DJMIX_SUFFIX = Regex("""^djmix(\d+)(?:-(.+))?$""", RegexOption.IGNORE_CASE)
+    private val TRAILING_INT = Regex("""(\d+)$""")
+
+    internal fun parseVersion(raw: String): ParsedVersion {
+        val trimmed = raw.trim().removePrefix("v")
+        val dash = trimmed.indexOf('-')
+        val base = if (dash >= 0) trimmed.substring(0, dash) else trimmed
+        val suffix = if (dash >= 0) trimmed.substring(dash + 1) else null
+        val parts = base.split(".").map { it.toIntOrNull() ?: 0 }
+        if (suffix.isNullOrEmpty()) {
+            return ParsedVersion(parts, djmix = 0, isPreRelease = false, preReleaseNum = 0)
+        }
+        val djmixMatch = DJMIX_SUFFIX.matchEntire(suffix)
+        if (djmixMatch != null) {
+            val djmixNum = djmixMatch.groupValues[1].toIntOrNull() ?: 0
+            val rest = djmixMatch.groupValues[2].takeIf { it.isNotEmpty() }
+            val preNum = rest?.let { TRAILING_INT.find(it)?.groupValues?.get(1)?.toIntOrNull() ?: 0 } ?: 0
+            return ParsedVersion(parts, djmix = djmixNum, isPreRelease = rest != null, preReleaseNum = preNum)
+        }
+        val preNum = TRAILING_INT.find(suffix)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        return ParsedVersion(parts, djmix = 0, isPreRelease = true, preReleaseNum = preNum)
     }
 
     /**
-     * Numeric, dot-separated comparison — "1.10" outranks "1.9" — with one
-     * extra rule: a "-betaN" build (see the debug build type's
-     * `versionNameSuffix` in app/build.gradle.kts) is treated as older than a
-     * plain release of the same numbers, since the beta by definition predates
-     * the tag it was testing toward. Without this, a beta and the release it
-     * matches compare equal and testers never get nudged onto the real build.
+     * Numeric, dot-separated comparison — "1.10" outranks "1.9" — with fork
+     * ranking: `<upstream>-djmix<N>` outranks clean `<upstream>` (higher `N`
+     * wins), while clean releases still outrank `-betaN` pre-releases.
      */
-    private fun isNewer(latest: String, current: String): Boolean {
+    internal fun isNewer(latest: String, current: String): Boolean {
         val l = parseVersion(latest)
         val c = parseVersion(current)
         for (i in 0 until maxOf(l.parts.size, c.parts.size)) {
@@ -260,6 +295,8 @@ object AppUpdateChecker {
             val b = c.parts.getOrElse(i) { 0 }
             if (a != b) return a > b
         }
-        return c.isPreRelease && !l.isPreRelease
+        if (l.djmix != c.djmix) return l.djmix > c.djmix
+        if (l.isPreRelease != c.isPreRelease) return c.isPreRelease && !l.isPreRelease
+        return l.isPreRelease && c.isPreRelease && l.preReleaseNum > c.preReleaseNum
     }
 }
