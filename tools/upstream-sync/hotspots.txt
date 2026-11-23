@@ -1,0 +1,21 @@
+# Upstream-OWNED files that carry small, marked fork hooks. Merged normally (upstream wins everywhere
+# except the hook lines). hooks-check.sh verifies the hooks survived (see hooks.txt).
+app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
+app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
+app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+app/src/main/java/com/music/bitchord/data/stats/Backup.kt
+app/src/main/java/com/music/bitchord/BitChordApplication.kt
+app/src/main/java/com/music/bitchord/MainActivity.kt
+app/src/main/java/com/music/bitchord/ui/onboarding/OnboardingScreen.kt
+app/src/main/java/com/music/bitchord/ui/player/AndroidPlayerHost.kt
+app/src/main/AndroidManifest.xml
+app/proguard-rules.pro
+app/build.gradle.kts
+build.gradle.kts
+shared/build.gradle.kts
+sharedUi/build.gradle.kts
+settings.gradle.kts
+sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
+sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt
+sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerHost.kt

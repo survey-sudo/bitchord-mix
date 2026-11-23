@@ -1,0 +1,103 @@
+name: Upstream sync
+
+# Watches kushagrasinghx/BitChord releases. When a new one appears:
+#  - clean merge  -> pushes sync/upstream-<tag> and opens a PR (android-ci runs on it)
+#  - conflicts    -> opens an issue with CONFLICTS + PORT_LIST for the devbox agent
+# Needs repo secret SYNC_TOKEN: a fine-grained PAT on THIS repo with Contents, Pull requests,
+# Issues and Workflows = read/write. (GITHUB_TOKEN can't push upstream's workflow-file changes, and
+# PRs it opens don't trigger CI.)
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 08:00 WIB daily
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync (blank = latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Resolve target release
+        id: t
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG=$(gh api repos/kushagrasinghx/BitChord/releases/latest --jq .tag_name)
+          BASE=$(cat .upstream-base)
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          SKIP=0
+          [ "$TAG" = "$BASE" ] && SKIP=1
+          OPEN=$(gh pr list --head "sync/upstream-$TAG" --state open --json number --jq 'length')
+          [ "$OPEN" != "0" ] && SKIP=1
+          ISSUE=$(gh issue list --state open --search "Upstream $TAG needs a manual merge in:title" --json number --jq 'length')
+          [ "$ISSUE" != "0" ] && SKIP=1
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "upstream=$TAG fork-base=$BASE skip=$SKIP"
+
+      - name: Merge
+        id: m
+        if: steps.t.outputs.skip == '0'
+        run: |
+          set -uo pipefail
+          git config user.name  "bitchord-sync-bot"
+          git config user.email "bitchord-sync-bot@users.noreply.github.com"
+          bash tools/upstream-sync/sync.sh "${{ steps.t.outputs.tag }}" master
+          RC=$?
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          [ "$RC" -eq 0 ] || [ "$RC" -eq 2 ] || exit "$RC"
+
+      - name: Push branch and open PR
+        if: steps.t.outputs.skip == '0' && steps.m.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.t.outputs.tag }}"
+          B="sync/upstream-$TAG"
+          git push -f origin "$B"
+          { sed "s/{{TAG}}/$TAG/g; s/{{BASE}}/${{ steps.t.outputs.base }}/g" tools/upstream-sync/PR_BODY.md; echo; cat PORT_LIST.md; } > /tmp/body.md
+          gh pr create --base master --head "$B" --title "Sync upstream BitChord $TAG" --body-file /tmp/body.md
+
+      - name: Open issue for a manual merge
+        if: steps.t.outputs.skip == '0' && steps.m.outputs.rc == '2'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.t.outputs.tag }}"
+          {
+            echo "The automatic merge of upstream **$TAG** hit conflicts. On the devbox:"
+            echo
+            echo '```bash'
+            echo "cd ~/bitchord-unified && git fetch --all && git checkout master && git pull --ff-only"
+            echo "bash tools/upstream-sync/sync.sh $TAG master   # resolve per docs/UPSTREAM_SYNC_PLAYBOOK.md §5"
+            echo '```'
+            echo
+            cat CONFLICTS.txt
+            echo
+            cat PORT_LIST.md
+          } > /tmp/issue.md
+          gh issue create --title "Upstream $TAG needs a manual merge" --body-file /tmp/issue.md

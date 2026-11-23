@@ -1,0 +1,23 @@
+# <hook-id>|<file>|<min count of "FORK-HOOK(<hook-id>)">
+# Filled in by the refactor (docs/AUTOMIX_ENGINE_REFACTOR.md §3). Each hook is a single marked line or a
+# short marked block that calls into a fork-owned file. Add a row whenever you add a hook.
+version|build.gradle.kts|1
+gradle-djmix|app/build.gradle.kts|1
+gradle-djmix|shared/build.gradle.kts|1
+gradle-aar-metadata|sharedUi/build.gradle.kts|1
+settings-modules|settings.gradle.kts|1
+service-wiring|app/src/main/java/com/music/bitchord/playback/PlaybackService.kt|1
+settings-init|app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt|1
+settings-section|app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt|1
+manifest-npu|app/src/main/AndroidManifest.xml|1
+updater|app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt|1
+backup-remap|app/src/main/java/com/music/bitchord/data/stats/Backup.kt|1
+backup-remap|app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt|1
+proguard-npu|app/proguard-rules.pro|1
+crash-handler|app/src/main/java/com/music/bitchord/BitChordApplication.kt|1
+official-import|app/src/main/java/com/music/bitchord/MainActivity.kt|1
+official-import|app/src/main/java/com/music/bitchord/ui/onboarding/OnboardingScreen.kt|1
+player-status|sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt|1
+player-status|sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt|1
+player-status|sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerHost.kt|1
+player-status|app/src/main/java/com/music/bitchord/ui/player/AndroidPlayerHost.kt|1

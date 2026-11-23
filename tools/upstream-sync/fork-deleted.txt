@@ -1,0 +1,11 @@
+# Upstream files the fork deliberately deletes (they target upstream's branch names/secrets and only fail here).
+# Re-deleted after every sync if upstream modified them.
+.github/workflows/android.yml
+.github/workflows/check.yml
+.github/workflows/close-issue.yml
+.github/workflows/contributors-image.yml
+.github/workflows/deploy-backend.yml
+.github/workflows/tv.yml
+.github/workflows/update-contributors.yml
+.github/workflows/web.yml
+upi_support.jpg
