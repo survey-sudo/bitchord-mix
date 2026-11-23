@@ -5326,12 +5326,13 @@ class CrossfadeController(
         if (primeJob?.isActive == true && primedKey == key) return
         if (primedKey == key && nowMs() < primeRetryAt) return
         // AUTOMIX-V2(orch): stems are precomputed on the analysis worker, never separated at the splice.
-        if (prefetchStems != null && stemPrefetchedKey != key) {
+        val prefetch = prefetchStems
+        if (prefetch != null && stemPrefetchedKey != key) {
             stemPrefetchedKey = key
             runCatching {
                 val bounds = LoopMix.regionBounds(plan)
-                prefetchStems.invoke(outItem, durationMs, bounds.outFrom, bounds.outTo, sampleRate)
-                prefetchStems.invoke(inItem, nextDurationMs, bounds.inFrom, bounds.inTo, sampleRate)
+                prefetch.invoke(outItem, durationMs, bounds.outFrom, bounds.outTo, sampleRate)
+                prefetch.invoke(inItem, nextDurationMs, bounds.inFrom, bounds.inTo, sampleRate)
             }.onFailure { Log.w(TAG, "stem prefetch failed", it) }
         }
         discardPrime()
