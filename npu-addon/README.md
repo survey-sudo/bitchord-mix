@@ -1,5 +1,7 @@
 # Bundled NPU stack (vc90)
 
+> **Automix v2 note:** The main APK now carries QNN via Maven (`com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0` + `com.qualcomm.qti:qnn-runtime:2.42.0`); the separate add-on APK / `zero QNN libs` policy below is superseded.
+
 Mirrors Orchard mobile/android/npu-addon: the Maven onnxruntime-android AAR
 carries no QNN execution provider, so BitChord builds ONNX Runtime 1.31.0
 from source with the QNN EP linked in, and the QAIRT HTP libraries ride

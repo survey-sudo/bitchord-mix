@@ -2140,6 +2140,13 @@ class PlaybackService : MediaLibraryService() {
             separateTransitionPair = { left, right, rate ->
                 trackAnalyzer.separateTransitionBothWindows(left, right, rate)
             },
+            // AUTOMIX-V2(orch): 4-stem provider per track + background prefetch of planned regions.
+            stemProviderFor = { trackId, cachedOnly -> trackAnalyzer.stemProviderFor(trackId, cachedOnly) },
+            prefetchStems = { item, durationMs, from, to, rate ->
+                item.localConfiguration?.uri?.let { uri ->
+                    trackAnalyzer.prefetchStems(item.mediaId, uri, durationMs / 1000.0, from, to, rate)
+                }
+            },
             syncedLines = ::loopMixLyrics,
             loudnessGain = ::loudnessGainFor,
             onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },

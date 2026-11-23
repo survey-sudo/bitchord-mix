@@ -232,6 +232,10 @@ fun SettingsScreen(
     val crossfade by AppSettings.crossfadeSeconds.collectAsStateWithLifecycle()
     val smartFade by AppSettings.smartFadeEnabled.collectAsStateWithLifecycle()
     val automixPerformance by AppSettings.automixPerformanceMode.collectAsStateWithLifecycle()
+    // AUTOMIX-V2(orch)
+    val automixDjLevel by AppSettings.automixDjLevel.collectAsStateWithLifecycle()
+    val automixStems by AppSettings.automixStemsEnabled.collectAsStateWithLifecycle()
+    val automixNpu by AppSettings.automixNpuEnabled.collectAsStateWithLifecycle()
     val skipSilence by AppSettings.skipSilence.collectAsStateWithLifecycle()
     val dolbyAtmos by AppSettings.dolbyAtmos.collectAsStateWithLifecycle()
     val directSourceStream by AppSettings.directSourceStream.collectAsStateWithLifecycle()
@@ -839,6 +843,51 @@ fun SettingsScreen(
                         onClick = { onOpenChoice(SettingsChoiceKind.AUTOMIX_PERFORMANCE) },
                     )
                 }
+            }
+            // AUTOMIX-V2(orch): DJ level, 4-stem mixing and NPU.
+            val automixDjLevelTitle = stringResource(R.string.automix_dj_level)
+            row(automixDjLevelTitle, "dj", "mix", "intensity") {
+                BypassedByBitPerfect(bitPerfectReady) {
+                    SettingsRow(
+                        icon = SfIcons.GraphicEq,
+                        title = automixDjLevelTitle,
+                        subtitle = stringResource(R.string.automix_dj_level_subtitle),
+                        value = stringResource(automixDjLevel.labelRes()),
+                        onClick = { onOpenChoice(SettingsChoiceKind.AUTOMIX_DJ_LEVEL) },
+                    )
+                }
+            }
+            val automixStemsTitle = stringResource(R.string.automix_stems)
+            row(automixStemsTitle, "stems", "vocals", "bass", "drums") {
+                BypassedByBitPerfect(bitPerfectReady) {
+                    SettingsRow(
+                        icon = SfIcons.Waves,
+                        title = automixStemsTitle,
+                        subtitle = stringResource(R.string.automix_stems_subtitle),
+                        trailing = {
+                            IosSwitch(
+                                checked = automixStems,
+                                onCheckedChange = AppSettings::setAutomixStemsEnabled,
+                            )
+                        },
+                        onClick = { AppSettings.setAutomixStemsEnabled(!automixStems) },
+                    )
+                }
+            }
+            val automixNpuTitle = stringResource(R.string.automix_npu)
+            row(automixNpuTitle, "npu", "snapdragon", "hexagon", "ai") {
+                SettingsRow(
+                    icon = SfIcons.Performance,
+                    title = automixNpuTitle,
+                    subtitle = stringResource(R.string.automix_npu_subtitle),
+                    trailing = {
+                        IosSwitch(
+                            checked = automixNpu,
+                            onCheckedChange = AppSettings::setAutomixNpuEnabled,
+                        )
+                    },
+                    onClick = { AppSettings.setAutomixNpuEnabled(!automixNpu) },
+                )
             }
             val skipSilenceTitle = stringResource(R.string.skip_silence)
             row(skipSilenceTitle, "silence") {
@@ -2887,6 +2936,7 @@ enum class SettingsChoiceKind(@param:StringRes val title: Int) {
     AUDIO_QUALITY_CELLULAR(R.string.on_mobile_data),
     DOWNLOAD_QUALITY(R.string.download_quality),
     AUTOMIX_PERFORMANCE(R.string.automix_performance),
+    AUTOMIX_DJ_LEVEL(R.string.automix_dj_level), // AUTOMIX-V2(orch)
     BIT_PERFECT(R.string.bit_perfect_output),
     FONT(R.string.font),
 }
@@ -2987,6 +3037,29 @@ fun SettingsChoicePage(
                     footer = stringResource(R.string.automix_performance_warning),
                 ) { mode ->
                     AppSettings.setAutomixPerformanceMode(mode)
+                    onChosen()
+                }
+            }
+
+            // AUTOMIX-V2(orch)
+            SettingsChoiceKind.AUTOMIX_DJ_LEVEL -> {
+                val selected by AppSettings.automixDjLevel.collectAsStateWithLifecycle()
+                ChoiceGroup(
+                    options = com.music.bitchord.playback.smart.choreo.DjLevel.entries,
+                    selected = selected,
+                    label = { stringResource(it.labelRes()) },
+                    detail = {
+                        stringResource(
+                            when (it) {
+                                com.music.bitchord.playback.smart.choreo.DjLevel.SUBTLE -> R.string.automix_dj_subtle_subtitle
+                                com.music.bitchord.playback.smart.choreo.DjLevel.CLUB -> R.string.automix_dj_club_subtitle
+                                com.music.bitchord.playback.smart.choreo.DjLevel.FESTIVAL -> R.string.automix_dj_festival_subtitle
+                            },
+                        )
+                    },
+                    footer = stringResource(R.string.automix_dj_level_footer),
+                ) { level ->
+                    AppSettings.setAutomixDjLevel(level)
                     onChosen()
                 }
             }
@@ -3092,4 +3165,12 @@ internal fun <T> ChoiceGroup(
             }
         }
     }
+}
+
+/** AUTOMIX-V2(orch): display name of a DJ level. */
+@StringRes
+private fun com.music.bitchord.playback.smart.choreo.DjLevel.labelRes(): Int = when (this) {
+    com.music.bitchord.playback.smart.choreo.DjLevel.SUBTLE -> R.string.automix_dj_subtle
+    com.music.bitchord.playback.smart.choreo.DjLevel.CLUB -> R.string.automix_dj_club
+    com.music.bitchord.playback.smart.choreo.DjLevel.FESTIVAL -> R.string.automix_dj_festival
 }

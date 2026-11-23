@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 
+#include "loopmix/dj_fx.h"
 #include "loopmix/phrase_isolator.h"
 #include "signalsmith-stretch/signalsmith-stretch.h"
 
@@ -161,6 +162,47 @@ struct Flanger {
   void applyEnv(float inL, float inR, float wetMul, float& wetL, float& wetR, double frameTimeSec, double sampleRate);
 };
 
+/**
+ * AUTOMIX-V2(C): per-deck v2 state. Everything is inert until its setter /
+ * envelope is used, so a vc80 script renders bit-identically.
+ */
+struct DeckV2 {
+  // Stems: VOCALS, DRUMS, BASS stored as int16 + per-channel scale, aligned to
+  // the region. OTHER is never stored: it is dry - (V + D + B), so the deck
+  // renders gO*dry + sum_k (g_k - gO)*stem_k, which is the dry region exactly
+  // when every stem gain is 1 (the terms vanish), and needs 25 % less memory.
+  bool stemHas[3] = {false, false, false};
+  std::vector<int16_t> stemQL[3], stemQR[3];
+  float stemScaleL[3] = {0, 0, 0};
+  float stemScaleR[3] = {0, 0, 0};
+  /** Linear stem gains (KIND_STEM_VOCALS..OTHER), evaluated at the time the input is heard. */
+  Envelope stemGain[4];
+  bool stemsOn = false;  // validated in prepare()
+
+  // Filter sweep: Q multiplier and the DJM single knob (-1 LPF .. +1 HPF).
+  Envelope filterRes;
+  Envelope filterKnob;
+  bool filterV2 = false;
+  float hpQLast = -1.f, lpQLast = -1.f;
+
+  v2::Phaser phaser;
+  Envelope phaserWet;
+  v2::BeatGate gate;
+  Envelope gateDepth;
+  v2::Riser riser;
+  Envelope riserLevel;
+  v2::Pump pump;
+  Envelope pumpDepth;
+  v2::Brake brake;
+  Envelope brakeProgress;
+  bool fxActive = false;
+
+  // Loudness: K-weighted programme loudness of the deck (post-stretch, pre-EQ, pre-fader, x level).
+  v2::LoudnessMeter meter;
+  float matchDb = 0.f;
+  float match0 = 1.f, match1 = 1.f;
+};
+
 struct Deck {
   // The decoded region, planar, at the renderer's rate.
   std::vector<float> left;
@@ -263,7 +305,36 @@ struct Deck {
   double knotHeard(double t) const;
   /** Input samples per output sample around mix frame [t]. */
   double knotRate(double t) const;
+
+  // AUTOMIX-V2(C)
+  DeckV2 v2;
+  /** The exact sample/tail/weights read() uses for [unwrapped]; false = silence. */
+  bool tapsPlain(int64_t unwrapped, int seamSamples, int64_t& index, int64_t& tail, float& wIndex, float& wTail) const;
+  /** The exact sample/tail/weights readEffective() uses. */
+  bool tapsEffective(int64_t unwrapped, int seamSamples, double mixSec, int64_t& index, int64_t& tail, float& wIndex,
+                     float& wTail) const;
+  /** Stem-weighted read; [gains] = V, D, B, O. All-unity gains take the plain dry read (bit-identical). */
+  void readStems(int64_t unwrapped, int seamSamples, double mixSec, const float* gains, float& leftOut,
+                 float& rightOut) const;
 };
+
+/** AUTOMIX-V2(C): the v2 envelope for [kind] (9..19), or nullptr. */
+inline Envelope* v2Envelope(Deck& d, int kind) {
+  switch (kind) {
+    case v2::KIND_STEM_VOCALS: return &d.v2.stemGain[0];
+    case v2::KIND_STEM_DRUMS: return &d.v2.stemGain[1];
+    case v2::KIND_STEM_BASS: return &d.v2.stemGain[2];
+    case v2::KIND_STEM_OTHER: return &d.v2.stemGain[3];
+    case v2::KIND_FILTER_RES: return &d.v2.filterRes;
+    case v2::KIND_PHASER_WET: return &d.v2.phaserWet;
+    case v2::KIND_GATE_DEPTH: return &d.v2.gateDepth;
+    case v2::KIND_RISER_LEVEL: return &d.v2.riserLevel;
+    case v2::KIND_PUMP_DEPTH: return &d.v2.pumpDepth;
+    case v2::KIND_BRAKE: return &d.v2.brakeProgress;
+    case v2::KIND_FILTER_KNOB: return &d.v2.filterKnob;
+    default: return nullptr;
+  }
+}
 
 class Renderer {
  public:
@@ -297,6 +368,50 @@ class Renderer {
   /** How many times a deck went silent while still audible at stopAt (the exit gate's trip counter). */
   int exitGateViolations() const { return exitGateViolations_.load(std::memory_order_relaxed); }
 
+  // ---- AUTOMIX-V2(C) ------------------------------------------------------
+  /** Native capability bitmask (v2::Capability). */
+  static int capabilities() { return v2::kCapabilities; }
+  /**
+   * One stem of [index] (kind 0 VOCALS, 1 DRUMS, 2 BASS; 3 OTHER is accepted
+   * and ignored, being derived). Planar, [frames] must equal the region;
+   * checked again in prepare(). Worker thread only.
+   */
+  bool setDeckStem(int index, int kind, const float* left, const float* right, int frames);
+  void clearDeckStems(int index);
+  /** Phaser: LFO cycle [rateBeats] (1/16..64), sweep [depth] 0..1, [feedback] -0.85..0.85. Wet = KIND_PHASER_WET. */
+  void setPhaser(int index, double rateBeats, float depth, float feedback);
+  /**
+   * Beat gate: [division] gate steps per beat (1/16..16; 4 = 1/16 notes, DJM
+   * TRANS); a negative division selects stutter (repeat the first step's slice).
+   * [swing] 0..0.33. Depth = KIND_GATE_DEPTH. [beatSec] is the fallback grid.
+   */
+  void setGate(int index, double beatSec, float division, float swing);
+  /** White-noise riser of [lengthBeats], starting where KIND_RISER_LEVEL first rises. */
+  void setRiser(int index, double beatSec, double lengthBeats);
+  /** Beat-locked pump on the deck's low band (< 120 Hz), or the whole deck when [fullBand]. Depth = KIND_PUMP_DEPTH. */
+  void setPump(int index, double beatSec, bool fullBand = false);
+  /** Vinyl brake (or spinback) from mix second [startSec] over [lengthSec]; KIND_BRAKE overrides the progress. One-shot. */
+  void setBrake(int index, double startSec, double lengthSec, bool spinback = false);
+  /**
+   * Short-term loudness tracking with per-deck matching and the summed-bus
+   * "no dip / no bump" guard during overlaps; [targetLufs] (e.g. -14, the
+   * static normalisation reference) caps bumps; NaN/0 = no cap. Turns the
+   * true-peak limiter on.
+   */
+  void setLoudnessMatch(bool enabled, float targetLufs);
+  /** 4x oversampled true-peak detection in the limiter (-1 dBTP). */
+  void setTruePeak(bool on) { truePeakExplicit_ = on; }
+  /** EBU R128 short-term (3 s) loudness: 0/1 = deck programme, 2 = output bus. -120 when unknown. */
+  double shortTermLufs(int which) const {
+    return which >= 0 && which < 3 ? stLufs_[which].load(std::memory_order_relaxed) : -120.0;
+  }
+  /** The bus guard's current gain (dB). */
+  float loudnessGuardDb() const { return guardDbOut_.load(std::memory_order_relaxed); }
+  /** Beat position (beats since mix beat 0) at mix second [t], from the knot grid or the fallback beat. */
+  double beatPosAt(double t) const;
+  /** Local beat length (seconds) at mix second [t]. */
+  double beatDurAt(double t) const;
+
   int64_t firstFrame() const;
 
   /**
@@ -308,6 +423,13 @@ class Renderer {
  private:
   void renderDeck(Deck& deck, int64_t frame, int frames);
   void limit(int frames);
+  // AUTOMIX-V2(C)
+  void prepareV2();
+  void fillStemInput(Deck& deck, int64_t from, int count, int64_t mixFrameBase, double refFrame, double refHeard,
+                     double rate, int available);
+  void loudnessPreBlock(int64_t frame, int frames);
+  void loudnessGuard(int64_t frame, int frames);
+  void limitTruePeak(int frames);
 
   int sampleRate_;
   bool highQuality_ = true;
@@ -319,6 +441,26 @@ class Renderer {
   // Legacy input history; limit() detects sample peaks within each callback.
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
+
+  // AUTOMIX-V2(C) state. Pre-allocated in prepare(); render thread only after that.
+  bool loudnessOn_ = false;
+  float targetLufs_ = 0.f;
+  bool truePeakExplicit_ = false;
+  v2::LoudnessMeter busMeter_, outMeter_;
+  float guardDb_ = 0.f;
+  float guardLin_ = 1.f;
+  double lineLufs_ = -120.0;
+  float overlap_ = 0.f;
+  double deckLufs_[2] = {-120.0, -120.0};
+  std::atomic<float> guardDbOut_{0.f};
+  std::atomic<double> stLufs_[3];
+  v2::TruePeakFir tpFir_;
+  std::vector<float> tpBufL_, tpBufR_, tpPeak_;
+  float tpHistL_[v2::TruePeakFir::kHistory] = {};
+  float tpHistR_[v2::TruePeakFir::kHistory] = {};
+  std::vector<double> gridTimes_;
+  double gridOffset_ = 0.0;
+  double fxBeatSec_ = 0.5;
 };
 
 }  // namespace bitchord::loopmix

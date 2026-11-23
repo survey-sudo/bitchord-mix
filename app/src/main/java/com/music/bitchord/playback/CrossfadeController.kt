@@ -599,6 +599,10 @@ class CrossfadeController(
     private val separateTransitionBothWindows: ((left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
     /** Exact dual-stem (voc, inst) pair for loop vocal-duck (vc77); same service as above. */
     private val separateTransitionPair: ((left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
+    // AUTOMIX-V2(orch): 4-stem provider per track (Stream B); cachedOnly = never compute. Null = vc80 2-stem paths only.
+    private val stemProviderFor: ((trackId: String, cachedOnly: Boolean) -> com.music.bitchord.playback.smart.StemProvider?)? = null,
+    // AUTOMIX-V2(orch): background stem prefetch of a planned transition region (Stream B).
+    private val prefetchStems: ((item: MediaItem, durationMs: Long, from: Double, to: Double, rate: Int) -> Unit)? = null,
     /** True while a whole-track analysis pass is in flight (vc74 gate). */
     private val wholeTrackBusy: () -> Boolean = { false },
     /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
@@ -4420,6 +4424,8 @@ class CrossfadeController(
     /** Decks decoded ahead of arming, for [primedKey]. Held until the mix arms or the pair changes. */
     private var primedSession: LoopMixSession? = null
     private var primedKey: String? = null
+    /** AUTOMIX-V2(orch): last plan key whose stem regions were prefetched. */
+    private var stemPrefetchedKey: String? = null
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
@@ -4556,6 +4562,7 @@ class CrossfadeController(
             actualConfiguration = true, coarseDecline = coarseDecline) + mapOf(
             "outGridSource" to session.outGridSource.telemetryValue,
             "inGridSource" to session.inGridSource.telemetryValue,
+            "choreo" to session.choreoMove, // AUTOMIX-V2(orch): executed-move attribution
         )
 
     private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
@@ -5318,6 +5325,15 @@ class CrossfadeController(
         if (primedKey == key && primedSession != null) return
         if (primeJob?.isActive == true && primedKey == key) return
         if (primedKey == key && nowMs() < primeRetryAt) return
+        // AUTOMIX-V2(orch): stems are precomputed on the analysis worker, never separated at the splice.
+        if (prefetchStems != null && stemPrefetchedKey != key) {
+            stemPrefetchedKey = key
+            runCatching {
+                val bounds = LoopMix.regionBounds(plan)
+                prefetchStems.invoke(outItem, durationMs, bounds.outFrom, bounds.outTo, sampleRate)
+                prefetchStems.invoke(inItem, nextDurationMs, bounds.inFrom, bounds.inTo, sampleRate)
+            }.onFailure { Log.w(TAG, "stem prefetch failed", it) }
+        }
         discardPrime()
         val lead = (plan.out.loopStart * 1000).roundToLong() - player.currentPosition
         deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
@@ -5497,7 +5513,40 @@ class CrossfadeController(
                             }
                         }
                     }
-                    LoopMixSession.build(capturedPlan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script, separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair, outAnalysis = capturedOutAnalysis, inAnalysis = capturedInAnalysis, sungOut = capturedSungOut, sungIn = capturedSungIn, onRefusal = { reason -> buildFailure = reason }, decode = { side, from, to ->
+                    // AUTOMIX-V2(orch): per-deck 4-stem providers (B), structure v2 maps (D), DJ level + album order (E).
+                    fun v2Stems(id: String): com.music.bitchord.playback.smart.StemProvider? {
+                        val provider = stemProviderFor?.invoke(id, skipStemAtLaunch) ?: return null
+                        return com.music.bitchord.playback.smart.StemProvider { l, r, sr, start ->
+                            if (shouldSkipStemNearSplice(Long.MAX_VALUE, deckTiming.deadlineMs, nowMs())) {
+                                stemProviderFor.invoke(id, true)?.separate(l, r, sr, start)
+                            } else {
+                                provider.separate(l, r, sr, start)
+                            }
+                        }
+                    }
+                    val v2OutMap = PhraseMaps.get(outItem.mediaId)
+                        ?: runCatching { SongMaps.fromAnalysis(outItem.mediaId, capturedOutAnalysis) }.getOrNull()
+                    val v2InMap = PhraseMaps.get(inItem.mediaId)
+                        ?: runCatching { SongMaps.fromAnalysis(inItem.mediaId, capturedInAnalysis) }.getOrNull()
+                    val v2AlbumOrder = runCatching {
+                        isConsecutiveAlbumTrack(
+                            outItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", outItem.mediaMetadata.trackNumber ?: 0,
+                            inItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", inItem.mediaMetadata.trackNumber ?: 0,
+                        )
+                    }.getOrDefault(false)
+                    LoopMixSession.build(
+                        capturedPlan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script,
+                        separateStem = sepStem, separateVocalStem = sepVocal, separateVocalPair = sepVocalPair,
+                        outAnalysis = capturedOutAnalysis, inAnalysis = capturedInAnalysis,
+                        sungOut = capturedSungOut, sungIn = capturedSungIn,
+                        onRefusal = { reason -> buildFailure = reason },
+                        stemProvider = v2Stems(outItem.mediaId),
+                        inStemProvider = v2Stems(inItem.mediaId),
+                        outSongMap = v2OutMap,
+                        inSongMap = v2InMap,
+                        djLevel = AppSettings.automixDjLevel.value,
+                        albumOrder = v2AlbumOrder,
+                        decode = { side, from, to ->
                         // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
                         val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
                         deckSide = sideName
@@ -6575,8 +6624,8 @@ class CrossfadeController(
             val lockedNow = phraseLock.locked || phraseLock.shown || shownCountdownKey != null
             val lockTag = if (lockedNow) " · locked" else ""
             return status(
-                headline = listOf(session.plan.rung, stage, tempo).joinToString(" · ") + lockTag,
-                detail = "${session.plan.rung}. ${describeLoop(session.plan)}.$phrase$aligned$late",
+                headline = listOf(session.choreoLabel.ifEmpty { session.plan.rung }, stage, tempo).joinToString(" · ") + lockTag, // AUTOMIX-V2(orch)
+                detail = "${session.choreoLabel.ifEmpty { session.plan.rung }}. ${describeLoop(session.plan)}.$phrase$aligned$late",
                 style = session.plan.rung.lowercase(),
                 progress = if (m != null && m >= 0) 1f else countdownProgress(secondsLeft),
                 state = when (m) {

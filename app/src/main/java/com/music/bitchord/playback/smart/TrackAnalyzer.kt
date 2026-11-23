@@ -174,11 +174,97 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         npuCacheDir = { npuCacheDir },
     )
 
+    // AUTOMIX-V2(orch/B): 4-stem separation (SCNet, bundled asset) with the umxhq 2-stem fallback.
+    // All lazy: modelLock/executor are declared later in the class, and nothing may touch
+    // the context before the service is attached.
+    val stemModels by lazy {
+        StemModelStore(
+            directory = { java.io.File(context.filesDir, "stems").apply { mkdirs() } },
+            bundled = { asset -> runCatching { java.io.File(unpackedAsset(asset)) }.getOrNull() },
+            downloader = StemModelDownloader { url, destination ->
+                runCatching {
+                    okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(url).build()).execute().use { response ->
+                        if (!response.isSuccessful) return@use false
+                        val body = response.body ?: return@use false
+                        destination.outputStream().use { out -> body.byteStream().copyTo(out) }
+                        true
+                    }
+                }.getOrDefault(false)
+            },
+        )
+    }
+    private val stemEngines by lazy {
+        StemEngines(
+            store = stemModels,
+            dsp = { StemNative },
+            inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
+            npuVendor = { npuVendor },
+            npuBackendPath = { npuBackendPath },
+            npuCacheDir = { npuCacheDir },
+        )
+    }
+    val stemSeparator by lazy {
+        StemSeparator(
+            engine = { stemEngines.current() },
+            legacy = LegacyTwoStem { l, r, rate -> vocals.separateBothWindows(l, r, rate) },
+            cache = StemCache({ java.io.File(context.cacheDir, "stems") }),
+            modelLock = modelLock,
+            shouldStop = { stopped || overheated },
+        )
+    }
+
+    /**
+     * AUTOMIX-V2(orch): v2 stems have their own device gate. The vc80 windowed-stem gate
+     * also requires the legacy opt-in (off by default), which would leave 4-stem mixing
+     * dark on every phone; v2 keeps only the RAM check and the v2 setting.
+     */
+    private fun canUseV2Stems(): Boolean {
+        if (!AppSettings.automixStemsEnabled.value) return false
+        return try {
+            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+                ?: return false
+            val info = android.app.ActivityManager.MemoryInfo()
+            activityManager.getMemoryInfo(info)
+            !activityManager.isLowRamDevice &&
+                (info.totalMem >= 6L * 1024L * 1024L * 1024L || activityManager.memoryClass >= 256)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /** AUTOMIX-V2(orch): per-deck provider; null when stems are not allowed on this device. */
+    fun stemProviderFor(trackId: String, cachedOnly: Boolean): StemProvider? {
+        if (!AutomixV2Stems.enabled || !canUseV2Stems()) return null
+        return if (cachedOnly) stemSeparator.cachedOnly(trackId) else stemSeparator.forTrack(trackId)
+    }
+
+    /** AUTOMIX-V2(orch): separate a planned transition region ahead of the loop build (analysis worker). */
+    fun prefetchStems(trackId: String, uri: Uri, durationSeconds: Double, from: Double, to: Double, sampleRate: Int) {
+        if (!AutomixV2Stems.enabled || !canUseV2Stems() || stopped || overheated) return
+        runCatching {
+            executor.execute {
+                runCatching {
+                    val region = loopRegion(trackId, uri, durationSeconds, from, to, sampleRate) ?: return@runCatching
+                    stemSeparator.prefetch(trackId, region.left, region.right, sampleRate, region.start)
+                }
+            }
+        }
+    }
+
+    /** AUTOMIX-V2(orch): install the 4-stem model (worker thread). Bundled asset first, download second. */
+    fun installStemModel(): Boolean = runCatching { stemModels.install(StemModels.SCNET_INT8) }.getOrDefault(false)
+
     init {
         // The shared trackers report model failures and their timings through
         // this; with no sink they went nowhere on the phone, which is how a
         // beat model that found nothing went unnoticed.
         AnalysisLog.install { message, error -> Log.w(TAG, message, error) }
+        // AUTOMIX-V2(A): NPU runtime switch (user setting + self-test + auto-disable), QDQ-only QNN route.
+        // Safe pre-attach: NpuAndroid touches the Context lazily and guarded.
+        runCatching {
+            NpuAndroid.install(context) { AppSettings.automixNpuEnabled.value }
+            NpuQdqSelfTest.schedule(context, { npuVendor })
+        }.onFailure { Log.w(TAG, "NPU v2 init skipped", it) }
         // vc70 NPU: point the DSP library search at the bundled QAIRT libs
         // (mirrors the Orchard qnn_runner ADSP_LIBRARY_PATH setup). Best
         // effort: no NPU on the device, everything still runs on CPU.
@@ -1518,7 +1604,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // DSP is ~<50ms at 360s. The 120s cap only ever truncated the duration flag,
             // producing SongMap(durationSec=120, partial) on 210s tracks and early exits.
             // partial is derived from fullTrackDurationSec (shared: full > pcm + 1.0).
-            val fullCap = (structRate * 360.0).toInt().coerceAtLeast(1)
+            val fullCap = (structRate * 480.0).toInt().coerceAtLeast(1) // AUTOMIX-V2(D): 8-minute songs
             val fullPcm = if (samples.size > fullCap) samples.copyOf(fullCap) else samples
             val map = runCatching {
                 StructureAnalyzer.fromPcm(
@@ -1530,6 +1616,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     startedMs = started,
                     now = { SystemClock.elapsedRealtime() },
                     fullTrackDurationSec = effectiveDuration,
+                    // AUTOMIX-V2(D): bar phase from the native grid; DSP vocal evidence for v2 only.
+                    downbeatsHint = features.downbeats.toDoubleArray().takeIf { it.isNotEmpty() },
+                    v2Vocal = features.vocalActivityMask
+                        .map { heuristicVocalOnModelScale(it).toFloat() }
+                        .toFloatArray()
+                        .takeIf { it.isNotEmpty() },
                 )
             }.onFailure { Log.i("BitChordPhrase", "structure skipped: ${it.message}") }.getOrNull()
             // djmix18: when the head path truncates (pcm < effectiveDuration), the map
@@ -2271,6 +2363,7 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         _analysisUpdates.tryEmit("") // best-effort terminal signal (buffered, non-blocking)
         tracker.release()
         vocals.release()
+        runCatching { stemSeparator.trim() } // AUTOMIX-V2(orch)
     }
 
     private companion object {

@@ -70,9 +70,25 @@ jobs:
             /tmp/loop_mix_renderer_ab_main --selftest
             /tmp/loop_mix_renderer_ab_main --reverb-stop-probe
             /tmp/loop_mix_renderer_ab_main --loop-domain-probe
+            /tmp/loop_mix_renderer_ab_main --lp-bypass-probe
+            /tmp/loop_mix_renderer_ab_main --v2-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi
+
+      # >>> AUTOMIX-V2(B): stem separation DSP self-test (Stream B owns this block)
+      - name: Native stem DSP tests
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -I native \
+              native/analyzer/stem_dsp_test.cpp native/analyzer/stem_dsp.cpp \
+              -o /tmp/stem_dsp_test
+          /tmp/stem_dsp_test
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -I native \
+              native/analyzer/stem_dsp_test.cpp native/analyzer/stem_dsp.cpp \
+              -o /tmp/stem_dsp_test_asan
+          /tmp/stem_dsp_test_asan
+      # <<< AUTOMIX-V2(B)
 
       # The runner image is ~14 GB free and the NDK alone is ~2 GB.
       - name: Free disk space
@@ -148,6 +164,8 @@ jobs:
             /tmp/loop_mix_renderer_ab_main --selftest
             /tmp/loop_mix_renderer_ab_main --reverb-stop-probe
             /tmp/loop_mix_renderer_ab_main --loop-domain-probe
+            /tmp/loop_mix_renderer_ab_main --lp-bypass-probe
+            /tmp/loop_mix_renderer_ab_main --v2-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
           fi
@@ -220,10 +238,30 @@ jobs:
           # sed, not head: with `pipefail` aapt2 gets SIGPIPE when head exits
           # early, and the audit step would fail after a successful build.
           "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2" dump badging "$APK" | sed -n '1,2p'
-          echo "--- onnxruntime copies (expect 1) ---"
-          unzip -l "$APK" | grep -c 'libonnxruntime.so'
-          echo "--- QNN/HTP libs (expect 0) ---"
-          unzip -l "$APK" | grep -icE 'libQnn|libHtp' || true
+          # AUTOMIX-V2(A): onnxruntime-android-qnn + qnn-runtime. Exactly one
+          # libonnxruntime.so (a second copy means a stale CPU AAR or npu-addon crept back),
+          # and the QNN HTP stack for Hexagon v73 (SM8635) must be present.
+          # grep -c without a pipe into head (pipefail); "|| true" because grep -c exits 1 on 0.
+          LISTING=$(unzip -l "$APK")
+          ORT_COUNT=$(grep -cE 'lib/arm64-v8a/libonnxruntime\.so$' <<< "$LISTING" || true)
+          echo "--- onnxruntime copies (expect 1): $ORT_COUNT ---"
+          grep -E 'libonnxruntime' <<< "$LISTING" || true
+          QNN_MISSING=0
+          for LIB in libQnnHtp.so libQnnHtpV73Stub.so libQnnHtpV73Skel.so libQnnSystem.so; do
+            N=$(grep -cE "lib/arm64-v8a/${LIB//./\\.}$" <<< "$LISTING" || true)
+            echo "--- $LIB (expect 1): $N ---"
+            [ "$N" -ge 1 ] || QNN_MISSING=1
+          done
+          echo "--- all QNN/HTP libs ---"
+          grep -iE 'lib/.*(libQnn|libHtp)' <<< "$LISTING" || true
+          echo "--- QNN/HTP lib count: $(grep -ciE 'lib/.*(libQnn|libHtp)' <<< "$LISTING" || true) ---"
+          if [ "$ORT_COUNT" != "1" ]; then
+            echo "::error::expected exactly 1 libonnxruntime.so, found $ORT_COUNT"
+            exit 1
+          fi
+          if [ "$QNN_MISSING" != "0" ]; then
+            echo "::warning::QNN HTP v73 libraries missing: the NPU path will fall back to CPU"
+          fi
           echo "--- native libs ---"
           unzip -l "$APK" | grep 'libbitchord_' || true
           {

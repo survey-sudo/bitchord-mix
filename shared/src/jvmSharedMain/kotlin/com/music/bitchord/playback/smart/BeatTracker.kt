@@ -82,15 +82,19 @@ class BeatTracker(
     /** Parsing the graph is far too expensive to repeat per track, so one session is kept. */
     private fun session(): OrtSession? {
         val threads = inferenceThreads()
-        session?.takeIf { sessionThreads == threads }?.let { return it }
+        // AUTOMIX-V2(A): drop a QNN session once the NPU is switched off or auto-disabled.
+        session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
         synchronized(lock) {
-            session?.takeIf { sessionThreads == threads }?.let { return it }
+            session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
             runCatching { session?.close() }
             session = null
             return runCatching {
                 val file = File(modelPath())
-                // vc69 NPU: QNN when supported, CPU otherwise (automatic CPU fallback inside NpuSession).
-                NpuSession.open(file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir())
+                // AUTOMIX-V2(A): beat_this_final0_qdq(.ctx).onnx on QNN when allowed; otherwise the legacy CPU open.
+                NpuQnnSession.open(
+                    file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
+                    acceptsFixedShape = true,
+                )
                     .also {
                         session = it
                         sessionThreads = threads
@@ -116,6 +120,7 @@ class BeatTracker(
         val downbeatLogits = FloatArray(spectrogram.frames)
         val inferStarted = System.currentTimeMillis()
         if (!infer(active, spectrogram, beatLogits, downbeatLogits)) return null
+        NpuQnnSession.onRunSuccess(active) // AUTOMIX-V2(A): ends a QNN failure streak
         AnalysisLog.warn("mel ${melMs}ms (${spectrogram.frames} frames) " +
                 "infer ${System.currentTimeMillis() - inferStarted}ms",
         )
@@ -168,16 +173,26 @@ class BeatTracker(
         val environment = OrtEnvironment.getEnvironment()
         val mels = spectrogram.mels
         val name = session.inputNames.first()
-        val stride = CHUNK_FRAMES - 2 * BORDER_FRAMES
+        // AUTOMIX-V2(A): an HTP graph has a fixed time dimension; every chunk is exactly that long.
+        val fixed = NpuQnnSession.fixedInputFrames(session)
+        val chunkFrames = fixed ?: CHUNK_FRAMES
+        val stride = chunkFrames - 2 * BORDER_FRAMES
 
         var start = 0
         while (start < spectrogram.frames) {
-            val length = min(CHUNK_FRAMES, spectrogram.frames - start)
+            // Fixed shape: the last chunk is aligned to the end (overlapping, never short); a track
+            // shorter than one chunk is zero-padded and only its real frames are kept.
+            if (fixed != null && start > 0 && start + chunkFrames > spectrogram.frames) {
+                start = max(0, spectrogram.frames - chunkFrames)
+            }
+            val length = min(chunkFrames, spectrogram.frames - start)
             // A chunk shorter than the border padding carries no usable centre.
             if (length <= 2 * BORDER_FRAMES && start > 0) break
 
-            val chunk = spectrogram.values.copyOfRange(start * mels, (start + length) * mels)
-            val shape = longArrayOf(1, length.toLong(), mels.toLong())
+            val fedFrames = if (fixed != null) chunkFrames else length
+            val chunk = FloatArray(fedFrames * mels)
+            spectrogram.values.copyInto(chunk, 0, start * mels, (start + length) * mels)
+            val shape = longArrayOf(1, fedFrames.toLong(), mels.toLong())
 
             OnnxTensor.createTensor(environment, FloatBuffer.wrap(chunk), shape).use { tensor ->
                 session.run(mapOf(name to tensor)).use { outputs ->
@@ -199,7 +214,11 @@ class BeatTracker(
             start += stride
         }
         true
-    }.onFailure { AnalysisLog.warn("Beat inference failed", it) }.getOrDefault(false)
+    }.onFailure {
+        AnalysisLog.warn("Beat inference failed", it)
+        // AUTOMIX-V2(A): QNN failure (e.g. ENGINE_ERROR after a DSP restart) -> count it, recreate next time.
+        if (NpuQnnSession.onRunFailure(session, it)) release()
+    }.getOrDefault(false)
 
     fun release() {
         synchronized(lock) {

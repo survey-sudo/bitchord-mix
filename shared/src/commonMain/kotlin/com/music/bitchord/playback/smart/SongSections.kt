@@ -1,5 +1,6 @@
 package com.music.bitchord.playback.smart
 
+import com.music.bitchord.playback.smart.structure.AutomixV2Structure
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -23,6 +24,11 @@ enum class SectionKind {
     // buildup -> bass-drop; see paintBuildDrop below).
     BUILD,
     DROP,
+    // AUTOMIX-V2(D): appended (ordinals above unchanged). Painted only from a
+    // structure v2 SongMap: a bass-light interior stretch, and a short repeated
+    // high-energy block after a chorus (post-chorus hook / riff).
+    BREAKDOWN,
+    HOOK,
 }
 
 data class Section(val kind: SectionKind, val start: Double, val end: Double)
@@ -37,7 +43,12 @@ data class Section(val kind: SectionKind, val start: Double, val end: Double)
  * a lyric gap with energy is an instrumental, and the thin edges are the
  * intro and the outro.
  */
-fun labelSections(analysis: TrackAnalysis, lyrics: List<LyricCue> = emptyList()): List<Section> {
+fun labelSections(
+    analysis: TrackAnalysis,
+    lyrics: List<LyricCue> = emptyList(),
+    // AUTOMIX-V2(D): optional structure v2 map of the same track; null = vc80 behaviour.
+    map: SongMap? = null,
+): List<Section> {
     val duration = analysis.duration.takeIf { it > 1.0 }
         ?: analysis.contentEndTime.takeIf { it > 1.0 }
         ?: return emptyList()
@@ -131,7 +142,42 @@ fun labelSections(analysis: TrackAnalysis, lyrics: List<LyricCue> = emptyList())
     }
 
     paintBuildDrop(analysis, end, slots)
+    // AUTOMIX-V2(D): layer the v2 evidence over the lyric/energy labels.
+    paintStructureV2(map, end, chorus.isNotEmpty(), slots)
     return collapse(slots, end)
+}
+
+/**
+ * AUTOMIX-V2(D): paint confident structure v2 sections. Energy events (build,
+ * drop, breakdown, hook) always paint; the v2 chorus only paints when the
+ * lyrics and energy repetition found none, so lyric evidence keeps priority.
+ */
+private fun paintStructureV2(map: SongMap?, end: Double, haveChorus: Boolean, slots: IntArray) {
+    if (map == null || !AutomixV2Structure.enabled) return
+    val v2 = map.structure ?: return
+    if (v2.labelConfidence < AutomixV2Structure.minLabelConfidence ||
+        v2.phraseConfidence < AutomixV2Structure.minPhraseConfidence
+    ) return
+    fun paint(kind: SectionKind, from: Double, until: Double) {
+        if (until - from < 0.4) return
+        val code = kind.ordinal + 1
+        val rank = PRIORITY[code]
+        var i = (from / SLOT).toInt().coerceAtLeast(0)
+        val last = ((minOf(until, end) / SLOT) - 1e-6).toInt().coerceAtMost(slots.lastIndex)
+        while (i <= last) {
+            if (rank >= PRIORITY[slots[i]]) slots[i] = code
+            i++
+        }
+    }
+    for (section in v2.sections) {
+        val from = v2.barTime(section.startBar)
+        val until = v2.barTime(section.endBar)
+        when (section.kind) {
+            SectionKind.BUILD, SectionKind.DROP, SectionKind.BREAKDOWN, SectionKind.HOOK -> paint(section.kind, from, until)
+            SectionKind.CHORUS -> if (!haveChorus) paint(section.kind, from, until)
+            else -> Unit
+        }
+    }
 }
 
 /**
@@ -336,6 +382,8 @@ private val PRIORITY = intArrayOf(
     4, // OUTRO
     6, // BUILD (djmix21, never painted)
     7, // DROP (djmix21, never painted)
+    5, // BREAKDOWN (AUTOMIX-V2(D), v2 maps only)
+    6, // HOOK (AUTOMIX-V2(D), v2 maps only)
 )
 
 private data class LyricBlock(val start: Double, val end: Double, val signature: String)

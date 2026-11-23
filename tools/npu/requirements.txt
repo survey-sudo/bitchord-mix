@@ -1,0 +1,9 @@
+# tools/npu host requirements (Linux/macOS/Windows x64, Python 3.10-3.12)
+numpy>=1.24
+soundfile>=0.12        # wav/flac/ogg decode (mp3: decode to wav first with ffmpeg)
+scipy>=1.10            # resample_poly to 22050 Hz
+onnx>=1.16
+onnxruntime==1.29.0    # same minor as onnxruntime-android-qnn 1.29.0 (quantization tools + CPU parity)
+torch>=2.2             # Beat This! export only
+beat_this @ git+https://github.com/CPJKU/beat_this.git
+# Optional offline EP-context (Windows x64/arm64 only):  pip install onnxruntime-qnn==1.29.0

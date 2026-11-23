@@ -290,6 +290,12 @@ object AppSettings {
 
     /** The CPU budget used by Beat This! and vocal analysis for Automix. */
     val automixPerformanceMode = MutableStateFlow(AutomixPerformanceMode.BALANCED)
+    /** AUTOMIX-V2(orch): how much DJ the automix plays (Subtle default, like Apple's restraint). */
+    val automixDjLevel = MutableStateFlow(com.music.bitchord.playback.smart.choreo.DjLevel.SUBTLE)
+    /** AUTOMIX-V2(orch): 4-stem automix (SCNet; ~13 MB model). */
+    val automixStemsEnabled = MutableStateFlow(true)
+    /** AUTOMIX-V2(orch): Snapdragon NPU inference (falls back to CPU automatically). */
+    val automixNpuEnabled = MutableStateFlow(true)
     val skipSilence = MutableStateFlow(false)
 
     /** Requested PCM representation at the Android AudioTrack boundary. */
@@ -998,6 +1004,12 @@ object AppSettings {
                 prefs.getString(KEY_AUTOMIX_PERFORMANCE_MODE, null) ?: AutomixPerformanceMode.BALANCED.name,
             )
         }.getOrDefault(AutomixPerformanceMode.BALANCED)
+        // AUTOMIX-V2(orch)
+        automixDjLevel.value = com.music.bitchord.playback.smart.choreo.DjLevel.fromName(prefs.getString(KEY_AUTOMIX_DJ_LEVEL, null))
+        com.music.bitchord.playback.smart.choreo.AutomixV2Choreo.level = automixDjLevel.value
+        automixStemsEnabled.value = prefs.getBoolean(KEY_AUTOMIX_STEMS, true)
+        com.music.bitchord.playback.smart.AutomixV2Stems.enabled = automixStemsEnabled.value
+        automixNpuEnabled.value = prefs.getBoolean(KEY_AUTOMIX_NPU, true)
         skipSilence.value = prefs.getBoolean(KEY_SKIP_SILENCE, false)
         outputPcmMode.value = runCatching {
             OutputPcmMode.valueOf(
@@ -1321,6 +1333,24 @@ object AppSettings {
     fun setAutomixPerformanceMode(value: AutomixPerformanceMode) {
         automixPerformanceMode.value = value
         prefs.edit().putString(KEY_AUTOMIX_PERFORMANCE_MODE, value.name).apply()
+    }
+
+    // AUTOMIX-V2(orch)
+    fun setAutomixDjLevel(value: com.music.bitchord.playback.smart.choreo.DjLevel) {
+        automixDjLevel.value = value
+        com.music.bitchord.playback.smart.choreo.AutomixV2Choreo.level = value
+        prefs.edit().putString(KEY_AUTOMIX_DJ_LEVEL, value.name).apply()
+    }
+
+    fun setAutomixStemsEnabled(value: Boolean) {
+        automixStemsEnabled.value = value
+        com.music.bitchord.playback.smart.AutomixV2Stems.enabled = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_STEMS, value).apply()
+    }
+
+    fun setAutomixNpuEnabled(value: Boolean) {
+        automixNpuEnabled.value = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_NPU, value).apply()
     }
 
     fun setSkipSilence(value: Boolean) {
@@ -2284,6 +2314,9 @@ object AppSettings {
     private const val KEY_CROSSFADE = "crossfade_seconds"
     private const val KEY_SMART_FADE = "smart_fade_enabled"
     private const val KEY_AUTOMIX_PERFORMANCE_MODE = "automix_performance_mode"
+    private const val KEY_AUTOMIX_DJ_LEVEL = "automix_dj_level"
+    private const val KEY_AUTOMIX_STEMS = "automix_stems_v2"
+    private const val KEY_AUTOMIX_NPU = "automix_npu"
     private const val KEY_SKIP_SILENCE = "skip_silence"
     private const val KEY_OUTPUT_PCM_MODE = "output_pcm_mode"
     private const val KEY_PREFER_USB_DAC = "prefer_usb_dac"

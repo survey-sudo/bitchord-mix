@@ -57,3 +57,22 @@ Technologies, Inc. and/or its subsidiaries and is governed by the
 license in app/src/main/assets/licenses/Qualcomm-AI-Runtime-LICENSE.pdf
 and the notices in Qualcomm-AI-Runtime-QNN-NOTICE.txt. All rights
 reserved; no rights are granted except as stated in that license.
+
+## Automix v2 models (bundled / downloaded)
+
+SCNet: Sparse Compression Network for Music Source Separation, W. Tong et al., ICASSP 2024.
+Code and pretrained weights (c) 2024 starrytong, MIT License. ONNX export by audiojs.
+Bundled as `assets/scnet.int8.onnx` (SHA-256 98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845).
+
+Open-Unmix (UMX-HQ), F.-R. Stöter, S. Uhlich, A. Liutkus, Y. Mitsufuji, JOSS 2019,
+(c) Inria / Sony, MIT License.
+
+Both models were trained on MUSDB18-HQ, which its authors license for research and educational use;
+whether that reaches trained weights is unsettled and is recorded here for legal review.
+
+## Automix v2 NPU runtime
+
+ONNX Runtime with the QNN execution provider (`com.microsoft.onnxruntime:onnxruntime-android-qnn`), MIT License.
+Qualcomm AI Engine Direct / QAIRT runtime libraries (`com.qualcomm.qti:qnn-runtime`: libQnnHtp*, libQnnSystem),
+proprietary, (c) Qualcomm Technologies, Inc., redistributed under Qualcomm's licence terms shipped with that
+artifact. Review those terms before any public release.

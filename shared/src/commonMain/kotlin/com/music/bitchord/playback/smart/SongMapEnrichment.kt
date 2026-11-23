@@ -1,5 +1,7 @@
 package com.music.bitchord.playback.smart
 
+import com.music.bitchord.playback.smart.structure.AutomixV2Structure
+import com.music.bitchord.playback.smart.structure.StructureV2
 import kotlin.math.abs
 
 /**
@@ -110,6 +112,10 @@ object SongMapEnrichment {
             lastVocalBar = last,
             pickupBeats = pickup,
             startKind = startKind,
+            // AUTOMIX-V2(D): intro/outro vocal-free counts follow the measured vocals.
+            structure = base.structure?.let { v2 ->
+                if (AutomixV2Structure.enabled) runCatching { StructureV2.refreshEdges(v2, outSung) }.getOrElse { v2 } else v2
+            },
         )
     }
 }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <new>
+#include <vector>
 
 #include "loopmix/loop_mix_renderer.h"
 
@@ -80,7 +81,8 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEnvelope(
       : kind == 6                    ? &deck->highDb
       : kind == 7                    ? &deck->flangerWet
       : kind == 8                    ? &deck->reverbSend
-                                     : nullptr;
+                                     // AUTOMIX-V2(C): kinds 9..19 (stems, FX, brake, knob).
+                                     : bitchord::loopmix::v2Envelope(*deck, kind);
   if (envelope == nullptr) return;
   const jsize points = std::min(env->GetArrayLength(times), env->GetArrayLength(values));
   envelope->times.resize(points);
@@ -172,6 +174,86 @@ JNIEXPORT jdouble JNICALL
 Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeHeard(JNIEnv*, jclass, jlong handle, jint index) {
   Deck* deck = DeckOf(handle, index);
   return deck != nullptr ? deck->heard.load() : 0.0;
+}
+
+// ---- AUTOMIX-V2(C) -------------------------------------------------------
+
+JNIEXPORT jint JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeV2Capabilities(JNIEnv*, jclass) {
+  return Renderer::capabilities();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetDeckStem(
+    JNIEnv* env, jclass, jlong handle, jint index, jint kind, jfloatArray left, jfloatArray right) {
+  if (handle == 0 || left == nullptr || right == nullptr) return JNI_FALSE;
+  const jsize frames = std::min(env->GetArrayLength(left), env->GetArrayLength(right));
+  if (frames <= 0) return JNI_FALSE;
+  // Worker thread: copy out, quantize into the deck (no Java callbacks held open).
+  std::vector<float> l(static_cast<size_t>(frames)), r(static_cast<size_t>(frames));
+  env->GetFloatArrayRegion(left, 0, frames, l.data());
+  env->GetFloatArrayRegion(right, 0, frames, r.data());
+  if (env->ExceptionCheck()) return JNI_FALSE;
+  return From(handle)->setDeckStem(index, kind, l.data(), r.data(), static_cast<int>(frames)) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeClearDeckStems(JNIEnv*, jclass, jlong handle,
+                                                                            jint index) {
+  if (handle != 0) From(handle)->clearDeckStems(index);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetPhaser(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble rateBeats, jfloat depth, jfloat feedback) {
+  if (handle != 0) From(handle)->setPhaser(index, rateBeats, depth, feedback);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetGate(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble beatSec, jfloat division, jfloat swing) {
+  if (handle != 0) From(handle)->setGate(index, beatSec, division, swing);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetRiser(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble beatSec, jdouble lengthBeats) {
+  if (handle != 0) From(handle)->setRiser(index, beatSec, lengthBeats);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetPump(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble beatSec, jboolean fullBand) {
+  if (handle != 0) From(handle)->setPump(index, beatSec, fullBand == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetBrake(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble startSec, jdouble lengthSec, jboolean spinback) {
+  if (handle != 0) From(handle)->setBrake(index, startSec, lengthSec, spinback == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoudnessMatch(
+    JNIEnv*, jclass, jlong handle, jboolean enabled, jfloat targetLufs) {
+  if (handle != 0) From(handle)->setLoudnessMatch(enabled == JNI_TRUE, targetLufs);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetTruePeak(JNIEnv*, jclass, jlong handle,
+                                                                         jboolean on) {
+  if (handle != 0) From(handle)->setTruePeak(on == JNI_TRUE);
+}
+
+JNIEXPORT jdouble JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeShortTermLufs(JNIEnv*, jclass, jlong handle,
+                                                                           jint which) {
+  return handle != 0 ? From(handle)->shortTermLufs(which) : -120.0;
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeLoudnessGuardDb(JNIEnv*, jclass, jlong handle) {
+  return handle != 0 ? From(handle)->loudnessGuardDb() : 0.f;
 }
 
 }  // extern "C"

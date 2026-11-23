@@ -129,6 +129,9 @@ android {
     sourceSets {
         getByName("main") {
             java.srcDir("../wearos/protocol")
+            // AUTOMIX-V2(A): QNN now comes from Maven (onnxruntime-android-qnn +
+            // qnn-runtime, see dependencies); npu-addon/ stays OFF the jniLibs source
+            // sets (it would add a second libonnxruntime.so). Historical note follows.
             // QNN disabled in vc70 (see NpuSupport.QNN_ENABLED): the
             // reduced-ORT build in npu-addon/prebuilt cannot see the ops
             // ORT's optimizer introduces at load time, so both models fail
@@ -236,18 +239,40 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     packaging {
-        // Full Maven ORT ships (no pickFirsts override): the reduced-ORT
-        // pickFirsts trick is gone, so the AAR's full libonnxruntime.so is
-        // the only copy. QAIRT libs no longer ship either (see sourceSets:
-        // npu-addon is not a jniLibs source set), so the legacy-compressed
-        // rationale (shrinking 88 MB + 2x13 MB) is gone too: modern
-        // uncompressed aligned packaging, loaded via System.loadLibrary
-        // (no dlopen-by-path remains). extractNativeLibs=true in the
-        // manifest still works with this (it just extracts on install);
-        // flipping it to false is a separate cleanup, not needed for the
-        // ORT restore.
+        // AUTOMIX-V2(A): onnxruntime-android-qnn (one libonnxruntime.so, from that AAR
+        // only) + Qualcomm qnn-runtime (libQnnHtp, libQnnSystem, libQnnHtpPrepare,
+        // libQnnHtpV73Stub/Skel ...). Legacy (compressed, extracted-on-install) packaging is
+        // REQUIRED again: the HTP backend is dlopened by path from nativeLibraryDir and the
+        // DSP loads libQnnHtpV73Skel.so through ADSP_LIBRARY_PATH, which needs a real file on
+        // disk, not a page inside base.apk. 16 KB page-size support is unaffected: extracted
+        // libs need 16 KB-aligned ELF LOAD segments (our libs link with
+        // -Wl,-z,max-page-size=16384, see CMakeLists.txt), not 16 KB zip alignment.
+        // The manifest's extractNativeLibs="true" already matches this.
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
+            // Hexagon stubs/skels for other HTP generations are dead weight on the target
+            // (SM8635 = v73). Keep them all with -Pbitchord.qnnAllArchs=true (other phones
+            // then use the NPU too); without them a non-v73 phone fails the QNN open and
+            // stays on CPU, which is the designed fallback.
+            if (project.findProperty("bitchord.qnnAllArchs")?.toString() != "true") {
+                for (arch in listOf("V68", "V69", "V75", "V79", "V81")) {
+                    excludes += "**/libQnnHtp${arch}Stub.so"
+                    excludes += "**/libQnnHtp${arch}Skel.so"
+                    excludes += "**/libQnnHtp${arch}CalculatorStub.so"
+                }
+                // Other QNN backends (GPU, DSP, CPU reference, saver) are never used.
+                excludes += "**/libQnnGpu.so"
+                excludes += "**/libQnnDsp.so"
+                excludes += "**/libQnnDspV66Stub.so"
+                excludes += "**/libQnnDspV66Skel.so"
+                excludes += "**/libQnnCpu.so"
+                excludes += "**/libQnnSaver.so"
+            }
+            // When a precompiled beat_this_final0_qdq_ctx.onnx ships (tools/npu), the on-device
+            // graph compiler is not needed: -Pbitchord.qnnNoPrepare=true drops it (tens of MB).
+            if (project.findProperty("bitchord.qnnNoPrepare")?.toString() == "true") {
+                excludes += "**/libQnnHtpPrepare.so"
+            }
         }
         resources {
             // SMBJ's BouncyCastle and jspecify both ship this descriptor.
@@ -455,11 +480,16 @@ dependencies {
     // The full android artifact, not onnxruntime-mobile: mobile only loads .ort
     // files, which would put an offline conversion step between the model and
     // the app for a saving that does not matter in a self-distributed APK.
-    // Version mirrors Orchard (mobile/android/app/build.gradle): 1.31.0. This
-    // full AAR's libonnxruntime.so ships as-is (no pickFirsts override);
-    // QNN is disabled via NpuSupport.QNN_ENABLED (vc70 ORT restore), so the
-    // from-source reduced build in npu-addon/ does not enter the APK.
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.31.0")
+    // AUTOMIX-V2(A): the QNN build of the full runtime REPLACES onnxruntime-android
+    // 1.31.0 (never both: exactly one libonnxruntime.so may reach the APK; CI audits it).
+    // 1.29.0 is the newest onnxruntime-android-qnn on Maven Central; its POM depends on
+    // com.qualcomm.qti:qnn-runtime 2.42.0, pinned explicitly below so a transitive bump can
+    // never silently change the QAIRT version the EP-context caches (and any offline
+    // _qdq_ctx.onnx from tools/npu) were compiled against. The Java API used here (addQnn,
+    // addConfigEntry, createSession) is identical in 1.29 and 1.31. Whether QNN is used at
+    // runtime is decided by NpuSupport.runtimeEnabled() (user switch + self-test + auto-disable).
+    implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0")
+    implementation("com.qualcomm.qti:qnn-runtime:2.42.0")
 
     // ---- Casting: Google Cast sender + the route discovery it sits on ----
     // The framework and the router only. media3-cast is left out on purpose:

@@ -1,5 +1,7 @@
 package com.music.bitchord.playback.smart
 
+import com.music.bitchord.playback.smart.structure.StructureResult
+
 /**
  * One track's form. Cues and the planner read only these scalars. Nothing
  * here is a frame sequence that gets compared with another track.
@@ -86,8 +88,36 @@ data class SongMap(
     val activation: Float = 1f,
     val speechLike: Boolean = false,
     val chorusCount: Int = sections.count { it.fn == SectionFn.CHORUS },
+    // AUTOMIX-V2(D): structure v2 evidence. All default to "not measured" so every
+    // existing constructor and copy() keeps compiling and behaving exactly as before.
+    /** Track seconds of drop downbeats (bass + energy re-entry after a build/breakdown). Sorted. */
+    val drops: List<Double> = emptyList(),
+    /** Track-second spans of builds; each ends exactly on the drop it leads into. */
+    val builds: List<ClosedFloatingPointRange<Double>> = emptyList(),
+    /** Track-second spans of breakdowns (bass-light, quieter interior stretches). */
+    val breakdowns: List<ClosedFloatingPointRange<Double>> = emptyList(),
+    /**
+     * Repetition families as start times (seconds). [0] is the chorus family
+     * (the drop family on dance tracks); later entries are hooks. Empty = none found.
+     */
+    val chorusRepeats: List<List<Double>> = emptyList(),
+    /** 0..1 confidence that section starts here are real phrase boundaries. 0 = not measured. */
+    val phraseConfidence: Double = 0.0,
+    /** 1 = vc80 analyzer only; 2 = structure v2 ran (fields above are measured, possibly empty). */
+    val structureVersion: Int = 1,
+    /** Full v2 detail (sections with HOOK/BREAKDOWN, rekordbox tags, mode/mood, intro/outro mixability). */
+    val structure: StructureResult? = null,
 ) {
     val barSec: Double get() = if (bpm > 1.0) beatsPerBar * 60.0 / bpm else 0.0
+
+    /** AUTOMIX-V2(D): the drop downbeat at or after [sec], or null. */
+    fun nextDropAt(sec: Double): Double? = drops.firstOrNull { it >= sec - 1e-6 }
+
+    /** AUTOMIX-V2(D): true when [sec] sits inside a build. */
+    fun inBuild(sec: Double): Boolean = builds.any { sec >= it.start && sec < it.endInclusive }
+
+    /** AUTOMIX-V2(D): true when [sec] sits inside a breakdown. */
+    fun inBreakdown(sec: Double): Boolean = breakdowns.any { sec >= it.start && sec < it.endInclusive }
 
     fun barTime(bar: Int): Double {
         if (bar < 0) return 0.0

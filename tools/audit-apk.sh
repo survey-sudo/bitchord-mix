@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# APK audit for vc90 (2.2.3-djmix48). Runs anywhere with unzip + python3; uses aapt2/apksigner
+# APK audit for vc93 (2.3.0-djmix51). Runs anywhere with unzip + python3; uses aapt2/apksigner
 # when an SDK is present, and degrades to structural checks when it is not.
 #
 #   ./audit-apk.sh path/to/app.apk
@@ -29,8 +29,8 @@ if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
   echo "versionCode: ${2:-?}"
   echo "versionName: ${3:-?}"
   [ "${1:-}" = "com.music.bitchord.loopfix" ] && ok "package is loopfix" || bad "package is not com.music.bitchord.loopfix"
-  [ "${2:-}" = "91" ] && ok "versionCode 91" || bad "versionCode is not 91 (got ${2:-?})"
-  [ "${3:-}" = "2.2.3-djmix49" ] && ok "versionName 2.2.3-djmix49" || bad "versionName is not 2.2.3-djmix49 (got ${3:-?})"
+  [ "${2:-}" = "93" ] && ok "versionCode 93" || bad "versionCode is not 93 (got ${2:-?})"
+  [ "${3:-}" = "2.3.0-djmix51" ] && ok "versionName 2.3.0-djmix51" || bad "versionName is not 2.3.0-djmix51 (got ${3:-?})"
 else
   echo "aapt2 not found — skipping badging; set ANDROID_HOME to enable"
 fi
@@ -38,19 +38,34 @@ fi
 # --- native payload ---------------------------------------------------------
 listing=$(unzip -l "$APK")
 
+# AUTOMIX-V2(B): bundled 4-stem SCNet int8 model (12,900,277 B).
+if grep -q 'assets/scnet\.int8\.onnx$' <<< "$listing"; then
+  scnet_size=$(printf '%s\n' "$listing" | awk '/assets\/scnet\.int8\.onnx$/{print $1}' | head -1)
+  if [ "${scnet_size:-0}" = "12900277" ]; then
+    ok "assets/scnet.int8.onnx present (12900277 B)"
+  else
+    bad "assets/scnet.int8.onnx is ${scnet_size:-?} B, expected 12900277"
+  fi
+else
+  bad "assets/scnet.int8.onnx MISSING"
+fi
+
 # Exactly one onnxruntime, at the size the release line was pinned to. Two
 # copies means a stale ABI or a duplicated dependency; a wrong size means the
 # ONNX build changed under us.
 onnx_count=$(printf '%s\n' "$listing" | grep -c 'lib/arm64-v8a/libonnxruntime\.so$')
 onnx_size=$(printf '%s\n' "$listing" | awk '/lib\/arm64-v8a\/libonnxruntime\.so$/{print $1}' | head -1)
 [ "$onnx_count" -eq 1 ] && ok "exactly one libonnxruntime.so" || bad "$onnx_count libonnxruntime.so copies"
-[ "${onnx_size:-0}" = "34208672" ] && ok "onnxruntime is 34208672 B" || bad "onnxruntime is ${onnx_size:-absent} B, expected 34208672"
+# AUTOMIX-V2(A): onnxruntime-android-qnn 1.29.0; pin its size here after the first CI build prints it.
+echo "        onnxruntime is ${onnx_size:-absent} B (onnxruntime-android-qnn 1.29.0)"
 
 # QNN/HTP: count NATIVE OBJECTS only. The first version of this check grepped
 # the whole listing for 'qnn|htp' and flagged the Qualcomm licence notice in
 # assets/licenses/, which fails a perfectly good APK. Scope it to lib/.
-qnn=$(printf '%s\n' "$listing" | grep -E 'lib/.*\.so' | grep -ciE 'qnn|htp' || true)
-[ "${qnn:-0}" -eq 0 ] && ok "zero QNN/HTP native libraries" || bad "$qnn QNN/HTP .so present"
+# AUTOMIX-V2(A): the QNN HTP runtime now ships in the main APK (Hexagon v73 for SM8635).
+for lib in libQnnHtp.so libQnnHtpV73Stub.so libQnnHtpV73Skel.so libQnnSystem.so; do
+  if grep -q "lib/arm64-v8a/$lib" <<< "$listing"; then ok "$lib present"; else bad "$lib MISSING (NPU path dead)"; fi
+done
 
 libs=$(printf '%s\n' "$listing" | grep -oE 'libbitchord_[a-z_]*\.so' | sort -u)
 lib_count=$(printf '%s\n' "$libs" | grep -c . || true)

@@ -1337,4 +1337,18 @@
     <string name="diwali_title">BitChord wishes you a Happy Diwali</string>
     <string name="diwali_subtitle">May this festival of lights fill your home with joy and your days with music.</string>
     <string name="diwali_cta">Let\'s Celebrate</string>
+    <!-- AUTOMIX-V2(orch) -->
+    <string name="automix_dj_level" translatable="false">DJ level</string>
+    <string name="automix_dj_level_subtitle" translatable="false">How much DJ Automix plays between songs</string>
+    <string name="automix_dj_level_footer" translatable="false">Every level beat-matches on the phrase and keeps one bassline at a time. Higher levels add stem tricks and effects, and fall back to a clean fade when a pair doesn\'t suit them.</string>
+    <string name="automix_dj_subtle" translatable="false">Subtle</string>
+    <string name="automix_dj_subtle_subtitle" translatable="false">Smooth blends and bass swaps, one light effect at most</string>
+    <string name="automix_dj_club" translatable="false">Club</string>
+    <string name="automix_dj_club_subtitle" translatable="false">Stem swaps, filter washes, echo-outs, drops landed on the beat</string>
+    <string name="automix_dj_festival" translatable="false">Festival</string>
+    <string name="automix_dj_festival_subtitle" translatable="false">Builds, risers, gates, brakes and two effects per transition</string>
+    <string name="automix_stems" translatable="false">Stem mixing</string>
+    <string name="automix_stems_subtitle" translatable="false">Splits vocals, drums, bass and other on the phone for cleaner swaps</string>
+    <string name="automix_npu" translatable="false">Use the NPU</string>
+    <string name="automix_npu_subtitle" translatable="false">Runs analysis on the Snapdragon neural engine when available, with CPU fallback</string>
 </resources>

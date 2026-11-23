@@ -1,5 +1,11 @@
 package com.music.bitchord.playback.smart
 
+import com.music.bitchord.playback.smart.structure.AutomixV2Structure
+import com.music.bitchord.playback.smart.structure.BarFeatureExtractor
+import com.music.bitchord.playback.smart.structure.StemBars
+import com.music.bitchord.playback.smart.structure.StructureResult
+import com.music.bitchord.playback.smart.structure.StructureV2
+import com.music.bitchord.playback.smart.structure.V2Bar
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -45,6 +51,11 @@ object StructureAnalyzer {
         partial: Boolean,
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
+        // AUTOMIX-V2(D): structure v2 bar features on the same [downbeats]; null = vc80 only.
+        v2Bars: List<V2Bar>? = null,
+        stems: StemBars? = null,
+        /** Proportional vocal mask (same convention as [mask]) read by v2 only when [mask] is null. */
+        v2Vocal: FloatArray? = null,
     ): SongMap {
         checkTime(startedMs, now)
         val n = bars.size
@@ -67,7 +78,7 @@ object StructureAnalyzer {
         }
         val coarse = beatsPerBar != 4 || gridConfidence < PhraseConfig.GRID_COARSE || conf < 0.4f
         val wall = if (startedMs > 0L) (now() - startedMs).toInt().coerceAtLeast(0) else 0
-        return SongMap(
+        val base = SongMap(
             trackKey = trackKey,
             durationSec = durationSec,
             bpm = bpm,
@@ -95,6 +106,207 @@ object StructureAnalyzer {
             speechLike = speechLike,
             chorusCount = sections.count { it.fn == SectionFn.CHORUS },
         )
+        // AUTOMIX-V2(D): structure v2 behind its flag; any failure keeps the vc80 map.
+        if (!AutomixV2Structure.enabled || v2Bars == null || v2Bars.size != n) return base
+        val barSecV2 = if (bpm > 1) beatsPerBar * 60.0 / bpm else durationSec / n
+        val v2 = runCatching {
+            StructureV2.analyze(
+                bars = v2Bars,
+                downbeats = downbeats,
+                bpm = bpm,
+                beatsPerBar = beatsPerBar,
+                vocal = BarFeatureExtractor.vocalPerBar(mask ?: v2Vocal, downbeats, barSecV2, durationSec),
+                lyricPrior = lyricPrior,
+                gridConfidence = gridConfidence,
+                stems = stems,
+            )
+        }.getOrNull() ?: return base
+        return runCatching { mergeV2(base, v2, bars, sung, contentEnd, gridConfidence) }.getOrElse { base }
+    }
+
+    /**
+     * AUTOMIX-V2(D): fold a [StructureResult] into the vc80 map.
+     *
+     * Events, chorus repeats and phrase confidence are always attached
+     * ([SongMap.structureVersion] = 2). Sections are rebuilt from v2 only when
+     * both confidence gates pass and v2 found a chorus family or a drop; then
+     * vc80 FADE_OUT / SILENCE overlays win, and a vc80 PRE_CHORUS / BUILD that
+     * ends on a v2 chorus or drop is adopted where v2 only saw verse/instrumental.
+     * Numeric section fields come from the vc80 bars, so energy levels stay on
+     * the scale the planner already calibrated against.
+     */
+    private fun mergeV2(
+        base: SongMap, v2: StructureResult, bars: List<Bar>, sung: BooleanArray, contentEnd: Double, gridConfidence: Float,
+    ): SongMap {
+        val n = bars.size
+        val drops = v2.drops.map { v2.barTime(it.bar) }
+        val builds = v2.builds.map { v2.barTime(it.startBar)..v2.barTime(it.endBar) }
+        val breakdowns = v2.breakdowns.map { v2.barTime(it.startBar)..v2.barTime(it.endBar) }
+        val repeats = v2.families.map { fam -> fam.map { v2.barTime(it) } }
+        val apply = v2.labelConfidence >= AutomixV2Structure.minLabelConfidence &&
+            v2.phraseConfidence >= AutomixV2Structure.minPhraseConfidence &&
+            (v2.hasChorusFamily || v2.drops.isNotEmpty()) && v2.sections.isNotEmpty()
+        if (!apply) {
+            return base.copy(
+                drops = drops, builds = builds, breakdowns = breakdowns, chorusRepeats = repeats,
+                phraseConfidence = v2.phraseConfidence, structureVersion = AutomixV2Structure.VERSION,
+                structure = v2.withApplied(false), chorusCount = base.chorusCount,
+            )
+        }
+        // Per-bar function from v2, then overlays.
+        val fnBar = Array(n) { SectionFn.INSTRUMENTAL }
+        val segBar = IntArray(n) { -1 }
+        val confBar = FloatArray(n) { 0.4f }
+        val groupBar = IntArray(n)
+        val repeatBar = IntArray(n)
+        for ((index, sec) in v2.sections.withIndex()) {
+            val prevKind = v2.sections.getOrNull(index - 1)?.kind
+            val fn = fnOfV2(sec.kind, prevKind)
+            for (b in sec.startBar until min(sec.endBar, n)) {
+                fnBar[b] = fn
+                segBar[b] = index
+                confBar[b] = sec.conf
+                groupBar[b] = sec.family
+                repeatBar[b] = sec.repeatIndex
+            }
+        }
+        var tag = v2.sections.size
+        // vc80 pre-chorus / build that lands on a v2 chorus or drop.
+        for (old in base.sections) {
+            if (old.fn != SectionFn.PRE_CHORUS && old.fn != SectionFn.BUILD) continue
+            val landing = v2.sections.firstOrNull {
+                (it.kind == SectionKind.CHORUS || it.kind == SectionKind.DROP) && abs(it.startBar - old.endBar) <= 1
+            } ?: continue
+            val len = old.endBar - old.startBar
+            if (len !in 2..16) continue
+            val from = (landing.startBar - len).coerceAtLeast(0)
+            var free = true
+            for (b in from until landing.startBar) {
+                val f = fnBar[b]
+                if (f != SectionFn.VERSE && f != SectionFn.INSTRUMENTAL && f != SectionFn.INTRO) free = false
+            }
+            if (!free || from >= landing.startBar) continue
+            val id = tag++
+            for (b in from until landing.startBar) {
+                fnBar[b] = old.fn
+                segBar[b] = id
+                confBar[b] = 0.55f
+                groupBar[b] = old.group + 1000
+                repeatBar[b] = old.repeatIndex
+            }
+        }
+        // vc80 fade / silence detection wins.
+        for (old in base.sections) {
+            if (old.fn != SectionFn.FADE_OUT && old.fn != SectionFn.SILENCE) continue
+            val id = tag++
+            for (b in old.startBar until min(old.endBar, n)) {
+                fnBar[b] = old.fn
+                segBar[b] = id
+                confBar[b] = old.conf
+                groupBar[b] = old.group + 1000
+                repeatBar[b] = old.repeatIndex
+            }
+        }
+        val median = median(bars.map { it.rmsDb })
+        val sections = ArrayList<PhraseSection>()
+        var a = 0
+        while (a < n) {
+            var z = a + 1
+            while (z < n && segBar[z] == segBar[a] && fnBar[z] == fnBar[a]) z++
+            var sungN = 0
+            var rms = 0.0
+            var low = 0.0
+            var flux = 0.0
+            for (i in a until z) {
+                if (sung.getOrElse(i) { false }) sungN++
+                rms += bars[i].rmsDb
+                low += bars[i].bass
+                flux += bars[i].flux
+            }
+            val len = z - a
+            val vocal = sungN.toFloat() / len
+            val mean = (rms / len).toFloat()
+            val energyRel = ((mean - median) / 6f).coerceIn(-1f, 1f)
+            val bass = (low / len).toFloat().coerceIn(0f, 1f)
+            val onsets = (flux / len / 0.5).toFloat().coerceIn(0f, 12f)
+            val level = energyLevel(mean, onsets, bass, energyRel)
+            sections.add(
+                PhraseSection(
+                    startBar = a,
+                    endBar = z,
+                    fn = fnBar[a],
+                    role = roleOf(fnBar[a], energyRel, vocal),
+                    conf = confBar[a],
+                    group = groupBar[a],
+                    repeatIndex = repeatBar[a],
+                    energy = ((level - 1) / 9f).coerceIn(0f, 1f),
+                    energyLevel = level,
+                    energyRel = energyRel,
+                    energySlope = slopeOf(bars, a, z),
+                    vocal = vocal,
+                    bass = bass,
+                    loopable = vocal < 0.2f && len >= 4,
+                    lufs = mean,
+                    onsetRate = onsets,
+                ),
+            )
+            a = z
+        }
+        val labelConf = run {
+            var w = 0f
+            var acc = 0f
+            for (sec in sections) {
+                val len = (sec.endBar - sec.startBar).coerceAtLeast(1)
+                w += len
+                acc += sec.conf * len
+            }
+            if (w <= 0f) 0f else acc / w
+        }
+        // Local phrase anchors: confident v2 starts that break the running 4-bar count.
+        val anchors = ArrayList<Int>()
+        anchors.add(base.phraseAnchor)
+        var local = base.phraseAnchor
+        for (sec in v2.sections) {
+            val b = sec.startBar
+            if (b <= local || sec.startConfidence < 0.5f) continue
+            if ((b - local) % 4 != 0) {
+                anchors.add(b)
+                local = b
+            }
+        }
+        val start = startKind(sections, base.firstVocalBar)
+        val ending = endingKind(sections, bars, contentEnd, base.downbeats, base.bpm, base.beatsPerBar)
+        return base.copy(
+            sections = sections,
+            anchors = anchors.toIntArray(),
+            startKind = start,
+            endingKind = ending,
+            labelConfidence = labelConf,
+            coarse = base.beatsPerBar != 4 || gridConfidence < PhraseConfig.GRID_COARSE || labelConf < 0.4f,
+            chorusCount = sections.count { it.fn == SectionFn.CHORUS },
+            drops = drops,
+            builds = builds,
+            breakdowns = breakdowns,
+            chorusRepeats = repeats,
+            phraseConfidence = v2.phraseConfidence,
+            structureVersion = AutomixV2Structure.VERSION,
+            structure = v2.withApplied(true),
+        )
+    }
+
+    /** AUTOMIX-V2(D): v2 kind to the planner's [SectionFn]. */
+    private fun fnOfV2(kind: SectionKind, previous: SectionKind?): SectionFn = when (kind) {
+        SectionKind.INTRO -> SectionFn.INTRO
+        SectionKind.VERSE -> SectionFn.VERSE
+        SectionKind.PRE_CHORUS -> SectionFn.PRE_CHORUS
+        SectionKind.CHORUS -> SectionFn.CHORUS
+        SectionKind.HOOK -> if (previous == SectionKind.CHORUS || previous == SectionKind.DROP) SectionFn.POST_CHORUS else SectionFn.CHORUS
+        SectionKind.BRIDGE -> SectionFn.BRIDGE
+        SectionKind.INST -> SectionFn.INSTRUMENTAL
+        SectionKind.OUTRO -> SectionFn.OUTRO
+        SectionKind.BUILD -> SectionFn.BUILD
+        SectionKind.DROP -> SectionFn.DROP
+        SectionKind.BREAKDOWN -> SectionFn.BREAK
     }
 
     /**
@@ -113,6 +325,11 @@ object StructureAnalyzer {
         startedMs: Long = 0L,
         now: () -> Long = { 0L },
         fullTrackDurationSec: Double = 0.0,
+        // AUTOMIX-V2(D): downbeats from Beat This! / the native DSP (track seconds) and
+        // per-bar stem levels. Both optional; ignored when AutomixV2Structure is off.
+        downbeatsHint: DoubleArray? = null,
+        stems: StemBars? = null,
+        v2Vocal: FloatArray? = null,
     ): SongMap {
         val mono = if (sampleRate == RATE) pcm else resample(pcm, sampleRate, RATE)
         val frames = frames(mono)
@@ -123,7 +340,25 @@ object StructureAnalyzer {
         val beatSec = 60.0 / bpm.coerceAtLeast(1.0)
         val barSec = beatSec * 4.0
         val barsN = max(1, (pcmDurationSec / barSec).toInt())
-        val downbeats = DoubleArray(barsN) { it * barSec }
+        var downbeats = DoubleArray(barsN) { it * barSec }
+        // AUTOMIX-V2(D): own front end at the caller's rate + bar-phase repair. Skipped
+        // (vc80 path untouched) when disabled or when half the time budget is gone.
+        var v2Bars: List<V2Bar>? = null
+        val budgetLeft = startedMs <= 0L || now() <= 0L || now() - startedMs < PhraseConfig.STRUCT_TIMEOUT_MS / 2
+        if (AutomixV2Structure.enabled && budgetLeft) {
+            runCatching {
+                val v2Frames = BarFeatureExtractor.frames(pcm, sampleRate)
+                val hinted = gridFromHint(downbeatsHint, barSec, pcmDurationSec)
+                val grid = when {
+                    hinted != null -> hinted
+                    AutomixV2Structure.estimateGrid -> BarFeatureExtractor.estimateGrid(v2Frames, bpm, pcmDurationSec).downbeats
+                    else -> null
+                }
+                val chosen = if (grid != null && grid.isNotEmpty() && (hinted != null || grid[0] > 1e-9)) grid else downbeats
+                v2Bars = BarFeatureExtractor.bars(v2Frames, chosen, 4, barSec)
+                downbeats = chosen
+            }.onFailure { v2Bars = null }
+        }
         val bars = beatSync(frames, downbeats, beatSec)
         val fluxPeak = frames.maxOfOrNull { it.flux } ?: 0f
         val activation = if (fluxPeak <= 1e-6f) 0f else (frames.map { it.flux }.average() / fluxPeak).toFloat()
@@ -131,13 +366,35 @@ object StructureAnalyzer {
             trackKey, effectiveDuration, bpm, 4, downbeats, bars,
             mask, lyricPrior, gridConfidence = if (activation < PhraseConfig.ACTIVATION_FLOOR) 0.3f else 0.8f,
             tempoStable = true, activation = activation, speechLike = false, partial = effectivePartial,
-            startedMs = startedMs, now = now,
+            startedMs = startedMs, now = now, v2Bars = v2Bars, stems = stems, v2Vocal = v2Vocal,
         )
         return if (fullTrackDurationSec > pcmDurationSec + 1.0) {
             map.copy(contentEndSec = effectiveDuration)
         } else {
             map
         }
+    }
+
+    /**
+     * AUTOMIX-V2(D): a usable bar grid from external downbeats. Used as-is when
+     * they tile the PCM at a steady bar length; otherwise only their phase is
+     * kept on a uniform grid; null when they are absent or disagree with [barSec].
+     */
+    private fun gridFromHint(hint: DoubleArray?, barSec: Double, pcmDurationSec: Double): DoubleArray? {
+        if (hint == null || barSec <= 0.0) return null
+        val d = hint.filter { it.isFinite() && it >= 0.0 && it < pcmDurationSec }.sorted()
+        if (d.size < 8) return null
+        val gaps = ArrayList<Double>()
+        for (i in 1 until d.size) gaps.add(d[i] - d[i - 1])
+        val medianGap = gaps.sorted()[gaps.size / 2]
+        if (abs(medianGap - barSec) / barSec > 0.04) return null
+        val steady = gaps.all { abs(it - barSec) / barSec <= 0.15 }
+        if (steady && d.first() < 2.0 * barSec && d.last() > pcmDurationSec - 2.0 * barSec) {
+            return d.toDoubleArray()
+        }
+        val phase = ((d.first() % barSec) + barSec) % barSec
+        val count = max(1, ((pcmDurationSec - phase) / barSec).toInt())
+        return DoubleArray(count) { phase + it * barSec }
     }
 
     private fun empty(

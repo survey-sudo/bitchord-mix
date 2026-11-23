@@ -26,10 +26,14 @@ add_library(bitchord_analysis SHARED
     ${BITCHORD_NATIVE_DIR}/analyzer/resampler.cpp
     ${BITCHORD_NATIVE_DIR}/analyzer/mel_spectrogram.cpp
     ${BITCHORD_NATIVE_DIR}/analyzer/vocal_spectrogram.cpp
+    # AUTOMIX-V2(B): 4-stem separation DSP (STFT/Wiener/iSTFT/chunking) + JNI.
+    ${BITCHORD_NATIVE_DIR}/analyzer/stem_dsp.cpp
     jni/analysis_jni.cpp
     jni/mel_jni.cpp
     jni/vocal_jni.cpp
     jni/npu_jni.cpp
+    # AUTOMIX-V2(B)
+    jni/stem_jni.cpp
 )
 
 target_include_directories(bitchord_analysis PRIVATE

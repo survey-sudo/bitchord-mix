@@ -1219,6 +1219,7 @@ void printUsage(std::ostream& os, const char* argv0) {
      << "  " << argv0 << " --reverb-stop-probe\n"
      << "  " << argv0 << " --loop-domain-probe\n"
      << "  " << argv0 << " --lp-bypass-probe\n"
+     << "  " << argv0 << " --v2-probe\n"
      << "  " << argv0
      << " --out-bed <wav> --out-voc <wav> --in-bed <wav> --in-voc <wav>"
         " --out-prefix <path> [--clashE <val>] [--csv <gain.csv>]\n"
@@ -1640,6 +1641,359 @@ int runLpBypassProbe() {
   return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// --v2-probe (AUTOMIX-V2 Stream C): one compact gate for every v2 DSP block.
+//  1. stems: unity stems == dry bit-for-bit; a vocal kill nulls against a
+//     dry-minus-vocal deck below -90 dBFS, on a wrapping loop and a loop roll.
+//  2. each FX: bit-identical to the plain render while its envelope is 0;
+//     finite, |x| <= 1, no denormals, and audibly different when active.
+//  3. brake / spinback: reach exact silence, no step larger than the music's
+//     own, no exit-gate trip with the fader still up.
+//  4. loudness guard: short-term loudness of a constant-sum crossfade of
+//     uncorrelated noise stays within 2 LU (fail) / 1.5 LU (target) of the
+//     A->B line; without the guard the dip must exceed 2 LU (sensitivity).
+// ---------------------------------------------------------------------------
+
+namespace v2probe {
+
+using bitchord::loopmix::Deck;
+using bitchord::loopmix::Envelope;
+
+constexpr double kBeat = 0.5;
+
+void setEnv(Envelope& e, std::vector<double> t, std::vector<float> v) {
+  e.times = std::move(t);
+  e.values = std::move(v);
+  e.exponential = false;
+}
+
+/** Straight rate-1 deck, one knot per beat over [0, lenSec] (mix seconds == region seconds). */
+void straightDeck(Deck& d, const std::vector<float>& l, const std::vector<float>& r, double lenSec, double stopAt) {
+  d.left = l;
+  d.right = r;
+  d.regionStart = 0.0;
+  d.loopStart = 0;
+  d.loopEnd = 0;
+  d.releaseAt = 1e18;
+  d.knotTimes.clear();
+  d.knotPositions.clear();
+  const int beats = int(std::lround(lenSec / kBeat));
+  for (int k = 0; k <= beats; ++k) {
+    d.knotTimes.push_back(k * kBeat * kSampleRate);
+    d.knotPositions.push_back(k * kBeat * kSampleRate);
+  }
+  d.runOn = false;
+  d.stopAt = stopAt;
+  d.preroll = 0.4;
+  d.level = 1.0f;
+}
+
+/** A 2 s loop starting at region second 1, never released: wraps at 3, 5, 7 s of input. */
+void loopDeck(Deck& d, const std::vector<float>& l, const std::vector<float>& r, double lenSec) {
+  straightDeck(d, l, r, lenSec, 1e18);
+  d.loopStart = 1 * kSampleRate;
+  d.loopEnd = 3 * kSampleRate;
+  for (size_t k = 0; k < d.knotPositions.size(); ++k) d.knotPositions[k] += 1.0 * kSampleRate;
+  d.runOn = true;
+}
+
+struct Out {
+  std::vector<float> pcm;
+  int64_t first = 0;
+  int violations = 0;
+  double at(int64_t frame, int ch) const {
+    const int64_t i = frame - first;
+    return (i >= 0 && size_t(i) * 2 + 1 < pcm.size()) ? double(pcm[size_t(i) * 2 + size_t(ch)]) : 0.0;
+  }
+};
+
+Out renderTo(Renderer& r, double endSec, int block) {
+  r.prepare();
+  Out o;
+  o.first = r.firstFrame();
+  const int64_t end = int64_t(std::llround(endSec * kSampleRate));
+  o.pcm.assign(size_t(end - o.first) * 2, 0.0f);
+  for (int64_t f = o.first; f < end;) {
+    const int n = int(std::min<int64_t>(block, end - f));
+    r.render(f, o.pcm.data() + size_t(f - o.first) * 2, n);
+    f += n;
+  }
+  o.violations = r.exitGateViolations();
+  return o;
+}
+
+double toDb(double rms) { return rms > 0.0 && std::isfinite(rms) ? 20.0 * std::log10(rms) : -240.0; }
+
+/** RMS (dBFS) and peak of a - b over the common span. */
+void diff(const Out& a, const Out& b, double& rmsDb, double& peak) {
+  const size_t n = std::min(a.pcm.size(), b.pcm.size());
+  double s = 0;
+  peak = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const double d = double(a.pcm[i]) - double(b.pcm[i]);
+    s += d * d;
+    peak = std::max(peak, std::abs(d));
+  }
+  rmsDb = toDb(n ? std::sqrt(s / double(n)) : 0.0);
+  if (a.first != b.first || a.pcm.size() != b.pcm.size()) { rmsDb = 0.0; peak = 1.0; }
+}
+
+/** Finite, |x| <= 1, and no float denormals anywhere. */
+bool clean(const Out& o, int* denormals) {
+  bool ok = true;
+  int dn = 0;
+  for (float v : o.pcm) {
+    if (!std::isfinite(v) || std::abs(v) > 1.0f) ok = false;
+    if (v != 0.0f && std::abs(v) < 1.17549435e-38f) ++dn;
+  }
+  if (denormals) *denormals = dn;
+  return ok && dn == 0;
+}
+
+double windowRmsDb(const Out& o, double s, double e) {
+  const int64_t fs = int64_t(std::llround(s * kSampleRate)), fe = int64_t(std::llround(e * kSampleRate));
+  double sum = 0;
+  int64_t n = 0;
+  for (int64_t f = fs; f < fe; ++f, ++n) sum += o.at(f, 0) * o.at(f, 0) + o.at(f, 1) * o.at(f, 1);
+  return toDb(n ? std::sqrt(sum / double(2 * n)) : 0.0);
+}
+
+double maxStep(const Out& o, double s, double e) {
+  const int64_t fs = int64_t(std::llround(s * kSampleRate)), fe = int64_t(std::llround(e * kSampleRate));
+  double m = 0;
+  for (int64_t f = fs + 1; f < fe; ++f)
+    for (int ch = 0; ch < 2; ++ch) m = std::max(m, std::abs(o.at(f, ch) - o.at(f - 1, ch)));
+  return m;
+}
+
+struct Mix {
+  std::vector<float> vL, vR, dL, dR, bL, bR, dryL, dryR;
+};
+
+/** Deterministic 4-stem song: vocal tones, beat-locked noise drums, 55 Hz bass, noise pad (OTHER). */
+Mix makeMix(size_t n) {
+  Mix m;
+  for (auto* v : {&m.vL, &m.vR, &m.dL, &m.dR, &m.bL, &m.bR, &m.dryL, &m.dryR}) v->assign(n, 0.0f);
+  probe::Lcg a(0x1234567u), b(0x89ABCDEu), c(0x2468ACEu), d(0x13579BDu);
+  for (size_t i = 0; i < n; ++i) {
+    const double t = double(i) / kSampleRate;
+    const double beatT = t - std::floor(t / kBeat) * kBeat;
+    const float kick = float(std::exp(-beatT / 0.03));
+    m.vL[i] = float(0.20 * std::sin(2 * kPi * 440 * t) + 0.08 * std::sin(2 * kPi * 880 * t));
+    m.vR[i] = 0.9f * m.vL[i];
+    m.dL[i] = 0.35f * kick * a.next();
+    m.dR[i] = 0.35f * kick * b.next();
+    m.bL[i] = float(0.25 * std::sin(2 * kPi * 55 * t));
+    m.bR[i] = m.bL[i];
+    m.dryL[i] = m.vL[i] + m.dL[i] + m.bL[i] + 0.05f * c.next();
+    m.dryR[i] = m.vR[i] + m.dR[i] + m.bR[i] + 0.05f * d.next();
+  }
+  return m;
+}
+
+void attachStems(Renderer& r, const Mix& m) {
+  const int n = int(m.dryL.size());
+  r.setDeckStem(0, 0, m.vL.data(), m.vR.data(), n);
+  r.setDeckStem(0, 1, m.dL.data(), m.dR.data(), n);
+  r.setDeckStem(0, 2, m.bL.data(), m.bR.data(), n);
+}
+
+bool stemsProbe() {
+  bool ok = true;
+  const Mix m = makeMix(size_t(9 * kSampleRate));
+  std::vector<float> noVocL(m.dryL.size()), noVocR(m.dryR.size());
+  for (size_t i = 0; i < m.dryL.size(); ++i) {
+    noVocL[i] = m.dryL[i] - m.vL[i];
+    noVocR[i] = m.dryR[i] - m.vR[i];
+  }
+  for (bool roll : {false, true}) {
+    auto build = [&](Renderer& r, const std::vector<float>& l, const std::vector<float>& rr) {
+      r.setHighQuality(false);
+      loopDeck(r.deck(0), l, rr, 7.0);
+      if (roll) r.setLoopRoll(0, true, 2.0, kBeat, 5.0, 8.0);
+    };
+    Renderer dry(kSampleRate), unity(kSampleRate), kill(kSampleRate), ref(kSampleRate);
+    build(dry, m.dryL, m.dryR);
+    build(unity, m.dryL, m.dryR);
+    attachStems(unity, m);
+    build(kill, m.dryL, m.dryR);
+    attachStems(kill, m);
+    setEnv(kill.deck(0).v2.stemGain[0], {0.0}, {0.0f});  // KIND_STEM_VOCALS = 0
+    build(ref, noVocL, noVocR);
+    const Out oDry = renderTo(dry, 6.5, 1024), oUnity = renderTo(unity, 6.5, 1024);
+    const Out oKill = renderTo(kill, 6.5, 1024), oRef = renderTo(ref, 6.5, 1024);
+    double uRms, uPeak, kRms, kPeak;
+    diff(oUnity, oDry, uRms, uPeak);
+    diff(oKill, oRef, kRms, kPeak);
+    const double vocalDb = windowRmsDb(oDry, 1.0, 6.0) - windowRmsDb(oKill, 1.0, 6.0);
+    std::printf("v2 stems %s: unity-vs-dry peak=%.3g (want 0); vocal-kill null rms=%.1f dBFS peak=%.3g (want < -90 dBFS); "
+                "kill removed %.2f dB\n", roll ? "loop-roll" : "loop", uPeak, kRms, kPeak, vocalDb);
+    if (uPeak != 0.0) { std::printf("FAIL v2 stems unity is not bit-identical to dry\n"); ok = false; }
+    if (!(kRms < -90.0)) { std::printf("FAIL v2 stems vocal-kill null above -90 dBFS\n"); ok = false; }
+    if (!(vocalDb > 1.0)) { std::printf("FAIL v2 stems vocal kill had no effect\n"); ok = false; }
+  }
+  return ok;
+}
+
+bool fxProbe() {
+  bool ok = true;
+  const Mix m = makeMix(size_t(8 * kSampleRate));
+  struct Case {
+    const char* name;
+    void (*setup)(Renderer&);
+    int kind;
+    float idle;
+    std::vector<double> t;
+    std::vector<float> v;
+  };
+  const std::vector<double> win = {1.5, 1.6, 4.4, 4.5};
+  const std::vector<float> on = {0.f, 1.f, 1.f, 0.f};
+  const std::vector<Case> cases = {
+      {"phaser", [](Renderer& r) { r.setPhaser(0, 4.0, 0.8f, 0.5f); }, 14, 0.f, win, on},
+      {"gate", [](Renderer& r) { r.setGate(0, kBeat, 4.f, 0.1f); }, 15, 0.f, win, on},
+      {"stutter", [](Renderer& r) { r.setGate(0, kBeat, -2.f, 0.f); }, 15, 0.f, win, on},
+      {"pump-low", [](Renderer& r) { r.setPump(0, kBeat, false); }, 17, 0.f, win, on},
+      {"pump-full", [](Renderer& r) { r.setPump(0, kBeat, true); }, 17, 0.f, win, on},
+      {"riser", [](Renderer& r) { r.setRiser(0, kBeat, 6.0); }, 16, 0.f, win, on},
+      {"filter-knob+res", [](Renderer& r) { bitchord::loopmix::v2Envelope(r.deck(0), 13)->times = {0.0};
+                                            bitchord::loopmix::v2Envelope(r.deck(0), 13)->values = {2.5f}; },
+       19, 0.f, {1.5, 3.0, 4.5}, {0.f, -0.9f, 0.85f}},
+      {"brake", [](Renderer& r) { r.setBrake(0, 2.0, 1.0, false); }, 18, 0.f, {2.0, 3.0}, {0.f, 1.f}},
+      {"spinback", [](Renderer& r) { r.setBrake(0, 2.0, 1.0, true); }, 18, 0.f, {2.0, 3.0}, {0.f, 1.f}},
+  };
+  Renderer plain(kSampleRate);
+  plain.setHighQuality(false);
+  straightDeck(plain.deck(0), m.dryL, m.dryR, 7.0, 1e18);
+  const Out oPlain = renderTo(plain, 6.0, 777);
+  for (const Case& c : cases) {
+    Renderer idle(kSampleRate), live(kSampleRate);
+    for (Renderer* r : {&idle, &live}) {
+      r->setHighQuality(false);
+      straightDeck(r->deck(0), m.dryL, m.dryR, 7.0, 1e18);
+      c.setup(*r);
+    }
+    // Idle: the envelope is 0 throughout (for the knob+res case the Q multiplier is reset to 1).
+    setEnv(*bitchord::loopmix::v2Envelope(idle.deck(0), c.kind), {0.0}, {c.idle});
+    if (c.kind == 19) setEnv(*bitchord::loopmix::v2Envelope(idle.deck(0), 13), {0.0}, {1.0f});
+    setEnv(*bitchord::loopmix::v2Envelope(live.deck(0), c.kind), c.t, c.v);
+    const Out oIdle = renderTo(idle, 6.0, 777), oLive = renderTo(live, 6.0, 777);
+    double iRms, iPeak, lRms, lPeak;
+    diff(oIdle, oPlain, iRms, iPeak);
+    diff(oLive, oPlain, lRms, lPeak);
+    int dnIdle = 0, dnLive = 0;
+    const bool cleanIdle = clean(oIdle, &dnIdle), cleanLive = clean(oLive, &dnLive);
+    std::printf("v2 fx %-16s idle-vs-plain peak=%.3g  active diff rms=%.1f dBFS  finite/|x|<=1/no-denormal idle=%s live=%s (denormals %d/%d)\n",
+                c.name, iPeak, lRms, cleanIdle ? "yes" : "NO", cleanLive ? "yes" : "NO", dnIdle, dnLive);
+    if (iPeak != 0.0) { std::printf("FAIL v2 fx %s is not silent (bit-identical) at envelope 0\n", c.name); ok = false; }
+    if (!cleanIdle || !cleanLive) { std::printf("FAIL v2 fx %s produced non-finite, clipped or denormal output\n", c.name); ok = false; }
+    if (!(lRms > -60.0)) { std::printf("FAIL v2 fx %s had no audible effect when active\n", c.name); ok = false; }
+  }
+  return ok;
+}
+
+bool brakeProbe() {
+  bool ok = true;
+  const size_t n = size_t(7 * kSampleRate);
+  std::vector<float> l(n), r(n);
+  for (size_t i = 0; i < n; ++i) {
+    const double t = double(i) / kSampleRate;
+    l[i] = float(0.25 * std::sin(2 * kPi * 220 * t) + 0.15 * std::sin(2 * kPi * 330 * t));
+    r[i] = float(0.25 * std::sin(2 * kPi * 220 * t + 0.3) + 0.15 * std::sin(2 * kPi * 330 * t + 0.5));
+  }
+  for (bool spin : {false, true}) {
+    Renderer rr(kSampleRate);
+    rr.setHighQuality(false);
+    straightDeck(rr.deck(0), l, r, 6.0, 5.0);
+    setEnv(rr.deck(0).gain, {0.0, 10.0}, {1.0f, 1.0f});  // fader stays up through stopAt
+    rr.setBrake(0, 2.0, 1.5, spin);
+    const Out o = renderTo(rr, 5.5, 512);
+    const double refStep = maxStep(o, 1.0, 2.0);
+    const double brakeStep = maxStep(o, 2.0, 3.7);
+    const double tailDb = windowRmsDb(o, 3.6, 4.95);
+    const double limit = spin ? 4.5 : 1.25;
+    int dn = 0;
+    const bool cl = clean(o, &dn);
+    std::printf("v2 %s: pre-step=%.5f brake-step=%.5f (<= %.2fx) silence after=%.1f dBFS violations=%d clean=%s\n",
+                spin ? "spinback" : "brake", refStep, brakeStep, limit, tailDb, o.violations, cl ? "yes" : "NO");
+    if (!(brakeStep <= limit * refStep)) { std::printf("FAIL v2 brake click (step above the music's own)\n"); ok = false; }
+    if (!(tailDb < -120.0)) { std::printf("FAIL v2 brake does not reach silence\n"); ok = false; }
+    if (o.violations != 0) { std::printf("FAIL v2 completed brake tripped the exit gate\n"); ok = false; }
+    if (!cl) { std::printf("FAIL v2 brake output not clean\n"); ok = false; }
+  }
+  return ok;
+}
+
+bool loudnessProbe() {
+  bool ok = true;
+  constexpr double kLen = 20.0, kFadeIn = 4.0, kFadeOut = 16.0, kLiftDb = 2.0;
+  const size_t n = size_t((kLen + 1.0) * kSampleRate);
+  std::vector<float> aL(n), aR(n), bL(n), bR(n);
+  probe::Lcg s1(11u), s2(22u), s3(33u), s4(44u);
+  const float bGain = float(std::pow(10.0, kLiftDb / 20.0));
+  for (size_t i = 0; i < n; ++i) {
+    aL[i] = 0.15f * s1.next();
+    aR[i] = 0.15f * s2.next();
+    bL[i] = 0.15f * bGain * s3.next();
+    bR[i] = 0.15f * bGain * s4.next();
+  }
+  double maxDev[2] = {0, 0}, endGuard = 0;
+  for (int guard = 0; guard < 2; ++guard) {
+    Renderer r(kSampleRate);
+    r.setHighQuality(false);
+    straightDeck(r.deck(0), aL, aR, kLen, 1e18);
+    straightDeck(r.deck(1), bL, bR, kLen, 1e18);
+    // Constant-sum (linear) crossfade: right for correlated material, a ~3 dB dip for uncorrelated.
+    setEnv(r.deck(0).gain, {0.0, kFadeIn, kFadeOut}, {1.f, 1.f, 0.f});
+    setEnv(r.deck(1).gain, {0.0, kFadeIn, kFadeOut}, {0.f, 0.f, 1.f});
+    if (guard) r.setLoudnessMatch(true, -14.f);
+    const Out o = renderTo(r, kLen, 1024);
+    if (guard) endGuard = r.loudnessGuardDb();
+    bitchord::loopmix::v2::LoudnessMeter meter;
+    meter.setup(kSampleRate);
+    std::vector<double> st;  // short-term loudness at t = 0.1 k
+    for (int64_t f = 0; f < int64_t(kLen * kSampleRate); ++f) {
+      meter.push(float(o.at(f, 0)), float(o.at(f, 1)));
+      if ((f + 1) % (kSampleRate / 10) == 0) st.push_back(meter.shortTermLufs());
+    }
+    auto stAt = [&](double t) { const int k = int(std::lround(t * 10.0)) - 1; return st[size_t(std::clamp(k, 0, int(st.size()) - 1))]; };
+    const double la = stAt(kFadeIn), lb = stAt(kLen - 0.5);
+    double worst = 0;
+    for (double t = kFadeIn; t <= kLen - 0.5 + 1e-9; t += 0.1) {
+      // The A->B line, power-averaged over the same 3 s window the meter sees.
+      double p = 0;
+      int cnt = 0;
+      for (double tau = t - 3.0; tau < t; tau += 0.01, ++cnt) {
+        const double x = std::clamp((tau - kFadeIn) / (kFadeOut - kFadeIn), 0.0, 1.0);
+        p += std::pow(10.0, ((1.0 - x) * la + x * lb) / 10.0);
+      }
+      const double line = 10.0 * std::log10(p / cnt);
+      const double dev = stAt(t) - line;
+      if (std::abs(dev) > std::abs(worst)) worst = dev;
+    }
+    maxDev[guard] = worst;
+    std::printf("v2 loudness guard=%s: A=%.2f LUFS B=%.2f LUFS worst deviation from A->B line %+.2f LU\n",
+                guard ? "on " : "off", la, lb, worst);
+  }
+  if (!(std::abs(maxDev[0]) > 2.0)) { std::printf("FAIL v2 loudness probe insensitive (unguarded dip %.2f LU <= 2)\n", maxDev[0]); ok = false; }
+  if (!(std::abs(maxDev[1]) <= 2.0)) { std::printf("FAIL v2 loudness guard deviation %.2f LU > 2 LU\n", maxDev[1]); ok = false; }
+  std::printf("v2 loudness guard %s the 1.5 LU target (%.2f LU); guard gain after the overlap %.2f dB\n",
+              std::abs(maxDev[1]) <= 1.5 ? "meets" : "misses (within the 2 LU fail threshold)", std::abs(maxDev[1]), endGuard);
+  if (!(std::abs(endGuard) < 0.5)) { std::printf("FAIL v2 loudness guard did not release after the overlap\n"); ok = false; }
+  return ok;
+}
+
+}  // namespace v2probe
+
+int runV2Probe() {
+  bool ok = true;
+  ok = v2probe::stemsProbe() && ok;
+  ok = v2probe::fxProbe() && ok;
+  ok = v2probe::brakeProbe() && ok;
+  ok = v2probe::loudnessProbe() && ok;
+  std::printf("%s v2-probe (capabilities 0x%x)\n", ok ? "ok" : "FAIL", Renderer::capabilities());
+  return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1648,6 +2002,7 @@ int main(int argc, char** argv) {
   bool wantProbe = false;
   bool wantLoopDomain = false;
   bool wantLpBypass = false;
+  bool wantV2 = false;
   FileOpts opt;
   bool haveFileArgs = false;
   for (int i = 1; i < argc; ++i) {
@@ -1667,6 +2022,8 @@ int main(int argc, char** argv) {
       wantLoopDomain = true;
     } else if (arg == "--lp-bypass-probe") {
       wantLpBypass = true;
+    } else if (arg == "--v2-probe") {
+      wantV2 = true;
     } else if (arg == "--out-bed") {
       opt.outBed = needValue("--out-bed");
       haveFileArgs = true;
@@ -1717,6 +2074,7 @@ int main(int argc, char** argv) {
     return runFileMode(opt);
   }
   if (wantLpBypass) return runLpBypassProbe();
+  if (wantV2) return runV2Probe();
   if (wantLoopDomain) return runLoopDomainProbe();
   if (wantProbe) return runReverbStopProbe();
   if (wantSelftest || argc == 1) return runSelfTest();
