@@ -321,7 +321,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     /** How many times each rendition has been thrown off disk for being undecodable. */
     private val discarded = ConcurrentHashMap<String, Int>()
 
-    private val headAnalyzer = HeadAnalyzer(
+    // Explicit types: headAnalyzer and wholeTrackPipeline call into each other's lambdas,
+    // which otherwise makes Kotlin's property-type inference recursive (M9 T-1..T-5 extraction).
+    private val headAnalyzer: HeadAnalyzer = HeadAnalyzer(
         cache = cache,
         resolver = { resolver },
         badRenditions = badRenditions,
@@ -333,7 +335,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         },
     )
 
-    private val wholeTrackPipeline = WholeTrackPipeline(
+    private val wholeTrackPipeline: WholeTrackPipeline = WholeTrackPipeline(
         context = context,
         cache = cache,
         tracker = tracker,
