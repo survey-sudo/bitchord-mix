@@ -157,6 +157,38 @@ object ChoreoSessionGlue {
         return null
     }
 
+    /**
+     * Identity key for a [LoopMix.Plan]: the geometry the choreographer
+     * actually scored (both picks, fold, bar counts, loop/native flags).
+     * [LoopMix.Plan] carries no generation/planId of its own (that identity
+     * lives on `PairPreparer`'s generation / `Prep.pairKey` outside this
+     * glue), so identity here is this geometry key plus `Prep.pairKey`
+     * checked by callers.
+     */
+    fun planKey(plan: LoopMix.Plan): String = buildString {
+        append(plan.out.loopStart).append('/').append(plan.out.loopEnd).append('/')
+        append(plan.out.bars).append('/').append(plan.out.beatSec).append('/')
+        append(plan.out.bpm).append('|')
+        append(plan.inn.loopStart).append('/').append(plan.inn.loopEnd).append('/')
+        append(plan.inn.bars).append('/').append(plan.inn.beatSec).append('/')
+        append(plan.inn.bpm).append('|')
+        append(plan.fold).append('/').append(plan.enterBars).append('/')
+        append(plan.rampBars).append('/').append(plan.exitBars).append('/')
+        append(plan.totalBars).append('/').append(plan.outLoops).append('/')
+        append(plan.inLoops).append('/').append(plan.nativeIncoming)
+    }
+
+    /**
+     * True when [plan] is the plan [prepPlan] was prepared from. Identity
+     * (`===`) fast-paths the common case; otherwise the [planKey] geometry
+     * must match. Deliberately ignores `incomingHoldSec`/`handoff` copies:
+     * `LoopMixSession` derives an `effectivePlan` copy with a different hold
+     * between prepare and choreograph, and structural `Plan ==` rejected
+     * exactly those legitimate copies.
+     */
+    fun isSamePlan(prepPlan: LoopMix.Plan, plan: LoopMix.Plan): Boolean =
+        prepPlan === plan || planKey(prepPlan) == planKey(plan)
+
     fun choreograph(
         prep: Prep,
         plan: LoopMix.Plan,
@@ -172,7 +204,7 @@ object ChoreoSessionGlue {
         preparedInStems: StemSet? = null,
         preparedScript: ChoreoScript? = null,
     ): Result? = runCatching {
-        if (prep.plan != plan || (prep.sampleRate > 0 && prep.sampleRate != sampleRate)) return null
+        if (!isSamePlan(prep.plan, plan) || (prep.sampleRate > 0 && prep.sampleRate != sampleRate)) return null
         val wantStems = AutomixV2Choreo.useStems && ChoreoCaps.has(prep.caps, ChoreoCaps.STEMS)
         val outStems = if (wantStems && StemAdapter.matchesRegion(preparedOutStems, outRegion.left.size, sampleRate) &&
             preparedOutStems != null && abs(preparedOutStems.regionStartSec - outRegion.start) <= 0.5 / sampleRate) {

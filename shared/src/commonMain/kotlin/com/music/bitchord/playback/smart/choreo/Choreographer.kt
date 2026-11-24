@@ -75,7 +75,9 @@ object PairScorer {
             RecipeId.C6 -> 0.52
             RecipeId.C7 -> 1.15
             RecipeId.F1 -> 0.72 + (if (MoveCatalog.dropBeat(c) != null) 0.35 else 0.0)
-            RecipeId.F2 -> if (bad || c.tempoGap > 0.06) 0.78 else 0.42
+            // ADR 0010: F2 (Brake slam) is never boosted for low grid
+            // confidence; only a genuine tempo jump justifies it.
+            RecipeId.F2 -> if (c.tempoGap > 0.06) 0.78 else 0.42
             RecipeId.F3 -> 0.68
             RecipeId.F4 -> 0.66 + (if (c.harmony == Harmony.SAME) 0.1 else 0.0)
             RecipeId.F5 -> if (bad) 0.72 else 0.56
@@ -430,9 +432,10 @@ object Choreographer {
         val c = PairContext(inputs)
         var ranked = rankRecipes(inputs, log, forced = forced)
         if (forced == null && inputs.level == DjLevel.FESTIVAL) {
-            // Ensure Festival fallback ladder (F2 / F5) is always present at the end if everything else failed.
+            // ADR 0010: Festival low-confidence fallback is musical, never a
+            // brake slam: F5 (Tunnel) and C2 (Filter wash + echo).
             val presentIds = ranked.map { it.recipeId }.toSet()
-            val fallbacks = listOf(RecipeId.F2, RecipeId.F5).filter { it !in presentIds && it !in inputs.excludedRecipes }
+            val fallbacks = listOf(RecipeId.F5, RecipeId.C2).filter { it !in presentIds && it !in inputs.excludedRecipes }
             if (fallbacks.isNotEmpty()) {
                 val extra = ArrayList<Candidate>(ranked)
                 for (fbId in fallbacks) {
@@ -448,7 +451,7 @@ object Choreographer {
                         score = s,
                         recipeId = fb.id,
                         recipeName = fb.displayName,
-                        reason = "${fb.id.code} fallback (${fb.fxSummary})",
+                        reason = "${fb.id.code} musical fallback (${fb.fxSummary})",
                     )
                 }
                 ranked = extra.sortedWith(compareByDescending<Candidate> { it.total }.thenBy { it.recipeId.ordinal })

@@ -70,14 +70,22 @@ object MoveCatalog {
      */
     fun reject(recipe: Recipe, c: PairContext, forcedMode: Boolean = false): String? {
         val inputs = c.inputs
-        if (inputs.level != recipe.minLevel) {
+        // ADR 0010: C2 (Filter wash + echo) is the one cross-level exception,
+        // allowed only in forced/fallback mode at FESTIVAL so the musical
+        // fallback ladder can actually build it. Normal ranking never sees
+        // it there (Recipes.forLevel is strictly scoped), so strict level
+        // scoping is preserved everywhere else.
+        val isFestivalMusicalFallback = forcedMode && inputs.level == DjLevel.FESTIVAL && recipe.id == RecipeId.C2
+        if (inputs.level != recipe.minLevel && !isFestivalMusicalFallback) {
             return "level ${inputs.level} != ${recipe.minLevel}"
         }
         if (inputs.albumOrder) {
+            // ADR 0010: F2 (Brake slam) is not a Festival album-order
+            // fallback; F5 (Tunnel) and C2 (Filter wash + echo) are.
             val allowedOnAlbum = when (inputs.level) {
                 DjLevel.SUBTLE -> recipe.id == RecipeId.S5 || recipe.id == RecipeId.S1
                 DjLevel.CLUB -> recipe.id == RecipeId.C2
-                DjLevel.FESTIVAL -> recipe.id == RecipeId.F2 || recipe.id == RecipeId.F5
+                DjLevel.FESTIVAL -> recipe.id == RecipeId.F5 || recipe.id == RecipeId.C2
             }
             if (!allowedOnAlbum) return "album order"
         }

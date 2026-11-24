@@ -3,7 +3,27 @@ package com.music.bitchord.playback.djmix
 import android.os.Process
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
+import com.music.bitchord.djmix.core.contracts.AnalysisLevel
+import com.music.bitchord.djmix.core.contracts.CandidateScoreSummary
+import com.music.bitchord.djmix.core.contracts.DeckStemRequirement
+import com.music.bitchord.djmix.core.contracts.DjLevel as CoreDjLevel
+import com.music.bitchord.djmix.core.contracts.FailureKind
+import com.music.bitchord.djmix.core.contracts.MixOutcome
+import com.music.bitchord.djmix.core.contracts.RefusalReason
+import com.music.bitchord.djmix.core.contracts.TempoKnot
+import com.music.bitchord.djmix.core.contracts.TimeRangeMs
+import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
+import com.music.bitchord.djmix.core.contracts.TransitionGeometry
+import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
+import com.music.bitchord.djmix.core.machine.MixEvent
+import com.music.bitchord.djmix.core.machine.MixState
+import com.music.bitchord.djmix.core.planner.BuiltInRecipeCatalog
+import com.music.bitchord.djmix.core.planner.PairPlanner
+import com.music.bitchord.djmix.core.planner.PlannerRequest
 import com.music.bitchord.playback.AutomixTelemetry
+import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
+import com.music.bitchord.playback.djmix.store.TrackAnalysisV3Mapper
+import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.LoopMix
@@ -19,9 +39,11 @@ import com.music.bitchord.playback.smart.PhrasePlanner
 import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.SongMap
 import com.music.bitchord.playback.smart.SongMaps
+import com.music.bitchord.playback.smart.StemKind
 import com.music.bitchord.playback.smart.StemSet
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.TransitionMoves
+import com.music.bitchord.playback.smart.alignTempoOctave
 import com.music.bitchord.playback.smart.camelotCode
 import com.music.bitchord.playback.smart.choreo.AutomixV2Choreo
 import com.music.bitchord.playback.smart.choreo.Candidate
@@ -37,6 +59,7 @@ import com.music.bitchord.playback.smart.choreo.RecipeId
 import com.music.bitchord.playback.smart.choreo.Recipes
 import com.music.bitchord.playback.smart.choreo.StemAdapter
 import com.music.bitchord.playback.smart.choreo.StemView
+import com.music.bitchord.playback.smart.choreo.StructureView
 import com.music.bitchord.playback.smart.choreo.TrackClock
 import com.music.bitchord.playback.smart.entryKeyConfidence
 import com.music.bitchord.playback.smart.entryKeyForMix
@@ -55,11 +78,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 import kotlin.math.abs
+import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 /**
  * Lifecycle state machine for background preparation of an upcoming `(outId, inId)` pair.
@@ -144,6 +166,9 @@ data class PrepRequest(
     val fallbackSeconds: Double = 8.0,
     val lyricsOut: List<LyricCue> = emptyList(),
     val lyricsIn: List<LyricCue> = emptyList(),
+    val minExitMs: Long? = null,
+    val preferNoStemVariant: Boolean = false,
+    val machineGeneration: Long? = null,
 )
 
 data class PlanInput(
@@ -166,6 +191,14 @@ data class PlanInput(
     val lyricsOut: List<LyricCue> = emptyList(),
     val lyricsIn: List<LyricCue> = emptyList(),
     val caps: Int = 0,
+    val recentRecipeIds: List<String> = emptyList(),
+    val transitionsSinceLastAbrupt: Int = 999,
+    val minExitMs: Long? = null,
+    val preferNoStemVariant: Boolean = false,
+    val tasteWeights: Map<String, Double> = emptyMap(),
+    val machineGeneration: Long = 0L,
+    val outDecodeRangeMs: TimeRangeMs? = null,
+    val inDecodeRangeMs: TimeRangeMs? = null,
 )
 
 data class SelectedPlan(
@@ -178,6 +211,8 @@ data class SelectedPlan(
     val fallbackReason: String = "",
     val straightRateMode: StraightRateMode? = null,
     val previewScript: ChoreoScript? = null,
+    val transitionPlanV1: TransitionPlanV1? = null,
+    val refusalReason: RefusalReason? = null,
 )
 
 fun interface TransitionPlanSelector {
@@ -185,8 +220,9 @@ fun interface TransitionPlanSelector {
 }
 
 /**
- * Background-only planner. Loop placement may refuse a pair; straight choreography may not
- * inherit those musical vetoes. Every accepted result carries v2 geometry, never a NATURAL handoff.
+ * Sole transition planner: consults `:djmix-core` [PairPlanner] first for `{exit window, entry cue,
+ * geometry, recipe, requiredStems}`, then constructs the concrete `LoopMix.Plan` and
+ * [ChoreoSessionGlue.Prep] aligned strictly to that frozen decision.
  */
 class DefaultTransitionPlanSelector(
     private val straightFallback: (PlanInput) -> SelectedPlan? = { StraightMixGeometry.select(it, it.caps) },
@@ -195,155 +231,397 @@ class DefaultTransitionPlanSelector(
         val outA = input.outAnalysis
         val inA = input.inAnalysis
         val classic = StraightMixGeometry.classicPlan(input)
-        if (StraightMixGeometry.policyExcluded(classic, input.albumOrder)) return null
-        if (input.preferStraight || !outA.isUsable || !inA.isUsable) return straightFallback(input)
+        if (StraightMixGeometry.policyExcluded(classic, input.albumOrder)) {
+            return SelectedPlan(
+                plan = null,
+                fallbackReason = if (input.albumOrder) "album-order-excluded" else classic.reason,
+                refusalReason = if (input.albumOrder) RefusalReason.ALBUM_ORDER_EXCLUDED else null,
+            )
+        }
         val outDur = input.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: outA.duration
         val inDur = input.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: inA.duration
-        val loop = LoopMix.plan(
-            out = outA,
-            outDuration = outDur,
-            inn = inA,
-            inDuration = inDur,
-            earliestOutSec = input.positionSec + 1.0,
-            sungOut = input.sungOut,
-            sungIn = input.sungIn,
-            playableOutDurationSec = outDur,
-        )?.let { crown ->
-            if (crown.outLoops && crown.inLoops && PhraseConfig.PHRASE_PLANNER_ENABLED) {
+        if (input.preferStraight && (!outA.isUsable || !inA.isUsable)) {
+            return straightFallback(input)
+        }
+
+        val outV3 = PairPreparer.toV3ForPlanner(input.outTrack.id, outA, PhraseMaps.get(input.outTrack.id), input.outSongMap, outDur)
+        val inV3 = PairPreparer.toV3ForPlanner(input.inTrack.id, inA, PhraseMaps.get(input.inTrack.id), input.inSongMap, inDur)
+        val positionMs = (input.positionSec * 1000.0).roundToLong().coerceAtLeast(0L)
+        val plannerReq = PlannerRequest(
+            generation = input.machineGeneration.coerceAtLeast(0L),
+            outTrack = outV3,
+            inTrack = inV3,
+            outTitle = input.outTrack.title,
+            inTitle = input.inTrack.title,
+            djLevel = PairPreparer.toCoreDjLevel(input.djLevel),
+            positionMs = positionMs,
+            minExitMs = input.minExitMs,
+            recentRecipeIds = input.recentRecipeIds,
+            transitionsSinceLastAbrupt = input.transitionsSinceLastAbrupt,
+            excludedRecipeIds = input.excludedRecipes.map { it.code }.toSet(),
+            preferNoStemVariant = input.preferNoStemVariant || !input.stemsExpected,
+            tasteWeights = input.tasteWeights,
+            outDecodeRangeMs = input.outDecodeRangeMs,
+            inDecodeRangeMs = input.inDecodeRangeMs,
+        )
+
+        var outcome = PairPlanner.plan(plannerReq)
+        if (outcome is MixOutcome.Refused && outcome.reason == RefusalReason.NO_ELIGIBLE_BOUNDARY) {
+            val lastResort = PairPlanner.planLastResortMusicalExit(plannerReq)
+            if (lastResort is MixOutcome.Ok) {
+                outcome = lastResort
+            }
+        }
+        if (outcome !is MixOutcome.Ok) {
+            val refused = outcome as? MixOutcome.Refused
+            return SelectedPlan(
+                plan = null,
+                fallbackReason = refused?.detail ?: "no-v2-plan",
+                refusalReason = refused?.reason ?: RefusalReason.NO_ELIGIBLE_BOUNDARY,
+            )
+        }
+
+        return buildConcreteFromPlanV1(outcome.value, input, outDur, inDur)
+    }
+
+    private fun buildConcreteFromPlanV1(
+        v1: TransitionPlanV1,
+        input: PlanInput,
+        outDur: Double,
+        inDur: Double,
+    ): SelectedPlan? {
+        val outA = input.outAnalysis
+        val inA = input.inAnalysis
+        val exitSec = v1.frozenExitMs / 1000.0
+        val entrySec = v1.frozenEntryMs / 1000.0
+        val barSec = (v1.barDurationMs / 1000.0).coerceAtLeast(0.5)
+        val overlapBars = (v1.overlapDurationMs.toDouble() / v1.barDurationMs.coerceAtLeast(500L))
+            .roundToInt().coerceIn(1, 16)
+        val requestedRecipe = RecipeId.fromCode(v1.recipeId) ?: fallbackChoreoRecipeId(v1)
+        val effectiveNoStem = input.preferNoStemVariant || !input.stemsExpected || v1.requiredStems.isEmpty()
+
+        // Try matching LOOP geometry via candidate builder only when aligned to PairPlanner's frozen window.
+        if (!input.preferStraight && v1.geometry == TransitionGeometry.LOOP) {
+            val crown = LoopMix.plan(
+                out = outA,
+                outDuration = outDur,
+                inn = inA,
+                inDuration = inDur,
+                earliestOutSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
+                sungOut = input.sungOut,
+                sungIn = input.sungIn,
+                playableOutDurationSec = outDur,
+            )
+            if (crown != null && abs(crown.out.loopStart - exitSec) <= 1.5 * barSec &&
+                abs(crown.inn.loopStart - entrySec) <= 2.0 * barSec
+            ) {
+                val stamped = stamp(crown, outA, inA)
+                val prep = ChoreoSessionGlue.prepare(
+                    plan = stamped,
+                    script = null,
+                    outAnalysis = outA,
+                    inAnalysis = inA,
+                    outSongMap = input.outSongMap,
+                    inSongMap = input.inSongMap,
+                    level = input.djLevel,
+                    outId = input.outTrack.id,
+                    inId = input.inTrack.id,
+                    sampleRate = input.sampleRate,
+                    albumOrder = input.albumOrder,
+                    stemsExpected = !effectiveNoStem,
+                    excludedRecipes = input.excludedRecipes,
+                    capsOverride = input.caps,
+                )?.let { base ->
+                    ChoreoSessionGlue.Prep(
+                        plan = base.plan,
+                        forced = base.forced,
+                        forcedRecipe = requestedRecipe,
+                        caps = base.caps,
+                        level = base.level,
+                        outStructure = base.outStructure,
+                        inStructure = base.inStructure,
+                        pairKey = base.pairKey,
+                        albumOrder = base.albumOrder,
+                        note = base.note,
+                        sampleRate = base.sampleRate,
+                        straightRateMode = base.straightRateMode,
+                        excludedRecipes = base.excludedRecipes,
+                    )
+                }
+                if (prep != null && prep.plan.handoff == null) {
+                    return SelectedPlan(
+                        plan = prep.plan,
+                        phraseScript = null,
+                        v2Prep = prep,
+                        exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
+                        entryCueSec = prep.plan.inn.loopStart,
+                        pathHint = "v2-native",
+                        transitionPlanV1 = alignV1Timing(v1, prep.plan),
+                    )
+                }
+            }
+        }
+
+        // Try matching BRIDGE geometry via PhrasePlanner / LoopMix.bridge only when aligned to PairPlanner's window.
+        if (!input.preferStraight && v1.geometry == TransitionGeometry.BRIDGE) {
+            val steps = regionalCamelotSteps(outA, inA)
+            val phraseChoice = if (PhraseConfig.PHRASE_PLANNER_ENABLED && !shouldDeclineToMix(outA, inA)) {
                 runCatching {
-                    val choice = PhrasePlanner.select(
-                        input.outSongMap ?: SongMaps.fromAnalysis(input.outTrack.id, outA),
-                        input.inSongMap ?: SongMaps.fromAnalysis(input.inTrack.id, inA),
-                        regionalCamelotSteps(outA, inA),
+                    PhrasePlanner.select(
+                        input.outSongMap,
+                        input.inSongMap,
+                        steps,
                         outA.bpm,
                         inA.bpm,
-                        legacyLoop = crown,
+                        earliestExitSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
                         playableOutDurationSec = outDur,
                         outAnalysis = outA,
                         inAnalysis = inA,
                     )
-                    val kept = choice?.legacyLoop
-                    if (kept != null && kept.out.bars >= crown.out.bars && kept.inn.bars >= crown.inn.bars &&
-                        kept.outLoops && kept.inLoops
-                    ) kept else crown
-                }.getOrDefault(crown)
-            } else crown
-        }
-
-        if (loop != null) {
-            val stamped = stamp(loop, outA, inA)
-            val prep = ChoreoSessionGlue.prepare(
-                plan = stamped,
-                script = null,
-                outAnalysis = outA,
-                inAnalysis = inA,
-                outSongMap = input.outSongMap,
-                inSongMap = input.inSongMap,
-                level = input.djLevel,
-                outId = input.outTrack.id,
-                inId = input.inTrack.id,
-                sampleRate = input.sampleRate,
-                albumOrder = input.albumOrder,
-                stemsExpected = input.stemsExpected,
-                excludedRecipes = input.excludedRecipes,
-                capsOverride = input.caps,
+                }.getOrNull()
+            } else null
+            if (phraseChoice != null) {
+                val script = TransitionMoves.compile(
+                    phraseChoice, outA.bpm, inA.bpm,
+                    outgoingId = input.outTrack.id,
+                    incomingId = input.inTrack.id,
+                )
+                if (abs(script.plan.out.loopStart - exitSec) <= 1.5 * barSec &&
+                    abs(script.plan.inn.loopStart - entrySec) <= 2.0 * barSec
+                ) {
+                    val stamped = stamp(script.plan, outA, inA)
+                    val base = ChoreoSessionGlue.prepare(
+                        plan = stamped,
+                        script = script,
+                        outAnalysis = outA,
+                        inAnalysis = inA,
+                        outSongMap = input.outSongMap,
+                        inSongMap = input.inSongMap,
+                        level = input.djLevel,
+                        outId = input.outTrack.id,
+                        inId = input.inTrack.id,
+                        sampleRate = input.sampleRate,
+                        albumOrder = input.albumOrder,
+                        stemsExpected = !effectiveNoStem,
+                        excludedRecipes = input.excludedRecipes,
+                        capsOverride = input.caps,
+                    )
+                    if (base != null && base.plan.handoff == null) {
+                        val prep = ChoreoSessionGlue.Prep(
+                            plan = base.plan,
+                            forced = base.forced,
+                            forcedRecipe = requestedRecipe,
+                            caps = base.caps,
+                            level = base.level,
+                            outStructure = base.outStructure,
+                            inStructure = base.inStructure,
+                            pairKey = base.pairKey,
+                            albumOrder = base.albumOrder,
+                            note = base.note,
+                            sampleRate = base.sampleRate,
+                            straightRateMode = base.straightRateMode,
+                            excludedRecipes = base.excludedRecipes,
+                        )
+                        return SelectedPlan(
+                            plan = prep.plan,
+                            phraseScript = script,
+                            v2Prep = prep,
+                            exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
+                            entryCueSec = prep.plan.inn.loopStart,
+                            pathHint = "v2-native",
+                            transitionPlanV1 = alignV1Timing(v1, prep.plan),
+                        )
+                    }
+                }
+            }
+            val bridge = LoopMix.bridge(
+                out = outA,
+                outDuration = outDur,
+                inn = inA,
+                inDuration = inDur,
+                earliestOutSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
+                sungOut = input.sungOut,
+                sungIn = input.sungIn,
+                playableOutDurationSec = outDur,
             )
-            if (prep == null) return straightFallback(input)
-            return SelectedPlan(
-                plan = prep?.plan ?: stamped,
-                phraseScript = null,
-                v2Prep = prep,
-                pathHint = "v2-native",
-            )
-        }
-
-        val steps = regionalCamelotSteps(outA, inA)
-        val phraseChoice = if (PhraseConfig.PHRASE_PLANNER_ENABLED && !shouldDeclineToMix(outA, inA)) {
-            runCatching {
-                PhrasePlanner.select(
-                    input.outSongMap,
-                    input.inSongMap,
-                    steps,
-                    outA.bpm,
-                    inA.bpm,
-                    earliestExitSec = input.positionSec,
-                    playableOutDurationSec = outDur,
+            if (bridge != null && bridge.handoff == null &&
+                abs(bridge.out.loopStart - exitSec) <= 1.5 * barSec &&
+                abs(bridge.inn.loopStart - entrySec) <= 2.0 * barSec
+            ) {
+                val stamped = stamp(bridge, outA, inA)
+                val base = ChoreoSessionGlue.prepare(
+                    plan = stamped,
+                    script = null,
                     outAnalysis = outA,
                     inAnalysis = inA,
+                    outSongMap = input.outSongMap,
+                    inSongMap = input.inSongMap,
+                    level = input.djLevel,
+                    outId = input.outTrack.id,
+                    inId = input.inTrack.id,
+                    sampleRate = input.sampleRate,
+                    albumOrder = input.albumOrder,
+                    stemsExpected = !effectiveNoStem,
+                    excludedRecipes = input.excludedRecipes,
+                    capsOverride = input.caps,
                 )
-            }.getOrNull()
-        } else null
-
-        if (phraseChoice != null) {
-            val script = TransitionMoves.compile(
-                phraseChoice, outA.bpm, inA.bpm,
-                outgoingId = input.outTrack.id,
-                incomingId = input.inTrack.id,
-            )
-            val stamped = stamp(script.plan, outA, inA)
-            val prep = ChoreoSessionGlue.prepare(
-                plan = stamped,
-                script = script,
-                outAnalysis = outA,
-                inAnalysis = inA,
-                outSongMap = input.outSongMap,
-                inSongMap = input.inSongMap,
-                level = input.djLevel,
-                outId = input.outTrack.id,
-                inId = input.inTrack.id,
-                sampleRate = input.sampleRate,
-                albumOrder = input.albumOrder,
-                stemsExpected = input.stemsExpected,
-                excludedRecipes = input.excludedRecipes,
-                capsOverride = input.caps,
-            )
-            if (prep == null || prep.plan.handoff != null) return straightFallback(input)
-            return SelectedPlan(
-                plan = prep?.plan ?: stamped,
-                phraseScript = script,
-                v2Prep = prep,
-                pathHint = "v2-native",
-            )
+                if (base != null) {
+                    val prep = ChoreoSessionGlue.Prep(
+                        plan = base.plan,
+                        forced = base.forced,
+                        forcedRecipe = requestedRecipe,
+                        caps = base.caps,
+                        level = base.level,
+                        outStructure = base.outStructure,
+                        inStructure = base.inStructure,
+                        pairKey = base.pairKey,
+                        albumOrder = base.albumOrder,
+                        note = base.note,
+                        sampleRate = base.sampleRate,
+                        straightRateMode = base.straightRateMode,
+                        excludedRecipes = base.excludedRecipes,
+                    )
+                    return SelectedPlan(
+                        plan = prep.plan,
+                        phraseScript = null,
+                        v2Prep = prep,
+                        exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
+                        entryCueSec = prep.plan.inn.loopStart,
+                        pathHint = "v2-native",
+                        transitionPlanV1 = alignV1Timing(v1, prep.plan),
+                    )
+                }
+            }
         }
 
-        val bridge = LoopMix.bridge(
-            out = outA,
-            outDuration = outDur,
-            inn = inA,
-            inDuration = inDur,
-            earliestOutSec = input.positionSec + 1.0,
-            sungOut = input.sungOut,
-            sungIn = input.sungIn,
-            playableOutDurationSec = outDur,
-        ) ?: return straightFallback(input)
+        // Anchored straight geometry preserving PairPlanner's {frozenExitMs, frozenEntryMs, recipe}.
+        return buildStraightFromV1(v1, input, outDur, inDur, overlapBars, requestedRecipe)
+            ?: straightFallback(input)?.copy(transitionPlanV1 = v1)
+    }
 
-        // Contracted natural/echo handoffs have legacy envelopes, not an installed v2 recipe.
-        if (bridge.handoff != null) return straightFallback(input)
+    private fun buildStraightFromV1(
+        v1: TransitionPlanV1,
+        input: PlanInput,
+        outDur: Double,
+        inDur: Double,
+        requestedBars: Int,
+        requestedRecipe: RecipeId,
+    ): SelectedPlan? {
+        val outA = input.outAnalysis
+        val inA = input.inAnalysis
+        val outBpm = outA.tailBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
+            ?: outA.bpm.takeIf { it.isFinite() && it > 1.0 } ?: 120.0
+        val inBpm = inA.headBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
+            ?: inA.bpm.takeIf { it.isFinite() && it > 1.0 } ?: outBpm
+        val rateMode = StraightMixGeometry.rateMode(outA, inA, input.djLevel)
+        val folded = alignTempoOctave(outBpm, inBpm)
+        val fold = if (rateMode == StraightRateMode.BEAT_MATCH) inBpm / folded else 1.0
+        val exitSec = (v1.frozenExitMs / 1000.0).coerceAtLeast(0.0)
+        val entrySec = (v1.frozenEntryMs / 1000.0).coerceAtLeast(0.0)
+        val outStruct = StructureView.best(input.outSongMap, outA)
+        val inStruct = StructureView.best(input.inSongMap, inA)
+        val recipeForStraight = if (requestedRecipe == RecipeId.C5) {
+            RecipeId.C2
+        } else requestedRecipe
 
-        val stamped = stamp(bridge, outA, inA)
-        val prep = ChoreoSessionGlue.prepare(
+        var bars = requestedBars.coerceIn(1, 16)
+        var fitted: LoopMix.Plan? = null
+        while (bars >= 1) {
+            val enter = if (bars >= 4) 1 else 0
+            val exit = if (bars >= 2) 1 else 0
+            val cand = LoopMix.Plan(
+                out = LoopMix.Pick(exitSec, exitSec, 0, 60.0 / outBpm, outBpm, 0.0, LoopMix.Check.MASK),
+                inn = LoopMix.Pick(entrySec, entrySec, 0, 60.0 / inBpm, inBpm, 0.0, LoopMix.Check.MASK),
+                fold = fold,
+                enterBars = enter,
+                rampBars = bars - enter - exit,
+                exitBars = exit,
+                totalBars = bars,
+                outLoops = false,
+                inLoops = false,
+                nativeIncoming = rateMode == StraightRateMode.RATE_ONE,
+                targetBpmOverride = if (rateMode == StraightRateMode.RATE_ONE) 0.0 else null,
+                rung = v1.recipeName.ifBlank { "Straight" },
+                alternativeKind = "v2-straight",
+            )
+            val span = LoopMix.Clock(cand).releaseAt
+            val req = runCatching {
+                LoopMixSession.decodeRequirements(cand, input.sampleRate, outA, inA, rateMode, input.djLevel)
+            }.getOrNull()
+            if (req != null && exitSec + span <= outDur + 0.5 && entrySec < inDur) {
+                fitted = cand
+                break
+            }
+            bars--
+        }
+        val placed = fitted ?: return null
+        val stamped = stamp(placed, outA, inA)
+        val prep = ChoreoSessionGlue.Prep(
             plan = stamped,
-            script = null,
-            outAnalysis = outA,
-            inAnalysis = inA,
-            outSongMap = input.outSongMap,
-            inSongMap = input.inSongMap,
+            forced = null,
+            forcedRecipe = recipeForStraight,
+            caps = input.caps,
             level = input.djLevel,
-            outId = input.outTrack.id,
-            inId = input.inTrack.id,
-            sampleRate = input.sampleRate,
+            outStructure = outStruct,
+            inStructure = inStruct,
+            pairKey = "${input.outTrack.id}->${input.inTrack.id}",
             albumOrder = input.albumOrder,
-            stemsExpected = input.stemsExpected,
+            note = "core-planner:${v1.recipeId}:${rateMode.name.lowercase()}",
+            sampleRate = input.sampleRate,
+            straightRateMode = rateMode,
             excludedRecipes = input.excludedRecipes,
-            capsOverride = input.caps,
         )
-        if (prep == null) return straightFallback(input)
+        val previewScript = ChoreoSessionGlue.withoutStems(
+            prep, stamped, LoopMix.Clock(stamped), input.sampleRate, outA, inA,
+            input.sungOut, input.sungIn, recipeForStraight,
+        ) ?: ChoreoSessionGlue.withoutStems(
+            prep, stamped, LoopMix.Clock(stamped), input.sampleRate, outA, inA,
+            input.sungOut, input.sungIn, null,
+        ) ?: return null
+        val span = LoopMix.Clock(stamped).releaseAt
+        val alignedV1 = v1.copy(
+            frozenExitMs = (stamped.out.loopStart * 1000.0).roundToLong(),
+            frozenEntryMs = (stamped.inn.loopStart * 1000.0).roundToLong(),
+            overlapDurationMs = (span * 1000.0).roundToLong().coerceAtLeast(500L),
+        )
         return SelectedPlan(
-            plan = prep?.plan ?: stamped,
-            phraseScript = null,
+            plan = stamped,
             v2Prep = prep,
-            pathHint = "v2-native",
+            entryCueSec = stamped.inn.loopStart,
+            exitWindowSec = stamped.out.loopStart..(stamped.out.loopStart + span),
+            pathHint = "v2-straight",
+            straightRateMode = rateMode,
+            fallbackReason = if (v1.isLastResort) "last-resort-musical-exit" else "",
+            previewScript = previewScript,
+            transitionPlanV1 = alignedV1,
         )
+    }
+
+    private fun alignV1Timing(v1: TransitionPlanV1, plan: LoopMix.Plan): TransitionPlanV1 {
+        val clock = LoopMix.Clock(plan)
+        val exitMs = (plan.out.loopStart * 1000.0).roundToLong().coerceAtLeast(0L)
+        val entryMs = (plan.inn.loopStart * 1000.0).roundToLong().coerceAtLeast(0L)
+        val overlapMs = (clock.releaseAt * 1000.0).roundToLong().coerceAtLeast(1L)
+        return v1.copy(
+            frozenExitMs = exitMs,
+            frozenEntryMs = entryMs,
+            swapDownbeatMs = v1.swapDownbeatMs.coerceIn(exitMs, exitMs + overlapMs),
+            overlapDurationMs = overlapMs,
+        )
+    }
+
+    private fun fallbackChoreoRecipeId(v1: TransitionPlanV1): RecipeId = when (v1.recipeId) {
+        "S6" -> RecipeId.S2
+        "C8" -> RecipeId.C2
+        "C9" -> RecipeId.C1
+        "F9" -> RecipeId.F7
+        "F10" -> RecipeId.F1
+        "F11" -> RecipeId.F5
+        else -> when (v1.djLevel) {
+            CoreDjLevel.SUBTLE -> RecipeId.S4
+            CoreDjLevel.CLUB -> RecipeId.C2
+            CoreDjLevel.FESTIVAL -> RecipeId.F5
+        }
     }
 
     private fun stamp(plan: LoopMix.Plan, out: TrackAnalysis, inn: TrackAnalysis): LoopMix.Plan {
@@ -394,16 +672,17 @@ data class PreparedPair(
     val generation: Long = 0L,
     val analysisSignature: String = "",
     val straightRateMode: StraightRateMode? = null,
+    val transitionPlanV1: TransitionPlanV1? = null,
+    val useNoStemVariant: Boolean = false,
+    val preparedSession: LoopMixSession? = null,
+    val preparedSessionNoStem: Boolean = false,
+    val lastRefusalReason: RefusalReason? = null,
 )
 
 /**
- * Fork-owned background pipeline that prepares `(outId, inId)` well before the splice:
- * analysis readiness -> pass-1 planning + padded decode -> overlap-window stem separation ->
- * pass-2 choreography + artwork prefetch.
- *
- * Runs strictly on its own dedicated single-thread `"djmix-prep"` executor at
- * `Process.THREAD_PRIORITY_BACKGROUND + Process.THREAD_PRIORITY_MORE_FAVORABLE` (never on
- * `TrackAnalyzer.executor`).
+ * Background pipeline that prepares `(outId, inId)` well before the splice:
+ * HEAD_TAIL/FULL analysis -> [PairPlanner] freeze -> containment-aware decode on `djmix-prep` ->
+ * SCNet stem separation on dedicated `djmix-stems` -> off-thread `LoopMixSession` + `nativePrepare`.
  */
 class PairPreparer(
     private val scope: CoroutineScope,
@@ -441,19 +720,54 @@ class PairPreparer(
     private val fullPreferredWaitMs: Long = DEFAULT_FULL_PREFERRED_WAIT_MS,
     private val executor: ExecutorService = newPrepExecutor(),
     private val ownsExecutor: Boolean = true,
+    private val store: DjmixAnalysisStore? = null,
+    private val stemExecutor: ExecutorService = newStemExecutor(),
 ) {
     private val _state = MutableStateFlow<PreparedPair?>(null)
     val state: StateFlow<PreparedPair?> = _state.asStateFlow()
 
     private val generation = AtomicLong(0L)
-    private val waitLock = ReentrantLock()
-    private val waitCondition = waitLock.newCondition()
+    private val historyLock = Any()
+    private val recentRecipeIds = ArrayDeque<String>()
+    private var transitionsSinceLastAbrupt: Int = 999
+    private var lastRecordedDoneGen: Long = -1L
+
+    @Volatile private var mixExecutor: MixExecutor? = null
+    @Volatile private var inLevelProvider: (String, String) -> Float = { _, _ -> 1f }
+    @Volatile private var highQualityProvider: () -> Boolean = { true }
 
     @Volatile private var collectorJob: Job? = null
     @Volatile private var inspectorCollectorJob: Job? = null
     @Volatile private var activeRequest: PrepRequest? = null
     @Volatile private var activeGeneration: Long = 0L
     @Volatile private var released = false
+
+    fun attachExecutionBridge(
+        executor: MixExecutor?,
+        inLevel: (String, String) -> Float = { _, _ -> 1f },
+        highQuality: () -> Boolean = { true },
+    ) {
+        mixExecutor = executor
+        inLevelProvider = inLevel
+        highQualityProvider = highQuality
+    }
+
+    fun recordCompletedRecipe(recipeId: String?) {
+        val id = recipeId?.trim()?.uppercase().takeUnless { it.isNullOrEmpty() } ?: return
+        synchronized(historyLock) {
+            if (recentRecipeIds.size >= RECIPE_HISTORY_CAP) recentRecipeIds.removeFirst()
+            recentRecipeIds.addLast(id)
+            transitionsSinceLastAbrupt = if (id in ABRUPT_RECIPE_IDS) {
+                0
+            } else {
+                (transitionsSinceLastAbrupt + 1).coerceAtMost(999)
+            }
+        }
+    }
+
+    private fun recentRecipeIdsSnapshot(): List<String> = synchronized(historyLock) { recentRecipeIds.toList() }
+
+    private fun currentTransitionsSinceLastAbrupt(): Int = synchronized(historyLock) { transitionsSinceLastAbrupt }
 
     // FORK-HOOK(mix-inspector): PairPreparer is the only process-global producer of this feed.
     init {
@@ -480,10 +794,9 @@ class PairPreparer(
             return
         }
 
-        val gen = generation.incrementAndGet()
+        val gen = request.machineGeneration?.also { generation.set(it) } ?: generation.incrementAndGet()
         activeRequest = request
         activeGeneration = gen
-        signalWaiters()
 
         val initialTimings = PairTimings(
             outId = outId,
@@ -491,6 +804,8 @@ class PairPreparer(
             prepStartMs = nowMs(),
             level = request.djLevel.name,
         )
+        val previous = _state.value
+        closeSupersededSession(previous, gen)
         _state.value = PreparedPair(
             outId = outId,
             inId = inId,
@@ -504,11 +819,12 @@ class PairPreparer(
             albumOrder = request.albumOrder,
             timings = initialTimings,
             generation = gen,
+            useNoStemVariant = request.preferNoStemVariant,
         )
 
         runCatching {
             executor.execute {
-                executePipeline(gen, request, initialTimings)
+                executePipeline(gen, request, initialTimings, reuseFrom = previous)
             }
         }
     }
@@ -533,37 +849,56 @@ class PairPreparer(
         val current = _state.value ?: return false
         if (released || current.state in ACTIVE_EXECUTION_STATES || current.outId != request.outTrack.id ||
             current.inId != request.inTrack.id || current.djLevel != request.djLevel) return false
-        val excluded = exclude ?: RecipeId.fromCode(current.script?.recipeId) ?: return false
-        if (current.topCandidates.none { it.recipeId != excluded }) {
-            // A straight preparation can often fit another same-level no-stem recipe with a different length.
-            val input = planInput(request.copy(excludedRecipes = setOf(excluded)), current)
-            if (StraightMixGeometry.select(input, capabilities()) == null && current.v2Prep?.let { prep ->
-                    Choreographer.rank(buildChoreoInputs(
-                        current.plan ?: return false, prep, current.outAnalysis ?: return false,
-                        current.inAnalysis ?: return false, current.sungOut, current.sungIn,
-                        StemAdapter.view(current.outStems), StemAdapter.view(current.inStems),
-                        current.sampleRate, prep.caps, current.djLevel, current.outId, current.inId,
-                        current.albumOrder, current.outStems != null || current.inStems != null,
-                        setOf(excluded),
-                    )).none { it.recipeId != excluded }
-                } != false) return false
+        val currentCode = current.transitionPlanV1?.recipeId ?: current.script?.recipeId
+        val excluded = exclude ?: RecipeId.fromCode(currentCode)
+        val excludedCodes = (request.excludedRecipes.map { it.code } + listOfNotNull(currentCode, excluded?.code)).toSet()
+        val outA = current.outAnalysis ?: analysisFor(request.outTrack.id)
+        val inA = current.inAnalysis ?: analysisFor(request.inTrack.id)
+        if (outA.isUsable && inA.isUsable) {
+            val outV3 = toV3ForPlanner(request.outTrack.id, outA, PhraseMaps.get(request.outTrack.id), current.outSongMap, request.outTrack.durationSec)
+            val inV3 = toV3ForPlanner(request.inTrack.id, inA, PhraseMaps.get(request.inTrack.id), current.inSongMap, request.inTrack.durationSec)
+            val probe = PairPlanner.plan(
+                PlannerRequest(
+                    generation = current.generation,
+                    outTrack = outV3,
+                    inTrack = inV3,
+                    outTitle = request.outTrack.title,
+                    inTitle = request.inTrack.title,
+                    djLevel = toCoreDjLevel(request.djLevel),
+                    positionMs = (request.positionSec * 1000.0).roundToLong().coerceAtLeast(0L),
+                    minExitMs = request.minExitMs,
+                    recentRecipeIds = recentRecipeIdsSnapshot(),
+                    transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
+                    excludedRecipeIds = excludedCodes,
+                    preferNoStemVariant = request.preferNoStemVariant,
+                    tasteWeights = store?.getPreferenceWeights().orEmpty(),
+                ),
+            )
+            if (probe !is MixOutcome.Ok) return false
+        } else if (excluded == null) {
+            return false
         }
-        trigger(request.copy(excludedRecipes = setOf(excluded)), force = true)
+        val nextExcluded = if (excluded != null) request.excludedRecipes + excluded else request.excludedRecipes
+        trigger(request.copy(excludedRecipes = nextExcluded), force = true)
         return true
     }
 
+    /**
+     * Handles analysis updates reactively on `djmix-prep` without calling `trigger(force = true)`
+     * or cancelling running decode/SCNet jobs. Refines quietly via [PairPlanner] and re-freezes
+     * only if refined exit/entry shifts by `>= 1 bar` or breaks recipe requirements.
+     */
     fun onAnalysisUpdated(trackId: String) {
         if (released) return
-        signalWaiters()
         val req = activeRequest ?: return
         if (trackId != req.outTrack.id && trackId != req.inTrack.id) return
         val current = _state.value ?: return
-        if (current.state in ACTIVE_EXECUTION_STATES || current.state == PrepState.ANALYZING) return
-        val outA = analysisFor(req.outTrack.id)
-        val inA = analysisFor(req.inTrack.id)
-        val sig = analysisSignature(outA, inA)
-        if (sig != current.analysisSignature && outA.isUsable && inA.isUsable) {
-            trigger(req.copy(positionSec = positionSecProvider()), force = true)
+        if (current.state in ACTIVE_EXECUTION_STATES) return
+        val targetGen = current.generation
+        runCatching {
+            executor.execute {
+                refineOnAnalysisUpdate(targetGen, req)
+            }
         }
     }
 
@@ -573,17 +908,31 @@ class PairPreparer(
                 (djLevel == null || it.djLevel == djLevel)
         }
 
-    /** Inspection may match a pair; applying a script/stems requires this exact execution identity. */
-    fun snapshotForBuild(outId: String, inId: String, djLevel: DjLevel, plan: LoopMix.Plan,
-        sampleRate: Int, straightRateMode: StraightRateMode? = null, expectedGeneration: Long? = null): PreparedPair? =
-        snapshotFor(outId, inId, djLevel)?.takeIf {
-            it.plan == plan && it.sampleRate == sampleRate && it.straightRateMode == straightRateMode &&
-                (expectedGeneration == null || it.generation == expectedGeneration) &&
-                it.state in setOf(PrepState.PREPARED, PrepState.BUILDING, PrepState.ARMED, PrepState.RUNNING) &&
-                it.v2Prep?.plan == plan && it.script != null &&
-                LoopMixSession.preparedCoverageRefusal(plan, sampleRate, it.outRegion, it.inRegion,
-                    it.outAnalysis, it.inAnalysis, straightRateMode, djLevel) == null
+    /**
+     * Exact execution lookup replacing `snapshotForBuild` and structural `plan ==` comparisons.
+     * Validates pair identity, exact frozen generation, active DJ level, script/prep readiness,
+     * and PCM coverage.
+     */
+    fun frozen(
+        outId: String,
+        inId: String,
+        generation: Long,
+        djLevel: DjLevel? = null,
+    ): PreparedPair? {
+        val expectedLevel = djLevel ?: activeRequest?.djLevel
+        return snapshotFor(outId, inId, expectedLevel)?.takeIf { pair ->
+            pair.generation == generation &&
+                pair.state in setOf(PrepState.PREPARED, PrepState.BUILDING, PrepState.ARMED, PrepState.RUNNING) &&
+                pair.plan != null &&
+                pair.v2Prep != null &&
+                ChoreoSessionGlue.isSamePlan(pair.v2Prep.plan, pair.plan) &&
+                pair.script != null &&
+                LoopMixSession.preparedCoverageRefusal(
+                    pair.plan, pair.sampleRate, pair.outRegion, pair.inRegion,
+                    pair.outAnalysis, pair.inAnalysis, pair.straightRateMode, pair.djLevel,
+                ) == null
         }
+    }
 
     fun isCurrentGeneration(outId: String, inId: String, expected: Long): Boolean =
         snapshotFor(outId, inId)?.generation == expected
@@ -614,8 +963,12 @@ class PairPreparer(
     }
 
     fun markDone(outId: String, inId: String) {
-        updateIfPair(outId, inId) { cur ->
+        val updated = updateIfPair(outId, inId) { cur ->
             cur.copy(state = PrepState.DONE)
+        } ?: return
+        if (updated.generation != lastRecordedDoneGen) {
+            lastRecordedDoneGen = updated.generation
+            recordCompletedRecipe(updated.transitionPlanV1?.recipeId ?: updated.script?.recipeId)
         }
     }
 
@@ -687,8 +1040,8 @@ class PairPreparer(
     fun invalidate(reason: String = "") {
         generation.incrementAndGet()
         activeRequest = null
-        signalWaiters()
         val cur = _state.value
+        closeSupersededSession(cur, generation.get())
         if (cur != null && cur.state != PrepState.IDLE) {
             _state.value = cur.copy(
                 state = PrepState.IDLE,
@@ -696,6 +1049,7 @@ class PairPreparer(
                 inStems = null,
                 outRegion = null,
                 inRegion = null,
+                preparedSession = null,
                 timings = if (reason.isNotEmpty()) cur.timings.copy(fallbackReason = reason) else cur.timings,
             )
         }
@@ -705,15 +1059,198 @@ class PairPreparer(
         released = true
         generation.incrementAndGet()
         activeRequest = null
-        signalWaiters()
         collectorJob?.cancel()
         collectorJob = null
+        closeSupersededSession(_state.value, generation.get())
         _state.value = null
         publishInspectorSnapshot(null)
         inspectorCollectorJob?.cancel()
         inspectorCollectorJob = null
         if (ownsExecutor) {
             runCatching { executor.shutdownNow() }
+            runCatching { stemExecutor.shutdownNow() }
+        }
+    }
+
+    fun consumePreparedSession(
+        outId: String,
+        inId: String,
+        expectedGeneration: Long,
+        useNoStemVariant: Boolean = false,
+    ): LoopMixSession? {
+        while (true) {
+            val cur = _state.value ?: return null
+            if (cur.outId != outId || cur.inId != inId || cur.generation != expectedGeneration) return null
+            val session = cur.preparedSession ?: return null
+            if (cur.preparedSessionNoStem != useNoStemVariant) return null
+            if (_state.compareAndSet(cur, cur.copy(preparedSession = null))) {
+                return session
+            }
+        }
+    }
+
+    /** Builds `LoopMixSession` + `nativePrepare()` off the main/audio thread during `PREPARING -> READY`. */
+    fun prepareRenderer(
+        frozen: PreparedPair,
+        useNoStemVariant: Boolean = frozen.useNoStemVariant,
+        onRefusal: ((String) -> Unit)? = null,
+    ): LoopMixSession? {
+        val plan = frozen.plan ?: return null.also { onRefusal?.invoke("prepared_plan_missing") }
+        val sampleRate = frozen.sampleRate
+        if (sampleRate <= 0) return null.also { onRefusal?.invoke("invalid_sample_rate") }
+        frozen.preparedSession?.let { existing ->
+            if (frozen.preparedSessionNoStem == useNoStemVariant) return existing
+            closeSessionAsync(existing)
+        }
+        val inLevel = runCatching { inLevelProvider(frozen.outId, frozen.inId) }
+            .getOrDefault(1f).takeIf { it.isFinite() && it > 0f } ?: 1f
+        val highQuality = runCatching { highQualityProvider() }.getOrDefault(true)
+        val planId = frozen.transitionPlanV1?.planId.orEmpty()
+        var refusal: String? = null
+        val session = if (frozen.straightRateMode != null) {
+            LoopMixSession.buildStraight(
+                prepared = frozen,
+                outId = frozen.outId,
+                inId = frozen.inId,
+                sampleRate = sampleRate,
+                inLevel = inLevel,
+                highQuality = highQuality,
+                onRefusal = { refusal = it },
+                useNoStemVariant = useNoStemVariant,
+                planId = planId,
+            )
+        } else {
+            LoopMixSession.build(
+                plan = plan,
+                outId = frozen.outId,
+                inId = frozen.inId,
+                sampleRate = sampleRate,
+                inLevel = inLevel,
+                highQuality = highQuality,
+                script = frozen.phraseScript,
+                outAnalysis = frozen.outAnalysis,
+                inAnalysis = frozen.inAnalysis,
+                sungOut = frozen.sungOut,
+                sungIn = frozen.sungIn,
+                onRefusal = { refusal = it },
+                outSongMap = frozen.outSongMap,
+                inSongMap = frozen.inSongMap,
+                djLevel = frozen.djLevel,
+                albumOrder = frozen.albumOrder,
+                preparedPrep = frozen.v2Prep,
+                preparedOutStems = if (useNoStemVariant) null else frozen.outStems,
+                preparedInStems = if (useNoStemVariant) null else frozen.inStems,
+                preparedScript = frozen.script,
+                preparedOutRegion = frozen.outRegion,
+                preparedInRegion = frozen.inRegion,
+                preparedOnly = true,
+                preparedSampleRate = sampleRate,
+                straightRateMode = null,
+                preparationGeneration = frozen.generation,
+                useNoStemVariant = useNoStemVariant,
+                planId = planId,
+                preparedGeneration = frozen.generation,
+                preparedPlanId = planId,
+                decode = { _, _, _ -> null },
+            )
+        }
+        if (session == null) {
+            onRefusal?.invoke(refusal ?: "session_build_failed")
+            return null
+        }
+        publishIfCurrent(frozen.generation) { cur ->
+            if (cur.outId != frozen.outId || cur.inId != frozen.inId) cur
+            else {
+                if (cur.preparedSession != null && cur.preparedSession !== session) {
+                    closeSessionAsync(cur.preparedSession)
+                }
+                cur.copy(preparedSession = session, preparedSessionNoStem = useNoStemVariant)
+            }
+        }
+        return session
+    }
+
+    /** Executes `MixEffect.PrepareRenderer` off-thread on `djmix-prep`. */
+    fun prepareRendererOffThread(planId: String, targetGeneration: Long, useNoStemVariant: Boolean) {
+        if (released) return
+        runCatching {
+            executor.execute {
+                if (released || generation.get() != targetGeneration) return@execute
+                val cur = _state.value ?: return@execute
+                if (cur.generation != targetGeneration || cur.plan == null || cur.v2Prep == null ||
+                    cur.outRegion == null || cur.inRegion == null
+                ) return@execute
+                val pair = if (cur.script == null && (useNoStemVariant || cur.v2Prep != null)) {
+                    val v2 = cur.v2Prep
+                    val noStemScript = ChoreoSessionGlue.withoutStems(
+                        v2, cur.plan, LoopMix.Clock(cur.plan), cur.sampleRate,
+                        cur.outAnalysis, cur.inAnalysis, cur.sungOut, cur.sungIn,
+                        plannedRecipe = v2.forcedRecipe,
+                    )
+                    if (noStemScript != null) {
+                        val next = cur.copy(script = noStemScript, useNoStemVariant = useNoStemVariant, state = PrepState.PREPARED)
+                        publishIfCurrent(targetGeneration) { next }
+                        next
+                    } else cur
+                } else cur
+
+                if (pair.script == null) {
+                    mixExecutor?.dispatch(MixEvent.RendererError(FailureKind.RENDERER_PREPARE_ERROR, "no_script_for_renderer", recoverable = true))
+                    return@execute
+                }
+                if (!LoopMixRenderer.available) {
+                    // Without native JNI, live MixExecutor enters Failed -> classic fallback;
+                    // standalone PairPreparer keeps PREPARED cleanly for JVM unit tests.
+                    mixExecutor?.dispatch(MixEvent.RendererError(FailureKind.RENDERER_PREPARE_ERROR, "renderer_unavailable", recoverable = false))
+                    return@execute
+                }
+                val buildStarted = nowMs()
+                var refusalReason: String? = null
+                var usedNoStem = useNoStemVariant
+                var session = prepareRenderer(pair, useNoStemVariant = usedNoStem) { refusalReason = it }
+                if (session == null && !usedNoStem && pair.transitionPlanV1?.hasNoStemVariant == true) {
+                    usedNoStem = true
+                    refusalReason = null
+                    session = prepareRenderer(pair.copy(useNoStemVariant = true), useNoStemVariant = true) { refusalReason = it }
+                }
+                if (released || generation.get() != targetGeneration) {
+                    closeSessionAsync(session)
+                    return@execute
+                }
+                if (session == null) {
+                    mixExecutor?.dispatch(
+                        MixEvent.RendererError(
+                            FailureKind.RENDERER_PREPARE_ERROR,
+                            refusalReason ?: "renderer_prepare_failed",
+                            recoverable = pair.transitionPlanV1?.hasNoStemVariant == true,
+                        ),
+                    )
+                    return@execute
+                }
+                val buildMs = (nowMs() - buildStarted).coerceAtLeast(0L)
+                publishIfCurrent(targetGeneration) { s ->
+                    s.copy(
+                        state = if (s.state.ordinal < PrepState.PREPARED.ordinal) PrepState.PREPARED else s.state,
+                        useNoStemVariant = usedNoStem,
+                        preparedSession = session,
+                        preparedSessionNoStem = usedNoStem,
+                        timings = s.timings.copy(buildMs = buildMs),
+                    )
+                }
+                mixExecutor?.dispatch(MixEvent.RendererPrepared(planId, targetGeneration, usedNoStem))
+            }
+        }
+    }
+
+    private fun closeSupersededSession(pair: PreparedPair?, newGen: Long) {
+        val session = pair?.preparedSession ?: return
+        if (pair.generation != newGen) closeSessionAsync(session)
+    }
+
+    private fun closeSessionAsync(session: LoopMixSession?) {
+        if (session == null) return
+        scope.launch(Dispatchers.IO) {
+            runCatching { session.close() }
         }
     }
 
@@ -774,6 +1311,12 @@ class PairPreparer(
             lyricsOut = request.lyricsOut,
             lyricsIn = request.lyricsIn,
             caps = capabilities(),
+            recentRecipeIds = recentRecipeIdsSnapshot(),
+            transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
+            minExitMs = request.minExitMs,
+            preferNoStemVariant = request.preferNoStemVariant,
+            tasteWeights = store?.getPreferenceWeights().orEmpty(),
+            machineGeneration = current.generation,
         )
     }
 
@@ -790,199 +1333,413 @@ class PairPreparer(
         }
     }
 
-    private fun executePipeline(gen: Long, request: PrepRequest, initialTimings: PairTimings) {
+    private fun executePipeline(
+        gen: Long,
+        request: PrepRequest,
+        initialTimings: PairTimings,
+        reuseFrom: PreparedPair? = null,
+    ) {
         fun isAborted(): Boolean = released || generation.get() != gen
 
         runCatching {
             if (isAborted()) return
 
-            // --- Stage 1: ANALYZING ---
+            // --- Stage 1: Non-blocking HEAD_TAIL/FULL check (never stall 15 s in awaitAnalysis) ---
             requestAnalysis(request.outTrack)
             requestAnalysis(request.inTrack)
 
-            val analysisReady = awaitAnalysis(gen, request, ::isAborted)
-            if (isAborted()) return
-            val analysisMs = (nowMs() - initialTimings.prepStartMs).coerceAtLeast(0L)
-            if (analysisReady == null) {
-                val cur = _state.value
-                if (cur != null && cur.generation == gen) {
-                    _state.value = cur.copy(
-                        state = PrepState.IDLE,
-                        timings = initialTimings.copy(
-                            analysisMs = analysisMs,
-                            fallbackReason = "analysis-unavailable",
+            val rawOut = analysisFor(request.outTrack.id)
+            val rawIn = analysisFor(request.inTrack.id)
+            mixExecutor?.dispatch(MixEvent.AnalysisReady(request.outTrack.id, analysisLevelOf(rawOut), gen, rawOut.isUsable))
+            mixExecutor?.dispatch(MixEvent.AnalysisReady(request.inTrack.id, analysisLevelOf(rawIn), gen, rawIn.isUsable))
+
+            val outTermFail = rawOut.status == TrackAnalysis.STATUS_READY && !rawOut.isUsable && !analysisRunningFor(request.outTrack.id)
+            val inTermFail = rawIn.status == TrackAnalysis.STATUS_READY && !rawIn.isUsable && !analysisRunningFor(request.inTrack.id)
+
+            if ((!rawOut.isUsable || !rawIn.isUsable) && !request.preferStraight) {
+                val sig = analysisSignature(rawOut, rawIn)
+                val analysisMs = (nowMs() - initialTimings.prepStartMs).coerceAtLeast(0L)
+                if (outTermFail || inTermFail) {
+                    publishIfCurrent(gen) { cur ->
+                        cur.copy(
+                            state = PrepState.IDLE,
+                            outAnalysis = rawOut,
+                            inAnalysis = rawIn,
+                            analysisSignature = sig,
+                            timings = cur.timings.copy(
+                                analysisMs = analysisMs,
+                                fallbackReason = "analysis-unavailable",
+                            ),
+                        )
+                    }
+                    mixExecutor?.dispatch(
+                        MixEvent.AnalysisReady(
+                            trackId = if (outTermFail) request.outTrack.id else request.inTrack.id,
+                            level = AnalysisLevel.NONE,
+                            generation = gen,
+                            usable = false,
+                            refusalReason = RefusalReason.WAITING_ON_ANALYSIS,
                         ),
                     )
+                } else {
+                    publishIfCurrent(gen) { cur ->
+                        cur.copy(
+                            outAnalysis = rawOut,
+                            inAnalysis = rawIn,
+                            analysisSignature = sig,
+                            timings = cur.timings.copy(analysisMs = analysisMs),
+                        )
+                    }
                 }
                 return
             }
-            val (rawOut, rawIn, outMap, inMap) = analysisReady
-            val sig = analysisSignature(rawOut, rawIn)
-            // Physical durations come from what plays. Musical evidence/confidence is left intact.
-            val outA = rawOut.copy(duration = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawOut.duration)
-            val inA = rawIn.copy(duration = request.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawIn.duration)
-            val sungOut = sungFor(request.outTrack.id)
-            val sungIn = sungFor(request.inTrack.id)
 
-            // --- Stage 2: PLANNED ---
-            val planStartMs = nowMs()
-            val stemsAllowed = canUseStems() && AutomixV2Choreo.useStems &&
-                ChoreoCaps.has(capabilities(), ChoreoCaps.STEMS)
-            val input =
-                PlanInput(
-                    outTrack = request.outTrack,
-                    inTrack = request.inTrack,
+            planDecodeAndLaunchStems(
+                gen = gen,
+                request = request,
+                initialTimings = initialTimings,
+                rawOut = rawOut,
+                rawIn = rawIn,
+                reuseFrom = reuseFrom,
+            )
+        }
+    }
+
+    private fun refineOnAnalysisUpdate(targetGen: Long, request: PrepRequest) {
+        if (released || generation.get() != targetGen) return
+        val cur = _state.value ?: return
+        if (cur.generation != targetGen || cur.state in ACTIVE_EXECUTION_STATES) return
+        if (cur.outId != request.outTrack.id || cur.inId != request.inTrack.id) return
+
+        val rawOut = analysisFor(request.outTrack.id)
+        val rawIn = analysisFor(request.inTrack.id)
+        mixExecutor?.dispatch(MixEvent.AnalysisReady(request.outTrack.id, analysisLevelOf(rawOut), targetGen, rawOut.isUsable))
+        mixExecutor?.dispatch(MixEvent.AnalysisReady(request.inTrack.id, analysisLevelOf(rawIn), targetGen, rawIn.isUsable))
+
+        if (cur.state == PrepState.ANALYZING && cur.plan == null) {
+            if ((rawOut.isUsable && rawIn.isUsable) || request.preferStraight) {
+                planDecodeAndLaunchStems(
+                    gen = targetGen,
+                    request = request.copy(positionSec = positionSecProvider()),
+                    initialTimings = cur.timings,
+                    rawOut = rawOut,
+                    rawIn = rawIn,
+                    reuseFrom = cur,
+                )
+            } else {
+                val outTermFail = rawOut.status == TrackAnalysis.STATUS_READY && !rawOut.isUsable && !analysisRunningFor(request.outTrack.id)
+                val inTermFail = rawIn.status == TrackAnalysis.STATUS_READY && !rawIn.isUsable && !analysisRunningFor(request.inTrack.id)
+                if (outTermFail || inTermFail) {
+                    publishIfCurrent(targetGen) { s ->
+                        s.copy(
+                            state = PrepState.IDLE,
+                            outAnalysis = rawOut,
+                            inAnalysis = rawIn,
+                            analysisSignature = analysisSignature(rawOut, rawIn),
+                            timings = s.timings.copy(fallbackReason = "analysis-unavailable"),
+                        )
+                    }
+                }
+            }
+            return
+        }
+
+        val sig = analysisSignature(rawOut, rawIn)
+        val outMap = if (rawOut.isUsable) songMapFor(request.outTrack.id, rawOut) else cur.outSongMap
+        val inMap = if (rawIn.isUsable) songMapFor(request.inTrack.id, rawIn) else cur.inSongMap
+        if (sig == cur.analysisSignature && outMap == cur.outSongMap && inMap == cur.inSongMap) return
+        if (!rawOut.isUsable || !rawIn.isUsable) return
+
+        val outA = rawOut.copy(duration = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawOut.duration)
+        val inA = rawIn.copy(duration = request.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawIn.duration)
+        val outDur = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: outA.duration
+        val inDur = request.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: inA.duration
+        val liveReq = request.copy(positionSec = positionSecProvider().coerceAtLeast(request.positionSec))
+
+        val outV3 = toV3ForPlanner(liveReq.outTrack.id, outA, PhraseMaps.get(liveReq.outTrack.id), outMap, outDur)
+        val inV3 = toV3ForPlanner(liveReq.inTrack.id, inA, PhraseMaps.get(liveReq.inTrack.id), inMap, inDur)
+        val refinedOutcome = PairPlanner.plan(
+            PlannerRequest(
+                generation = targetGen,
+                outTrack = outV3,
+                inTrack = inV3,
+                outTitle = liveReq.outTrack.title,
+                inTitle = liveReq.inTrack.title,
+                djLevel = toCoreDjLevel(liveReq.djLevel),
+                positionMs = (liveReq.positionSec * 1000.0).roundToLong().coerceAtLeast(0L),
+                minExitMs = liveReq.minExitMs,
+                recentRecipeIds = recentRecipeIdsSnapshot(),
+                transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
+                excludedRecipeIds = liveReq.excludedRecipes.map { it.code }.toSet(),
+                preferNoStemVariant = liveReq.preferNoStemVariant,
+                tasteWeights = store?.getPreferenceWeights().orEmpty(),
+            ),
+        )
+        val oldV1 = cur.transitionPlanV1
+        val refinedV1 = (refinedOutcome as? MixOutcome.Ok)?.value
+        val barMs = (oldV1?.barDurationMs ?: refinedV1?.barDurationMs ?: (barSeconds(outA.bpm, 0.5) * 1000.0).roundToLong())
+            .coerceAtLeast(500L)
+        val oldExitMs = oldV1?.frozenExitMs ?: (cur.plannedWindowStartSec * 1000.0).roundToLong()
+        val oldEntryMs = oldV1?.frozenEntryMs ?: (cur.entryCueSec * 1000.0).roundToLong()
+        val shiftedGeBar = refinedV1 != null &&
+            (abs(refinedV1.frozenExitMs - oldExitMs) >= barMs || abs(refinedV1.frozenEntryMs - oldEntryMs) >= barMs)
+        val reqInvalidated = refinedV1 != null && oldV1 != null &&
+            (oldV1.requiredStems != refinedV1.requiredStems && cur.state == PrepState.PREPARED &&
+                ((cur.script?.outUsesStems == true && cur.outStems == null) ||
+                    (cur.script?.inUsesStems == true && cur.inStems == null)))
+
+        if (!shiftedGeBar && !reqInvalidated) {
+            // < 1 bar shift and requirements intact: keep the frozen plan and any decoded/stem work.
+            publishIfCurrent(targetGen) { s ->
+                s.copy(
+                    outAnalysis = outA,
+                    inAnalysis = inA,
+                    outSongMap = outMap,
+                    inSongMap = inMap,
+                    analysisSignature = sig,
+                )
+            }
+            return
+        }
+
+        // Only re-freeze if MixMachine has not yet promoted past Preparing/Moved (or when standalone).
+        val machineState = mixExecutor?.currentState()
+        if (machineState != null && machineState !is MixState.Preparing && machineState !is MixState.Moved) {
+            publishIfCurrent(targetGen) { s ->
+                s.copy(
+                    outAnalysis = outA,
+                    inAnalysis = inA,
+                    outSongMap = outMap,
+                    inSongMap = inMap,
+                    analysisSignature = sig,
+                )
+            }
+            return
+        }
+
+        planDecodeAndLaunchStems(
+            gen = targetGen,
+            request = liveReq,
+            initialTimings = cur.timings,
+            rawOut = rawOut,
+            rawIn = rawIn,
+            reuseFrom = cur,
+        )
+    }
+
+    private fun planDecodeAndLaunchStems(
+        gen: Long,
+        request: PrepRequest,
+        initialTimings: PairTimings,
+        rawOut: TrackAnalysis,
+        rawIn: TrackAnalysis,
+        reuseFrom: PreparedPair?,
+    ) {
+        fun isAborted(): Boolean = released || generation.get() != gen
+
+        val outMap = if (rawOut.isUsable) songMapFor(request.outTrack.id, rawOut) else null
+        val inMap = if (rawIn.isUsable) songMapFor(request.inTrack.id, rawIn) else null
+        val analysisMs = (nowMs() - initialTimings.prepStartMs).coerceAtLeast(0L)
+        val sig = analysisSignature(rawOut, rawIn)
+        // Physical durations come from what plays; musical evidence remains intact.
+        val outA = rawOut.copy(duration = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawOut.duration)
+        val inA = rawIn.copy(duration = request.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawIn.duration)
+        val sungOut = sungFor(request.outTrack.id)
+        val sungIn = sungFor(request.inTrack.id)
+
+        // --- Stage 2: PLANNED ---
+        val planStartMs = nowMs()
+        val stemsAllowed = canUseStems() && AutomixV2Choreo.useStems &&
+            ChoreoCaps.has(capabilities(), ChoreoCaps.STEMS) && !request.preferNoStemVariant
+        val input = PlanInput(
+            outTrack = request.outTrack,
+            inTrack = request.inTrack,
+            outAnalysis = outA,
+            inAnalysis = inA,
+            outSongMap = outMap,
+            inSongMap = inMap,
+            sungOut = sungOut,
+            sungIn = sungIn,
+            djLevel = request.djLevel,
+            sampleRate = request.sampleRate,
+            positionSec = request.positionSec,
+            albumOrder = request.albumOrder,
+            stemsExpected = stemsAllowed,
+            preferStraight = request.preferStraight,
+            excludedRecipes = request.excludedRecipes,
+            fallbackSeconds = request.fallbackSeconds,
+            lyricsOut = request.lyricsOut,
+            lyricsIn = request.lyricsIn,
+            caps = capabilities(),
+            recentRecipeIds = recentRecipeIdsSnapshot(),
+            transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
+            minExitMs = request.minExitMs,
+            preferNoStemVariant = request.preferNoStemVariant,
+            tasteWeights = store?.getPreferenceWeights().orEmpty(),
+            machineGeneration = gen,
+        )
+        val selected = planSelector.select(input)
+        val planMs = (nowMs() - planStartMs).coerceAtLeast(0L)
+        if (isAborted()) return
+
+        if (selected == null || (selected.plan == null && selected.exitWindowSec == null)) {
+            val reason = selected?.fallbackReason?.ifBlank { "no-v2-plan" } ?: "no-v2-plan"
+            publishIfCurrent(gen) { cur ->
+                cur.copy(
+                    state = PrepState.IDLE,
                     outAnalysis = outA,
                     inAnalysis = inA,
                     outSongMap = outMap,
                     inSongMap = inMap,
                     sungOut = sungOut,
                     sungIn = sungIn,
-                    djLevel = request.djLevel,
-                    sampleRate = request.sampleRate,
-                    positionSec = request.positionSec,
-                    albumOrder = request.albumOrder,
-                    stemsExpected = stemsAllowed,
-                    preferStraight = request.preferStraight,
-                    excludedRecipes = request.excludedRecipes,
-                    fallbackSeconds = request.fallbackSeconds,
-                    lyricsOut = request.lyricsOut, lyricsIn = request.lyricsIn,
-                    caps = capabilities(),
-                )
-            val selected = planSelector.select(input)
-            val planMs = (nowMs() - planStartMs).coerceAtLeast(0L)
-            if (isAborted()) return
-
-            if (selected == null || (selected.plan == null && selected.exitWindowSec == null)) {
-                val reason = selected?.fallbackReason?.ifBlank { "no-v2-plan" } ?: "no-v2-plan"
-                publishIfCurrent(gen) { cur ->
-                    cur.copy(
-                        state = PrepState.IDLE,
-                        outAnalysis = outA,
-                        inAnalysis = inA,
-                        outSongMap = outMap,
-                        inSongMap = inMap,
-                        sungOut = sungOut,
-                        sungIn = sungIn,
-                        analysisSignature = sig,
-                        timings = cur.timings.copy(
-                            analysisMs = analysisMs,
-                            planMs = planMs,
-                            path = selected?.pathHint.orEmpty(),
-                            fallbackReason = reason,
-                        ),
-                    )
-                }
-                return
-            }
-
-            val v2Prep = selected.v2Prep ?: selected.plan?.let { plan ->
-                ChoreoSessionGlue.prepare(
-                    plan = plan,
-                    script = selected.phraseScript,
-                    outAnalysis = outA,
-                    inAnalysis = inA,
-                    outSongMap = outMap,
-                    inSongMap = inMap,
-                    level = request.djLevel,
-                    outId = request.outTrack.id,
-                    inId = request.inTrack.id,
-                    sampleRate = request.sampleRate,
-                    albumOrder = request.albumOrder,
-                    stemsExpected = stemsAllowed,
-                    straightRateMode = selected.straightRateMode,
-                    excludedRecipes = request.excludedRecipes,
-                    capsOverride = input.caps,
+                    analysisSignature = sig,
+                    lastRefusalReason = selected?.refusalReason,
+                    timings = cur.timings.copy(
+                        analysisMs = analysisMs,
+                        planMs = planMs,
+                        path = selected?.pathHint.orEmpty(),
+                        fallbackReason = reason,
+                    ),
                 )
             }
-            val effectivePlan = v2Prep?.plan ?: selected.plan
-            val windowStartSec = effectivePlan?.out?.loopStart
-                ?: selected.exitWindowSec?.start
-                ?: 0.0
-            val windowEndSec = effectivePlan?.let {
-                val c = LoopMix.Clock(it)
-                it.out.loopStart + c.releaseAt + it.exitTailSeconds
-            } ?: selected.exitWindowSec?.endInclusive ?: (windowStartSec + 8.0)
-            val entryCueSec = effectivePlan?.inn?.loopStart ?: selected.entryCueSec ?: 0.0
+            return
+        }
 
-            val plannedPair = PreparedPair(
-                outId = request.outTrack.id,
-                inId = request.inTrack.id,
-                outTitle = request.outTrack.title,
-                outArtist = request.outTrack.artist,
-                inTitle = request.inTrack.title,
-                inArtist = request.inTrack.artist,
-                djLevel = request.djLevel,
-                state = PrepState.PLANNED,
-                plan = effectivePlan,
-                phraseScript = selected.phraseScript,
-                v2Prep = v2Prep,
-                sampleRate = request.sampleRate,
+        val v2Prep = selected.v2Prep ?: selected.plan?.let { plan ->
+            ChoreoSessionGlue.prepare(
+                plan = plan,
+                script = selected.phraseScript,
                 outAnalysis = outA,
                 inAnalysis = inA,
                 outSongMap = outMap,
                 inSongMap = inMap,
-                sungOut = sungOut,
-                sungIn = sungIn,
-                albumOrder = request.albumOrder,
-                timings = initialTimings.copy(
-                    analysisMs = analysisMs,
-                    planMs = planMs,
-                    path = selected.pathHint,
-                ),
-                plannedWindowStartSec = windowStartSec,
-                plannedWindowEndSec = windowEndSec,
-                entryCueSec = entryCueSec,
-                generation = gen,
-                analysisSignature = sig,
-                straightRateMode = selected.straightRateMode,
-            )
-            publishIfCurrent(gen) { plannedPair }
-
-            val (outBounds, inBounds) = computeDecodeWindows(
-                effectivePlan = effectivePlan,
-                exitWindowSec = selected.exitWindowSec,
-                entryCueSec = entryCueSec,
-                outDurationSec = request.outTrack.durationSec.takeIf { it > 0.0 } ?: outA.duration,
-                inDurationSec = request.inTrack.durationSec.takeIf { it > 0.0 } ?: inA.duration,
-                outAnalysis = outA,
-                inAnalysis = inA,
-                sampleRate = request.sampleRate,
-                straightRateMode = selected.straightRateMode,
                 level = request.djLevel,
+                outId = request.outTrack.id,
+                inId = request.inTrack.id,
+                sampleRate = request.sampleRate,
+                albumOrder = request.albumOrder,
+                stemsExpected = stemsAllowed,
+                straightRateMode = selected.straightRateMode,
+                excludedRecipes = request.excludedRecipes,
+                capsOverride = input.caps,
             )
+        }
+        val effectivePlan = v2Prep?.plan ?: selected.plan
+        val windowStartSec = effectivePlan?.out?.loopStart
+            ?: selected.exitWindowSec?.start
+            ?: 0.0
+        val windowEndSec = effectivePlan?.let {
+            val c = LoopMix.Clock(it)
+            it.out.loopStart + c.releaseAt + it.exitTailSeconds
+        } ?: selected.exitWindowSec?.endInclusive ?: (windowStartSec + 8.0)
+        val entryCueSec = effectivePlan?.inn?.loopStart ?: selected.entryCueSec ?: 0.0
 
-            val outRegion = decodeRegion(request.outTrack, outBounds.first, outBounds.second, request.sampleRate)
+        val planV1 = resolveTransitionPlanV1(selected, request, gen, outA, inA, selected.previewScript)
+        if (planV1 != null) {
+            mixExecutor?.dispatch(MixEvent.PlanFrozen(planV1, gen))
             if (isAborted()) return
-            publishIfCurrent(gen) { it.copy(outRegion = outRegion) }
-            val inRegion = decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
-            if (isAborted()) return
-            val coverageReason = effectivePlan?.let {
-                LoopMixSession.preparedCoverageRefusal(it, request.sampleRate, outRegion, inRegion,
-                    outA, inA, selected.straightRateMode, request.djLevel)
-            } ?: "prepared_script_geometry_missing"
-            if (coverageReason != null) {
-                publishIfCurrent(gen) { it.copy(state = PrepState.IDLE, outRegion = outRegion, inRegion = inRegion,
-                    timings = it.timings.copy(fallbackReason = coverageReason)) }
-                return
-            }
+        }
 
-            // --- Stage 3: STEMMING ---
-            publishIfCurrent(gen) { cur ->
-                cur.copy(
-                    state = PrepState.STEMMING,
+        val plannedPair = PreparedPair(
+            outId = request.outTrack.id,
+            inId = request.inTrack.id,
+            outTitle = request.outTrack.title,
+            outArtist = request.outTrack.artist,
+            inTitle = request.inTrack.title,
+            inArtist = request.inTrack.artist,
+            djLevel = request.djLevel,
+            state = PrepState.PLANNED,
+            plan = effectivePlan,
+            phraseScript = selected.phraseScript,
+            v2Prep = v2Prep,
+            sampleRate = request.sampleRate,
+            outAnalysis = outA,
+            inAnalysis = inA,
+            outSongMap = outMap,
+            inSongMap = inMap,
+            sungOut = sungOut,
+            sungIn = sungIn,
+            albumOrder = request.albumOrder,
+            timings = initialTimings.copy(
+                analysisMs = analysisMs,
+                planMs = planMs,
+                path = selected.pathHint,
+            ),
+            plannedWindowStartSec = windowStartSec,
+            plannedWindowEndSec = windowEndSec,
+            entryCueSec = entryCueSec,
+            generation = gen,
+            analysisSignature = sig,
+            straightRateMode = selected.straightRateMode,
+            transitionPlanV1 = planV1,
+            useNoStemVariant = request.preferNoStemVariant,
+        )
+        publishIfCurrent(gen) { plannedPair }
+
+        val (outBounds, inBounds) = computeDecodeWindows(
+            effectivePlan = effectivePlan,
+            exitWindowSec = selected.exitWindowSec,
+            entryCueSec = entryCueSec,
+            outDurationSec = request.outTrack.durationSec.takeIf { it > 0.0 } ?: outA.duration,
+            inDurationSec = request.inTrack.durationSec.takeIf { it > 0.0 } ?: inA.duration,
+            outAnalysis = outA,
+            inAnalysis = inA,
+            sampleRate = request.sampleRate,
+            straightRateMode = selected.straightRateMode,
+            level = request.djLevel,
+        )
+
+        // Containment reuse of previously decoded PCM before decoding.
+        val reusableSamePair = reuseFrom?.takeIf {
+            it.outId == request.outTrack.id && it.inId == request.inTrack.id && it.sampleRate == request.sampleRate
+        }
+        val outRegion = sliceLoopRegion(reusableSamePair?.outRegion, request.sampleRate, outBounds.first, outBounds.second)
+            ?: decodeRegion(request.outTrack, outBounds.first, outBounds.second, request.sampleRate)
+        if (isAborted()) return
+        publishIfCurrent(gen) { it.copy(outRegion = outRegion) }
+
+        val inRegion = sliceLoopRegion(reusableSamePair?.inRegion, request.sampleRate, inBounds.first, inBounds.second)
+            ?: decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
+        if (isAborted()) return
+
+        val coverageReason = effectivePlan?.let {
+            LoopMixSession.preparedCoverageRefusal(
+                it, request.sampleRate, outRegion, inRegion,
+                outA, inA, selected.straightRateMode, request.djLevel,
+            )
+        } ?: "prepared_script_geometry_missing"
+        if (coverageReason != null) {
+            publishIfCurrent(gen) {
+                it.copy(
+                    state = PrepState.IDLE,
                     outRegion = outRegion,
                     inRegion = inRegion,
+                    lastRefusalReason = RefusalReason.PCM_COVERAGE_INCOMPLETE,
+                    timings = it.timings.copy(fallbackReason = coverageReason),
                 )
             }
+            return
+        }
 
-            var outStems: StemSet? = null
-            var inStems: StemSet? = null
-            var stemMsOut = 0L
-            var stemMsIn = 0L
+        // --- Stage 3: STEMMING ---
+        publishIfCurrent(gen) { cur ->
+            cur.copy(
+                state = PrepState.STEMMING,
+                outRegion = outRegion,
+                inRegion = inRegion,
+            )
+        }
+        if (planV1 != null) {
+            mixExecutor?.dispatch(MixEvent.RegionsReady(planV1.planId, gen))
+            if (isAborted()) return
+        }
 
-            if (stemsAllowed && (outRegion != null || inRegion != null)) {
-                val (needOutStems, needInStems) = requiredStemSides(
+        val (needOutStems, needInStems) = if (stemsAllowed && (outRegion != null || inRegion != null)) {
+            if (planV1 != null && selected.transitionPlanV1 != null && planV1.requiredStems.isEmpty()) {
+                false to false
+            } else {
+                requiredStemSides(
                     effectivePlan = effectivePlan,
                     v2Prep = v2Prep,
                     outA = outA,
@@ -996,9 +1753,73 @@ class PairPreparer(
                     inId = request.inTrack.id,
                     albumOrder = request.albumOrder,
                 )
-                if (needOutStems && outRegion != null &&
-                    outRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
-                ) {
+            }
+        } else {
+            false to false
+        }
+
+        // Containment reuse of already-separated stems when the window fits inside prior StemSet.
+        val slicedOutStems = if (needOutStems && outRegion != null) {
+            sliceStemSet(
+                reusableSamePair?.outStems,
+                outRegion.start,
+                outRegion.start + outRegion.left.size.toDouble() / request.sampleRate,
+            )?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
+        } else null
+        val slicedInStems = if (needInStems && inRegion != null) {
+            sliceStemSet(
+                reusableSamePair?.inStems,
+                inRegion.start,
+                inRegion.start + inRegion.left.size.toDouble() / request.sampleRate,
+            )?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
+        } else null
+
+        val needSepOut = needOutStems && slicedOutStems == null && outRegion != null &&
+            outRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
+        val needSepIn = needInStems && slicedInStems == null && inRegion != null &&
+            inRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
+
+        if (!needSepOut && !needSepIn) {
+            val initialCompleted = (if (slicedOutStems != null) 1 else 0) + (if (slicedInStems != null) 1 else 0)
+            val totalRequired = maxOf(initialCompleted, planV1?.requiredStems?.size ?: 0)
+            finalizePreparedPair(
+                gen = gen,
+                request = request,
+                selected = selected,
+                effectivePlan = effectivePlan,
+                planV1 = planV1,
+                v2Prep = v2Prep,
+                outA = outA,
+                inA = inA,
+                outMap = outMap,
+                inMap = inMap,
+                sungOut = sungOut,
+                sungIn = sungIn,
+                outRegion = outRegion,
+                inRegion = inRegion,
+                outStems = slicedOutStems,
+                inStems = slicedInStems,
+                stemMsOut = 0L,
+                stemMsIn = 0L,
+                stemsCompleted = initialCompleted,
+                stemsRequired = totalRequired,
+                analysisMs = analysisMs,
+                planMs = planMs,
+                windowStartSec = windowStartSec,
+            )
+            return
+        }
+
+        // Run slow SCNet inference on dedicated single-thread `djmix-stems` so `djmix-prep` stays free.
+        runCatching {
+            stemExecutor.execute {
+                if (isAborted()) return@execute
+                var outStems = slicedOutStems
+                var inStems = slicedInStems
+                var stemMsOut = 0L
+                var stemMsIn = 0L
+
+                if (needSepOut && outRegion != null) {
                     val t0 = nowMs()
                     outStems = synchronized(stemLock) {
                         if (isAborted()) null
@@ -1013,10 +1834,9 @@ class PairPreparer(
                     }?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
                     stemMsOut = (nowMs() - t0).coerceAtLeast(0L)
                 }
-                if (isAborted()) return
-                if (needInStems && inRegion != null &&
-                    inRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
-                ) {
+                if (isAborted()) return@execute
+
+                if (needSepIn && inRegion != null) {
                     val t0 = nowMs()
                     inStems = synchronized(stemLock) {
                         if (isAborted()) null
@@ -1031,75 +1851,219 @@ class PairPreparer(
                     }?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
                     stemMsIn = (nowMs() - t0).coerceAtLeast(0L)
                 }
-                if (isAborted()) return
-            }
+                if (isAborted()) return@execute
 
-            // --- Stage 4: PREPARED ---
-            val (script, top3) = chooseFinalScript(
-                effectivePlan = effectivePlan,
-                v2Prep = v2Prep,
-                outA = outA,
-                inA = inA,
-                sungOut = sungOut,
-                sungIn = sungIn,
-                outStems = outStems,
-                inStems = inStems,
-                sampleRate = request.sampleRate,
-                caps = v2Prep?.caps ?: capabilities(),
-                level = request.djLevel,
-                outId = request.outTrack.id,
-                inId = request.inTrack.id,
-                albumOrder = request.albumOrder,
-                // A straight selection's script was already validated against this exact geometry,
-                // rate mode and PCM coverage; executing it verbatim keeps PREPARED honest.
-                preferredScript = selected.previewScript,
-            )
-            if (isAborted()) return
-
-            if (script == null) {
-                publishIfCurrent(gen) { it.copy(state = PrepState.IDLE, outRegion = outRegion, inRegion = inRegion,
-                    timings = it.timings.copy(fallbackReason = "same-level-choreography-unavailable")) }
-                return
-            }
-
-            val usedOutStems = if (script?.outUsesStems == true) outStems else null
-            val usedInStems = if (script?.inUsesStems == true) inStems else null
-            val stemsCount = maxOf(usedOutStems?.stemCount ?: 0, usedInStems?.stemCount ?: 0)
-            val leadSec = (windowStartSec - positionSecProvider()).coerceAtLeast(0.0)
-            val readyAtMs = nowMs()
-
-            publishIfCurrent(gen) { cur ->
-                cur.copy(
-                    state = PrepState.PREPARED,
-                    script = script,
-                    topCandidates = top3,
-                    outStems = usedOutStems,
-                    inStems = usedInStems,
+                val required = (if (needOutStems) 1 else 0) + (if (needInStems) 1 else 0)
+                val completed = (if (outStems != null) 1 else 0) + (if (inStems != null) 1 else 0)
+                finalizePreparedPair(
+                    gen = gen,
+                    request = request,
+                    selected = selected,
+                    effectivePlan = effectivePlan,
+                    planV1 = planV1,
+                    v2Prep = v2Prep,
+                    outA = outA,
+                    inA = inA,
+                    outMap = outMap,
+                    inMap = inMap,
+                    sungOut = sungOut,
+                    sungIn = sungIn,
                     outRegion = outRegion,
                     inRegion = inRegion,
-                    preparedAtMs = readyAtMs,
-                    timings = cur.timings.copy(
-                        analysisMs = analysisMs,
-                        planMs = planMs,
-                        stemMsOut = stemMsOut,
-                        stemMsIn = stemMsIn,
-                        preparedLeadSec = leadSec,
-                        path = selected.pathHint,
-                        level = request.djLevel.name,
-                        move = script?.move?.name.orEmpty(),
-                        fxCount = script?.fxCount ?: 0,
-                        stems = stemsCount,
-                        fallbackReason = selected.fallbackReason,
-                    ),
+                    outStems = outStems,
+                    inStems = inStems,
+                    stemMsOut = stemMsOut,
+                    stemMsIn = stemMsIn,
+                    stemsCompleted = completed,
+                    stemsRequired = planV1?.requiredStems?.size ?: required,
+                    analysisMs = analysisMs,
+                    planMs = planMs,
+                    windowStartSec = windowStartSec,
                 )
             }
+        }
+    }
 
-            request.inTrack.mediaItem?.let { item ->
-                scope.launch(mainDispatcher) {
-                    if (!isAborted()) onArtworkPrefetch(item)
+    private fun finalizePreparedPair(
+        gen: Long,
+        request: PrepRequest,
+        selected: SelectedPlan,
+        effectivePlan: LoopMix.Plan?,
+        planV1: TransitionPlanV1?,
+        v2Prep: ChoreoSessionGlue.Prep?,
+        outA: TrackAnalysis,
+        inA: TrackAnalysis,
+        outMap: SongMap?,
+        inMap: SongMap?,
+        sungOut: List<LoopMix.Span>?,
+        sungIn: List<LoopMix.Span>?,
+        outRegion: LoopRegion?,
+        inRegion: LoopRegion?,
+        outStems: StemSet?,
+        inStems: StemSet?,
+        stemMsOut: Long,
+        stemMsIn: Long,
+        stemsCompleted: Int,
+        stemsRequired: Int,
+        analysisMs: Long,
+        planMs: Long,
+        windowStartSec: Double,
+    ) {
+        if (released || generation.get() != gen) return
+        val effectiveCaps = if (request.preferNoStemVariant) {
+            (v2Prep?.caps ?: capabilities()) and ChoreoCaps.STEMS.inv()
+        } else {
+            v2Prep?.caps ?: capabilities()
+        }
+        val (script, top3) = chooseFinalScript(
+            effectivePlan = effectivePlan,
+            v2Prep = v2Prep,
+            outA = outA,
+            inA = inA,
+            sungOut = sungOut,
+            sungIn = sungIn,
+            outStems = if (request.preferNoStemVariant) null else outStems,
+            inStems = if (request.preferNoStemVariant) null else inStems,
+            sampleRate = request.sampleRate,
+            caps = effectiveCaps,
+            level = request.djLevel,
+            outId = request.outTrack.id,
+            inId = request.inTrack.id,
+            albumOrder = request.albumOrder,
+            preferredScript = selected.previewScript.takeIf {
+                request.preferNoStemVariant || (outStems == null && inStems == null)
+            },
+        )
+        if (released || generation.get() != gen) return
+
+        if (script == null) {
+            publishIfCurrent(gen) {
+                it.copy(
+                    state = PrepState.IDLE,
+                    outRegion = outRegion,
+                    inRegion = inRegion,
+                    lastRefusalReason = RefusalReason.CHOREOGRAPHY_UNAVAILABLE,
+                    timings = it.timings.copy(fallbackReason = "same-level-choreography-unavailable"),
+                )
+            }
+            return
+        }
+
+        val usedOutStems = if (script.outUsesStems) outStems else null
+        val usedInStems = if (script.inUsesStems) inStems else null
+        val usedNoStemVariant = request.preferNoStemVariant || (!script.outUsesStems && !script.inUsesStems && stemsRequired > 0)
+        val stemsCount = maxOf(usedOutStems?.stemCount ?: 0, usedInStems?.stemCount ?: 0)
+        val leadSec = (windowStartSec - positionSecProvider()).coerceAtLeast(0.0)
+        val readyAtMs = nowMs()
+
+        publishIfCurrent(gen) { cur ->
+            cur.copy(
+                state = PrepState.PREPARED,
+                script = script,
+                topCandidates = top3,
+                outStems = usedOutStems,
+                inStems = usedInStems,
+                outRegion = outRegion,
+                inRegion = inRegion,
+                preparedAtMs = readyAtMs,
+                useNoStemVariant = usedNoStemVariant,
+                timings = cur.timings.copy(
+                    analysisMs = analysisMs,
+                    planMs = planMs,
+                    stemMsOut = stemMsOut,
+                    stemMsIn = stemMsIn,
+                    preparedLeadSec = leadSec,
+                    path = selected.pathHint,
+                    level = request.djLevel.name,
+                    move = script.move.name,
+                    fxCount = script.fxCount,
+                    stems = stemsCount,
+                    fallbackReason = selected.fallbackReason,
+                ),
+            )
+        }
+
+        request.inTrack.mediaItem?.let { item ->
+            scope.launch(mainDispatcher) {
+                if (!released && generation.get() == gen) onArtworkPrefetch(item)
+            }
+        }
+
+        if (planV1 != null) {
+            val activeExecutor = mixExecutor
+            if (activeExecutor != null) {
+                activeExecutor.dispatch(
+                    MixEvent.StemsReady(
+                        planId = planV1.planId,
+                        generation = gen,
+                        stemsCompleted = stemsCompleted,
+                        stemsRequired = if (usedNoStemVariant) 0 else stemsRequired,
+                        stemLatencyOutMs = stemMsOut.takeIf { it > 0L },
+                        stemLatencyInMs = stemMsIn.takeIf { it > 0L },
+                    ),
+                )
+            } else if (LoopMixRenderer.available) {
+                _state.value?.takeIf { it.generation == gen }?.let { frozenPair ->
+                    prepareRenderer(frozenPair, useNoStemVariant = usedNoStemVariant)
                 }
             }
         }
+    }
+
+    private fun resolveTransitionPlanV1(
+        selected: SelectedPlan,
+        request: PrepRequest,
+        gen: Long,
+        outA: TrackAnalysis,
+        inA: TrackAnalysis,
+        script: ChoreoScript?,
+    ): TransitionPlanV1? {
+        selected.transitionPlanV1?.let { return it }
+        val plan = selected.plan
+        val outBpm = outA.bpm.takeIf { it.isFinite() && it > 1.0 } ?: plan?.out?.bpm?.takeIf { it > 1.0 } ?: 120.0
+        val barMs = (barSeconds(outBpm, plan?.out?.beatSec ?: 0.5) * 1000.0).roundToLong().coerceAtLeast(500L)
+        val exitMs = ((plan?.out?.loopStart ?: selected.exitWindowSec?.start ?: 0.0) * 1000.0).roundToLong().coerceAtLeast(0L)
+        val entryMs = ((plan?.inn?.loopStart ?: selected.entryCueSec ?: 0.0) * 1000.0).roundToLong().coerceAtLeast(0L)
+        val overlapMs = if (plan != null) {
+            (LoopMix.Clock(plan).releaseAt * 1000.0).roundToLong().coerceAtLeast(1L)
+        } else {
+            val w = selected.exitWindowSec ?: return null
+            ((w.endInclusive - w.start) * 1000.0).roundToLong().coerceAtLeast(1L)
+        }
+        val geom = when {
+            plan == null -> TransitionGeometry.STRAIGHT
+            plan.outLoops || plan.inLoops -> TransitionGeometry.LOOP
+            selected.straightRateMode == null -> TransitionGeometry.BRIDGE
+            else -> TransitionGeometry.STRAIGHT
+        }
+        val recipeCode = script?.recipeId?.takeIf { it.isNotBlank() }
+            ?: selected.previewScript?.recipeId?.takeIf { it.isNotBlank() }
+            ?: selected.v2Prep?.forcedRecipe?.code
+            ?: "S1"
+        val recipeName = script?.recipeName?.takeIf { it.isNotBlank() }
+            ?: selected.previewScript?.recipeName?.takeIf { it.isNotBlank() }
+            ?: selected.v2Prep?.forcedRecipe?.displayName
+            ?: "Smooth blend"
+        val catalogEntry = BuiltInRecipeCatalog.byId(recipeCode)
+        return TransitionPlanV1(
+            planId = "plan-$gen-$recipeCode-$exitMs",
+            generation = gen,
+            outTrackId = request.outTrack.id,
+            inTrackId = request.inTrack.id,
+            outTitle = request.outTrack.title,
+            inTitle = request.inTrack.title,
+            djLevel = toCoreDjLevel(request.djLevel),
+            geometry = geom,
+            frozenExitMs = exitMs,
+            frozenEntryMs = entryMs,
+            swapDownbeatMs = exitMs + overlapMs / 2L,
+            overlapDurationMs = overlapMs,
+            barDurationMs = barMs,
+            recipeId = recipeCode,
+            recipeName = recipeName,
+            requiredStems = catalogEntry?.requiredStems ?: emptySet(),
+            hasNoStemVariant = catalogEntry?.hasNoStemVariant ?: true,
+        )
     }
 
     private fun publishIfCurrent(gen: Long, transform: (PreparedPair) -> PreparedPair) {
@@ -1122,6 +2086,7 @@ class PairPreparer(
             return
         }
         val script = pair.script
+        val planV1 = pair.transitionPlanV1
         val timings = pair.timings
         val plannedPath = timings.path.takeIf { it.isNotBlank() }
         val actualPath = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) plannedPath else null
@@ -1134,6 +2099,16 @@ class PairPreparer(
                     score = candidate.total,
                     reason = candidate.reason,
                 )
+            }
+            .ifEmpty {
+                planV1?.topScores.orEmpty().take(3).map { s ->
+                    MixInspectorRecipeScore(
+                        recipeId = s.recipeId,
+                        recipeName = s.recipeName,
+                        score = s.score,
+                        reason = s.reason,
+                    )
+                }
             }
         val effects = if (script == null) {
             emptyList()
@@ -1180,13 +2155,16 @@ class PairPreparer(
                 },
                 plannedPath = plannedPath,
                 path = actualPath,
-                recipeId = script?.recipeId?.takeIf { it.isNotBlank() }
+                recipeId = planV1?.recipeId?.takeIf { it.isNotBlank() }
+                    ?: script?.recipeId?.takeIf { it.isNotBlank() }
                     ?: pair.v2Prep?.forcedRecipe?.code
                     ?: candidates.firstOrNull()?.recipeId,
-                recipeName = script?.recipeName?.takeIf { it.isNotBlank() }
+                recipeName = planV1?.recipeName?.takeIf { it.isNotBlank() }
+                    ?: script?.recipeName?.takeIf { it.isNotBlank() }
                     ?: pair.v2Prep?.forcedRecipe?.displayName
                     ?: candidates.firstOrNull()?.recipeName,
-                reason = script?.reason?.takeIf { it.isNotBlank() },
+                reason = script?.reason?.takeIf { it.isNotBlank() }
+                    ?: planV1?.placementReasons?.firstOrNull(),
                 stemsReady = stemsReady,
                 stemCount = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) timings.stems else null,
                 prepStartMs = timings.prepStartMs.takeIf { it > 0L },
@@ -1206,76 +2184,6 @@ class PairPreparer(
                 remixUnavailableReason = remixUnavailableReason,
             ),
         )
-    }
-
-    private data class ReadyAnalysis(
-        val outA: TrackAnalysis,
-        val inA: TrackAnalysis,
-        val outMap: SongMap?,
-        val inMap: SongMap?,
-    )
-
-    private fun awaitAnalysis(
-        gen: Long,
-        request: PrepRequest,
-        isAborted: () -> Boolean,
-    ): ReadyAnalysis? {
-        val deadlineMs = nowMs() + analysisWaitTimeoutMs
-        var minimumMetAtMs = 0L
-
-        while (!isAborted()) {
-            val outA = analysisFor(request.outTrack.id)
-            val inA = analysisFor(request.inTrack.id)
-            val outMap = if (outA.isUsable) songMapFor(request.outTrack.id, outA) else null
-            val inMap = if (inA.isUsable) songMapFor(request.inTrack.id, inA) else null
-
-            val outMinReady = outA.isUsable &&
-                (outA.tailBeats != null || outA.quality == TrackAnalysis.QUALITY_FULL || !analysisRunningFor(request.outTrack.id))
-            val inMinReady = inA.isUsable
-
-            if (outMinReady && inMinReady) {
-                val bothFull = outA.quality == TrackAnalysis.QUALITY_FULL && inA.quality == TrackAnalysis.QUALITY_FULL
-                val analyzingAny = analysisRunningFor(request.outTrack.id) || analysisRunningFor(request.inTrack.id)
-                val now = nowMs()
-                if (minimumMetAtMs == 0L) minimumMetAtMs = now
-                val waitedFullMs = now - minimumMetAtMs
-                if (bothFull || !analyzingAny || fullPreferredWaitMs <= 0L || waitedFullMs >= fullPreferredWaitMs) {
-                    return ReadyAnalysis(outA, inA, outMap, inMap)
-                }
-                val remFullMs = (fullPreferredWaitMs - waitedFullMs).coerceIn(10L, 500L)
-                awaitSignal(remFullMs)
-                continue
-            }
-
-            // Terminal failure on either track -> don't spin until timeout.
-            val outTerminalFail = outA.status == TrackAnalysis.STATUS_READY && !outA.isUsable && !analysisRunningFor(request.outTrack.id)
-            val inTerminalFail = inA.status == TrackAnalysis.STATUS_READY && !inA.isUsable && !analysisRunningFor(request.inTrack.id)
-            if (outTerminalFail || inTerminalFail) {
-                return ReadyAnalysis(outA, inA, outMap, inMap)
-            }
-
-            val now = nowMs()
-            if (now >= deadlineMs) {
-                return ReadyAnalysis(outA, inA, outMap, inMap)
-            }
-            val waitSliceMs = (deadlineMs - now).coerceIn(10L, 500L)
-            awaitSignal(waitSliceMs)
-        }
-        return null
-    }
-
-    private fun awaitSignal(timeoutMs: Long) {
-        waitLock.withLock {
-            runCatching {
-                waitCondition.await(timeoutMs, TimeUnit.MILLISECONDS)
-            }
-        }
-    }
-
-    private fun signalWaiters() {
-        waitLock.withLock {
-            waitCondition.signalAll()
-        }
     }
 
     private fun computeDecodeWindows(
@@ -1534,6 +2442,8 @@ class PairPreparer(
     companion object {
         private const val DEFAULT_ANALYSIS_WAIT_MS = 15_000L
         private const val DEFAULT_FULL_PREFERRED_WAIT_MS = 3_000L
+        private const val RECIPE_HISTORY_CAP = 12
+        private val ABRUPT_RECIPE_IDS = setOf("F2", "F7", "F9")
         private val ACTIVE_EXECUTION_STATES = setOf(
             PrepState.BUILDING,
             PrepState.ARMED,
@@ -1547,6 +2457,115 @@ class PairPreparer(
                 }
                 runnable.run()
             }, "djmix-prep").apply { isDaemon = true }
+        }
+
+        internal fun newStemExecutor(): ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+            Thread({
+                runCatching {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND + Process.THREAD_PRIORITY_MORE_FAVORABLE)
+                }
+                runnable.run()
+            }, "djmix-stems").apply { isDaemon = true }
+        }
+
+        internal fun toCoreDjLevel(level: DjLevel): CoreDjLevel = when (level) {
+            DjLevel.SUBTLE -> CoreDjLevel.SUBTLE
+            DjLevel.CLUB -> CoreDjLevel.CLUB
+            DjLevel.FESTIVAL -> CoreDjLevel.FESTIVAL
+        }
+
+        internal fun analysisLevelOf(analysis: TrackAnalysis): AnalysisLevel = when {
+            !analysis.isUsable -> AnalysisLevel.NONE
+            analysis.quality == TrackAnalysis.QUALITY_FULL -> AnalysisLevel.FULL
+            else -> AnalysisLevel.HEAD_TAIL
+        }
+
+        internal fun toV3ForPlanner(
+            trackId: String,
+            analysis: TrackAnalysis,
+            phraseMap: SongMap?,
+            songMap: SongMap?,
+            fallbackDurationSec: Double,
+        ): TrackAnalysisV3 {
+            val durSec = fallbackDurationSec.takeIf { it.isFinite() && it > 1.0 } ?: analysis.duration
+            val normalizedAnalysis = if (durSec > 1.0 && durSec != analysis.duration) {
+                analysis.copy(duration = durSec)
+            } else analysis
+            val v3 = TrackAnalysisV3Mapper.toV3(
+                trackId = trackId,
+                contentHash = "",
+                analysis = normalizedAnalysis,
+                phraseMap = phraseMap,
+                songMap = songMap,
+                modelVersions = emptyMap(),
+            )
+            if (normalizedAnalysis.isUsable && v3.beatsMs.isEmpty() && v3.bpm > 1.0 && v3.durationMs > 0L) {
+                val beatMs = (60_000.0 / v3.bpm).roundToLong().coerceAtLeast(250L)
+                val firstMs = (normalizedAnalysis.firstBeat.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0)
+                    .let { (it * 1000.0).roundToLong().coerceIn(0L, v3.durationMs) }
+                val beats = ArrayList<Long>()
+                val downs = ArrayList<Long>()
+                var t = firstMs
+                var idx = 0
+                while (t <= v3.durationMs && beats.size < 2048) {
+                    beats += t
+                    if (idx % 4 == 0) downs += t
+                    t += beatMs
+                    idx++
+                }
+                return v3.copy(
+                    analysisLevel = if (v3.analysisLevel == AnalysisLevel.NONE) AnalysisLevel.HEAD_TAIL else v3.analysisLevel,
+                    beatsMs = beats,
+                    downbeatsMs = if (v3.downbeatsMs.isEmpty()) downs else v3.downbeatsMs,
+                )
+            }
+            return v3
+        }
+
+        internal fun sliceLoopRegion(
+            region: LoopRegion?,
+            sampleRate: Int,
+            fromSec: Double,
+            toSec: Double,
+        ): LoopRegion? {
+            if (region == null || sampleRate <= 0 || region.left.isEmpty() ||
+                region.left.size != region.right.size || toSec <= fromSec
+            ) return null
+            val frames = region.left.size
+            val endSec = region.start + frames.toDouble() / sampleRate
+            if (fromSec + 0.5 / sampleRate < region.start || toSec - 0.5 / sampleRate > endSec) return null
+            val startOffset = ((fromSec - region.start) * sampleRate).roundToLong().toInt().coerceIn(0, frames)
+            val endOffset = ((toSec - region.start) * sampleRate).roundToLong().toInt().coerceIn(startOffset, frames)
+            if (endOffset <= startOffset) return null
+            return LoopRegion(
+                left = region.left.copyOfRange(startOffset, endOffset),
+                right = region.right.copyOfRange(startOffset, endOffset),
+                start = region.start + startOffset.toDouble() / sampleRate,
+            )
+        }
+
+        internal fun sliceStemSet(
+            stems: StemSet?,
+            fromSec: Double,
+            toSec: Double,
+        ): StemSet? {
+            if (stems == null || stems.sampleRate <= 0 || stems.frames <= 0 || toSec <= fromSec) return null
+            val sr = stems.sampleRate
+            val endSec = stems.regionStartSec + stems.frames.toDouble() / sr
+            if (fromSec + 0.5 / sr < stems.regionStartSec || toSec - 0.5 / sr > endSec) return null
+            val startOffset = ((fromSec - stems.regionStartSec) * sr).roundToLong().toInt().coerceIn(0, stems.frames)
+            val endOffset = ((toSec - stems.regionStartSec) * sr).roundToLong().toInt().coerceIn(startOffset, stems.frames)
+            val newFrames = endOffset - startOffset
+            if (newFrames <= 0) return null
+            return StemSet(
+                sampleRate = sr,
+                frames = newFrames,
+                regionStartSec = stems.regionStartSec + startOffset.toDouble() / sr,
+                left = stems.left.mapValues { (_, arr) -> arr.copyOfRange(startOffset, endOffset) },
+                right = stems.right.mapValues { (_, arr) -> arr.copyOfRange(startOffset, endOffset) },
+                stemCount = stems.stemCount,
+                confidence = stems.confidence,
+            )
         }
 
         internal fun barSeconds(bpm: Double, fallbackBeatSec: Double): Double =

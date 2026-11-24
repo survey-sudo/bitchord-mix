@@ -181,7 +181,8 @@ class PairPreparerTest {
             assertNotNull("PairPreparer must reach PREPARED", snap)
             val ready = snap!!
             assertEquals("djmix-prep", threadNames.firstOrNull())
-            assertTrue("All prep work must stay on djmix-prep", threadNames.all { it == "djmix-prep" })
+            assertTrue("Prep/decode work must stay on djmix-prep, stems on djmix-stems", threadNames.all { it == "djmix-prep" || it == "djmix-stems" })
+            assertTrue("SCNet stems must run on dedicated djmix-stems thread (AE3 Part A 3.2)", "djmix-stems" in threadNames)
             assertEquals(2, decodeCalls.get())
             assertTrue("Stems separated on CLUB", stemCalls.get() >= 1)
             assertNotNull(ready.outRegion)

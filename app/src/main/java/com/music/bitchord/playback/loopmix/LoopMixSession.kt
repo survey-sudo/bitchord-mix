@@ -19,6 +19,7 @@ import com.music.bitchord.playback.smart.qualifyMusicalHandoff
 import com.music.bitchord.playback.smart.SongMap
 import com.music.bitchord.playback.smart.StemSet
 import com.music.bitchord.playback.smart.choreo.AutomixV2Choreo
+import com.music.bitchord.playback.smart.choreo.ChoreoCaps
 import com.music.bitchord.playback.smart.choreo.ChoreoRendererBridge
 import com.music.bitchord.playback.smart.choreo.ChoreoScript
 import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
@@ -72,6 +73,7 @@ class LoopMixSession private constructor(
     /** Actual installed script path; a non-looping bridge is not automatically a straight recipe. */
     val executionPath: String = "classic",
     val preparationGeneration: Long = 0L,
+    val planId: String = "",
 ) {
     /** Bounded attribution; holds/tail/settle retain their existing clock geometry. */
     enum class GridSource(val telemetryValue: String) {
@@ -316,6 +318,10 @@ class LoopMixSession private constructor(
             preparedSampleRate: Int? = null,
             straightRateMode: StraightRateMode? = null,
             preparationGeneration: Long = 0L,
+            useNoStemVariant: Boolean = false,
+            planId: String = "",
+            preparedGeneration: Long = 0L,
+            preparedPlanId: String = "",
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
             fun refuse(reason: String): LoopMixSession? {
@@ -323,8 +329,14 @@ class LoopMixSession private constructor(
                 return null
             }
             if (sampleRate <= 0) return refuse("invalid_sample_rate")
+            val genMismatch = preparationGeneration > 0L && preparedGeneration > 0L &&
+                preparedGeneration != preparationGeneration
+            val idMismatch = planId.isNotEmpty() && preparedPlanId.isNotEmpty() &&
+                preparedPlanId != planId
             if (preparedOnly && (preparedSampleRate != sampleRate || preparedPrep == null ||
-                    preparedPrep.sampleRate != sampleRate || preparedPrep.plan != plan ||
+                    preparedPrep.sampleRate != sampleRate ||
+                    !ChoreoSessionGlue.isSamePlan(preparedPrep.plan, plan) ||
+                    genMismatch || idMismatch ||
                     preparedPrep.level != djLevel || preparedPrep.pairKey != "$outId->$inId" ||
                     preparedPrep.albumOrder != albumOrder || preparedPrep.straightRateMode != straightRateMode)) {
                 return refuse("prepared_geometry_or_rate_mismatch")
@@ -339,27 +351,32 @@ class LoopMixSession private constructor(
             val contractEcho = naturalHandoff || (plan.handoff != null && plan.echoTail &&
                 ((plan.rung == "Echo" && script == null) || script?.choice?.template == MixTemplate.M6))
             val handoff = plan.handoff.takeIf { contractEcho }
-            // AUTOMIX-V2(E) pass 1: caps, structure, and (CLUB+) a verified drop re-time of a
-            // straight native incoming cue. Zero synchronous stem separation at build time.
+            // Pass 1: caps, structure, and optional verified drop re-time without synchronous stem separation.
             val v2Prep = if (preparedOnly) preparedPrep else if (AutomixV2Choreo.enabled && LoopMixRenderer.available && handoff == null) {
                 preparedPrep?.takeIf {
                     it.pairKey == "$outId->$inId" &&
                         it.level == djLevel &&
                         it.albumOrder == albumOrder &&
-                        it.plan == plan && (it.sampleRate == 0 || it.sampleRate == sampleRate) &&
+                        ChoreoSessionGlue.isSamePlan(it.plan, plan) &&
+                        (it.sampleRate == 0 || it.sampleRate == sampleRate) &&
                         it.straightRateMode == straightRateMode
                 }
                     ?: ChoreoSessionGlue.prepare(
                         plan, script, outAnalysis, inAnalysis, outSongMap, inSongMap, djLevel, outId, inId,
-                        sampleRate, albumOrder, stemsExpected = (preparedOutStems != null || preparedInStems != null) && AutomixV2Choreo.useStems,
+                        sampleRate, albumOrder,
+                        stemsExpected = !useNoStemVariant && (preparedOutStems != null || preparedInStems != null) && AutomixV2Choreo.useStems,
                     )
             } else null
             return buildPlanned(
                 v2Prep?.plan ?: plan, outId, inId, sampleRate, inLevel, highQuality, script,
                 separateStem, separateVocalStem, separateVocalPair, outAnalysis, inAnalysis, sungOut, sungIn,
                 onRefusal, onEnvelopeInstalled,
-                v2Prep, preparedOutStems, preparedInStems, preparedScript, preparedOutRegion, preparedInRegion,
-                preparedOnly, straightRateMode, djLevel, preparationGeneration, decode,
+                v2Prep,
+                if (useNoStemVariant) null else preparedOutStems,
+                if (useNoStemVariant) null else preparedInStems,
+                preparedScript, preparedOutRegion, preparedInRegion,
+                preparedOnly, straightRateMode, djLevel, preparationGeneration,
+                useNoStemVariant, planId, decode,
             )
         }
 
@@ -372,6 +389,8 @@ class LoopMixSession private constructor(
             inLevel: Float,
             highQuality: Boolean = true,
             onRefusal: ((String) -> Unit)? = null,
+            useNoStemVariant: Boolean = false,
+            planId: String = "",
         ): LoopMixSession? {
             val plan = prepared.plan
             if (plan == null || plan.outLoops || plan.inLoops || plan.handoff != null ||
@@ -380,16 +399,25 @@ class LoopMixSession private constructor(
                 onRefusal?.invoke("straight_prepared_contract_missing")
                 return null
             }
+            val effectiveNoStem = useNoStemVariant || prepared.useNoStemVariant
+            val effectivePlanId = planId.ifEmpty { prepared.transitionPlanV1?.planId.orEmpty() }
+            val preparedPlanId = prepared.transitionPlanV1?.planId.orEmpty()
             return build(
                 plan, outId, inId, sampleRate, inLevel, highQuality,
                 outAnalysis = prepared.outAnalysis, inAnalysis = prepared.inAnalysis,
                 sungOut = prepared.sungOut, sungIn = prepared.sungIn,
                 onRefusal = onRefusal, djLevel = prepared.djLevel, albumOrder = prepared.albumOrder,
-                preparedPrep = prepared.v2Prep, preparedScript = prepared.script,
-                preparedOutStems = prepared.outStems, preparedInStems = prepared.inStems,
+                preparedPrep = prepared.v2Prep,
+                preparedOutStems = if (effectiveNoStem) null else prepared.outStems,
+                preparedInStems = if (effectiveNoStem) null else prepared.inStems,
+                preparedScript = prepared.script,
                 preparedOutRegion = prepared.outRegion, preparedInRegion = prepared.inRegion,
                 preparedOnly = true, preparedSampleRate = prepared.sampleRate,
                 straightRateMode = prepared.straightRateMode, preparationGeneration = prepared.generation,
+                useNoStemVariant = effectiveNoStem,
+                planId = effectivePlanId,
+                preparedGeneration = prepared.generation,
+                preparedPlanId = preparedPlanId,
                 decode = { _, _, _ -> error("prepared-only straight build must never decode") },
             )
         }
@@ -421,6 +449,8 @@ class LoopMixSession private constructor(
             straightRateMode: StraightRateMode?,
             djLevel: DjLevel,
             preparationGeneration: Long,
+            useNoStemVariant: Boolean = false,
+            planId: String = "",
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
@@ -434,10 +464,8 @@ class LoopMixSession private constructor(
             // qualify first, even without JNI, so a geometry refusal is not
             // misattributed to renderer capability (and never reaches decode).
             if (!crown && !LoopMixRenderer.available) return refuse("renderer_unavailable")
-            // djmix18: the script hold is the truth for the handover: pass it into the
-            // clock so clock.handoverTrackSec, the IN knots and setFadeOut share ONE
-            // timestamp (was: Clock(plan) defaulted to plan.incomingHoldSec while IN knots
-            // read script?.incomingHoldSec — up to seconds apart on phrase plans).
+            // The script hold is the truth for the handover: pass it into the clock so
+            // clock.handoverTrackSec, the IN knots and setFadeOut share ONE timestamp.
             val naturalHandoff = plan.handoff != null && plan.alternativeKind == "natural-end" &&
                 !plan.echoTail && script == null
             val contractEcho = naturalHandoff || (plan.handoff != null && plan.echoTail &&
@@ -572,9 +600,10 @@ class LoopMixSession private constructor(
                 return refuse("handoff_pcm_before_protected_event")
             }
             Log.i(TAG, "loop-domain outId=$outId inId=$inId rung=${effectivePlan.rung} script=${script != null} outLoops=${effectivePlan.outLoops} inLoops=${incomingGeometry.loops} loopStart=${effectivePlan.inn.loopStart} loopEnd=${effectivePlan.inn.loopEnd} releaseUnwrapped=${incomingGeometry.releaseTrack} lastUnwrapped=${knots.inPositionsSec.last()} handoverPhysical=${incomingGeometry.handoverTrack} requestedInFrom=${bounds.inFrom} requestedInTo=$actualInTo decodedInFrom=${inRegion.start} decodedInTo=${inRegion.start + inRegion.left.size.toDouble() / sampleRate} requiredInTo=${incomingGeometry.requiredEnd} requestedOutFrom=${bounds.outFrom} requestedOutTo=$actualOutTo decodedOutFrom=${outRegion.start} decodedOutTo=${outRegion.start + outRegion.left.size.toDouble() / sampleRate} requiredOutTo=$requiredOutEnd")
-            // AUTOMIX-V2(E) pass 2: pure CPU choreography on pre-separated stems and real knots.
-            // Null keeps every vc80 envelope below (no synchronous ONNX inference at build time).
-            val v2 = if (v2Prep != null) {
+            // Pass 2: pure CPU choreography on pre-separated stems and real knots, or isolator EQ without stems.
+            // Null keeps legacy envelopes (no synchronous ONNX inference at build time).
+            val allowStems = !useNoStemVariant
+            val v2 = if (v2Prep != null && allowStems) {
                 ChoreoSessionGlue.choreograph(
                     v2Prep, effectivePlan, clock, sampleRate, outRegion, inRegion,
                     outAnalysis, inAnalysis, sungOut, sungIn,
@@ -583,14 +612,26 @@ class LoopMixSession private constructor(
                     preparedScript = preparedScript,
                 )
             } else null
-            var v2Script: ChoreoScript? = v2?.script
+            var v2Script: ChoreoScript? = when {
+                v2Prep == null -> null
+                !allowStems -> {
+                    val reusableNoStem = preparedScript?.takeIf {
+                        !it.outUsesStems && !it.inUsesStems &&
+                            it.level == v2Prep.level &&
+                            RecipeId.fromCode(it.recipeId) !in v2Prep.excludedRecipes
+                    }
+                    reusableNoStem ?: ChoreoSessionGlue.withoutStems(
+                        v2Prep, effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
+                        sungOut, sungIn,
+                        plannedRecipe = RecipeId.fromCode(preparedScript?.recipeId) ?: v2Prep.forcedRecipe,
+                    )
+                }
+                else -> v2?.script
+            }
             if (preparedOnly && v2Script == null) return refuse("choreography_unavailable")
-            // vc67: on-device umxhq Wiener stem separation for the acapella rung.
-            // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
-            // instrumental when windowed stems are enabled. Worker thread only; null
-            // falls back to the dry region so the build never fails on separation.
-            // AUTOMIX-V2(E): a choreographed script owns separation; the vc80 2-stem paths run only without one.
-            if (!preparedOnly && handoff == null && v2Script == null && effectivePlan.acapella && separateStem != null) {
+            // On-device umxhq Wiener stem separation for the acapella rung when running un-prepared.
+            // A choreographed script owns separation; legacy 2-stem paths run only without one.
+            if (!preparedOnly && allowStems && handoff == null && v2Script == null && effectivePlan.acapella && separateStem != null) {
                 if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                     val split = runCatching {
                         separateStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate, true)
@@ -867,12 +908,13 @@ class LoopMixSession private constructor(
                 ),
             )
 
-            // AUTOMIX-V2(E): stems on the decks the script relies on (after setDeck, before prepare).
-            // A refused StemSet re-chooses without stems, so a stem move never plays on a dry deck.
+            // Attach stems on the decks the script relies on (after setDeck, before prepare).
+            // If useNoStemVariant or a deck refuses a StemSet, re-choose isolator EQ without stems
+            // while preserving DJ level and frozen transition geometry.
             var v2OutStems = false
             var v2InStems = false
             val v2Chosen = v2Script
-            if (v2Chosen != null && v2 != null && v2Prep != null) {
+            if (allowStems && v2Chosen != null && v2 != null && v2Prep != null) {
                 if (v2Chosen.outUsesStems) v2OutStems = ChoreoRendererBridge.attachStems(renderer, LoopMixRenderer.OUT, v2.outStems)
                 if (v2Chosen.inUsesStems) v2InStems = ChoreoRendererBridge.attachStems(renderer, LoopMixRenderer.IN, v2.inStems)
                 if ((v2Chosen.outUsesStems && !v2OutStems) || (v2Chosen.inUsesStems && !v2InStems)) {
@@ -1188,11 +1230,11 @@ class LoopMixSession private constructor(
                 renderer.setIsolate(LoopMixRenderer.OUT, true)
                 renderer.setIsolate(LoopMixRenderer.IN, true)
             }
-            // AUTOMIX-V2(E): the choreographed script owns every envelope kind it writes (all vc80
-            // kinds on both decks, v2 kinds only where V2_CAPABILITIES has the bit).
+            // The choreographed script owns every envelope kind it writes (with or without stems).
             val v2Final = v2Script
             if (v2Final != null && v2Prep != null) {
-                ChoreoRendererBridge.apply(renderer, v2Final, v2Prep.caps, v2OutStems, v2InStems)
+                val applyCaps = if (useNoStemVariant) v2Prep.caps and ChoreoCaps.STEMS.inv() else v2Prep.caps
+                ChoreoRendererBridge.apply(renderer, v2Final, applyCaps, v2OutStems, v2InStems)
             }
             renderer.setHighQuality(highQuality)
             renderer.prepare()
@@ -1202,6 +1244,7 @@ class LoopMixSession private constructor(
                 outGridSource = knots.outGridSource, inGridSource = knots.inGridSource,
                 executionPath = if (v2Final == null) "classic" else if (straightRateMode != null) "v2-straight" else "v2-native",
                 preparationGeneration = preparationGeneration,
+                planId = planId,
             ).also {
                 it.planIncomingStart()
                 // AUTOMIX-V2(E): what the choreographer did, for the status line / Mix Inspector / telemetry.
