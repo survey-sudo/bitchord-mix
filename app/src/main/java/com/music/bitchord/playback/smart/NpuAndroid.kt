@@ -19,7 +19,6 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   the EP-context cache key;
  * - the bundled libQnnHtp.so resolver, which runs the ADSP_LIBRARY_PATH + dlopen preflight
  *   (npu_jni.cpp) once, before the first QNN session;
- * - an [NpuQnnSession.QdqResolver] that unpacks `*_qdq.onnx` / `*_qdq_ctx.onnx` assets on demand.
  *
  * Safe to call while the Service is still unattached: nothing touches the Context until a
  * method needs it, and every Context access is guarded (null state = defaults, retried later).
@@ -34,7 +33,6 @@ object NpuAndroid {
     private const val KEY_VERDICT = "selftest_verdict"
 
     private val installed = AtomicBoolean(false)
-    private val assetLock = Any()
     private val preflightLock = Any()
     @Volatile private var preflightDone = false
     @Volatile private var preflightOk = false
@@ -70,10 +68,6 @@ object NpuAndroid {
             NpuRuntime.installSocModel(socModel())
             NpuRuntime.install(NpuPolicy(PrefsStore(context, userEnabled), BuildConfig.VERSION_CODE.toLong()))
             NpuRuntime.installBackendProvider { preflightBackend(context) }
-            NpuQnnSession.qdqResolver = NpuQnnSession.QdqResolver { model, name ->
-                model.parentFile?.let { File(it, name) }?.takeIf { it.isFile && it.length() > 0 }
-                    ?: unpackAsset(context, name)
-            }
         }.onFailure { Log.w(TAG, "BitChordNPU install failed; NPU stays off", it) }
     }
 
@@ -84,29 +78,6 @@ object NpuAndroid {
     fun socModel(): String? = runCatching {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else null
     }.getOrNull()?.takeIf { it.isNotBlank() && !it.equals("unknown", ignoreCase = true) }
-
-    /** Unpacks a bundled asset named [name] into noBackupFilesDir/npu/models/<versionCode>/, or null. */
-    fun unpackAsset(context: Context, name: String): File? = runCatching {
-        val app = context.applicationContext ?: return@runCatching null
-        val names = app.assets.list("") ?: return@runCatching null
-        if (name !in names) return@runCatching null
-        val root = File(app.noBackupFilesDir, "npu/models")
-        val dir = File(root, BuildConfig.VERSION_CODE.toString())
-        val target = File(dir, name)
-        synchronized(assetLock) {
-            if (!(target.isFile && target.length() > 0)) {
-                dir.mkdirs()
-                root.listFiles()?.forEach { old -> if (old.isDirectory && old.name != dir.name) old.deleteRecursively() }
-                val tmp = File(dir, name + ".tmp")
-                app.assets.open(name).use { input -> tmp.outputStream().use { output -> input.copyTo(output) } }
-                if (!tmp.renameTo(target)) {
-                    tmp.copyTo(target, overwrite = true)
-                    tmp.delete()
-                }
-            }
-        }
-        target.takeIf { it.isFile && it.length() > 0 }
-    }.getOrNull()
 
     private class PrefsStore(
         private val context: Context,

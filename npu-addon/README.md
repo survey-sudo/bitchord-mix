@@ -19,7 +19,7 @@ three must change before anything below becomes live:
 
 `NpuRuntime.runtimeEnabled()` returns `false` immediately while
 `RUNTIME_AVAILABLE` is `false`, so no policy, persisted opt-in, SoC detection or
-self-test verdict can activate a QNN session. `NpuQnnSession.qdqResolver` also
+self-test verdict can activate a QNN session. QDQ resolution also
 refuses to resolve (unpack) a QDQ file behind the same gate, and
 `NpuNative.nativeInitAdspPath` (see `app/src/main/cpp/jni/npu_jni.cpp`) is a
 no-op returning `JNI_FALSE` — no `dlopen`, no `setenv`, no DSP search path.

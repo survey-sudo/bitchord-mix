@@ -53,15 +53,15 @@ class VocalPresence(
 
     private fun session(): OrtSession? {
         val threads = inferenceThreads().coerceIn(1, 4)
-        session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
+        session?.takeIf { sessionThreads == threads }?.let { return it }
         synchronized(lock) {
-            session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
+            session?.takeIf { sessionThreads == threads }?.let { return it }
             runCatching { session?.close() }
             session = null
             return runCatching {
                 val file = File(modelPath())
                 if (!file.isFile || file.length() <= 0L) return@runCatching null
-                NpuQnnSession.open(
+                NpuSession.open(
                     file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
                 ).also {
                     session = it
@@ -91,7 +91,6 @@ class VocalPresence(
         val presence = FloatArray(spectrogram.frames)
         val started = System.currentTimeMillis()
         if (!infer(active, spectrogram, presence)) return null
-        NpuQnnSession.onRunSuccess(active)
         AnalysisLog.warn(
             "syvenu.ms=${System.currentTimeMillis() - started} frames=${spectrogram.frames}",
         )
@@ -121,7 +120,7 @@ class VocalPresence(
         val outNames = session.outputNames.toList()
         val outIdx = outNames.indexOfFirst { it.equals("presence", ignoreCase = true) }.let { if (it >= 0) it else 0 }
 
-        val fixed = NpuQnnSession.fixedInputFrames(session)
+        val fixed = NpuSession.fixedInputFrames(session)
         val chunkFrames = fixed ?: CHUNK_FRAMES
         val stride = (chunkFrames - 2 * BORDER_FRAMES).coerceAtLeast(1)
 
@@ -158,7 +157,6 @@ class VocalPresence(
         true
     }.onFailure {
         AnalysisLog.warn("Syvenu inference failed", it)
-        if (NpuQnnSession.onRunFailure(session, it)) release()
     }.getOrDefault(false)
 
     fun release() {

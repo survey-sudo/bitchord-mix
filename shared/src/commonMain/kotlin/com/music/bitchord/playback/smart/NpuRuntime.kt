@@ -13,8 +13,8 @@ import kotlin.math.sin
  * Pure and testable: vendor and SoC
  * detection, option maps, model routing (which file may run on the NPU), the
  * context-cache key, and the self-test maths. The ONNX Runtime plumbing lives in
- * [NpuSession] (jvmSharedMain) and the Android wiring in NpuAndroid / NpuNative /
- * NpuSelfTest (app module).
+ * [NpuSession] (jvmSharedMain) and the Android wiring in NpuAndroid / NpuNative
+ * (app module).
  *
  * A later runtime can also use [runtimeEnabled], backed by an injectable [NpuPolicy] (user switch, persisted
  * auto-disable after repeated QNN failures or a self-test mismatch, reset when the app
