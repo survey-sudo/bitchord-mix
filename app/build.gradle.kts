@@ -459,7 +459,7 @@ dependencies {
     // ---- Automix: beat/downbeat, vocal and stem models on the CPU ----
     // Official CPU-only ORT. No QNN execution provider, no vendor runtime, and the
     // three weights are delivered at first use (see AutomixModels), not packaged.
-    // Pinned: onnxruntime-android 1.31.0, arm64 core 34,208,680 B.
+    // Pinned: onnxruntime-android 1.31.0 (packaged core 34,208,672 B after release stripping).
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.31.0")
 
     // ---- Casting: Google Cast sender + the route discovery it sits on ----

@@ -41,10 +41,11 @@ need_tool() {
 EXPECTED_PACKAGE="com.music.bitchord.loopfix"
 EXPECTED_VERSION_CODE="94"
 EXPECTED_VERSION_NAME="1.10-djmix52"
-# The published onnxruntime-android:1.31.0 AAR's arm64 core (and its companion
-# libonnxruntime4j_jni.so, which is the Java bridge, NOT a second core).
-EXPECTED_ORT_BYTES="34208680"
-EXPECTED_ORT_SHA256="8005a741e57117b4d7b476417706c0e9af13cf1b89db47e60f0cbc56e1af91e0"
+# The published onnxruntime-android:1.31.0 AAR's arm64 core, after Gradle's
+# default release native stripping. The companion libonnxruntime4j_jni.so is
+# the Java bridge, NOT a second core.
+EXPECTED_ORT_BYTES="34208672"
+EXPECTED_ORT_SHA256="fcec92f4ef56964a2ba312cfcadbdbe03070a3165069712a41b4ce7115efa61f"
 EXPECTED_CERT_DN="CN=BitChord loop fix"
 EXPECTED_CERT_SHA256="20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c"
 
@@ -110,11 +111,11 @@ if [ "$core_count" -eq 1 ]; then
   rm -f "$core_tmp"
 fi
 
-# The companion libonnxruntime4j_jni.so is the official Java JNI bridge (122,576 B),
-# not a duplicate core: require it, and require that it stays a distinct file.
+# The companion libonnxruntime4j_jni.so is the official Java JNI bridge,
+# not a duplicate core: require it (post-strip size below).
 if printf '%s\n' "$listing" | grep -q 'lib/arm64-v8a/libonnxruntime4j_jni\.so$'; then
   jni_size=$(printf '%s\n' "$listing" | awk '/lib\/arm64-v8a\/libonnxruntime4j_jni\.so$/{print $1}' | head -1)
-  [ "$jni_size" = "122576" ] && ok "ORT Java JNI bridge present (122576 B)" || bad "libonnxruntime4j_jni.so is ${jni_size:-?} B, expected 122576"
+  [ "$jni_size" = "92064" ] && ok "ORT Java JNI bridge present (92064 B)" || bad "libonnxruntime4j_jni.so is ${jni_size:-?} B, expected 92064"
 else
   bad "libonnxruntime4j_jni.so MISSING (the Java API cannot load without it)"
 fi
