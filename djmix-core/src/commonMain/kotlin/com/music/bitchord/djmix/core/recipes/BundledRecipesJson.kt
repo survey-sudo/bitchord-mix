@@ -1,8 +1,12 @@
 package com.music.bitchord.djmix.core.recipes
 
 /**
- * Pure-KMP bundled JSON payloads mirroring `djmix-core/src/commonMain/resources/recipes/*.json`
- * and `app/src/main/assets/recipes/*.json` for zero-I/O initialization across all targets.
+ * Pure-KMP bundled JSON payloads mirroring the recipe JSON files under
+ * `djmix-core/src/commonMain/resources/recipes/` and `app/src/main/assets/recipes/`,
+ * for zero-I/O initialization across all targets.
+ *
+ * Written without a glob so the KDoc holds no block-comment opener: Kotlin
+ * block comments nest, and a literal glob here would swallow the rest of the file.
  */
 internal object BundledRecipesJson {
     val orderedIds: List<String> = listOf(
