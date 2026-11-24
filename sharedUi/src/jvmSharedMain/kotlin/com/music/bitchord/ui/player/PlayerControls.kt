@@ -597,11 +597,12 @@ private fun AutomixStatusLine(
                 textAlign = TextAlign.Center,
             )
         }
-        if (expanded && status != null) {
+        val currentStatus = status
+        if (expanded && currentStatus != null) {
             Spacer(Modifier.height(2.dp))
-            val why = automixReasonLine(status)
+            val why = automixReasonLine(currentStatus)
             Text(
-                text = (if (why.isNotEmpty()) "$why · " else "") + status.detail,
+                text = (if (why.isNotEmpty()) "$why · " else "") + currentStatus.detail,
                 style = textStyle,
                 color = Color.White.copy(alpha = 0.5f),
                 maxLines = 6,

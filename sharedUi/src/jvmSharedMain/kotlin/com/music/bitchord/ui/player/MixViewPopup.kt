@@ -542,10 +542,9 @@ private fun MixInspectorDetailsContent(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (state.remixAvailable && onRemix != null) {
+                val remixRejected = stringResource(Res.string.mix_inspector_remix_rejected)
                 TextButton(onClick = {
-                    if (!onRemix()) PlayerPlatform.host.showMessage(
-                        stringResource(Res.string.mix_inspector_remix_rejected),
-                    )
+                    if (!onRemix()) PlayerPlatform.host.showMessage(remixRejected)
                 }) { Text("Try another mix") }
             }
             Spacer(Modifier.weight(1f))
@@ -1234,7 +1233,7 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                 modifier = Modifier
                     .offset {
                         IntOffset(
-                            (width * (BoxStart + (BoxEnd - BoxStart) * view.bassSwapAt) +
+                            (width.toPx() * (BoxStart + (BoxEnd - BoxStart) * view.bassSwapAt) +
                                 4.dp.toPx()).toInt(),
                             (DeckTop - 18.dp).toPx().toInt(),
                         )
