@@ -1,0 +1,133 @@
+{
+  "schema": 2,
+  "id": "S5",
+  "name": "Simple fade",
+  "description": "Restrained equal-power fade for ballads and drifting tempi",
+  "level": "SUBTLE",
+  "family": "BLEND",
+  "abruptness": "SMOOTH",
+  "requirements": {
+    "maxTempoGap": 1.0,
+    "requiresBeatMatch": false,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "BALLAD": 0.48,
+      "ROCK": 0.15
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.0,
+    "minOverlapBars": 1.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    4,
+    2,
+    8
+  ],
+  "placementPrefs": {
+    "swapRule": "FULL_FADE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "FADE_START"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "FADE_START"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 16
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "FADE_START"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "FADE_START"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 16
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

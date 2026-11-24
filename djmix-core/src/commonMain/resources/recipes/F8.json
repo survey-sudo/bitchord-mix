@@ -1,0 +1,527 @@
+{
+  "schema": 2,
+  "id": "F8",
+  "name": "Double drop",
+  "description": "Aligned drops collide on bar 1 with riser, gate, and echo",
+  "level": "FESTIVAL",
+  "family": "DROP",
+  "abruptness": "PUNCHY",
+  "requirements": {
+    "maxTempoGap": 0.04,
+    "requiresBeatMatch": true,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "DANCE": 0.36
+    },
+    "requiresDrops": true,
+    "requiresOutDrop": true,
+    "requiresOutLoop": false,
+    "requiredStems": [
+      {
+        "deck": "OUT",
+        "stem": "BASS"
+      },
+      {
+        "deck": "IN",
+        "stem": "DRUMS"
+      },
+      {
+        "deck": "IN",
+        "stem": "BASS"
+      }
+    ],
+    "minStemCount": 3,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 4.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    16,
+    8
+  ],
+  "placementPrefs": {
+    "swapRule": "DROP_OR_MID",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": true,
+    "maxEntrySkipBars": 64,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.75
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.01,
+            "minAt": "IN_AUDIBLE",
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "params": {
+        "lengthBeats": 16.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 1.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 4.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.75
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "GATE",
+      "requiredCap": "GATE",
+      "params": {
+        "divisionStepsPerBeat": 4.0,
+        "swing": 0.05,
+        "depthPeak": 0.85,
+        "rampBars": 2.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.6
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.5,
+            "minAt": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.6,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.75
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.25,
+            "minAt": "SWAP"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "IMPACT",
+      "params": {
+        "peakDbfs": -6.0,
+        "lowThumpHz": 55.0,
+        "noiseBurstMs": 180.0
+      },
+      "startTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "STEM_DRUMS",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "STEM_VOCALS",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.05,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "STEM_OTHER",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.05,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.75
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.01,
+            "minAt": "IN_AUDIBLE",
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "params": {
+        "lengthBeats": 16.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 1.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 4.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.75
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "GATE",
+      "requiredCap": "GATE",
+      "params": {
+        "divisionStepsPerBeat": 4.0,
+        "swing": 0.05,
+        "depthPeak": 0.85,
+        "rampBars": 2.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.6
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.5,
+            "minAt": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.6,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "OVERLAP_FRAC",
+            "param": 0.75
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.25,
+            "minAt": "SWAP"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "IMPACT",
+      "params": {
+        "peakDbfs": -6.0,
+        "lowThumpHz": 55.0,
+        "noiseBurstMs": 180.0
+      },
+      "startTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "enable_isolator"
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "MID_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.05,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": -9.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.4,
+  "enabled": true
+}

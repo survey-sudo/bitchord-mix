@@ -1,0 +1,479 @@
+{
+  "schema": 2,
+  "id": "F2",
+  "name": "Brake slam",
+  "description": "Exponential turntable brake with LPF roll-off slamming on the 1",
+  "level": "FESTIVAL",
+  "family": "CUT",
+  "abruptness": "ABRUPT",
+  "requirements": {
+    "maxTempoGap": 1.0,
+    "requiresBeatMatch": false,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "HIPHOP": 0.24,
+      "ROCK": 0.26,
+      "BALLAD": 0.2,
+      "UNKNOWN": 0.12
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.0,
+    "minOverlapBars": 1.0,
+    "requiredCapabilities": [
+      "BRAKE"
+    ],
+    "requiresTempoOrGenreJump": true
+  },
+  "lengthOptionsBars": [
+    4,
+    2,
+    8
+  ],
+  "placementPrefs": {
+    "swapRule": "CUT_LATE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "LOW_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": -24.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.6,
+        "damping": 0.45,
+        "wet": 0.5
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.5
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "BRAKE",
+      "requiredCap": "BRAKE",
+      "fallbackFx": "ECHO",
+      "params": {
+        "endRate": 0.05,
+        "lpfStartHz": 18000.0,
+        "lpfEndHz": 800.0,
+        "endFadeMs": 10.0
+      },
+      "startTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.5,
+        "minAt": "ZERO"
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ],
+      "fallbackWetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.12,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "params": {
+        "lengthBeats": 4.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 0.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.02,
+            "maxAt": "RELEASE"
+          },
+          "value": 0.7
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "LOW_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": -24.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.6,
+        "damping": 0.45,
+        "wet": 0.5
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.5
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "BRAKE",
+      "requiredCap": "BRAKE",
+      "fallbackFx": "ECHO",
+      "params": {
+        "endRate": 0.05,
+        "lpfStartHz": 18000.0,
+        "lpfEndHz": 800.0,
+        "endFadeMs": 10.0
+      },
+      "startTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.5,
+        "minAt": "ZERO"
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ],
+      "fallbackWetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.12,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "params": {
+        "lengthBeats": 4.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 0.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.02,
+            "maxAt": "RELEASE"
+          },
+          "value": 0.7
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

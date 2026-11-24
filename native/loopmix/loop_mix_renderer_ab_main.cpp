@@ -167,8 +167,8 @@ inline uint32_t readU32(const uint8_t* p) {
          (static_cast<uint32_t>(p[3]) << 24);
 }
 
-bool readWav48k(const std::string& path, std::vector<float>& outL,
-                std::vector<float>& outR, std::string& err) {
+bool readWavAtRate(const std::string& path, std::vector<float>& outL,
+                   std::vector<float>& outR, int targetRate, std::string& err) {
   std::FILE* f = std::fopen(path.c_str(), "rb");
   if (f == nullptr) {
     err = "cannot open " + path;
@@ -296,7 +296,7 @@ bool readWav48k(const std::string& path, std::vector<float>& outL,
     srcR[i] = r;
   }
 
-  if (srcRate == static_cast<uint32_t>(kSampleRate)) {
+  if (srcRate == static_cast<uint32_t>(targetRate)) {
     outL = std::move(srcL);
     outR = std::move(srcR);
     return true;
@@ -308,11 +308,11 @@ bool readWav48k(const std::string& path, std::vector<float>& outL,
   }
   const size_t outFrames =
       static_cast<size_t>(std::llround(static_cast<double>(srcFrames) *
-                                       static_cast<double>(kSampleRate) /
+                                       static_cast<double>(targetRate) /
                                        static_cast<double>(srcRate)));
   outL.assign(outFrames, 0.0f);
   outR.assign(outFrames, 0.0f);
-  const double step = static_cast<double>(srcRate) / static_cast<double>(kSampleRate);
+  const double step = static_cast<double>(srcRate) / static_cast<double>(targetRate);
   for (size_t i = 0; i < outFrames; ++i) {
     const double pos = static_cast<double>(i) * step;
     const size_t i0 = std::min(srcFrames - 1, static_cast<size_t>(std::floor(pos)));
@@ -324,10 +324,19 @@ bool readWav48k(const std::string& path, std::vector<float>& outL,
   return true;
 }
 
-bool writeWav48kStereo16(const std::string& path, const std::vector<float>& inter,
-                         size_t frames, std::string& err) {
+bool readWav48k(const std::string& path, std::vector<float>& outL,
+                std::vector<float>& outR, std::string& err) {
+  return readWavAtRate(path, outL, outR, kSampleRate, err);
+}
+
+bool writeWavStereo16(const std::string& path, const std::vector<float>& inter,
+                      size_t frames, int sampleRate, std::string& err) {
   if (inter.size() < frames * 2) {
     err = "short interleaved buffer for " + path;
+    return false;
+  }
+  if (sampleRate <= 0) {
+    err = "bad output sample rate";
     return false;
   }
   std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -356,8 +365,8 @@ bool writeWav48kStereo16(const std::string& path, const std::vector<float>& inte
   w32(16u);
   w16(1);  // PCM
   w16(2);  // stereo
-  w32(static_cast<uint32_t>(kSampleRate));
-  w32(static_cast<uint32_t>(kSampleRate) * 4u);  // byte rate
+  w32(static_cast<uint32_t>(sampleRate));
+  w32(static_cast<uint32_t>(sampleRate) * 4u);  // byte rate
   w16(4);   // block align
   w16(16);  // bits
   std::fwrite("data", 1, 4, f);
@@ -372,6 +381,11 @@ bool writeWav48kStereo16(const std::string& path, const std::vector<float>& inte
   }
   std::fclose(f);
   return true;
+}
+
+bool writeWav48kStereo16(const std::string& path, const std::vector<float>& inter,
+                         size_t frames, std::string& err) {
+  return writeWavStereo16(path, inter, frames, kSampleRate, err);
 }
 
 // time_sec,gain CSV for the baked vocal envelope (track time in seconds).
@@ -1220,9 +1234,13 @@ void printUsage(std::ostream& os, const char* argv0) {
      << "  " << argv0 << " --loop-domain-probe\n"
      << "  " << argv0 << " --lp-bypass-probe\n"
      << "  " << argv0 << " --v2-probe\n"
+     << "  " << argv0 << " --render <script.json> --out <file.wav>\n"
      << "  " << argv0
      << " --out-bed <wav> --out-voc <wav> --in-bed <wav> --in-voc <wav>"
         " --out-prefix <path> [--clashE <val>] [--csv <gain.csv>]\n"
+     << "\n"
+     << "--render executes a TransitionScriptV1 (or compatible) JSON script\n"
+     << "using bitchord::loopmix::Renderer and writes a 48 kHz stereo PCM16 WAV.\n"
      << "\n"
      << "--reverb-stop-probe runs the vc77 production-faithful reverb-stop\n"
      << "regression probe (see header comment). Exit 1 on hard cut.\n"
@@ -2063,6 +2081,982 @@ int runV2Probe() {
   return ok ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// Standalone --render <script.json> --out <file.wav> mode (TransitionScriptV1)
+// ---------------------------------------------------------------------------
+
+namespace render_script {
+
+struct JsonVal {
+  enum Kind { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ };
+  Kind kind = J_NULL;
+  bool b = false;
+  double num = 0.0;
+  std::string str;
+  std::vector<JsonVal> arr;
+  std::vector<std::pair<std::string, JsonVal>> obj;
+
+  const JsonVal* get(const char* key) const {
+    if (kind != J_OBJ) return nullptr;
+    for (const auto& kv : obj) {
+      if (kv.first == key) return &kv.second;
+    }
+    return nullptr;
+  }
+  bool asBool(bool def = false) const {
+    if (kind == J_BOOL) return b;
+    if (kind == J_NUM) return num != 0.0;
+    return def;
+  }
+  double asNum(double def = 0.0) const {
+    return (kind == J_NUM && std::isfinite(num)) ? num : def;
+  }
+  std::string asStr(const std::string& def = "") const {
+    return kind == J_STR ? str : def;
+  }
+  bool boolField(const char* key, bool def = false) const {
+    const JsonVal* v = get(key);
+    return (v && v->kind != J_NULL) ? v->asBool(def) : def;
+  }
+  double numField(const char* key, double def = 0.0) const {
+    const JsonVal* v = get(key);
+    return (v && v->kind != J_NULL) ? v->asNum(def) : def;
+  }
+  bool hasNum(const char* key) const {
+    const JsonVal* v = get(key);
+    return v != nullptr && v->kind == J_NUM && std::isfinite(v->num);
+  }
+  std::string strField(const char* key, const std::string& def = "") const {
+    const JsonVal* v = get(key);
+    return (v && v->kind != J_NULL) ? v->asStr(def) : def;
+  }
+};
+
+class JsonParser {
+ public:
+  explicit JsonParser(const std::string& src) : s_(src) {}
+
+  bool parse(JsonVal& out, std::string& err) {
+    skipWs();
+    if (!parseValue(out, 0, err)) return false;
+    skipWs();
+    if (pos_ != s_.size()) {
+      err = "trailing bytes at offset " + std::to_string(pos_);
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  const std::string& s_;
+  size_t pos_ = 0;
+
+  void skipWs() {
+    while (pos_ < s_.size()) {
+      const unsigned char c = static_cast<unsigned char>(s_[pos_]);
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') ++pos_;
+      else break;
+    }
+  }
+
+  bool matchLit(const char* lit) {
+    const size_t n = std::strlen(lit);
+    if (pos_ + n > s_.size()) return false;
+    if (std::memcmp(s_.data() + pos_, lit, n) != 0) return false;
+    pos_ += n;
+    return true;
+  }
+
+  bool parseString(std::string& out, std::string& err) {
+    if (pos_ >= s_.size() || s_[pos_] != '"') {
+      err = "expected '\"' at offset " + std::to_string(pos_);
+      return false;
+    }
+    ++pos_;
+    out.clear();
+    while (pos_ < s_.size()) {
+      const char c = s_[pos_++];
+      if (c == '"') return true;
+      if (c == '\\') {
+        if (pos_ >= s_.size()) { err = "unterminated escape"; return false; }
+        const char e = s_[pos_++];
+        switch (e) {
+          case '"': out.push_back('"'); break;
+          case '\\': out.push_back('\\'); break;
+          case '/': out.push_back('/'); break;
+          case 'b': out.push_back('\b'); break;
+          case 'f': out.push_back('\f'); break;
+          case 'n': out.push_back('\n'); break;
+          case 'r': out.push_back('\r'); break;
+          case 't': out.push_back('\t'); break;
+          case 'u': {
+            if (pos_ + 4 > s_.size()) { err = "short \\u escape"; return false; }
+            uint32_t cp = 0;
+            for (int k = 0; k < 4; ++k) {
+              const char h = s_[pos_++];
+              cp <<= 4;
+              if (h >= '0' && h <= '9') cp |= uint32_t(h - '0');
+              else if (h >= 'a' && h <= 'f') cp |= uint32_t(h - 'a' + 10);
+              else if (h >= 'A' && h <= 'F') cp |= uint32_t(h - 'A' + 10);
+              else { err = "bad hex in \\u escape"; return false; }
+            }
+            if (cp < 0x80) {
+              out.push_back(static_cast<char>(cp));
+            } else if (cp < 0x800) {
+              out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+              out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+              out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+              out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            break;
+          }
+          default:
+            err = "unknown JSON escape";
+            return false;
+        }
+      } else {
+        out.push_back(c);
+      }
+    }
+    err = "unterminated string";
+    return false;
+  }
+
+  bool parseNumber(double& out, std::string& err) {
+    const char* begin = s_.c_str() + pos_;
+    char* end = nullptr;
+    const double val = std::strtod(begin, &end);
+    if (end == begin || !std::isfinite(val)) {
+      err = "invalid number at offset " + std::to_string(pos_);
+      return false;
+    }
+    pos_ = size_t(end - s_.c_str());
+    out = val;
+    return true;
+  }
+
+  bool parseValue(JsonVal& v, int depth, std::string& err) {
+    if (depth > 64) { err = "JSON nesting too deep"; return false; }
+    skipWs();
+    if (pos_ >= s_.size()) { err = "unexpected end of JSON"; return false; }
+    const char c = s_[pos_];
+    if (c == 'n') {
+      if (!matchLit("null")) { err = "expected null"; return false; }
+      v = JsonVal();
+      v.kind = JsonVal::J_NULL;
+      return true;
+    }
+    if (c == 't') {
+      if (!matchLit("true")) { err = "expected true"; return false; }
+      v = JsonVal();
+      v.kind = JsonVal::J_BOOL;
+      v.b = true;
+      return true;
+    }
+    if (c == 'f') {
+      if (!matchLit("false")) { err = "expected false"; return false; }
+      v = JsonVal();
+      v.kind = JsonVal::J_BOOL;
+      v.b = false;
+      return true;
+    }
+    if (c == '"') {
+      v = JsonVal();
+      v.kind = JsonVal::J_STR;
+      return parseString(v.str, err);
+    }
+    if (c == '[') {
+      ++pos_;
+      v = JsonVal();
+      v.kind = JsonVal::J_ARR;
+      skipWs();
+      if (pos_ < s_.size() && s_[pos_] == ']') { ++pos_; return true; }
+      while (true) {
+        JsonVal item;
+        if (!parseValue(item, depth + 1, err)) return false;
+        v.arr.push_back(std::move(item));
+        skipWs();
+        if (pos_ >= s_.size()) { err = "unterminated array"; return false; }
+        if (s_[pos_] == ']') { ++pos_; return true; }
+        if (s_[pos_] != ',') { err = "expected ',' or ']' in array"; return false; }
+        ++pos_;
+      }
+    }
+    if (c == '{') {
+      ++pos_;
+      v = JsonVal();
+      v.kind = JsonVal::J_OBJ;
+      skipWs();
+      if (pos_ < s_.size() && s_[pos_] == '}') { ++pos_; return true; }
+      while (true) {
+        skipWs();
+        std::string key;
+        if (!parseString(key, err)) return false;
+        skipWs();
+        if (pos_ >= s_.size() || s_[pos_] != ':') { err = "expected ':'"; return false; }
+        ++pos_;
+        JsonVal val;
+        if (!parseValue(val, depth + 1, err)) return false;
+        v.obj.emplace_back(std::move(key), std::move(val));
+        skipWs();
+        if (pos_ >= s_.size()) { err = "unterminated object"; return false; }
+        if (s_[pos_] == '}') { ++pos_; return true; }
+        if (s_[pos_] != ',') { err = "expected ',' or '}' in object"; return false; }
+        ++pos_;
+      }
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+      v = JsonVal();
+      v.kind = JsonVal::J_NUM;
+      return parseNumber(v.num, err);
+    }
+    err = std::string("unexpected char '") + c + "' at offset " + std::to_string(pos_);
+    return false;
+  }
+};
+
+std::string upperStr(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return s;
+}
+
+int parseDeckIndex(const JsonVal* v, int def = 0) {
+  if (!v || v->kind == JsonVal::J_NULL) return def;
+  if (v->kind == JsonVal::J_NUM) return v->num >= 0.5 ? 1 : 0;
+  if (v->kind == JsonVal::J_STR) {
+    const std::string u = upperStr(v->str);
+    if (u == "IN" || u == "B" || u == "1") return 1;
+    if (u == "OUT" || u == "A" || u == "0") return 0;
+  }
+  return def;
+}
+
+int parseEnvelopeKind(const JsonVal* v) {
+  if (!v || v->kind == JsonVal::J_NULL) return -1;
+  if (v->kind == JsonVal::J_NUM) {
+    const int k = int(std::llround(v->num));
+    return (k >= 0 && k <= 19) ? k : -1;
+  }
+  if (v->kind != JsonVal::J_STR) return -1;
+  const std::string u = upperStr(v->str);
+  if (u == "GAIN") return 0;
+  if (u == "LOW_DB") return 1;
+  if (u == "HIGH_PASS_HZ" || u == "HPF_HZ") return 2;
+  if (u == "LOW_PASS_HZ" || u == "LPF_HZ") return 3;
+  if (u == "ECHO_SEND") return 4;
+  if (u == "MID_DB") return 5;
+  if (u == "HIGH_DB") return 6;
+  if (u == "FLANGER_WET") return 7;
+  if (u == "REVERB_SEND") return 8;
+  if (u == "STEM_VOCALS") return 9;
+  if (u == "STEM_DRUMS") return 10;
+  if (u == "STEM_BASS") return 11;
+  if (u == "STEM_OTHER") return 12;
+  if (u == "FILTER_RES") return 13;
+  if (u == "PHASER_WET") return 14;
+  if (u == "GATE_DEPTH") return 15;
+  if (u == "RISER_LEVEL") return 16;
+  if (u == "PUMP_DEPTH") return 17;
+  if (u == "BRAKE") return 18;
+  if (u == "FILTER_KNOB") return 19;
+  return -1;
+}
+
+int parseStemKind(const JsonVal* v) {
+  if (!v || v->kind == JsonVal::J_NULL) return -1;
+  if (v->kind == JsonVal::J_NUM) {
+    const int k = int(std::llround(v->num));
+    return (k >= 0 && k <= 3) ? k : -1;
+  }
+  if (v->kind != JsonVal::J_STR) return -1;
+  const std::string u = upperStr(v->str);
+  if (u == "VOCALS" || u == "VOCAL") return 0;
+  if (u == "DRUMS" || u == "DRUM") return 1;
+  if (u == "BASS") return 2;
+  if (u == "OTHER" || u == "ACCOMPANIMENT") return 3;
+  return -1;
+}
+
+bitchord::loopmix::Envelope* envelopeSlot(bitchord::loopmix::Deck& d, int kind) {
+  switch (kind) {
+    case 0: return &d.gain;
+    case 1: return &d.lowDb;
+    case 2: return &d.highPassHz;
+    case 3: return &d.lowPassHz;
+    case 4: return &d.echoSend;
+    case 5: return &d.midDb;
+    case 6: return &d.highDb;
+    case 7: return &d.flangerWet;
+    case 8: return &d.reverbSend;
+    default: return bitchord::loopmix::v2Envelope(d, kind);
+  }
+}
+
+std::string parentDirOf(const std::string& p) {
+  const size_t slash = p.find_last_of("/\\");
+  return slash == std::string::npos ? "" : p.substr(0, slash);
+}
+
+std::string resolveAudioPath(const std::string& rawPath, const std::string& scriptDir) {
+  if (rawPath.empty()) return "";
+  std::FILE* f = std::fopen(rawPath.c_str(), "rb");
+  if (f) { std::fclose(f); return rawPath; }
+  if (!scriptDir.empty() && rawPath[0] != '/') {
+    const std::string joined = scriptDir + "/" + rawPath;
+    std::FILE* f2 = std::fopen(joined.c_str(), "rb");
+    if (f2) { std::fclose(f2); return joined; }
+  }
+  return rawPath;
+}
+
+bool loadAudioAuto(const std::string& rawPath, const std::string& scriptDir, int srcRateHint,
+                   int targetRate, std::vector<float>& outL, std::vector<float>& outR,
+                   std::string& err) {
+  const std::string path = resolveAudioPath(rawPath, scriptDir);
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) {
+    err = "cannot open audio file: " + path;
+    return false;
+  }
+  std::fseek(f, 0, SEEK_END);
+  const long sz = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  if (sz <= 0) {
+    std::fclose(f);
+    err = "empty audio file: " + path;
+    return false;
+  }
+  uint8_t hdr[12] = {};
+  const size_t nHdr = std::fread(hdr, 1, std::min<size_t>(12, size_t(sz)), f);
+  std::fclose(f);
+  if (nHdr == 12 && std::memcmp(hdr, "RIFF", 4) == 0 && std::memcmp(hdr + 8, "WAVE", 4) == 0) {
+    return readWavAtRate(path, outL, outR, targetRate, err);
+  }
+  // Headerless interleaved float32 stereo PCM (.f32 / .pcm).
+  if (sz % 8 != 0) {
+    err = "audio file is neither WAVE nor stereo float32 interleaved (size=" +
+          std::to_string(sz) + "): " + path;
+    return false;
+  }
+  const size_t srcFrames = size_t(sz) / 8;
+  std::vector<float> inter(srcFrames * 2);
+  std::FILE* fr = std::fopen(path.c_str(), "rb");
+  if (!fr || std::fread(inter.data(), sizeof(float), inter.size(), fr) != inter.size()) {
+    if (fr) std::fclose(fr);
+    err = "short read on float32 file: " + path;
+    return false;
+  }
+  std::fclose(fr);
+  const int srcRate = srcRateHint > 0 ? srcRateHint : targetRate;
+  std::vector<float> srcL(srcFrames), srcR(srcFrames);
+  for (size_t i = 0; i < srcFrames; ++i) {
+    srcL[i] = inter[i * 2];
+    srcR[i] = inter[i * 2 + 1];
+  }
+  if (srcRate == targetRate || srcFrames == 0) {
+    outL = std::move(srcL);
+    outR = std::move(srcR);
+    return true;
+  }
+  const size_t outFrames = static_cast<size_t>(std::llround(
+      double(srcFrames) * double(targetRate) / double(srcRate)));
+  outL.assign(outFrames, 0.f);
+  outR.assign(outFrames, 0.f);
+  const double step = double(srcRate) / double(targetRate);
+  for (size_t i = 0; i < outFrames; ++i) {
+    const double pos = double(i) * step;
+    const size_t i0 = std::min(srcFrames - 1, size_t(std::floor(pos)));
+    const size_t i1 = std::min(srcFrames - 1, i0 + 1);
+    const float f = float(pos - double(i0));
+    outL[i] = srcL[i0] * (1.f - f) + srcL[i1] * f;
+    outR[i] = srcR[i0] * (1.f - f) + srcR[i1] * f;
+  }
+  return true;
+}
+
+void sliceRegionIfFullTrack(std::vector<float>& L, std::vector<float>& R,
+                            double startSec, double endSec, int sr) {
+  if (!(startSec > 0.0) || L.empty()) return;
+  const size_t sIdx = size_t(std::max<int64_t>(0, int64_t(std::llround(startSec * sr))));
+  const size_t eIdx = (endSec > startSec)
+      ? std::min(L.size(), size_t(std::llround(endSec * sr)))
+      : L.size();
+  if (L.size() + 2048 >= eIdx && sIdx < eIdx && eIdx > sIdx) {
+    L.assign(L.begin() + sIdx, L.begin() + eIdx);
+    R.assign(R.begin() + sIdx, R.begin() + eIdx);
+  }
+}
+
+struct ParsedKnots {
+  std::vector<double> mixSec;
+  std::vector<double> trackSec;
+  double firstBpm = 0.0;
+};
+
+ParsedKnots parseKnotArray(const JsonVal* arrVal) {
+  ParsedKnots pk;
+  if (!arrVal || arrVal->kind != JsonVal::J_ARR) return pk;
+  for (const auto& item : arrVal->arr) {
+    double mSec = 0.0, tSec = 0.0;
+    if (item.kind == JsonVal::J_OBJ) {
+      if (item.hasNum("exactMixSec")) mSec = item.numField("exactMixSec");
+      else if (item.hasNum("mixSec")) mSec = item.numField("mixSec");
+      else if (item.hasNum("t")) mSec = item.numField("t");
+      else mSec = item.numField("mixTimeMs") * 0.001;
+
+      if (item.hasNum("exactTrackPosSec")) tSec = item.numField("exactTrackPosSec");
+      else if (item.hasNum("trackPosSec")) tSec = item.numField("trackPosSec");
+      else if (item.hasNum("posSec")) tSec = item.numField("posSec");
+      else if (item.hasNum("pos")) tSec = item.numField("pos");
+      else tSec = item.numField("trackPosMs") * 0.001;
+
+      if (!(pk.firstBpm > 0.0) && item.hasNum("bpm")) {
+        const double b = item.numField("bpm");
+        if (b > 20.0 && b < 300.0) pk.firstBpm = b;
+      }
+      pk.mixSec.push_back(mSec);
+      pk.trackSec.push_back(tSec);
+    } else if (item.kind == JsonVal::J_ARR && item.arr.size() >= 2) {
+      pk.mixSec.push_back(item.arr[0].asNum(0.0));
+      pk.trackSec.push_back(item.arr[1].asNum(0.0));
+    }
+  }
+  return pk;
+}
+
+bool knotsLookValid(const ParsedKnots& pk) {
+  if (pk.mixSec.size() < 2) return false;
+  bool anyAdvance = false;
+  for (size_t i = 1; i < pk.mixSec.size(); ++i) {
+    const double dt = pk.mixSec[i] - pk.mixSec[i - 1];
+    const double dp = pk.trackSec[i] - pk.trackSec[i - 1];
+    if (!(dt > 0.0)) return false;
+    if (std::abs(dp) > 1e-4) {
+      anyAdvance = true;
+      const double rate = dp / dt;
+      if (rate < 0.45 || rate > 2.2) return false;
+    }
+  }
+  return anyAdvance;
+}
+
+int runRenderMode(const std::string& scriptPath, const std::string& outWavPath) {
+  std::FILE* f = std::fopen(scriptPath.c_str(), "rb");
+  if (!f) {
+    std::fprintf(stderr, "error: cannot open script %s\n", scriptPath.c_str());
+    return 1;
+  }
+  std::fseek(f, 0, SEEK_END);
+  const long sz = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  if (sz <= 0) {
+    std::fclose(f);
+    std::fprintf(stderr, "error: empty script %s\n", scriptPath.c_str());
+    return 1;
+  }
+  std::string raw(size_t(sz), '\0');
+  if (std::fread(raw.data(), 1, raw.size(), f) != raw.size()) {
+    std::fclose(f);
+    std::fprintf(stderr, "error: failed to read %s\n", scriptPath.c_str());
+    return 1;
+  }
+  std::fclose(f);
+
+  JsonVal root;
+  std::string err;
+  JsonParser parser(raw);
+  if (!parser.parse(root, err) || root.kind != JsonVal::J_OBJ) {
+    std::fprintf(stderr, "error: invalid script JSON (%s): %s\n",
+                 scriptPath.c_str(), err.empty() ? "root must be object" : err.c_str());
+    return 2;
+  }
+
+  const int sr = std::clamp(int(std::llround(root.numField("sampleRateHz", double(kSampleRate)))),
+                            16000, 192000);
+  const std::string scriptDir = parentDirOf(scriptPath);
+
+  const JsonVal* outReg = root.get("outRegion");
+  const JsonVal* inReg = root.get("inRegion");
+  std::string outPath = outReg ? outReg->strField("pcmPath") : "";
+  std::string inPath = inReg ? inReg->strField("pcmPath") : "";
+  if (outPath.empty()) outPath = root.strField("outPcmPath");
+  if (inPath.empty()) inPath = root.strField("inPcmPath");
+  if (outPath.empty() && inPath.empty()) {
+    std::fprintf(stderr, "error: script missing outRegion.pcmPath / inRegion.pcmPath\n");
+    return 2;
+  }
+
+  Renderer r(sr);
+  r.setHighQuality(root.boolField("highQuality", true));
+
+  struct RegionMeta {
+    double startSec = 0.0, endSec = 0.0, prerollSec = 0.4, stopAtSec = 1e18, fadeOutTrackSec = -1.0;
+    float level = 1.f;
+    bool runOn = false;
+    int rateHint = 48000;
+  };
+  auto loadDeck = [&](int dIdx, const JsonVal* reg, const std::string& pPath, bool defRunOn, RegionMeta& rm) -> bool {
+    rm.runOn = defRunOn;
+    rm.rateHint = sr;
+    if (reg && reg->kind == JsonVal::J_OBJ) {
+      rm.startSec = reg->numField("startMs", 0.0) * 0.001;
+      rm.endSec = reg->numField("endMs", 0.0) * 0.001;
+      rm.prerollSec = reg->hasNum("prerollMs") ? reg->numField("prerollMs", 400.0) * 0.001
+                                               : reg->numField("prerollSec", 0.4);
+      if (reg->hasNum("stopAtMixMs")) rm.stopAtSec = reg->numField("stopAtMixMs") * 0.001;
+      else if (reg->hasNum("stopAtSec")) rm.stopAtSec = reg->numField("stopAtSec");
+      if (reg->hasNum("fadeOutTrackMs")) rm.fadeOutTrackSec = reg->numField("fadeOutTrackMs") * 0.001;
+      rm.level = float(reg->numField("levelGain", 1.0));
+      rm.runOn = reg->boolField("runOn", defRunOn);
+      rm.rateHint = int(std::llround(reg->numField("sampleRateHz", double(sr))));
+    }
+    auto& d = r.deck(dIdx);
+    d.regionStart = rm.startSec;
+    d.preroll = std::clamp(rm.prerollSec, 0.0, 4.0);
+    d.stopAt = rm.stopAtSec;
+    d.level = std::clamp(rm.level, 0.f, 4.f);
+    d.runOn = rm.runOn;
+    if (pPath.empty()) return true;
+    if (!loadAudioAuto(pPath, scriptDir, rm.rateHint, sr, d.left, d.right, err)) {
+      std::fprintf(stderr, "error: loading deck %d PCM: %s\n", dIdx, err.c_str());
+      return false;
+    }
+    sliceRegionIfFullTrack(d.left, d.right, rm.startSec, rm.endSec, sr);
+    return true;
+  };
+
+  RegionMeta outMeta, inMeta;
+  if (!loadDeck(0, outReg, outPath, false, outMeta)) return 1;
+  if (!loadDeck(1, inReg, inPath, true, inMeta)) return 1;
+
+  // Envelopes & transition timing scan.
+  double maxEnvSec = 0.0;
+  double fadeStart = 0.0, fadeEnd = 0.0;
+  bool haveFadeStart = false;
+  if (const JsonVal* envs = root.get("envelopes"); envs && envs->kind == JsonVal::J_ARR) {
+    for (const auto& ev : envs->arr) {
+      if (ev.kind != JsonVal::J_OBJ) continue;
+      const int dIdx = parseDeckIndex(ev.get("deck"), -1);
+      const int kId = parseEnvelopeKind(ev.get("kind"));
+      if (dIdx < 0 || dIdx > 1 || kId < 0) continue;
+      auto* slot = envelopeSlot(r.deck(dIdx), kId);
+      const JsonVal* tv = ev.get("timesSec");
+      bool msScale = false;
+      if (!tv || tv->kind != JsonVal::J_ARR) {
+        tv = ev.get("timesMs");
+        msScale = true;
+      }
+      const JsonVal* vv = ev.get("values");
+      if (!slot || !tv || !vv || tv->kind != JsonVal::J_ARR || vv->kind != JsonVal::J_ARR) continue;
+      const size_t n = std::min(tv->arr.size(), vv->arr.size());
+      if (n == 0) continue;
+      slot->times.resize(n);
+      slot->values.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        slot->times[i] = tv->arr[i].asNum(0.0) * (msScale ? 0.001 : 1.0);
+        slot->values[i] = float(vv->arr[i].asNum(0.0));
+        maxEnvSec = std::max(maxEnvSec, slot->times[i]);
+      }
+      slot->exponential = ev.boolField("exponential", kId == 2 || kId == 3);
+      if (kId == 0) {
+        if (!haveFadeStart || slot->times.front() < fadeStart) {
+          fadeStart = slot->times.front();
+          haveFadeStart = true;
+        }
+        fadeEnd = std::max(fadeEnd, slot->times.back());
+      }
+    }
+  }
+
+  // Render duration calculation.
+  const double outDur = r.deck(0).left.empty() ? 0.0 : double(r.deck(0).left.size()) / double(sr);
+  const double inDur = r.deck(1).left.empty() ? 0.0 : double(r.deck(1).left.size()) / double(sr);
+  double renderDurSec = std::max({outDur, maxEnvSec, fadeEnd + 2.0, inDur});
+  if (outDur > 0.0 && inDur > 0.0 && root.hasNum("durationSec") == false && !root.hasNum("totalFrames")) {
+    renderDurSec = std::max(outDur, fadeEnd + 2.0);
+  }
+  if (root.hasNum("durationSec")) renderDurSec = std::max(0.1, root.numField("durationSec"));
+  if (root.hasNum("totalFrames")) renderDurSec = std::max(1.0, root.numField("totalFrames")) / double(sr);
+  if (!(renderDurSec > 0.0)) renderDurSec = 8.0;
+
+  // Knots: support per-deck knots or top-level TransitionScriptV1 knots array.
+  const JsonVal* topKnots = root.get("knots");
+  ParsedKnots pkOut, pkIn;
+  double defaultBpm = 120.0;
+  if (root.get("outKnots")) pkOut = parseKnotArray(root.get("outKnots"));
+  else if (topKnots && topKnots->kind == JsonVal::J_OBJ && topKnots->get("out")) pkOut = parseKnotArray(topKnots->get("out"));
+  else if (outReg && outReg->get("knots")) pkOut = parseKnotArray(outReg->get("knots"));
+  else if (topKnots && topKnots->kind == JsonVal::J_ARR) pkOut = parseKnotArray(topKnots);
+
+  if (root.get("inKnots")) pkIn = parseKnotArray(root.get("inKnots"));
+  else if (topKnots && topKnots->kind == JsonVal::J_OBJ && topKnots->get("in")) pkIn = parseKnotArray(topKnots->get("in"));
+  else if (inReg && inReg->get("knots")) pkIn = parseKnotArray(inReg->get("knots"));
+
+  if (pkOut.firstBpm > 0.0) defaultBpm = pkOut.firstBpm;
+  if (pkIn.firstBpm > 0.0 && !(pkOut.firstBpm > 0.0)) defaultBpm = pkIn.firstBpm;
+
+  auto assignKnots = [&](int dIdx, const ParsedKnots& pk, double holdUntilSec) {
+    auto& d = r.deck(dIdx);
+    const double bufDur = d.left.empty() ? renderDurSec : double(d.left.size()) / double(sr);
+    const double span = std::max(1.0, std::max(renderDurSec, bufDur));
+    if (knotsLookValid(pk)) {
+      d.knotTimes.resize(pk.mixSec.size());
+      d.knotPositions.resize(pk.trackSec.size());
+      for (size_t i = 0; i < pk.mixSec.size(); ++i) {
+        d.knotTimes[i] = pk.mixSec[i] * double(sr);
+        d.knotPositions[i] = std::max(0.0, pk.trackSec[i] - d.regionStart) * double(sr);
+      }
+      return;
+    }
+    if (d.left.empty()) return;
+    if (holdUntilSec > 0.25 && (span - holdUntilSec) > 0.5) {
+      d.knotTimes = {0.0, holdUntilSec * double(sr), renderDurSec * double(sr)};
+      d.knotPositions = {0.0, 0.0, std::max(0.1, renderDurSec - holdUntilSec) * double(sr)};
+    } else {
+      d.knotTimes = {0.0, renderDurSec * double(sr)};
+      d.knotPositions = {0.0, renderDurSec * double(sr)};
+    }
+  };
+  // Hold IN silently at sample 0 until GAIN rises when IN wasn't pre-shifted by inKnots.
+  double inHoldSec = 0.0;
+  if (!r.deck(1).gain.empty()) {
+    const auto& gt = r.deck(1).gain.times;
+    const auto& gv = r.deck(1).gain.values;
+    if (!gv.empty() && gv.front() <= 1e-5f) {
+      inHoldSec = gt.front();
+      for (size_t i = 1; i < std::min(gt.size(), gv.size()); ++i) {
+        if (gv[i] > 1e-5f) {
+          inHoldSec = gt[i - 1];
+          break;
+        }
+      }
+    }
+  }
+  assignKnots(0, pkOut, 0.0);
+  assignKnots(1, pkIn, inHoldSec);
+
+  // Loop bounds.
+  if (const JsonVal* lb = root.get("loopBounds"); lb && lb->kind == JsonVal::J_OBJ) {
+    auto applyBounds = [&](int dIdx, const char* kStart, const char* kEnd, const char* kRelMix, const char* kRelUnwrap) {
+      auto& d = r.deck(dIdx);
+      if (lb->hasNum(kStart) && lb->hasNum(kEnd)) {
+        const int64_t ls = int64_t(std::llround((lb->numField(kStart) * 0.001 - d.regionStart) * double(sr)));
+        const int64_t le = int64_t(std::llround((lb->numField(kEnd) * 0.001 - d.regionStart) * double(sr)));
+        if (ls >= 0 && le > ls && le <= int64_t(d.left.size())) {
+          d.loopStart = ls;
+          d.loopEnd = le;
+        }
+      }
+      if (lb->hasNum(kRelUnwrap)) {
+        d.releaseAt = lb->numField(kRelUnwrap);
+      } else if (lb->hasNum(kRelMix) && !d.knotTimes.empty()) {
+        d.releaseAt = d.knotHeard(lb->numField(kRelMix) * 0.001 * double(sr));
+      }
+    };
+    applyBounds(0, "outLoopStartMs", "outLoopEndMs", "outReleaseAtMixMs", "outReleaseAtSamples");
+    applyBounds(1, "inLoopStartMs", "inLoopEndMs", "inReleaseAtMixMs", "inReleaseAtSamples");
+  }
+
+  // Stems (TransitionScriptV1 stems array or stems.{out,in}.{vocals,drums,bass}Path).
+  if (const JsonVal* stems = root.get("stems")) {
+    auto attachOne = [&](int dIdx, int sKind, const std::string& sPath, double stStartSec, double stEndSec) -> bool {
+      if (sPath.empty() || sKind == 3 || r.deck(dIdx).left.empty()) return true;
+      std::vector<float> sL, sR;
+      if (!loadAudioAuto(sPath, scriptDir, sr, sr, sL, sR, err)) {
+        std::fprintf(stderr, "error: loading stem deck=%d kind=%d: %s\n", dIdx, sKind, err.c_str());
+        return false;
+      }
+      sliceRegionIfFullTrack(sL, sR, stStartSec, stEndSec, sr);
+      const size_t regLen = r.deck(dIdx).left.size();
+      if (sL.size() < regLen) { sL.resize(regLen, 0.f); sR.resize(regLen, 0.f); }
+      r.setDeckStem(dIdx, sKind, sL.data(), sR.data(), int(regLen));
+      return true;
+    };
+    if (stems->kind == JsonVal::J_ARR) {
+      for (const auto& st : stems->arr) {
+        if (st.kind != JsonVal::J_OBJ) continue;
+        const int dIdx = parseDeckIndex(st.get("deck"), 0);
+        const int sKind = parseStemKind(st.get("stem"));
+        if (sKind < 0) continue;
+        if (!attachOne(dIdx, sKind, st.strField("pcmPath"),
+                       st.numField("startMs") * 0.001, st.numField("endMs") * 0.001)) {
+          return 1;
+        }
+      }
+    } else if (stems->kind == JsonVal::J_OBJ) {
+      for (int dIdx = 0; dIdx < 2; ++dIdx) {
+        const JsonVal* dObj = stems->get(dIdx == 0 ? "out" : "in");
+        if (!dObj || dObj->kind != JsonVal::J_OBJ) continue;
+        const char* keys[3] = {"vocalsPath", "drumsPath", "bassPath"};
+        for (int k = 0; k < 3; ++k) {
+          const std::string p = dObj->strField(keys[k]);
+          if (!p.empty() && !attachOne(dIdx, k, p, 0.0, 0.0)) return 1;
+        }
+      }
+    }
+  }
+
+  // Loudness & true-peak limiter settings.
+  if (const JsonVal* loud = root.get("loudness"); loud && loud->kind == JsonVal::J_OBJ) {
+    const bool en = loud->boolField("enabled", true);
+    const float target = float(loud->numField("targetLufs", -14.0));
+    const bool tp = loud->boolField("truePeakLimiter", true);
+    const float tpDb = float(loud->numField("truePeakCeilingDbtp", -1.0));
+    r.setLoudnessMatch(en, target);
+    r.setTruePeak(tp);
+    r.setTruePeakCeilingDb(tpDb);
+    if (const JsonVal* dw = root.get("dropWindowMs"); dw && dw->kind == JsonVal::J_OBJ) {
+      r.setLoudnessDropWindow(dw->numField("startMs") * 0.001, dw->numField("endMs") * 0.001,
+                              float(loud->numField("dropBumpLu", 0.0)));
+    }
+  } else {
+    r.setLoudnessMatch(true, -14.f);
+    r.setTruePeak(true);
+    r.setTruePeakCeilingDb(-1.0f);
+  }
+
+  // Part A §5 FX configuration.
+  double gridBeatSec = 60.0 / defaultBpm;
+  if (const JsonVal* fx = root.get("fxParams"); fx && fx->kind == JsonVal::J_OBJ) {
+    if (fx->boolField("isolate", false)) {
+      r.setIsolate(0, true);
+      r.setIsolate(1, true);
+    }
+    if (fx->hasNum("svfQ")) {
+      r.setSvfQ(0, float(fx->numField("svfQ", 0.707)));
+      r.setSvfQ(1, float(fx->numField("svfQ", 0.707)));
+    }
+    if (const JsonVal* loop = fx->get("loop"); loop && loop->kind == JsonVal::J_OBJ && loop->boolField("enabled")) {
+      r.setLoopSeamMs(0, loop->numField("seamCrossfadeMs", 8.0));
+    }
+    if (const JsonVal* roll = fx->get("roll"); roll && roll->kind == JsonVal::J_OBJ && roll->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(roll->get("deck"), 0);
+      const double bSec = roll->numField("beatSec", gridBeatSec);
+      gridBeatSec = bSec;
+      const double totB = roll->numField("totalBeats", 8.0);
+      double relSec = roll->numField("releaseMixSec", 0.0);
+      double stSec = roll->numField("startMixSec", 0.0);
+      if (relSec <= stSec && fadeEnd > 0.0) {
+        relSec = fadeEnd;
+        stSec = std::max(0.0, relSec - totB * bSec);
+      }
+      std::vector<double> sched;
+      if (const JsonVal* sc = roll->get("scheduleBeats"); sc && sc->kind == JsonVal::J_ARR) {
+        for (const auto& x : sc->arr) sched.push_back(x.asNum(1.0));
+      }
+      r.setLoopRollEx(dIdx, true, stSec, bSec, relSec, totB,
+                      float(roll->numField("hpfStartHz", 200.0)),
+                      float(roll->numField("hpfEndHz", 2000.0)),
+                      float(roll->numField("boostDb", 2.0)),
+                      roll->boolField("stopOnDownbeat", true),
+                      sched.empty() ? nullptr : sched.data(), int(sched.size()));
+    }
+    auto applySweep = [&](const JsonVal* sw, int defDeck) {
+      if (!sw || sw->kind != JsonVal::J_OBJ || !sw->boolField("enabled")) return;
+      const int dIdx = parseDeckIndex(sw->get("deck"), defDeck);
+      const double bars = sw->numField("bars", 8.0);
+      double endSec = sw->hasNum("endMixSec") ? sw->numField("endMixSec") : (fadeEnd > 0.0 ? fadeEnd : renderDurSec * 0.75);
+      double stSec = sw->hasNum("startMixSec") ? sw->numField("startMixSec") : std::max(0.0, endSec - bars * 4.0 * gridBeatSec);
+      r.setSweep(dIdx, sw->boolField("isHighPass", defDeck == 0),
+                 float(sw->numField("startHz", defDeck == 0 ? 20.0 : 250.0)),
+                 float(sw->numField("endHz", defDeck == 0 ? 1500.0 : 20000.0)),
+                 float(sw->numField("qStart", 0.707)),
+                 float(sw->numField("qEnd", 1.6)),
+                 stSec, endSec, sw->boolField("exponential", true));
+    };
+    applySweep(fx->get("sweep"), 0);
+    applySweep(fx->get("incomingSweep"), 1);
+
+    if (const JsonVal* fl = fx->get("flanger"); fl && fl->kind == JsonVal::J_OBJ && fl->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(fl->get("deck"), 0);
+      const double cyclesBars = std::max(0.25, fl->numField("lfoCyclesPerBars", 2.0));
+      double lfoHz = fl->numField("lfoHz", 0.0);
+      if (!(lfoHz > 0.0)) lfoHz = 1.0 / (cyclesBars * 4.0 * gridBeatSec);
+      const float wetPeak = float(fl->numField("wetPeak", 0.6));
+      r.setFlangerEx(dIdx, lfoHz, fl->numField("depthSec", 0.003),
+                     float(fl->numField("feedback", 0.64)), wetPeak,
+                     float(fl->numField("stereoOffsetDeg", 90.0)));
+      if (r.deck(dIdx).flangerWet.empty() && fadeEnd > 0.0) {
+        const double st = std::max(0.0, fadeEnd - 16.0 * gridBeatSec);
+        r.deck(dIdx).flangerWet.times = {st, fadeEnd};
+        r.deck(dIdx).flangerWet.values = {0.f, 1.f};
+      }
+    }
+    if (const JsonVal* ph = fx->get("phaser"); ph && ph->kind == JsonVal::J_OBJ && ph->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(ph->get("deck"), 0);
+      r.setPhaserEx(dIdx, ph->numField("rateBeats", 4.0), float(ph->numField("depth", 0.7)),
+                    float(ph->numField("feedback", 0.6)), int(std::llround(ph->numField("stages", 6.0))),
+                    float(ph->numField("stereoOffsetDeg", 90.0)));
+      if (r.deck(dIdx).v2.phaserWet.empty() && fadeEnd > 0.0) {
+        const float wp = float(ph->numField("wetPeak", 0.7));
+        const double st = fadeStart > 0.0 ? fadeStart : std::max(0.0, fadeEnd - 8.0 * gridBeatSec);
+        r.deck(dIdx).v2.phaserWet.times = {st, fadeEnd};
+        r.deck(dIdx).v2.phaserWet.values = {0.f, wp};
+      }
+    }
+    if (const JsonVal* ris = fx->get("riser"); ris && ris->kind == JsonVal::J_OBJ && ris->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(ris->get("deck"), 0);
+      const double bSec = ris->numField("beatSec", gridBeatSec);
+      const double lenB = ris->numField("lengthBeats", 16.0);
+      double stSec = ris->hasNum("startMixSec") ? ris->numField("startMixSec") : -1.0;
+      if (stSec < 0.0 && r.deck(dIdx).v2.riserLevel.empty() && fadeEnd > 0.0) {
+        stSec = std::max(0.0, fadeEnd - lenB * bSec);
+      }
+      r.setRiserEx(dIdx, bSec, lenB,
+                   float(ris->numField("noiseSweepStartHz", 300.0)),
+                   float(ris->numField("noiseSweepEndHz", 8000.0)),
+                   float(ris->numField("noiseLevelPeak", 0.7)),
+                   float(ris->numField("uplifterOctaves", 1.0)),
+                   ris->boolField("includeSnareRoll", true),
+                   ris->numField("reverseReverbTailBeats", 1.0),
+                   stSec);
+    }
+    if (const JsonVal* imp = fx->get("impact"); imp && imp->kind == JsonVal::J_OBJ && imp->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(imp->get("deck"), 1);
+      const double trig = imp->hasNum("triggerMixSec") ? imp->numField("triggerMixSec") : fadeEnd;
+      r.setImpact(dIdx, trig, float(imp->numField("peakDbfs", -6.0)),
+                  float(imp->numField("lowThumpHz", 55.0)), imp->numField("noiseBurstMs", 180.0));
+    }
+    if (const JsonVal* br = fx->get("brake"); br && br->kind == JsonVal::J_OBJ && br->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(br->get("deck"), 0);
+      const double st = br->hasNum("startMixSec") ? br->numField("startMixSec") : std::max(0.0, fadeEnd - br->numField("lengthSec", 0.5));
+      r.setBrakeEx(dIdx, st, br->numField("lengthSec", 0.5),
+                   float(br->numField("endRate", 0.05)),
+                   float(br->numField("lpfStartHz", 18000.0)),
+                   float(br->numField("lpfEndHz", 800.0)),
+                   br->numField("endFadeMs", 10.0));
+    }
+    if (const JsonVal* ts = fx->get("tapeStop"); ts && ts->kind == JsonVal::J_OBJ && ts->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(ts->get("deck"), 0);
+      const double st = ts->hasNum("startMixSec") ? ts->numField("startMixSec") : std::max(0.0, fadeEnd - ts->numField("lengthSec", 1.0));
+      r.setTapeStop(dIdx, st, ts->numField("lengthSec", 1.0),
+                    float(ts->numField("wowDepth", 0.03)),
+                    float(ts->numField("wowRateHz", 5.0)),
+                    float(ts->numField("lpfStartHz", 18000.0)),
+                    float(ts->numField("lpfEndHz", 600.0)),
+                    ts->numField("endFadeMs", 10.0));
+    }
+    if (const JsonVal* sp = fx->get("spinback"); sp && sp->kind == JsonVal::J_OBJ && sp->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(sp->get("deck"), 0);
+      const double st = sp->hasNum("startMixSec") ? sp->numField("startMixSec") : std::max(0.0, fadeEnd - sp->numField("lengthSec", 0.25) - sp->numField("silenceGapBeats", 1.0) * gridBeatSec);
+      r.setSpinback(dIdx, st, sp->numField("lengthSec", 0.25),
+                    sp->numField("peakReverseSpeed", 3.0),
+                    sp->numField("silenceGapBeats", 1.0) * gridBeatSec);
+    }
+    if (const JsonVal* ec = fx->get("echo"); ec && ec->kind == JsonVal::J_OBJ && ec->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(ec->get("deck"), 0);
+      double dSec = ec->numField("delaySec", 0.0);
+      if (!(dSec > 0.0)) dSec = ec->numField("delayBeats", 0.5) * gridBeatSec;
+      r.setEchoEx(dIdx, dSec, float(ec->numField("feedback", 0.6)),
+                  float(ec->numField("wet", 0.55)),
+                  float(ec->numField("wetHpfHz", 250.0)),
+                  float(ec->numField("wetLpfHz", 6000.0)),
+                  ec->boolField("pingPong", true));
+      if (r.deck(dIdx).echoSend.empty() && fadeEnd > 0.0) {
+        const double throwAt = std::max(0.0, fadeEnd - gridBeatSec);
+        r.deck(dIdx).echoSend.times = {std::max(0.0, throwAt - 0.005), throwAt, fadeEnd, fadeEnd + 0.005};
+        r.deck(dIdx).echoSend.values = {0.f, 1.f, 1.f, 0.f};
+      }
+    }
+    if (const JsonVal* gt = fx->get("gate"); gt && gt->kind == JsonVal::J_OBJ && gt->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(gt->get("deck"), 0);
+      const double bSec = gt->numField("beatSec", gridBeatSec);
+      const float div = float(gt->numField("divisionStepsPerBeat", 2.0));
+      const float divEnd = gt->hasNum("divisionEndStepsPerBeat") ? float(gt->numField("divisionEndStepsPerBeat")) : (div * 2.f <= 16.f ? div * 2.f : div);
+      const float sDiv = gt->boolField("isStutter", false) ? -std::abs(div) : std::abs(div);
+      const double rampBars = gt->numField("rampBars", 2.0);
+      const double endS = gt->hasNum("endMixSec") ? gt->numField("endMixSec") : (fadeEnd > 0.0 ? fadeEnd : renderDurSec * 0.75);
+      const double stS = gt->hasNum("startMixSec") ? gt->numField("startMixSec") : std::max(0.0, endS - rampBars * 4.0 * bSec);
+      r.setGateEx(dIdx, bSec, sDiv, divEnd, float(gt->numField("swing", 0.0)), stS, endS);
+      if (r.deck(dIdx).v2.gateDepth.empty()) {
+        const float dp = float(gt->numField("depthPeak", 1.0));
+        r.deck(dIdx).v2.gateDepth.times = {stS, endS, endS + 0.005};
+        r.deck(dIdx).v2.gateDepth.values = {0.f, dp, 0.f};
+      }
+    }
+    if (const JsonVal* rv = fx->get("reverb"); rv && rv->kind == JsonVal::J_OBJ && rv->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(rv->get("deck"), 0);
+      r.setReverb(dIdx, float(rv->numField("roomSize", 2.2)),
+                  float(rv->numField("damping", 0.55)),
+                  float(rv->numField("wet", 0.35)));
+    }
+    if (const JsonVal* pm = fx->get("pump"); pm && pm->kind == JsonVal::J_OBJ && pm->boolField("enabled")) {
+      const int dIdx = parseDeckIndex(pm->get("deck"), 0);
+      r.setPump(dIdx, pm->numField("beatSec", gridBeatSec), pm->boolField("fullBand", false));
+    }
+  }
+
+  // Fallback defaults when an envelope lane drives an FX without an explicit fxParams block.
+  for (int dIdx = 0; dIdx < 2; ++dIdx) {
+    const auto& dk = r.deck(dIdx);
+    auto hasNonZero = [](const bitchord::loopmix::Envelope& e) {
+      for (float v : e.values) if (v > 1e-6f) return true;
+      return false;
+    };
+    if (!dk.v2.phaser.enabled && hasNonZero(dk.v2.phaserWet)) {
+      r.setPhaserEx(dIdx, 4.0, 0.7f, 0.6f, 6, 90.f);
+    }
+    if (!dk.v2.gate.enabled && hasNonZero(dk.v2.gateDepth)) {
+      r.setGate(dIdx, gridBeatSec, 4.f, 0.f);
+    }
+    if (!dk.v2.riser.enabled && hasNonZero(dk.v2.riserLevel)) {
+      r.setRiserEx(dIdx, gridBeatSec, 8.0, 300.f, 8000.f, 0.7f, 1.0f, true, 1.0, -1.0);
+    }
+    if (!dk.v2.pump.enabled && hasNonZero(dk.v2.pumpDepth)) {
+      r.setPump(dIdx, gridBeatSec, false);
+    }
+    if (!dk.v2.brake.enabled && hasNonZero(dk.v2.brakeProgress)) {
+      r.setBrakeEx(dIdx, 0.0, 1.0, 0.05f, 18000.f, 800.f, 10.0);
+    }
+    if (!dk.flanger.enabled && hasNonZero(dk.flangerWet)) {
+      r.setFlangerEx(dIdx, 1.0 / (8.0 * gridBeatSec), 0.003, 0.64f, 0.6f, 90.f);
+    }
+    if (!dk.echo.enabled && hasNonZero(dk.echoSend)) {
+      r.setEchoEx(dIdx, 0.5 * gridBeatSec, 0.6f, 0.55f, 250.f, 6000.f, true);
+    }
+    if (!dk.reverb.enabled && hasNonZero(dk.reverbSend)) {
+      r.setReverb(dIdx, 2.2f, 0.55f, 0.35f);
+    }
+  }
+
+  r.prepare();
+  if (outMeta.fadeOutTrackSec >= 0.0) {
+    r.deck(0).fadeOutAt.store(r.deck(0).releasedPositionOf(outMeta.fadeOutTrackSec, sr), std::memory_order_relaxed);
+  }
+  if (inMeta.fadeOutTrackSec >= 0.0) {
+    r.deck(1).fadeOutAt.store(r.deck(1).releasedPositionOf(inMeta.fadeOutTrackSec, sr), std::memory_order_relaxed);
+  }
+
+  const int64_t totalFrames = int64_t(std::llround(renderDurSec * double(sr)));
+  const int64_t first = r.firstFrame();
+  std::vector<float> outInterleaved(size_t(totalFrames) * 2, 0.f);
+  std::vector<float> scratch(size_t(1024) * 2, 0.f);
+  for (int64_t fPos = first; fPos < totalFrames;) {
+    const int chunk = int(std::min<int64_t>(1024, totalFrames - fPos));
+    r.render(fPos, scratch.data(), chunk);
+    for (int i = 0; i < chunk; ++i) {
+      const int64_t dest = fPos + i;
+      if (dest >= 0 && dest < totalFrames) {
+        outInterleaved[size_t(dest) * 2] = scratch[size_t(i) * 2];
+        outInterleaved[size_t(dest) * 2 + 1] = scratch[size_t(i) * 2 + 1];
+      }
+    }
+    fPos += chunk;
+  }
+
+  if (!writeWavStereo16(outWavPath, outInterleaved, size_t(totalFrames), sr, err)) {
+    std::fprintf(stderr, "error: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("rendered %s frames=%lld sr=%d violations=%d\n",
+              outWavPath.c_str(), static_cast<long long>(totalFrames), sr, r.exitGateViolations());
+  return 0;
+}
+
+}  // namespace render_script
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2072,6 +3066,8 @@ int main(int argc, char** argv) {
   bool wantLoopDomain = false;
   bool wantLpBypass = false;
   bool wantV2 = false;
+  std::string renderScriptPath;
+  std::string renderOutPath;
   FileOpts opt;
   bool haveFileArgs = false;
   for (int i = 1; i < argc; ++i) {
@@ -2093,6 +3089,10 @@ int main(int argc, char** argv) {
       wantLpBypass = true;
     } else if (arg == "--v2-probe") {
       wantV2 = true;
+    } else if (arg == "--render") {
+      renderScriptPath = needValue("--render");
+    } else if (arg == "--out") {
+      renderOutPath = needValue("--out");
     } else if (arg == "--out-bed") {
       opt.outBed = needValue("--out-bed");
       haveFileArgs = true;
@@ -2131,6 +3131,14 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (!renderScriptPath.empty() || !renderOutPath.empty()) {
+    if (renderScriptPath.empty() || renderOutPath.empty()) {
+      std::fprintf(stderr, "error: --render needs both --render <script.json> and --out <file.wav>\n");
+      printUsage(std::cerr, argv[0]);
+      return 2;
+    }
+    return render_script::runRenderMode(renderScriptPath, renderOutPath);
+  }
   if (haveFileArgs) {
     if (opt.outBed.empty() || opt.outVoc.empty() || opt.inBed.empty() ||
         opt.inVoc.empty() || opt.outPrefix.empty()) {

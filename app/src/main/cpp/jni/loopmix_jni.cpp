@@ -262,4 +262,149 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeLoudnessGuardDb(J
   return handle != 0 ? From(handle)->loudnessGuardDb() : 0.f;
 }
 
+// ---- M4 Part A §5 FX & 40 s capture extensions ---------------------------
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoopSeamMs(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble seamMs) {
+  if (handle != 0) From(handle)->setLoopSeamMs(index, seamMs);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoopRollEx(
+    JNIEnv* env, jclass, jlong handle, jint index, jboolean enabled, jdouble rollStartSec,
+    jdouble beatSec, jdouble releaseSec, jdouble totalRollBeats, jfloat hpfStartHz,
+    jfloat hpfEndHz, jfloat boostDb, jboolean stopOnDownbeat, jdoubleArray scheduleBeats) {
+  if (handle == 0) return;
+  std::vector<double> sched;
+  if (scheduleBeats != nullptr) {
+    const jsize n = env->GetArrayLength(scheduleBeats);
+    if (n > 0) {
+      sched.resize(static_cast<size_t>(n));
+      env->GetDoubleArrayRegion(scheduleBeats, 0, n, sched.data());
+      if (env->ExceptionCheck()) return;
+    }
+  }
+  From(handle)->setLoopRollEx(
+      index, enabled == JNI_TRUE, rollStartSec, beatSec, releaseSec, totalRollBeats,
+      hpfStartHz, hpfEndHz, boostDb, stopOnDownbeat == JNI_TRUE,
+      sched.empty() ? nullptr : sched.data(), static_cast<int>(sched.size()));
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEchoEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble delaySeconds, jfloat feedback,
+    jfloat wet, jfloat wetHpfHz, jfloat wetLpfHz, jboolean pingPong) {
+  if (handle != 0) {
+    From(handle)->setEchoEx(index, delaySeconds, feedback, wet, wetHpfHz, wetLpfHz, pingPong == JNI_TRUE);
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetFlangerEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble lfoHz, jdouble depthSeconds,
+    jfloat feedback, jfloat wet, jfloat stereoOffsetDeg) {
+  if (handle != 0) From(handle)->setFlangerEx(index, lfoHz, depthSeconds, feedback, wet, stereoOffsetDeg);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetPhaserEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble rateBeats, jfloat depth,
+    jfloat feedback, jint stages, jfloat stereoOffsetDeg) {
+  if (handle != 0) From(handle)->setPhaserEx(index, rateBeats, depth, feedback, stages, stereoOffsetDeg);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetRiserEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble beatSec, jdouble lengthBeats,
+    jfloat noiseStartHz, jfloat noiseEndHz, jfloat noiseLevelPeak, jfloat uplifterOctaves,
+    jboolean includeSnareRoll, jdouble reverseReverbBeats, jdouble startSec) {
+  if (handle != 0) {
+    From(handle)->setRiserEx(index, beatSec, lengthBeats, noiseStartHz, noiseEndHz,
+                             noiseLevelPeak, uplifterOctaves, includeSnareRoll == JNI_TRUE,
+                             reverseReverbBeats, startSec);
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetImpact(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble triggerMixSec, jfloat peakDbfs,
+    jfloat lowThumpHz, jdouble noiseBurstMs) {
+  if (handle != 0) From(handle)->setImpact(index, triggerMixSec, peakDbfs, lowThumpHz, noiseBurstMs);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetGateEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble beatSec, jfloat divStart,
+    jfloat divEnd, jfloat swing, jdouble startSec, jdouble endSec) {
+  if (handle != 0) From(handle)->setGateEx(index, beatSec, divStart, divEnd, swing, startSec, endSec);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetBrakeEx(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble startSec, jdouble lengthSec,
+    jfloat endRate, jfloat lpfStartHz, jfloat lpfEndHz, jdouble endFadeMs) {
+  if (handle != 0) From(handle)->setBrakeEx(index, startSec, lengthSec, endRate, lpfStartHz, lpfEndHz, endFadeMs);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetTapeStop(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble startSec, jdouble lengthSec,
+    jfloat wowDepth, jfloat wowRateHz, jfloat lpfStartHz, jfloat lpfEndHz, jdouble endFadeMs) {
+  if (handle != 0) {
+    From(handle)->setTapeStop(index, startSec, lengthSec, wowDepth, wowRateHz, lpfStartHz, lpfEndHz, endFadeMs);
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetSpinback(
+    JNIEnv*, jclass, jlong handle, jint index, jdouble startSec, jdouble lengthSec,
+    jdouble peakReverseSpeed, jdouble silenceGapSec) {
+  if (handle != 0) From(handle)->setSpinback(index, startSec, lengthSec, peakReverseSpeed, silenceGapSec);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetSweep(
+    JNIEnv*, jclass, jlong handle, jint index, jboolean isHighPass, jfloat startHz,
+    jfloat endHz, jfloat qStart, jfloat qEnd, jdouble startSec, jdouble endSec,
+    jboolean exponential) {
+  if (handle != 0) {
+    From(handle)->setSweep(index, isHighPass == JNI_TRUE, startHz, endHz,
+                           qStart, qEnd, startSec, endSec, exponential == JNI_TRUE);
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetTruePeakCeilingDb(
+    JNIEnv*, jclass, jlong handle, jfloat ceilingDbtp) {
+  if (handle != 0) From(handle)->setTruePeakCeilingDb(ceilingDbtp);
+}
+
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetCaptureEnabled(
+    JNIEnv*, jclass, jlong handle, jboolean enabled) {
+  if (handle != 0) From(handle)->setCaptureEnabled(enabled == JNI_TRUE);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeCapturedFrames(
+    JNIEnv*, jclass, jlong handle) {
+  return handle != 0 ? static_cast<jlong>(From(handle)->capturedFrames()) : 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeReadCapturedAudio(
+    JNIEnv* env, jclass, jlong handle, jfloatArray outInterleaved, jint maxFrames) {
+  if (handle == 0 || outInterleaved == nullptr || maxFrames <= 0) return 0;
+  const jsize len = env->GetArrayLength(outInterleaved);
+  const int capped = std::min(static_cast<int>(maxFrames), static_cast<int>(len / 2));
+  if (capped <= 0) return 0;
+  std::vector<float> tmp(static_cast<size_t>(capped) * 2, 0.f);
+  const int copied = From(handle)->readCapturedAudio(tmp.data(), capped);
+  if (copied > 0) {
+    env->SetFloatArrayRegion(outInterleaved, 0, copied * 2, tmp.data());
+  }
+  return copied;
+}
+
 }  // extern "C"

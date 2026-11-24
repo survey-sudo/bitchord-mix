@@ -1,0 +1,358 @@
+{
+  "schema": 2,
+  "id": "F6",
+  "name": "Pump rider",
+  "description": "Beat-locked sidechain pump and jet flanger across a long phrase blend",
+  "level": "FESTIVAL",
+  "family": "FX",
+  "abruptness": "SMOOTH",
+  "requirements": {
+    "maxTempoGap": 0.08,
+    "requiresBeatMatch": true,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "DANCE": 0.3,
+      "POP": 0.14
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 4.0,
+    "requiredCapabilities": [
+      "PUMP"
+    ],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    16,
+    32
+  ],
+  "placementPrefs": {
+    "swapRule": "MID_PHRASE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 2.0
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 1200.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "PUMP",
+      "requiredCap": "PUMP",
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 1.0
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "FLANGER",
+      "params": {
+        "lfoCyclesPerBars": 2.0,
+        "depthSec": 0.0035,
+        "feedback": 0.64,
+        "wetPeak": 0.6,
+        "stereoOffsetDeg": 90.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "RELEASE_BACK_S",
+            "param": 4.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.5,
+            "minAt": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 2.0
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 1200.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "PUMP",
+      "requiredCap": "PUMP",
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 1.0
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.8
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "FLANGER",
+      "params": {
+        "lfoCyclesPerBars": 2.0,
+        "depthSec": 0.0035,
+        "feedback": 0.64,
+        "wetPeak": 0.6,
+        "stereoOffsetDeg": 90.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "RELEASE_BACK_S",
+            "param": 4.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.5,
+            "minAt": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

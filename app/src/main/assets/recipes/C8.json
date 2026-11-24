@@ -1,0 +1,330 @@
+{
+  "schema": 2,
+  "id": "C8",
+  "name": "Loop roll out",
+  "description": "Beat-locked loop tightens into a roll and cuts cleanly on bar 1",
+  "level": "CLUB",
+  "family": "FX",
+  "abruptness": "PUNCHY",
+  "requirements": {
+    "maxTempoGap": 0.06,
+    "requiresBeatMatch": true,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "DANCE": 0.22,
+      "HIPHOP": 0.14
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": true,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 4.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    8,
+    16
+  ],
+  "placementPrefs": {
+    "swapRule": "LATE_PHRASE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP",
+      "params": {
+        "bars": 4.0,
+        "seamCrossfadeMs": 8.0,
+        "holdPhrases": 1.0
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP_ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 200.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.01,
+            "minAt": "ZERO"
+          },
+          "value": 2000.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.03,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP",
+      "params": {
+        "bars": 4.0,
+        "seamCrossfadeMs": 8.0,
+        "holdPhrases": 1.0
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP_ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 200.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.01,
+            "minAt": "ZERO"
+          },
+          "value": 2000.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.03,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.15,
+  "enabled": true
+}

@@ -1,0 +1,367 @@
+{
+  "schema": 2,
+  "id": "F7",
+  "name": "Spinback cut",
+  "description": "Reverse platter spinback and echo throw into the incoming 1",
+  "level": "FESTIVAL",
+  "family": "CUT",
+  "abruptness": "ABRUPT",
+  "requirements": {
+    "maxTempoGap": 1.0,
+    "requiresBeatMatch": false,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "HIPHOP": 0.32,
+      "POP": 0.12
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.0,
+    "minOverlapBars": 1.0,
+    "requiredCapabilities": [
+      "SPINBACK"
+    ],
+    "requiresTempoOrGenreJump": true
+  },
+  "lengthOptionsBars": [
+    4,
+    2,
+    8
+  ],
+  "placementPrefs": {
+    "swapRule": "CUT_LATE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO",
+            "offsetSec": -0.02
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "LOW_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": -24.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "SPINBACK",
+      "requiredCap": "SPINBACK",
+      "params": {
+        "peakReverseSpeed": 3.0,
+        "silenceGapBeats": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.5,
+        "minAt": "ZERO"
+      },
+      "endTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.0,
+        "minAt": "ZERO"
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.58,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -2.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -0.85,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO",
+            "offsetSec": -0.02
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "LOW_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": -24.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "SPINBACK",
+      "requiredCap": "SPINBACK",
+      "params": {
+        "peakReverseSpeed": 3.0,
+        "silenceGapBeats": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.5,
+        "minAt": "ZERO"
+      },
+      "endTime": {
+        "anchor": "SWAP",
+        "offsetBeats": -1.0,
+        "minAt": "ZERO"
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.5,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.58,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -2.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -0.85,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

@@ -1,0 +1,482 @@
+{
+  "schema": 2,
+  "id": "F11",
+  "name": "Riser + impact cut",
+  "description": "Tempo-synced riser build cutting cleanly into an impact hit on the drop",
+  "level": "FESTIVAL",
+  "family": "DROP",
+  "abruptness": "PUNCHY",
+  "requirements": {
+    "maxTempoGap": 0.08,
+    "requiresBeatMatch": true,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "DANCE": 0.28,
+      "POP": 0.18
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 2.0,
+    "requiredCapabilities": [
+      "RISER"
+    ],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    8,
+    16
+  ],
+  "placementPrefs": {
+    "swapRule": "DROP_OR_LATE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": true,
+    "maxEntrySkipBars": 64,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.03,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 200.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "ZERO"
+          },
+          "value": 2000.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "FILTER_RES",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 4.0
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "ZERO"
+          },
+          "value": 1.6
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "fallbackFx": "FLANGER",
+      "params": {
+        "lengthBeats": 32.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 1.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.7
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "fallbackWetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "IMPACT",
+      "params": {
+        "peakDbfs": -6.0,
+        "lowThumpHz": 55.0,
+        "noiseBurstMs": 180.0
+      },
+      "startTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.03,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 2.0
+          },
+          "value": 200.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "ZERO"
+          },
+          "value": 2000.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "FILTER_RES",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 4.0
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "ZERO"
+          },
+          "value": 1.6
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ROLL",
+      "params": {
+        "totalBeats": 8.0,
+        "hpfStartHz": 200.0,
+        "hpfEndHz": 2000.0,
+        "boostDb": 2.0,
+        "stopOnDownbeat": 1.0
+      },
+      "startTime": {
+        "anchor": "SWAP_BACK_ZERO",
+        "param": 2.0
+      },
+      "endTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "RISER",
+      "requiredCap": "RISER",
+      "fallbackFx": "FLANGER",
+      "params": {
+        "lengthBeats": 32.0,
+        "noiseSweepStartHz": 300.0,
+        "noiseSweepEndHz": 8000.0,
+        "noiseLevelPeak": 0.7,
+        "uplifterOctaves": 1.0,
+        "includeSnareRoll": 1.0,
+        "reverseReverbTailBeats": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.7
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "fallbackWetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_ZERO",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.015,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.005,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "IMPACT",
+      "params": {
+        "peakDbfs": -6.0,
+        "lowThumpHz": 55.0,
+        "noiseBurstMs": 180.0
+      },
+      "startTime": {
+        "anchor": "SWAP"
+      }
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.3,
+  "enabled": true
+}

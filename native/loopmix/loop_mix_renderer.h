@@ -125,10 +125,17 @@ struct PingPong {
   int delay = 0;
   float feedback = 0;
   float wet = 0;
+  float wetHpfHz = 250.f;
+  float wetLpfHz = 6000.f;
+  bool pingPong = true;
+  float hpA = 0.f;
+  float lpA = 0.f;
   float hpL = 0, hpR = 0, lpL = 0, lpR = 0;
   bool enabled = false;
 
   void setup(double sampleRate, double delaySeconds, float feedbackGain, float wetGain);
+  void setupEx(double sampleRate, double delaySeconds, float feedbackGain, float wetGain,
+               float hpfHz, float lpfHz, bool pingPongIn);
   /**
    * Writes the delayed signal into [wetL]/[wetR].
    * The delay is fed `dry × send`. A send of 0 still recirculates what is
@@ -138,11 +145,10 @@ struct PingPong {
 };
 
 /**
- * djmix24 stereo Jet Flanger (DJM-style): true stereo quadrature LFO
- * (90 deg / 0.25 cycle offset, wide jet while mono-compatible), delay
- * sweep 0.65 ms .. 5.2 ms, metallic resonant feedback 0.64 with 1-pole
- * ~10 kHz HF damping + denormal guard + hard clamp [-0.78, 0.78], wet
- * 0.48 energy-balanced. History is cleared at prepare() (worker thread).
+ * Tempo-synced through-zero-style stereo jet flanger:
+ * fixed center reference delay crossed twice per LFO cycle by the swept tap,
+ * stereo quadrature offset (default 90 deg), damped resonant feedback,
+ * denormal-flushed and clamped [-0.78, 0.78].
  */
 struct Flanger {
   std::vector<float> left;
@@ -152,14 +158,33 @@ struct Flanger {
   float feedback = 0.0f;
   float wet = 0.0f;
   double lfoHz = 0.0;
+  float stereoOffsetDeg = 90.f;
+  double centerDelaySec = 0.0025;
+  float dampA = 0.f;
+  bool throughZero = true;
   bool enabled = false;
   float dampL = 0.f, dampR = 0.f;
 
   void setup(double sampleRate, double lfoHzIn, double depthSecondsIn, float feedbackGain, float wetGain);
+  void setupEx(double sampleRate, double lfoHzIn, double depthSecondsIn, float feedbackGain,
+               float wetGain, float stereoOffsetDegIn, bool throughZeroIn = true);
   /** Wet comb output for one frame pair, given absolute mix-frame time. */
   void apply(float inL, float inR, float& wetL, float& wetR, double frameTimeSec, double sampleRate);
   /** Wet with envelope multiplier (KIND_FLANGER_WET) + tail ring. */
   void applyEnv(float inL, float inR, float wetMul, float& wetL, float& wetR, double frameTimeSec, double sampleRate);
+};
+
+/** Automatic HPF/LPF resonant filter sweep curve over mix seconds. */
+struct SweepConfig {
+  bool enabled = false;
+  bool isHighPass = true;
+  float startHz = 20.f;
+  float endHz = 1500.f;
+  float qStart = 0.7071f;
+  float qEnd = 1.6f;
+  double startSec = 0.0;
+  double endSec = 0.0;
+  bool exponential = true;
 };
 
 /**
@@ -184,6 +209,7 @@ struct DeckV2 {
   Envelope filterKnob;
   bool filterV2 = false;
   float hpQLast = -1.f, lpQLast = -1.f;
+  SweepConfig sweep;
 
   v2::Phaser phaser;
   Envelope phaserWet;
@@ -191,6 +217,8 @@ struct DeckV2 {
   Envelope gateDepth;
   v2::Riser riser;
   Envelope riserLevel;
+  v2::Impact impact;
+  bool impactActive = false;
   v2::Pump pump;
   Envelope pumpDepth;
   v2::Brake brake;
@@ -245,6 +273,13 @@ struct Deck {
   double rollBeatSec = 0.5;
   double rollReleaseMixSec = 0.0;
   double rollTotalBeats = 16.0;
+  double loopSeamMs = 8.0;
+  bool rollFxActive = false;
+  float rollHpfStartHz = 200.f;
+  float rollHpfEndHz = 2000.f;
+  float rollBoostDb = 2.f;
+  bool rollStopOnDownbeat = true;
+  std::vector<double> rollScheduleBeats;
   /** djmix24 Cytomic SVF Q (0.707 default, 0.95 buildup). */
   float svfQ = 0.707f;
   /** djmix24 effective loop end for the current block (samples); -1 = use loopEnd. */
@@ -347,9 +382,17 @@ class Renderer {
   void setHighQuality(bool high) { highQuality_ = high; }
   /** Tempo-synced echo on [index]. A non-positive delay turns it off. */
   void setEcho(int index, double delaySeconds, float feedback, float wet);
+  void setEchoEx(int index, double delaySeconds, float feedback, float wet,
+                 float wetHpfHz, float wetLpfHz, bool pingPong);
   void setIsolate(int index, bool on);
+  /** Loop seam crossfade duration in milliseconds (clamped [0.5, 8.0] ms). */
+  void setLoopSeamMs(int index, double seamMs);
   /** djmix24 beat-quantized tightening loop roll. */
   void setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats);
+  /** Part A §5.2 loop roll with schedule, rising HPF, gain boost, and hard downbeat stop. */
+  void setLoopRollEx(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec,
+                     double totalRollBeats, float hpfStartHz, float hpfEndHz, float boostDb,
+                     bool stopOnDownbeat, const double* scheduleBeats = nullptr, int scheduleCount = 0);
   /** djmix24 stereo plate reverb wash. */
   void setReverb(int index, float roomSize, float damping, float wet);
   /** djmix24 Cytomic SVF Q. */
@@ -358,13 +401,12 @@ class Renderer {
   /** Call once both decks are filled in, before the first [render]. */
   void prepare();
 
-  /** The earliest mix frame anything renders at (negative: before t0). */
   /**
-   * Beat-synced flanger on [index]'s tail (djmix11 graceful exit).
-   * Depth is the delay's sweep in seconds (max 4 ms); lfoHz is one cycle
-   * per 8 beats, so the phasing reads as a dissolve, never a wobble.
+   * Beat-synced through-zero jet flanger on [index]'s tail.
    */
   void setFlanger(int index, double lfoHz, double depthSeconds, float feedback, float wet);
+  void setFlangerEx(int index, double lfoHz, double depthSeconds, float feedback, float wet,
+                    float stereoOffsetDeg);
   /** How many times a deck went silent while still audible at stopAt (the exit gate's trip counter). */
   int exitGateViolations() const { return exitGateViolations_.load(std::memory_order_relaxed); }
 
@@ -380,18 +422,40 @@ class Renderer {
   void clearDeckStems(int index);
   /** Phaser: LFO cycle [rateBeats] (1/16..64), sweep [depth] 0..1, [feedback] -0.85..0.85. Wet = KIND_PHASER_WET. */
   void setPhaser(int index, double rateBeats, float depth, float feedback);
+  void setPhaserEx(int index, double rateBeats, float depth, float feedback, int stages, float stereoOffsetDeg);
   /**
    * Beat gate: [division] gate steps per beat (1/16..16; 4 = 1/16 notes, DJM
    * TRANS); a negative division selects stutter (repeat the first step's slice).
    * [swing] 0..0.33. Depth = KIND_GATE_DEPTH. [beatSec] is the fallback grid.
    */
   void setGate(int index, double beatSec, float division, float swing);
-  /** White-noise riser of [lengthBeats], starting where KIND_RISER_LEVEL first rises. */
+  void setGateEx(int index, double beatSec, float divStart, float divEnd, float swing,
+                 double startSec, double endSec);
+  /** 3-layer tempo-synced riser + reverse-reverb tail, cut cleanly on beat 1. */
   void setRiser(int index, double beatSec, double lengthBeats);
+  void setRiserEx(int index, double beatSec, double lengthBeats, float noiseStartHz, float noiseEndHz,
+                  float noiseLevelPeak, float uplifterOctaves, bool includeSnareRoll,
+                  double reverseReverbBeats, double startSec = -1.0);
+  /** Drop impact on beat 1 (low thump + noise burst, <= -6 dBFS). */
+  void setImpact(int index, double triggerMixSec, float peakDbfs, float lowThumpHz, double noiseBurstMs);
   /** Beat-locked pump on the deck's low band (< 120 Hz), or the whole deck when [fullBand]. Depth = KIND_PUMP_DEPTH. */
   void setPump(int index, double beatSec, bool fullBand = false);
-  /** Vinyl brake (or spinback) from mix second [startSec] over [lengthSec]; KIND_BRAKE overrides the progress. One-shot. */
+  /** Pre-stretch vinyl brake / tape-stop / spinback. */
   void setBrake(int index, double startSec, double lengthSec, bool spinback = false);
+  void setBrakeEx(int index, double startSec, double lengthSec, float endRate,
+                  float lpfStartHz, float lpfEndHz, double endFadeMs);
+  void setTapeStop(int index, double startSec, double lengthSec, float wowDepth, float wowRateHz,
+                   float lpfStartHz, float lpfEndHz, double endFadeMs);
+  void setSpinback(int index, double startSec, double lengthSec, double peakReverseSpeed, double silenceGapSec);
+  /** Automatic HPF/LPF resonant filter sweep over mix seconds [startSec, endSec]. */
+  void setSweep(int index, bool isHighPass, float startHz, float endHz,
+                float qStart, float qEnd, double startSec, double endSec, bool exponential);
+  /** True-peak limiter ceiling in dBTP (default -1.0 dBTP). */
+  void setTruePeakCeilingDb(float ceilingDbtp);
+  /** Enables 40 s pre-allocated capture ring buffer (call before prepare()). */
+  void setCaptureEnabled(bool enabled) { captureEnabled_ = enabled; }
+  int64_t capturedFrames() const;
+  int readCapturedAudio(float* outInterleaved, int maxFrames) const;
   /**
    * Short-term loudness tracking with per-deck matching and the summed-bus
    * "no dip / no bump" guard during overlaps; [targetLufs] (e.g. -14, the
@@ -437,10 +501,12 @@ class Renderer {
   void loudnessPreBlock(int64_t frame, int frames);
   void loudnessGuard(int64_t frame, int frames);
   void limitTruePeak(int frames);
+  void sampleDeckVarispeed(Deck& deck, double unwrapped, int seam, double mixSec, float& outL, float& outR) const;
 
   int sampleRate_;
   bool highQuality_ = true;
   float limitGain_ = 1;
+  float truePeakCeiling_ = 0.89125094f;  // -1.0 dBTP default
   Deck decks_[2];
   std::atomic<int> exitGateViolations_{0};
   std::vector<float> inLeft_, inRight_, outLeft_, outRight_;
@@ -448,6 +514,11 @@ class Renderer {
   // Legacy input history; limit() detects sample peaks within each callback.
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
+  // Optional 40 s audio ring-buffer capture (enabled/allocated in prepare() when requested).
+  bool captureEnabled_ = false;
+  std::vector<float> captureRing_;
+  int captureCapFrames_ = 0;
+  std::atomic<int64_t> captureWriteFrames_{0};
 
   // AUTOMIX-V2(C) state. Pre-allocated in prepare(); render thread only after that.
   bool loudnessOn_ = false;

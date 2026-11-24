@@ -40,6 +40,10 @@ keystore.properties
 .tmp_verify/
 .debug/
 
+# Python bytecode from the host-side tools (tools/mixq, tools/audition)
+__pycache__/
+*.pyc
+
 # AI agent configuration
 AGENTS.md
 /output/

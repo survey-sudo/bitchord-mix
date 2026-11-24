@@ -1,0 +1,501 @@
+{
+  "schema": 2,
+  "id": "C2",
+  "name": "Filter wash + echo",
+  "description": "Resonant high-pass filter wash and tempo echo bridging any tempo gap",
+  "level": "CLUB",
+  "family": "FX",
+  "abruptness": "PUNCHY",
+  "requirements": {
+    "maxTempoGap": 1.0,
+    "requiresBeatMatch": false,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "HIPHOP": 0.2,
+      "ROCK": 0.25,
+      "BALLAD": 0.22,
+      "DANCE": 0.14,
+      "POP": 0.14
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.0,
+    "minOverlapBars": 2.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    8,
+    16
+  ],
+  "placementPrefs": {
+    "swapRule": "CUT_LATE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.05,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.01,
+            "minAt": "IN_AUDIBLE",
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1500.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "FILTER_RES",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.6
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "SVF_Q",
+      "params": {
+        "q": 0.9
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "LOW_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 350.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20000.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.4,
+        "damping": 0.55,
+        "wet": 0.45
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.45
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.58,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.85,
+          "scaleByFxDepth": true
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.12,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -12.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.05,
+            "minAt": "ZERO"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ],
+      "steps": 2
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.005,
+            "minAt": "IN_AUDIBLE"
+          },
+          "value": 0.9
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.01,
+            "minAt": "IN_AUDIBLE",
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1500.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "FILTER_RES",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 1.6
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "SVF_Q",
+      "params": {
+        "q": 0.9
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "LOW_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 350.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20000.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.4,
+        "damping": 0.55,
+        "wet": 0.45
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 8.0
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.45
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.58,
+        "wet": 0.55,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": -1.0,
+            "minAt": "ZERO"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": -0.02,
+            "minAt": "ZERO"
+          },
+          "value": 0.85,
+          "scaleByFxDepth": true
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetSec": 0.12,
+            "maxAt": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -12.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

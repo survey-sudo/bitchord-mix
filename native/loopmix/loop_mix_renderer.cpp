@@ -189,7 +189,7 @@ void TptLowpass::set(double sampleRate, double frequency, double q) {
     bypass();
     return;
   }
-  const double safeQ = std::max(0.5, q);
+  const double safeQ = std::clamp(q, 0.5, double(v2::kMaxResonanceQ));
   const double T = 1.0 / sampleRate;
   const double wa = (2.0 / T) * std::tan(kPi * frequency * T);
   g = float(wa * T / 2.0);
@@ -204,7 +204,7 @@ void TptHighpass::set(double sampleRate, double frequency, double q) {
     bypass();
     return;
   }
-  const double safeQ = std::max(0.5, q);
+  const double safeQ = std::clamp(q, 0.5, double(v2::kMaxResonanceQ));
   const double T = 1.0 / sampleRate;
   const double wa = (2.0 / T) * std::tan(kPi * frequency * T);
   g = float(wa * T / 2.0);
@@ -230,8 +230,10 @@ void ReverbWash::setup(double sampleRate, float roomSize, float dampingIn, float
   combR2.assign(szFor(0.0416f), 0.f); combR3.assign(szFor(0.0444f), 0.f);
   apL0.assign(szFor(0.0044f), 0.f); apL1.assign(szFor(0.0016f), 0.f);
   apR0.assign(szFor(0.0049f), 0.f); apR1.assign(szFor(0.0019f), 0.f);
-  for (int& i : combIdxL) i = 0; for (int& i : combIdxR) i = 0;
-  for (int& i : apIdxL) i = 0; for (int& i : apIdxR) i = 0;
+  for (int& i : combIdxL) i = 0;
+  for (int& i : combIdxR) i = 0;
+  for (int& i : apIdxL) i = 0;
+  for (int& i : apIdxR) i = 0;
   damping = dampingIn;
   wet = wetIn;
   enabled = true;
@@ -295,6 +297,11 @@ void ReverbWash::apply(float inL, float inR, float send, float& wetL, float& wet
 }
 
 void PingPong::setup(double sampleRate, double delaySeconds, float feedbackGain, float wetGain) {
+  setupEx(sampleRate, delaySeconds, feedbackGain, wetGain, 250.f, 6000.f, true);
+}
+
+void PingPong::setupEx(double sampleRate, double delaySeconds, float feedbackGain, float wetGain,
+                       float hpfHz, float lpfHz, bool pingPongIn) {
   enabled = false;
   left.clear();
   right.clear();
@@ -304,8 +311,13 @@ void PingPong::setup(double sampleRate, double delaySeconds, float feedbackGain,
   delay = std::clamp(int(std::lround(delaySeconds * sampleRate)), 1, int(sampleRate * 2.0));
   left.assign(delay, 0.f);
   right.assign(delay, 0.f);
-  feedback = feedbackGain;
-  wet = wetGain;
+  feedback = std::isfinite(feedbackGain) ? std::clamp(feedbackGain, 0.f, 0.85f) : 0.f;
+  wet = std::isfinite(wetGain) ? std::clamp(wetGain, 0.f, 2.f) : 0.f;
+  wetHpfHz = std::clamp(std::isfinite(hpfHz) ? hpfHz : 250.f, 40.f, 4000.f);
+  wetLpfHz = std::clamp(std::isfinite(lpfHz) ? lpfHz : 6000.f, 500.f, float(sampleRate * 0.45));
+  pingPong = pingPongIn;
+  hpA = float(1.0 - std::exp(-2.0 * kPi * double(wetHpfHz) / sampleRate));
+  lpA = float(1.0 - std::exp(-2.0 * kPi * double(wetLpfHz) / sampleRate));
   enabled = true;
 }
 
@@ -315,45 +327,54 @@ void PingPong::tap(float inL, float inR, float send, float& wetL, float& wetR, d
   if (!enabled || delay <= 0 || !(sampleRate > 0)) return;
   const float delayedL = left[pos];
   const float delayedR = right[pos];
-  // Inside the feedback loop, so each repeat is darker than the last.
-  // 300 Hz high-pass and 6 kHz low-pass. PhraseConfig.ECHO_HPF_HZ / ECHO_LPF_HZ.
-  const float hpA = float(1.0 - std::exp(-2.0 * kPi * 300.0 / sampleRate));
-  const float lpA = float(1.0 - std::exp(-2.0 * kPi * 6000.0 / sampleRate));
-  hpL += hpA * (delayedL - hpL);
-  hpR += hpA * (delayedR - hpR);
+  // Inside the feedback loop: 250 Hz HPF and 6 kHz LPF by default (Part A §5.9).
+  const float aHp = hpA > 0.f ? hpA : float(1.0 - std::exp(-2.0 * kPi * double(wetHpfHz) / sampleRate));
+  const float aLp = lpA > 0.f ? lpA : float(1.0 - std::exp(-2.0 * kPi * double(wetLpfHz) / sampleRate));
+  hpL = v2::flushTiny(hpL + aHp * (delayedL - hpL));
+  hpR = v2::flushTiny(hpR + aHp * (delayedR - hpR));
   const float hpOutL = delayedL - hpL;
   const float hpOutR = delayedR - hpR;
-  lpL += lpA * (hpOutL - lpL);
-  lpR += lpA * (hpOutR - lpR);
+  lpL = v2::flushTiny(lpL + aLp * (hpOutL - lpL));
+  lpR = v2::flushTiny(lpR + aLp * (hpOutR - lpR));
   const float gated = std::clamp(send, 0.f, 1.f);
-  // Ping-pong: each side's feedback lands in the other channel.
-  // The dry input is gated by [send], so pre-roll and the body of the
-  // phrase never enter the line.
-  left[pos] = inL * gated + std::tanh(lpR * feedback);
-  right[pos] = inR * gated + std::tanh(lpL * feedback);
+  if (pingPong) {
+    left[pos] = inL * gated + std::tanh(lpR * feedback);
+    right[pos] = inR * gated + std::tanh(lpL * feedback);
+  } else {
+    left[pos] = inL * gated + std::tanh(lpL * feedback);
+    right[pos] = inR * gated + std::tanh(lpR * feedback);
+  }
   pos++;
   if (pos >= delay) pos = 0;
-  wetL = lpL * wet;
-  wetR = lpR * wet;
+  wetL = v2::flushTiny(lpL * wet);
+  wetR = v2::flushTiny(lpR * wet);
 }
 
 void Flanger::setup(double sampleRate, double lfoHzIn, double depthSecondsIn,
                     float feedbackGain, float wetGain) {
+  setupEx(sampleRate, lfoHzIn, depthSecondsIn, feedbackGain, wetGain, 90.f, true);
+}
+
+void Flanger::setupEx(double sampleRate, double lfoHzIn, double depthSecondsIn, float feedbackGain,
+                      float wetGain, float stereoOffsetDegIn, bool throughZeroIn) {
   enabled = false;
   left.clear();
   right.clear();
   pos = 0;
   dampL = dampR = 0.f;
-  if (!(sampleRate > 0) || !(lfoHzIn > 0) || !(depthSecondsIn > 0.0005) || !(wetGain > 0.f)) return;
-  depthSeconds = float(depthSecondsIn);
-  // djmix24: clamp up to 12 ms (pre-allocated in prepare). Depth 0.0045
-  // (buildup) + 0.65 ms base = ~5.2 ms sweep.
-  const int size = std::clamp(int(std::lround(depthSecondsIn * sampleRate)) + 2, 4, int(sampleRate * 0.012));
+  if (!(sampleRate > 0) || !(lfoHzIn > 0) || !(depthSecondsIn >= 0.0002) || !(wetGain > 0.f)) return;
+  centerDelaySec = 0.0025;
+  depthSeconds = float(std::clamp(depthSecondsIn, 0.0002, 0.0045));
+  const int need = int(std::ceil((centerDelaySec + 0.5 * double(depthSeconds) + 0.002) * sampleRate)) + 4;
+  const int size = std::max(need, std::clamp(int(std::lround(sampleRate * 0.012)), 16, int(sampleRate * 0.05)));
   left.assign(size, 0.f);
   right.assign(size, 0.f);
-  feedback = feedbackGain;
-  wet = wetGain;
+  feedback = std::isfinite(feedbackGain) ? std::clamp(feedbackGain, -0.78f, 0.78f) : 0.f;
+  wet = std::isfinite(wetGain) ? std::clamp(wetGain, 0.f, 1.f) : 0.f;
   lfoHz = lfoHzIn;
+  stereoOffsetDeg = std::isfinite(stereoOffsetDegIn) ? stereoOffsetDegIn : 90.f;
+  throughZero = throughZeroIn;
+  dampA = float(1.0 - std::exp(-2.0 * kPi * 10000.0 / sampleRate));
   enabled = true;
 }
 
@@ -366,54 +387,65 @@ void Flanger::applyEnv(float inL, float inR, float wetMul, float& wetL, float& w
   wetR = 0;
   if (!enabled || left.empty() || !(sampleRate > 0)) return;
   const int size = int(left.size());
-  // djmix24 Jet: 0.65 ms .. 5.2 ms stereo quadrature (90 deg offset).
-  // LFO is one cycle per 8 beats (1/(8*beatSec) ~ 0.258 Hz at 124 BPM).
-  const double phaseL = 2 * kPi * lfoHz * frameTimeSec;
-  const double phaseR = phaseL + kPi / 2.0;
-  const double lfoL = 0.5 * std::sin(phaseL) + 0.5;
-  const double lfoR = 0.5 * std::sin(phaseR) + 0.5;
-  const double delayLSmp = (0.00065 + double(depthSeconds) * lfoL) * sampleRate;
-  const double delayRSmp = (0.00065 + double(depthSeconds) * lfoR) * sampleRate;
-  double fposL = std::fmod(double(pos) - delayLSmp, double(size));
-  if (fposL < 0) fposL += size;
-  double fposR = std::fmod(double(pos) - delayRSmp, double(size));
-  if (fposR < 0) fposR += size;
-  const int i0L = int(fposL);
-  const int i1L = (i0L + 1) % size;
-  const float fracL = float(fposL - i0L);
-  const int i0R = int(fposR);
-  const int i1R = (i0R + 1) % size;
-  const float fracR = float(fposR - i0R);
-  const float rawL = left[i0L] * (1.f - fracL) + left[i1L] * fracL;
-  const float rawR = right[i0R] * (1.f - fracR) + right[i1R] * fracR;
-  // 1-pole ~10 kHz HF damping inside the feedback loop + denormal guard.
-  const float dampA = float(1.0 - std::exp(-2.0 * kPi * 10000.0 / sampleRate));
-  dampL += dampA * (rawL - dampL);
-  dampR += dampA * (rawR - dampR);
-  float fbL = dampL * feedback;
-  float fbR = dampR * feedback;
-  if (std::abs(fbL) < 1e-20f) fbL = 0;
-  if (std::abs(fbR) < 1e-20f) fbR = 0;
-  fbL = std::clamp(fbL, -0.78f, 0.78f);
-  fbR = std::clamp(fbR, -0.78f, 0.78f);
+  const double phaseL = 2.0 * kPi * lfoHz * frameTimeSec;
+  const double phaseR = phaseL + double(stereoOffsetDeg) * (kPi / 180.0);
+  auto readTap = [&](const std::vector<float>& buf, double delaySmp) -> float {
+    double fpos = std::fmod(double(pos) - std::clamp(delaySmp, 1.0, double(size - 2)), double(size));
+    if (fpos < 0.0) fpos += double(size);
+    const int i0 = int(fpos);
+    const int i1 = (i0 + 1) % size;
+    const float frac = float(fpos - double(i0));
+    return buf[i0] * (1.f - frac) + buf[i1] * frac;
+  };
+  const double centerSmp = centerDelaySec * sampleRate;
+  const double sweptSmpL = (centerDelaySec + double(depthSeconds) * 0.5 * std::sin(phaseL)) * sampleRate;
+  const double sweptSmpR = (centerDelaySec + double(depthSeconds) * 0.5 * std::sin(phaseR)) * sampleRate;
+  const float rawL = readTap(left, sweptSmpL);
+  const float rawR = readTap(right, sweptSmpR);
+  const float refL = throughZero ? readTap(left, centerSmp) : 0.f;
+  const float refR = throughZero ? readTap(right, centerSmp) : 0.f;
+  const float a = dampA > 0.f ? dampA : float(1.0 - std::exp(-2.0 * kPi * 10000.0 / sampleRate));
+  dampL = v2::flushTiny(dampL + a * (rawL - dampL));
+  dampR = v2::flushTiny(dampR + a * (rawR - dampR));
+  const float fbL = std::clamp(v2::flushTiny(dampL * feedback), -0.78f, 0.78f);
+  const float fbR = std::clamp(v2::flushTiny(dampR * feedback), -0.78f, 0.78f);
   left[pos] = inL + fbL;
   right[pos] = inR + fbR;
   pos++;
   if (pos >= size) pos = 0;
   const float mul = std::clamp(wetMul, 0.f, 1.f) * wet;
-  wetL = rawL * mul;
-  wetR = rawR * mul;
+  if (throughZero) {
+    // Crossing refTap == sweptTap nulls cleanly through zero (jet notch sweep),
+    // mixed against dry via (l + flangeL) == (1 - mul)*l + mul*tzL.
+    const float tzL = 0.7071f * (refL - rawL);
+    const float tzR = 0.7071f * (refR - rawR);
+    wetL = v2::flushTiny(mul * (tzL - inL));
+    wetR = v2::flushTiny(mul * (tzR - inR));
+  } else {
+    wetL = v2::flushTiny(rawL * mul);
+    wetR = v2::flushTiny(rawR * mul);
+  }
 }
 
-// djmix24 tightening schedule: loop length in beats for the roll.
-// 4 -> 2 -> 1 -> 0.5 in the final 2 beats; Rung 4 slip is 1 -> 0.5 -> 0.25
-// but native reuses the same table anchored at loopStart.
-static double rollLoopBeatsNative(double beatsIntoRoll, double totalRollBeats) {
+// Part A §5.2 tightening loop-roll schedule (in beats):
+//   1 bar -> 1/2 -> 1/4 -> 1/8 -> 1/16  (4.0 -> 2.0 -> 1.0 -> 0.5 -> 0.25 beats)
+// over the final 2 bars before beat 1 swap/stop, anchored at loopStart.
+static double rollLoopBeatsNative(double beatsIntoRoll, double totalRollBeats, const std::vector<double>& schedule) {
   if (!(totalRollBeats > 0)) return 4.0;
   const double b = std::clamp(beatsIntoRoll, 0.0, totalRollBeats);
-  if (b >= totalRollBeats - 1.0) return 0.5;
-  if (b >= totalRollBeats - 2.0) return 1.0;
-  if (b >= totalRollBeats - 4.0) return 2.0;
+  const double rem = std::max(0.0, totalRollBeats - b);
+  if (!schedule.empty()) {
+    double thresh = 0.0;
+    for (size_t i = schedule.size(); i-- > 0;) {
+      const double stepBeats = std::clamp(schedule[i], 0.0625, 32.0);
+      thresh += (i == schedule.size() - 1) ? 2.0 * stepBeats : stepBeats;
+      if (rem <= thresh + 1e-9 || i == 0) return stepBeats;
+    }
+  }
+  if (rem <= 0.5 + 1e-9) return 0.25;
+  if (rem <= 1.0 + 1e-9) return 0.5;
+  if (rem <= 2.0 + 1e-9) return 1.0;
+  if (rem <= 4.0 + 1e-9) return 2.0;
   return 4.0;
 }
 
@@ -436,51 +468,22 @@ int64_t Deck::sampleAtEffective(int64_t unwrapped) const {
 }
 
 void Deck::readEffective(int64_t unwrapped, int seamSamples, double mixSec, float& leftOut, float& rightOut) const {
-  // Tightening: when loopRoll is on and mixSec is inside the roll window,
-  // effective loop length is beat-locked (anchored at loopStart). Compute
-  // it from the mix clock; the seam crossfade below is always 8 ms
-  // Hann / equal-power (sin/cos), zero allocation.
-  int64_t effEnd = loopEnd;
-  if (loopRoll && rollBeatSec > 1e-6) {
-    if (mixSec >= rollStartMixSec && mixSec < rollReleaseMixSec) {
-      const double beatsInto = (mixSec - rollStartMixSec) / rollBeatSec;
-      const double loopBeats = rollLoopBeatsNative(beatsInto, rollTotalBeats);
-      const double effLen = loopBeats * rollBeatSec * 48000.0;  // placeholder, fixed below by caller
-      (void)effLen;
-      // The caller (renderDeck) sets effectiveLoopEnd per-block from the
-      // exact sample rate, so use it when present; otherwise fall back
-      // to the full loop.
-      if (effectiveLoopEnd > loopStart) effEnd = effectiveLoopEnd;
-    }
-  }
+  (void)mixSec;
   const int64_t index = sampleAtEffective(unwrapped);
   if (index < 0) { leftOut = 0; rightOut = 0; return; }
-  // If effective loop is active, sampleAtEffective already wraps; for the
-  // seam blend use the effective length.
   leftOut = left[index];
   rightOut = right[index];
-  const int64_t length = effEnd - loopStart;
-  if (length <= seamSamples || seamSamples <= 1) return;
-  if (unwrapped < effEnd || unwrapped >= static_cast<int64_t>(releaseAt)) {
-    // Also handle the full-loop case when effective is not tightened.
-    if (!(loopRoll && effectiveLoopEnd > loopStart)) {
-      // Fall through to full-loop check below by using loopEnd.
-    } else {
-      return;
-    }
-  }
-  // Seam position within the effective (or full) loop.
-  const int64_t eff = (effEnd > loopStart) ? effEnd : loopEnd;
-  const int64_t fullLen = loopEnd - loopStart;
-  const int64_t useLen = (effectiveLoopEnd > loopStart) ? (effectiveLoopEnd - loopStart) : fullLen;
-  if (useLen <= seamSamples) return;
-  // Only blend inside the loop region.
-  if (unwrapped < loopStart || unwrapped >= static_cast<int64_t>(releaseAt)) return;
+  const int64_t effEnd = (loopRoll && effectiveLoopEnd > loopStart) ? effectiveLoopEnd : loopEnd;
+  const int64_t useLen = effEnd - loopStart;
+  if (useLen <= 2 || seamSamples <= 1) return;
+  const int seamEff = std::min(seamSamples, std::max(1, int(useLen / 4)));
+  if (seamEff <= 1) return;
+  if (unwrapped < effEnd || unwrapped >= static_cast<int64_t>(releaseAt)) return;
   const int64_t pos = (unwrapped - loopStart) % useLen;
-  if (pos < 0 || pos >= seamSamples) return;
-  const int64_t tail = loopStart + useLen + pos;
-  if (tail < 0 || tail >= int64_t(left.size())) return;
-  const float tt = float(pos) / float(seamSamples);
+  if (pos < 0 || pos >= seamEff) return;
+  const int64_t tail = effEnd + pos;
+  if (tail < 0 || tail >= int64_t(left.size()) || tail >= int64_t(right.size())) return;
+  const float tt = float(pos) / float(seamEff);
   const float intoLoop = std::sin(tt * float(kPi / 2.0));
   const float fromTail = std::cos(tt * float(kPi / 2.0));
   leftOut = left[index] * intoLoop + left[tail] * fromTail;
@@ -522,13 +525,15 @@ void Deck::read(int64_t unwrapped, int seamSamples, float& leftOut, float& right
   leftOut = left[index];
   rightOut = right[index];
   const int64_t length = loopEnd - loopStart;
-  if (length <= seamSamples || seamSamples <= 1) return;
+  if (length <= 2 || seamSamples <= 1) return;
+  const int seamEff = std::min(seamSamples, std::max(1, int(length / 4)));
+  if (seamEff <= 1) return;
   if (unwrapped < loopEnd || unwrapped >= static_cast<int64_t>(releaseAt)) return;
   const int64_t pos = (unwrapped - loopStart) % length;
-  if (pos < 0 || pos >= seamSamples) return;
+  if (pos < 0 || pos >= seamEff) return;
   const int64_t tail = loopEnd + pos;
   if (tail < 0 || tail >= int64_t(left.size()) || tail >= int64_t(right.size())) return;
-  const float t = float(pos) / float(seamSamples);
+  const float t = float(pos) / float(seamEff);
   const float intoLoop = std::sin(t * float(kPi / 2.0));
   const float fromTail = std::cos(t * float(kPi / 2.0));
   leftOut = left[index] * intoLoop + left[tail] * fromTail;
@@ -597,14 +602,31 @@ void Renderer::setEcho(int index, double delaySeconds, float feedback, float wet
   decks_[index].echo.setup(sampleRate_, delaySeconds, feedback, wet);
 }
 
+void Renderer::setEchoEx(int index, double delaySeconds, float feedback, float wet,
+                         float wetHpfHz, float wetLpfHz, bool pingPong) {
+  if (index < 0 || index > 1) return;
+  decks_[index].echo.setupEx(sampleRate_, delaySeconds, feedback, wet, wetHpfHz, wetLpfHz, pingPong);
+}
+
 void Renderer::setIsolate(int index, bool on) {
   if (index < 0 || index > 1) return;
   decks_[index].isolate = on;
 }
 
+void Renderer::setLoopSeamMs(int index, double seamMs) {
+  if (index < 0 || index > 1) return;
+  decks_[index].loopSeamMs = std::isfinite(seamMs) ? std::clamp(seamMs, 0.5, 8.0) : 8.0;
+}
+
 void Renderer::setFlanger(int index, double lfoHz, double depthSeconds, float feedback, float wet) {
   if (index < 0 || index > 1) return;
   decks_[index].flanger.setup(sampleRate_, lfoHz, depthSeconds, feedback, wet);
+}
+
+void Renderer::setFlangerEx(int index, double lfoHz, double depthSeconds, float feedback, float wet,
+                            float stereoOffsetDeg) {
+  if (index < 0 || index > 1) return;
+  decks_[index].flanger.setupEx(sampleRate_, lfoHz, depthSeconds, feedback, wet, stereoOffsetDeg, true);
 }
 
 void Renderer::setLoopRoll(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec, double totalRollBeats) {
@@ -615,6 +637,29 @@ void Renderer::setLoopRoll(int index, bool enabled, double rollStartSec, double 
   d.rollBeatSec = beatSec;
   d.rollReleaseMixSec = releaseSec;
   d.rollTotalBeats = totalRollBeats;
+  d.rollFxActive = false;
+  d.rollScheduleBeats.clear();
+}
+
+void Renderer::setLoopRollEx(int index, bool enabled, double rollStartSec, double beatSec, double releaseSec,
+                             double totalRollBeats, float hpfStartHz, float hpfEndHz, float boostDb,
+                             bool stopOnDownbeat, const double* scheduleBeats, int scheduleCount) {
+  if (index < 0 || index > 1) return;
+  Deck& d = decks_[index];
+  d.loopRoll = enabled;
+  d.rollStartMixSec = rollStartSec;
+  d.rollBeatSec = beatSec;
+  d.rollReleaseMixSec = releaseSec;
+  d.rollTotalBeats = totalRollBeats;
+  d.rollFxActive = enabled;
+  d.rollHpfStartHz = std::clamp(std::isfinite(hpfStartHz) ? hpfStartHz : 200.f, 20.f, 8000.f);
+  d.rollHpfEndHz = std::clamp(std::isfinite(hpfEndHz) ? hpfEndHz : 2000.f, d.rollHpfStartHz, 16000.f);
+  d.rollBoostDb = std::clamp(std::isfinite(boostDb) ? boostDb : 2.f, -6.f, 6.f);
+  d.rollStopOnDownbeat = stopOnDownbeat;
+  d.rollScheduleBeats.clear();
+  if (scheduleBeats != nullptr && scheduleCount > 0) {
+    d.rollScheduleBeats.assign(scheduleBeats, scheduleBeats + scheduleCount);
+  }
 }
 
 void Renderer::setReverb(int index, float roomSize, float damping, float wet) {
@@ -714,8 +759,10 @@ void Renderer::prepare() {
       std::fill(deck.reverb.apL1.begin(), deck.reverb.apL1.end(), 0.f);
       std::fill(deck.reverb.apR0.begin(), deck.reverb.apR0.end(), 0.f);
       std::fill(deck.reverb.apR1.begin(), deck.reverb.apR1.end(), 0.f);
-      for (int& i : deck.reverb.combIdxL) i = 0; for (int& i : deck.reverb.combIdxR) i = 0;
-      for (int& i : deck.reverb.apIdxL) i = 0; for (int& i : deck.reverb.apIdxR) i = 0;
+      for (int& i : deck.reverb.combIdxL) i = 0;
+      for (int& i : deck.reverb.combIdxR) i = 0;
+      for (int& i : deck.reverb.apIdxL) i = 0;
+      for (int& i : deck.reverb.apIdxR) i = 0;
       deck.reverb.hpL = deck.reverb.hpR = 0.f;
     }
     deck.shelf.bypass();
@@ -731,6 +778,20 @@ void Renderer::prepare() {
   // AUTOMIX-V2(C): stems validation, FX/loudness state, beat grid (worker thread).
   // Must run before heldStartup pre-priming so deck.v2.stemsOn is already known.
   prepareV2();
+
+  if (captureEnabled_) {
+    const int cap = std::clamp(sampleRate_ * 40, 48000, 192000 * 40);
+    if (int(captureRing_.size()) < cap * 2) {
+      captureRing_.assign(size_t(cap) * 2, 0.f);
+    } else {
+      std::fill(captureRing_.begin(), captureRing_.end(), 0.f);
+    }
+    captureCapFrames_ = cap;
+    captureWriteFrames_.store(0, std::memory_order_release);
+  } else {
+    captureCapFrames_ = 0;
+    captureWriteFrames_.store(0, std::memory_order_release);
+  }
 
   for (Deck& deck : decks_) {
     // Held non-loop-roll decks can be prepared here without changing the
@@ -813,6 +874,16 @@ void Renderer::render(int64_t frame, float* interleaved, int frames) {
       interleaved[2 * (offset + i)] = mixLeft_[i];
       interleaved[2 * (offset + i) + 1] = mixRight_[i];
     }
+    if (captureEnabled_ && captureCapFrames_ > 0 && !captureRing_.empty()) {
+      int64_t wp = captureWriteFrames_.load(std::memory_order_relaxed);
+      for (int i = 0; i < chunk; ++i) {
+        const size_t idx = size_t(wp % captureCapFrames_) * 2;
+        captureRing_[idx] = mixLeft_[i];
+        captureRing_[idx + 1] = mixRight_[i];
+        ++wp;
+      }
+      captureWriteFrames_.store(wp, std::memory_order_release);
+    }
     offset += chunk;
   }
 }
@@ -827,8 +898,9 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     // region are built so this can never trip; a violation is recorded to
     // telemetry as proof the guarantee held or broke.
     if (!deck.gain.empty() && deck.gain.at(blockStart) > 0.001f) {
-      // AUTOMIX-V2(C): a completed vinyl brake is already silent at its stopAt.
-      if (!(deck.v2.brake.enabled && deck.v2.brake.done)) {
+      // Completed vinyl brake / tape-stop / spinback or beat-1 loop-roll stop is already silent at stopAt.
+      if (!(deck.v2.brake.enabled && deck.v2.brake.done) &&
+          !(deck.rollFxActive && deck.rollStopOnDownbeat && blockStart >= deck.rollReleaseMixSec)) {
         exitGateViolations_.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -855,6 +927,7 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       : 0;
   const int activeFrames = frames - silentFrames;
   const double activeFrameStart = frameStart + double(silentFrames);
+  const int deckSeam = std::clamp(int(std::lround((deck.loopSeamMs * 0.001) * sr)), 1, std::max(1, int(kLoopSeamSeconds * sr)));
   if (!deck.started) {
     if (deck.heldStartup && (!std::isfinite(deck.activeStartFrame) ||
         !std::isfinite(activeFrameStart))) {
@@ -889,7 +962,6 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       return;
     }
     if (!exactPreparedStart) {
-      const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
       const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
       if (deck.v2.stemsOn) {
         // AUTOMIX-V2(C): same read/loop/seam taps, stem-weighted.
@@ -897,15 +969,12 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       } else {
         for (int i = 0; i < seekLength; ++i) {
           const double mixSec = double(frame + silentFrames + i) / sr;
-          if (deck.loopRoll) deck.readEffective(first + i, seam, mixSec, inLeft_[i], inRight_[i]);
-          else deck.read(first + i, seam, inLeft_[i], inRight_[i]);
+          if (deck.loopRoll) deck.readEffective(first + i, deckSeam, mixSec, inLeft_[i], inRight_[i]);
+          else deck.read(first + i, deckSeam, inLeft_[i], inRight_[i]);
         }
       }
       float* seekInput[2] = {inLeft_.data(), inRight_.data()};
       if (deck.heldStartup) {
-        // Exceptional held-start recovery: loop-roll retains the runtime
-        // effective-loop setup path, and rejected preparation or a skipped
-        // cue may use this callback fallback. Normal held starts are primed.
         deck.stretch.outputSeek(seekInput, seekLength);
       } else {
         deck.stretch.reset();
@@ -950,52 +1019,90 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     if (advance < 0.0) heardEnd = deck.heardPos;
   }
 
-  // djmix24 tightening: effective loop length from the mix clock.
-  // Anchored at loopStart, beat-locked via knotTimes/beatSec. 8 ms
-  // clickless wraps are handled in readEffective (sin/cos equal-power).
+  // Tightening loop roll: effective loop length from the mix clock (1 -> 1/2 -> 1/4 -> 1/8 -> 1/16).
   deck.effectiveLoopEnd = -1;
   if (deck.loopRoll && deck.loopEnd > deck.loopStart && deck.rollBeatSec > 1e-6) {
     const double blockMixSec = double(frame) / sr;
     if (blockMixSec >= deck.rollStartMixSec && blockMixSec < deck.rollReleaseMixSec) {
       const double beatsInto = (blockMixSec - deck.rollStartMixSec) / deck.rollBeatSec;
-      const double loopBeats = rollLoopBeatsNative(beatsInto, deck.rollTotalBeats);
+      const double loopBeats = rollLoopBeatsNative(beatsInto, deck.rollTotalBeats, deck.rollScheduleBeats);
       const double effSamples = loopBeats * deck.rollBeatSec * sr;
       deck.effectiveLoopEnd = deck.loopStart + int64_t(std::llround(effSamples));
-      // Clamp to the decoded region when the full loop allows it.
       if (deck.effectiveLoopEnd > int64_t(deck.left.size()) && deck.effectiveLoopEnd > deck.loopEnd) {
         deck.effectiveLoopEnd = deck.loopEnd;
       }
       if (deck.effectiveLoopEnd <= deck.loopStart) deck.effectiveLoopEnd = -1;
     }
   }
-  const double inputEnd = deck.inputEnd();
-  const bool loopsForever = inputEnd > 1e15;
-  const int64_t readFrom = int64_t(std::floor(deck.readPos));
-  const int minInput = std::max(1, int(std::floor(double(activeFrames) * 0.75)));
-  const int maxInput = std::max(minInput, int(std::ceil(double(activeFrames) * 1.35)));
-  const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, int64_t(std::ceil(inputEnd)) - readFrom);
 
-  {
+  auto evalBrakeP = [&](double tMix) -> double {
+    if (!deck.v2.brake.enabled) return 0.0;
+    double p = 0.0;
+    if (!deck.v2.brakeProgress.empty()) {
+      p = deck.v2.brakeProgress.at(tMix);
+    } else {
+      p = (tMix - deck.v2.brake.startSec) / deck.v2.brake.lengthSec;
+    }
+    return (std::isfinite(p) && p > 0.0) ? p : 0.0;
+  };
+
+  bool brakeEngagedInBlock = false;
+  int firstBrakeSample = frames;
+  bool needStretch = true;
+  if (deck.v2.brake.enabled) {
+    const double pBlockEnd = evalBrakeP(frameEnd / sr);
+    if (deck.v2.brake.done) {
+      needStretch = false;
+      std::fill(outLeft_.begin() + silentFrames, outLeft_.begin() + frames, 0.f);
+      std::fill(outRight_.begin() + silentFrames, outRight_.begin() + frames, 0.f);
+      heardEnd = deck.heardPos;
+    } else if (deck.v2.brake.active || pBlockEnd > 0.0) {
+      brakeEngagedInBlock = true;
+      if (deck.v2.brake.active) {
+        firstBrakeSample = silentFrames;
+      } else {
+        for (int n = silentFrames; n < frames; ++n) {
+          if (evalBrakeP(double(frame + n) / sr) > 0.0) {
+            firstBrakeSample = n;
+            break;
+          }
+        }
+        if (firstBrakeSample < frames) {
+          const double frac0 = activeFrames > 0
+              ? double(std::max(0, firstBrakeSample - silentFrames)) / double(activeFrames)
+              : 0.0;
+          deck.v2.brake.active = true;
+          deck.v2.brake.handoffSamples = 0;
+          deck.v2.brake.handoffTotal = std::clamp(int(std::lround(0.020 * sr)), 64, 1536);
+          deck.v2.brake.readCursor = deck.heardPos + (heardEnd - deck.heardPos) * frac0;
+        }
+      }
+      needStretch = (deck.v2.brake.handoffSamples < deck.v2.brake.handoffTotal) ||
+                    (firstBrakeSample > silentFrames);
+    }
+  }
+
+  if (needStretch) {
+    const double inputEnd = deck.inputEnd();
+    const bool loopsForever = inputEnd > 1e15;
+    const int64_t readFrom = int64_t(std::floor(deck.readPos));
+    const int minInput = std::max(1, int(std::floor(double(activeFrames) * 0.75)));
+    const int maxInput = std::max(minInput, int(std::ceil(double(activeFrames) * 1.35)));
+    const int64_t remaining = loopsForever ? int64_t(maxInput) : std::max<int64_t>(0, int64_t(std::ceil(inputEnd)) - readFrom);
+
     const double readEnd = heardEnd + inLatency + rateEnd * outLatency;
     int inputSamples = int(std::floor(readEnd - deck.readPos));
     inputSamples = std::clamp(inputSamples, minInput, maxInput);
-    // Always feed a positive bounded block. At true EOF pad input with zero
-    // through the stretcher so its buffered latency drains on the same path;
-    // never replace stretched output with raw input or park an unwrapped
-    // pointer at a physical array size.
     const int available = int(std::min<int64_t>(inputSamples, remaining));
-    // No resize on the audio thread (pre-allocated in prepare()).
     if (int(inLeft_.size()) < inputSamples || int(inRight_.size()) < inputSamples) return;
-    const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
     if (deck.v2.stemsOn) {
-      // AUTOMIX-V2(C): stem gains evaluated when each input sample will be heard.
       fillStemInput(deck, readFrom, inputSamples, frame + silentFrames, frameEnd, heardEnd, rateEnd, available);
     } else {
       for (int i = 0; i < inputSamples; ++i) {
         if (i >= available) { inLeft_[i] = 0.f; inRight_[i] = 0.f; continue; }
         const double mixSec = double(frame + silentFrames + i) / sr;
-        if (deck.loopRoll) deck.readEffective(readFrom + i, seam, mixSec, inLeft_[i], inRight_[i]);
-        else deck.read(readFrom + i, seam, inLeft_[i], inRight_[i]);
+        if (deck.loopRoll) deck.readEffective(readFrom + i, deckSeam, mixSec, inLeft_[i], inRight_[i]);
+        else deck.read(readFrom + i, deckSeam, inLeft_[i], inRight_[i]);
       }
     }
     deck.readPos += double(inputSamples);
@@ -1005,6 +1112,53 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     deck.stretch.process(input, inputSamples, output, activeFrames);
   }
 
+  // Pre-stretch Brake / Tape-Stop / Spinback: read pointer driven directly without time-stretch.
+  if (brakeEngagedInBlock && firstBrakeSample < frames) {
+    v2::Brake& br = deck.v2.brake;
+    for (int n = firstBrakeSample; n < frames; ++n) {
+      if ((n - firstBrakeSample) % kControlFrames == 0) {
+        const double tC0 = double(frame + n) / sr;
+        const int nEnd = std::min(frames, n + kControlFrames);
+        const double tC1 = double(frame + nEnd) / sr;
+        const double pC0 = evalBrakeP(tC0);
+        const double pC1 = evalBrakeP(tC1);
+        const double rSave0 = br.r0, rSave1 = br.r1;
+        const float aSave0 = br.amp0, aSave1 = br.amp1;
+        br.control(pC0, pC1, std::max(0.0, tC0 - br.startSec));
+        br.done = false;  // updated per sample below
+        br.r0 = rSave0; br.r1 = rSave1;
+        br.amp0 = aSave0; br.amp1 = aSave1;
+      }
+      const double tMix = double(frame + n) / sr;
+      const double p = evalBrakeP(tMix);
+      float vL = 0.f, vR = 0.f;
+      if (br.done || p >= 1.0) {
+        br.done = true;
+      } else {
+        const double elapsed = std::max(0.0, tMix - br.startSec);
+        const double r = br.rateAt(p, elapsed);
+        sampleDeckVarispeed(deck, br.readCursor, deckSeam, tMix, vL, vR);
+        br.readCursor += r;
+        float lpL = 0.f, lpR = 0.f, dA = 0.f, dB = 0.f;
+        br.lpf.tick(0, vL, lpL, dA, dB);
+        br.lpf.tick(1, vR, lpR, dA, dB);
+        const float a = br.ampAt(p);
+        vL = v2::flushTiny(lpL * a);
+        vR = v2::flushTiny(lpR * a);
+      }
+      if (br.handoffSamples < br.handoffTotal) {
+        const float w = 0.5f - 0.5f * std::cos(float(kPi) * float(br.handoffSamples) / float(br.handoffTotal));
+        outLeft_[n] = (1.f - w) * outLeft_[n] + w * vL;
+        outRight_[n] = (1.f - w) * outRight_[n] + w * vR;
+        ++br.handoffSamples;
+      } else {
+        outLeft_[n] = vL;
+        outRight_[n] = vR;
+      }
+    }
+    heardEnd = br.readCursor;
+  }
+
   const double heardStart = deck.heardPos;
   deck.heardPos = heardEnd;
   deck.heard.store(deck.trackSecondsAt(heardEnd, sr), std::memory_order_relaxed);
@@ -1012,8 +1166,6 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
   // Gain, bass shelf and high-pass, in control blocks; the gain ramps per sample.
   const double fadeAt = deck.fadeOutAt.load(std::memory_order_relaxed);
   const double fadeSamples = kFadeSeconds * sr;
-  // Scheduled wet-output retirement (stopAt), from each effect's send release.
-  // runOn decks get kNoRetire (see helper).
   const double echoFadeStart = echoWetRetireStart(deck.echoSend, deck.gain, deck.stopAt, deck.runOn);
   const double revFadeStart = wetRetireStart(deck.reverbSend, deck.gain, deck.stopAt, deck.runOn);
   for (int at = 0; at < frames; at += kControlFrames) {
@@ -1038,7 +1190,6 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         if (hz <= 20.5f) {
           deck.tptHighPass.bypass();
         } else {
-          // Cytomic TPT SVF: 0.707 default, 0.95 musical during buildup.
           deck.tptHighPass.set(sr, hz, deck.svfQ);
         }
       }
@@ -1047,13 +1198,12 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       const float hz = deck.lowPassHz.at((t0 + t1) / 2);
       if (std::abs(hz - deck.lowPassFreq) > 1.f) {
         deck.lowPassFreq = hz;
-        // Near-open cutoff counts as bypass (Nyquist-safe, sr-relative).
         const float lpBypass = std::min(19800.f, float(sr) * 0.44f);
         if (hz >= lpBypass) deck.lowPass.bypass();
         else deck.lowPass.set(sr, hz, 0.707);
       }
     }
-    // AUTOMIX-V2(C): resonant sweep (KIND_FILTER_RES) and DJM single knob (KIND_FILTER_KNOB).
+    // AUTOMIX-V2(C) + Part A §5.3: resonant sweep, DJM single knob, roll HPF (Q clamped <= 1.92).
     if (deck.v2.filterV2) {
       const double tm = (t0 + t1) / 2;
       float res = deck.v2.filterRes.empty() ? 1.f : deck.v2.filterRes.at(tm);
@@ -1068,8 +1218,32 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         hpHz = std::max(hpHz, knobHp);
         lpHz = std::min(lpHz, knobLp);
       }
-      const float hpQ = std::clamp(deck.svfQ * res * qBoost, 0.5f, 6.f);
-      const float lpQ = std::clamp(0.707f * res * qBoost, 0.5f, 6.f);
+      float sweepHpQ = 0.f, sweepLpQ = 0.f;
+      if (deck.v2.sweep.enabled && tm >= deck.v2.sweep.startSec) {
+        const SweepConfig& sw = deck.v2.sweep;
+        const double span = sw.endSec - sw.startSec;
+        const double u = span > 1e-6 ? std::clamp((tm - sw.startSec) / span, 0.0, 1.0) : 1.0;
+        const double hz = sw.exponential && sw.startHz > 0.f && sw.endHz > 0.f
+            ? double(sw.startHz) * std::pow(double(sw.endHz) / double(sw.startHz), u)
+            : double(sw.startHz) + (double(sw.endHz) - double(sw.startHz)) * u;
+        const float qVal = std::clamp(sw.qStart + (sw.qEnd - sw.qStart) * float(u), 0.5f, v2::kMaxResonanceQ);
+        if (sw.isHighPass) {
+          hpHz = std::max(hpHz, float(hz));
+          sweepHpQ = qVal;
+        } else {
+          lpHz = std::min(lpHz, float(hz));
+          sweepLpQ = qVal;
+        }
+      }
+      if (deck.rollFxActive && deck.loopRoll && tm >= deck.rollStartMixSec && tm < deck.rollReleaseMixSec) {
+        const float uRoll = float(std::clamp((tm - deck.rollStartMixSec) /
+            std::max(1e-6, deck.rollReleaseMixSec - deck.rollStartMixSec), 0.0, 1.0));
+        const float rollHp = deck.rollHpfStartHz *
+            std::pow(deck.rollHpfEndHz / std::max(20.f, deck.rollHpfStartHz), uRoll);
+        hpHz = std::max(hpHz, rollHp);
+      }
+      const float hpQ = std::clamp(std::max(deck.svfQ * res * qBoost, sweepHpQ), 0.5f, v2::kMaxResonanceQ);
+      const float lpQ = std::clamp(std::max(0.707f * res * qBoost, sweepLpQ), 0.5f, v2::kMaxResonanceQ);
       if (std::abs(hpHz - deck.highPassFreq) > 0.5f || std::abs(hpQ - deck.v2.hpQLast) > 0.005f) {
         deck.highPassFreq = hpHz;
         deck.v2.hpQLast = hpQ;
@@ -1095,7 +1269,6 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       bp0 = beatPosAt(t0);
       bp1 = beatPosAt(t1);
       beatDur = beatDurAt(t0);
-      // Denormal guard for the recursive states (-ffast-math may not flush on every ABI).
       if (v2s.phaser.enabled) v2s.phaser.flush();
       if (v2s.pump.enabled) v2s.pump.split.flush();
       if (v2s.phaser.enabled && !v2s.phaserWet.empty()) {
@@ -1105,18 +1278,32 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       } else if (v2s.phaser.enabled) {
         v2s.phaser.control(bp0, bp1, sr);
       }
-      if (v2s.gate.enabled && !v2s.gateDepth.empty()) {
-        gateD0 = std::clamp(v2s.gateDepth.at(t0), 0.f, 1.f);
-        gateD1 = std::clamp(v2s.gateDepth.at(t1), 0.f, 1.f);
+      if (v2s.gate.enabled) {
+        if (!v2s.gateDepth.empty()) {
+          gateD0 = std::clamp(v2s.gateDepth.at(t0), 0.f, 1.f);
+          gateD1 = std::clamp(v2s.gateDepth.at(t1), 0.f, 1.f);
+        } else if (v2s.gate.endSec < 1e15) {
+          const double gSpan = std::max(1e-6, v2s.gate.endSec - v2s.gate.startSec);
+          gateD0 = t0 >= v2s.gate.startSec && t0 < v2s.gate.endSec
+              ? float(std::clamp((t0 - v2s.gate.startSec) / gSpan, 0.0, 1.0))
+              : 0.f;
+          gateD1 = t1 >= v2s.gate.startSec && t1 < v2s.gate.endSec
+              ? float(std::clamp((t1 - v2s.gate.startSec) / gSpan, 0.0, 1.0))
+              : 0.f;
+        }
       }
       if (v2s.pump.enabled && !v2s.pumpDepth.empty()) {
         pumpD0 = std::clamp(v2s.pumpDepth.at(t0), 0.f, 1.f);
         pumpD1 = std::clamp(v2s.pumpDepth.at(t1), 0.f, 1.f);
       }
-      if (v2s.riser.enabled && !v2s.riserLevel.empty()) {
-        risL0 = std::clamp(v2s.riserLevel.at(t0), 0.f, 2.f);
-        risL1 = std::clamp(v2s.riserLevel.at(t1), 0.f, 2.f);
-        // 20 ms fade before stopAt: the riser is outside the deck gain, so it must not hard-stop.
+      if (v2s.riser.enabled) {
+        if (!v2s.riserLevel.empty()) {
+          risL0 = std::clamp(v2s.riserLevel.at(t0), 0.f, 2.f);
+          risL1 = std::clamp(v2s.riserLevel.at(t1), 0.f, 2.f);
+        } else if (v2s.riser.explicitStartSec >= 0.0) {
+          risL0 = (t0 >= v2s.riser.startSec && t0 < v2s.riser.endSec()) ? 1.f : 0.f;
+          risL1 = (t1 >= v2s.riser.startSec && t1 < v2s.riser.endSec()) ? 1.f : 0.f;
+        }
         const double fadeEnd = deck.stopAt;
         if (fadeEnd < 1e15) {
           risL0 *= float(std::clamp((fadeEnd - t0) / 0.02, 0.0, 1.0));
@@ -1124,25 +1311,13 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         }
         if (risL0 > 0.f || risL1 > 0.f) v2s.riser.control(t0, sr);
       }
-      if (v2s.brake.enabled) {
-        double p0, p1;
-        if (!v2s.brakeProgress.empty()) {
-          p0 = v2s.brakeProgress.at(t0);
-          p1 = v2s.brakeProgress.at(t1);
-        } else {
-          p0 = (t0 - v2s.brake.startSec) / v2s.brake.lengthSec;
-          p1 = (t1 - v2s.brake.startSec) / v2s.brake.lengthSec;
-        }
-        if (!(p0 >= 0.0)) p0 = 0.0;
-        if (!(p1 >= 0.0)) p1 = 0.0;
-        v2s.brake.control(std::max(p0, v2s.brake.done ? 1.0 : 0.0), std::max(p1, v2s.brake.done ? 1.0 : 0.0));
+      if (v2s.impactActive) {
+        v2s.impact.control(t0);
       }
     }
     for (int i = 0; i < count; ++i) {
       const int n = at + i;
-      // Emergency cancellation fade (fadeOutAt): linear 1->0 over
-      // kFadeSeconds of heard position. It scales the dry (via g) AND the
-      // whole wet mix below, so an emergency exit cannot leak echo/reverb.
+      const double tMix = double(frame + n) / sr;
       float cancel = 1.f;
       if (fadeAt >= 0) {
         const double heard = silentFrames > 0
@@ -1154,12 +1329,27 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         cancel = float(fade);
       }
       float g = (g0 + (g1 - g0) * (float(i) / count)) * deck.level * cancel;
-      // AUTOMIX-V2(C): overlap level matching (1 exactly when loudness is off).
       if (loudnessOn_) g *= v2s.match0 + (v2s.match1 - v2s.match0) * (float(n) / float(frames));
-      float srcL = outLeft_[n];
-      float srcR = outRight_[n];
+      if (deck.rollFxActive && deck.loopRoll) {
+        if (tMix >= deck.rollStartMixSec && tMix < deck.rollReleaseMixSec) {
+          const float uRoll = float(std::clamp((tMix - deck.rollStartMixSec) /
+              std::max(1e-6, deck.rollReleaseMixSec - deck.rollStartMixSec), 0.0, 1.0));
+          if (deck.rollBoostDb != 0.f) {
+            g *= std::pow(10.f, (deck.rollBoostDb * uRoll) / 20.f);
+          }
+          if (deck.rollStopOnDownbeat) {
+            const double remRoll = deck.rollReleaseMixSec - tMix;
+            if (remRoll < 0.001) {
+              g *= float(0.5 - 0.5 * std::cos(kPi * std::max(0.0, remRoll) / 0.001));
+            }
+          }
+        } else if (deck.rollStopOnDownbeat && tMix >= deck.rollReleaseMixSec) {
+          g = 0.f;
+        }
+      }
+      const float srcL = outLeft_[n];
+      const float srcR = outRight_[n];
       const float frac = float(i) / float(count);
-      if (v2fx && v2s.brake.enabled) v2s.brake.tick(srcL, srcR, frac);
       if (loudnessOn_ && n >= silentFrames) v2s.meter.push(srcL * deck.level, srcR * deck.level);
       float l = deck.shelf.tick(0, srcL);
       float r = deck.shelf.tick(1, srcR);
@@ -1171,29 +1361,33 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         float loL, midL, hiL, loR, midR, hiR;
         deck.isolator.process(0, l, loL, midL, hiL);
         deck.isolator.process(1, r, loR, midR, hiR);
-        // djmix24 LR4 band gains: mid/high dB envelopes (vocal handoff
-        // carve -6..-9 dB over 4 beats; incoming mid/high stay at 0 dB).
         float midDb = 0.f, highDb = 0.f;
-        const double bandT = (frame + n) / sr;
-        if (!deck.midDb.empty()) midDb = deck.midDb.at(bandT);
-        if (!deck.highDb.empty()) highDb = deck.highDb.at(bandT);
+        if (!deck.midDb.empty()) midDb = deck.midDb.at(tMix);
+        if (!deck.highDb.empty()) highDb = deck.highDb.at(tMix);
         const float midLin = std::pow(10.f, midDb / 20.f);
         const float highLin = std::pow(10.f, highDb / 20.f);
         l = loL + midL * midLin + hiL * highLin;
         r = loR + midR * midLin + hiR * highLin;
       }
-      // AUTOMIX-V2(C): insert FX after the EQ/filters, before the sends.
+      if (v2fx && v2s.riser.enabled && !v2s.riser.snareLocked) {
+        v2s.riser.captureDeck(l, r, tMix);
+      }
       float risOutL = 0.f, risOutR = 0.f;
       bool risOn = false;
+      float impOutL = 0.f, impOutR = 0.f;
+      bool impOn = false;
       if (v2fx) {
         const double bp = bp0 + (bp1 - bp0) * double(frac);
         if (v2s.phaser.enabled) v2s.phaser.process(l, r, frac, phW0 + (phW1 - phW0) * frac);
         if (v2s.gate.enabled) {
           const float d = gateD0 + (gateD1 - gateD0) * frac;
+          const float div = v2s.gate.activeDivisionAt(tMix);
           if (v2s.gate.stutter) {
-            v2s.gate.stutterTick(l, r, d, int64_t(std::floor(bp * double(v2s.gate.division))));
+            v2s.gate.stutterTick(l, r, d, int64_t(std::floor(bp * double(div))));
           } else if (d > 0.f) {
-            const float m = 1.f - d * (1.f - v2s.gate.gateValue(bp, beatDur));
+            const float rel = v2s.gate.releaseBlendAt(tMix);
+            const float deff = d * rel;
+            const float m = 1.f - deff * (1.f - v2s.gate.gateValueFor(bp, beatDur, div));
             l *= m;
             r *= m;
           }
@@ -1204,38 +1398,37 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
         }
         const float rl = risL0 + (risL1 - risL0) * frac;
         if (v2s.riser.enabled && rl > 0.f) {
-          v2s.riser.tick(rl * 0.35f * v2s.riser.tremolo(bp), risOutL, risOutR);
+          v2s.riser.tick(rl, tMix, bp, beatDur, risOutL, risOutR);
           risOn = true;
+        }
+        if (v2s.impactActive) {
+          v2s.impact.tick(tMix, impOutL, impOutR);
+          impOn = true;
         }
       }
       float flangeL = 0.f, flangeR = 0.f;
       if (deck.flanger.enabled) {
         float wetMul = 1.f;
-        if (!deck.flangerWet.empty()) wetMul = deck.flangerWet.at((frame + n) / sr);
-        deck.flanger.applyEnv(l, r, wetMul, flangeL, flangeR, double(frame + n) / sr, sr);
+        if (!deck.flangerWet.empty()) wetMul = deck.flangerWet.at(tMix);
+        deck.flanger.applyEnv(l, r, wetMul, flangeL, flangeR, tMix, sr);
       }
       float wetL = 0, wetR = 0;
       float send = 0.f;
       if (deck.echo.enabled) {
         if (!deck.echoSend.empty()) {
-          send = deck.echoSend.at((frame + n) / sr);
+          send = deck.echoSend.at(tMix);
         } else if (!deck.knotTimes.empty() && (frame + n) >= deck.knotTimes.front()) {
           send = 1.f;
         }
       }
       deck.echo.tap(l, r, send, wetL, wetR, sr);
-      // djmix24 reverb wash: send envelope (0..1), tail rings past the dry.
       float revL = 0, revR = 0;
       float revSend = 0.f;
       if (deck.reverb.enabled) {
-        if (!deck.reverbSend.empty()) revSend = deck.reverbSend.at((frame + n) / sr);
+        if (!deck.reverbSend.empty()) revSend = deck.reverbSend.at(tMix);
         else if (!deck.knotTimes.empty() && (frame + n) >= deck.knotTimes.front()) revSend = 0.5f;
         deck.reverb.apply(l, r, revSend, revL, revR, sr);
       }
-      // Retire stored effect output independently from dry gain. Emergency
-      // cancellation remains multiplicative and can never be undone by this.
-      // Flanger already rides g (hence cancel) and its own envelope.
-      const double tMix = double(frame + n) / sr;
       const float echoMul = wetRetireMul(tMix, echoFadeStart, deck.stopAt) * cancel;
       const float revMul = wetRetireMul(tMix, revFadeStart, deck.stopAt) * cancel;
       mixLeft_[n] += l * g + wetL * echoMul + flangeL * g + revL * revMul;
@@ -1243,6 +1436,10 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
       if (risOn) {
         mixLeft_[n] += risOutL * cancel;
         mixRight_[n] += risOutR * cancel;
+      }
+      if (impOn) {
+        mixLeft_[n] += impOutL * cancel;
+        mixRight_[n] += impOutR * cancel;
       }
     }
   }
@@ -1253,9 +1450,8 @@ void Renderer::limit(int frames) {
   // Sample-peak limiter: scan up to 1.5 ms within this callback. It does not
   // oversample or inspect future callbacks. Gain state carries across
   // callbacks with an ~80 ms release.
-  constexpr float kCeiling = 0.89125094f;
-  constexpr float kKneeDb = 2.0f;  // soft-knee width (dB below ceiling)
-  constexpr float kKnee = 0.794f;  // approximately -2 dBFS sample-peak knee start
+  const float kCeiling = truePeakCeiling_;
+  const float kKnee = kCeiling * 0.89088f;
   const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
   const float release = 1.f - std::exp(-1.f / (0.08f * float(sampleRate_)));
   const int ringSize = std::max(1, int(limitRingL_.size()));
@@ -1312,20 +1508,21 @@ float faderAt(const Deck& d, double t) {
 
 bool Deck::tapsPlain(int64_t unwrapped, int seamSamples, int64_t& index, int64_t& tail, float& wIndex,
                      float& wTail) const {
-  // Mirrors read() exactly.
   tail = -1;
   wIndex = 1.f;
   wTail = 0.f;
   index = sampleAt(unwrapped);
   if (index < 0) return false;
   const int64_t length = loopEnd - loopStart;
-  if (length <= seamSamples || seamSamples <= 1) return true;
+  if (length <= 2 || seamSamples <= 1) return true;
+  const int seamEff = std::min(seamSamples, std::max(1, int(length / 4)));
+  if (seamEff <= 1) return true;
   if (unwrapped < loopEnd || unwrapped >= static_cast<int64_t>(releaseAt)) return true;
   const int64_t pos = (unwrapped - loopStart) % length;
-  if (pos < 0 || pos >= seamSamples) return true;
+  if (pos < 0 || pos >= seamEff) return true;
   const int64_t t = loopEnd + pos;
   if (t < 0 || t >= int64_t(left.size()) || t >= int64_t(right.size())) return true;
-  const float u = float(pos) / float(seamSamples);
+  const float u = float(pos) / float(seamEff);
   wIndex = std::sin(u * float(kPi / 2.0));
   wTail = std::cos(u * float(kPi / 2.0));
   tail = t;
@@ -1334,36 +1531,62 @@ bool Deck::tapsPlain(int64_t unwrapped, int seamSamples, int64_t& index, int64_t
 
 bool Deck::tapsEffective(int64_t unwrapped, int seamSamples, double mixSec, int64_t& index, int64_t& tail,
                          float& wIndex, float& wTail) const {
-  // Mirrors readEffective() exactly (including its seam on first loop entry).
+  (void)mixSec;
   tail = -1;
   wIndex = 1.f;
   wTail = 0.f;
-  int64_t effEnd = loopEnd;
-  if (loopRoll && rollBeatSec > 1e-6 && mixSec >= rollStartMixSec && mixSec < rollReleaseMixSec &&
-      effectiveLoopEnd > loopStart) {
-    effEnd = effectiveLoopEnd;
-  }
   index = sampleAtEffective(unwrapped);
   if (index < 0) return false;
-  const int64_t length = effEnd - loopStart;
-  if (length <= seamSamples || seamSamples <= 1) return true;
-  if ((unwrapped < effEnd || unwrapped >= static_cast<int64_t>(releaseAt)) && loopRoll &&
-      effectiveLoopEnd > loopStart) {
-    return true;
-  }
-  const int64_t fullLen = loopEnd - loopStart;
-  const int64_t useLen = (effectiveLoopEnd > loopStart) ? (effectiveLoopEnd - loopStart) : fullLen;
-  if (useLen <= seamSamples) return true;
-  if (unwrapped < loopStart || unwrapped >= static_cast<int64_t>(releaseAt)) return true;
+  const int64_t effEnd = (loopRoll && effectiveLoopEnd > loopStart) ? effectiveLoopEnd : loopEnd;
+  const int64_t useLen = effEnd - loopStart;
+  if (useLen <= 2 || seamSamples <= 1) return true;
+  const int seamEff = std::min(seamSamples, std::max(1, int(useLen / 4)));
+  if (seamEff <= 1) return true;
+  if (unwrapped < effEnd || unwrapped >= static_cast<int64_t>(releaseAt)) return true;
   const int64_t pos = (unwrapped - loopStart) % useLen;
-  if (pos < 0 || pos >= seamSamples) return true;
-  const int64_t t = loopStart + useLen + pos;
-  if (t < 0 || t >= int64_t(left.size())) return true;
-  const float u = float(pos) / float(seamSamples);
+  if (pos < 0 || pos >= seamEff) return true;
+  const int64_t t = effEnd + pos;
+  if (t < 0 || t >= int64_t(left.size()) || t >= int64_t(right.size())) return true;
+  const float u = float(pos) / float(seamEff);
   wIndex = std::sin(u * float(kPi / 2.0));
   wTail = std::cos(u * float(kPi / 2.0));
   tail = t;
   return true;
+}
+
+void Renderer::sampleDeckVarispeed(Deck& deck, double unwrapped, int seam, double mixSec,
+                                   float& outL, float& outR) const {
+  const double fl = std::floor(unwrapped);
+  const float mu = float(unwrapped - fl);
+  const int64_t iBase = int64_t(fl);
+  float g[4] = {1.f, 1.f, 1.f, 1.f};
+  if (deck.v2.stemsOn) {
+    for (int k = 0; k < 4; ++k) {
+      float x = deck.v2.stemGain[k].empty() ? 1.f : deck.v2.stemGain[k].at(mixSec);
+      if (!(x > 0.f)) x = 0.f;
+      if (x > 4.f) x = 4.f;
+      g[k] = x;
+    }
+  }
+  auto tapAt = [&](int64_t u, float& l, float& r) {
+    if (deck.v2.stemsOn) deck.readStems(u, seam, mixSec, g, l, r);
+    else if (deck.loopRoll) deck.readEffective(u, seam, mixSec, l, r);
+    else deck.read(u, seam, l, r);
+  };
+  float l0, r0, l1, r1, l2, r2, l3, r3;
+  tapAt(iBase - 1, l0, r0);
+  tapAt(iBase + 0, l1, r1);
+  tapAt(iBase + 1, l2, r2);
+  tapAt(iBase + 2, l3, r3);
+  auto hermite = [](float y0, float y1, float y2, float y3, float t) {
+    const float c0 = y1;
+    const float c1 = 0.5f * (y2 - y0);
+    const float c2 = y0 - 2.5f * y1 + 2.f * y2 - 0.5f * y3;
+    const float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+    return ((c3 * t + c2) * t + c1) * t + c0;
+  };
+  outL = hermite(l0, l1, l2, l3, mu);
+  outR = hermite(r0, r1, r2, r3, mu);
 }
 
 void Deck::readStems(int64_t unwrapped, int seamSamples, double mixSec, const float* gains, float& leftOut,
@@ -1447,16 +1670,44 @@ void Renderer::setPhaser(int index, double rateBeats, float depth, float feedbac
   decks_[index].v2.phaser.setup(rateBeats, depth, feedback);
 }
 
+void Renderer::setPhaserEx(int index, double rateBeats, float depth, float feedback,
+                           int stages, float stereoOffsetDeg) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.phaser.setup(rateBeats, depth, feedback, stages, stereoOffsetDeg);
+}
+
 void Renderer::setGate(int index, double beatSec, float division, float swing) {
   if (index < 0 || index > 1) return;
   decks_[index].v2.gate.setup(sampleRate_, beatSec, division, swing);
   if (decks_[index].v2.gate.enabled) fxBeatSec_ = beatSec;
 }
 
+void Renderer::setGateEx(int index, double beatSec, float divStart, float divEnd, float swing,
+                         double startSec, double endSec) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.gate.setupEx(sampleRate_, beatSec, divStart, divEnd, swing, startSec, endSec);
+  if (decks_[index].v2.gate.enabled) fxBeatSec_ = beatSec;
+}
+
 void Renderer::setRiser(int index, double beatSec, double lengthBeats) {
   if (index < 0 || index > 1) return;
-  decks_[index].v2.riser.setup(beatSec, lengthBeats);
+  decks_[index].v2.riser.setupEx(sampleRate_, beatSec, lengthBeats, 300.f, 8000.f, 0.7f, 1.0f, true, 1.0, -1.0);
   if (decks_[index].v2.riser.enabled) fxBeatSec_ = beatSec;
+}
+
+void Renderer::setRiserEx(int index, double beatSec, double lengthBeats, float noiseStartHz,
+                          float noiseEndHz, float noiseLevelPeak, float uplifterOctaves,
+                          bool includeSnareRoll, double reverseReverbBeats, double startSec) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.riser.setupEx(sampleRate_, beatSec, lengthBeats, noiseStartHz, noiseEndHz,
+                                   noiseLevelPeak, uplifterOctaves, includeSnareRoll,
+                                   reverseReverbBeats, startSec);
+  if (decks_[index].v2.riser.enabled) fxBeatSec_ = beatSec;
+}
+
+void Renderer::setImpact(int index, double triggerMixSec, float peakDbfs, float lowThumpHz, double noiseBurstMs) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.impact.setup(sampleRate_, triggerMixSec, peakDbfs, lowThumpHz, noiseBurstMs);
 }
 
 void Renderer::setPump(int index, double beatSec, bool fullBand) {
@@ -1468,6 +1719,70 @@ void Renderer::setPump(int index, double beatSec, bool fullBand) {
 void Renderer::setBrake(int index, double startSec, double lengthSec, bool spinback) {
   if (index < 0 || index > 1) return;
   decks_[index].v2.brake.setup(sampleRate_, startSec, lengthSec, spinback);
+}
+
+void Renderer::setBrakeEx(int index, double startSec, double lengthSec, float endRate,
+                          float lpfStartHz, float lpfEndHz, double endFadeMs) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.brake.setupBrakeEx(sampleRate_, startSec, lengthSec, endRate, lpfStartHz, lpfEndHz, endFadeMs);
+}
+
+void Renderer::setTapeStop(int index, double startSec, double lengthSec, float wowDepth, float wowRateHz,
+                           float lpfStartHz, float lpfEndHz, double endFadeMs) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.brake.setupTapeStop(sampleRate_, startSec, lengthSec, wowDepth, wowRateHz,
+                                       lpfStartHz, lpfEndHz, endFadeMs);
+}
+
+void Renderer::setSpinback(int index, double startSec, double lengthSec,
+                           double peakReverseSpeed, double silenceGapSec) {
+  if (index < 0 || index > 1) return;
+  decks_[index].v2.brake.setupSpinback(sampleRate_, startSec, lengthSec, peakReverseSpeed, silenceGapSec);
+}
+
+void Renderer::setSweep(int index, bool isHighPass, float startHz, float endHz,
+                        float qStart, float qEnd, double startSec, double endSec, bool exponential) {
+  if (index < 0 || index > 1) return;
+  SweepConfig& sw = decks_[index].v2.sweep;
+  sw.enabled = std::isfinite(startSec) && std::isfinite(endSec) && endSec > startSec &&
+               startHz > 0.f && endHz > 0.f;
+  sw.isHighPass = isHighPass;
+  sw.startHz = std::clamp(startHz, 20.f, float(sampleRate_) * 0.45f);
+  sw.endHz = std::clamp(endHz, 20.f, float(sampleRate_) * 0.45f);
+  sw.qStart = std::clamp(std::isfinite(qStart) ? qStart : 0.7071f, 0.5f, v2::kMaxResonanceQ);
+  sw.qEnd = std::clamp(std::isfinite(qEnd) ? qEnd : 1.6f, 0.5f, v2::kMaxResonanceQ);
+  sw.startSec = startSec;
+  sw.endSec = endSec;
+  sw.exponential = exponential;
+}
+
+void Renderer::setTruePeakCeilingDb(float ceilingDbtp) {
+  if (!std::isfinite(ceilingDbtp)) return;
+  const float db = std::clamp(ceilingDbtp, -12.0f, -0.1f);
+  truePeakCeiling_ = float(std::pow(10.0, double(db) / 20.0));
+}
+
+int64_t Renderer::capturedFrames() const {
+  if (!captureEnabled_ || captureCapFrames_ <= 0) return 0;
+  return std::min<int64_t>(captureWriteFrames_.load(std::memory_order_acquire), int64_t(captureCapFrames_));
+}
+
+int Renderer::readCapturedAudio(float* outInterleaved, int maxFrames) const {
+  if (!captureEnabled_ || captureCapFrames_ <= 0 || outInterleaved == nullptr || maxFrames <= 0 || captureRing_.empty()) {
+    return 0;
+  }
+  const int64_t totalWritten = captureWriteFrames_.load(std::memory_order_acquire);
+  const int64_t avail = std::min<int64_t>(totalWritten, int64_t(captureCapFrames_));
+  const int count = int(std::min<int64_t>(avail, int64_t(maxFrames)));
+  if (count <= 0) return 0;
+  const int64_t oldestPos = totalWritten - avail;
+  const int64_t startPos = oldestPos + (avail - count);
+  for (int i = 0; i < count; ++i) {
+    const size_t srcIdx = size_t((startPos + i) % captureCapFrames_) * 2;
+    outInterleaved[i * 2] = captureRing_[srcIdx];
+    outInterleaved[i * 2 + 1] = captureRing_[srcIdx + 1];
+  }
+  return count;
 }
 
 void Renderer::setLoudnessMatch(bool enabled, float targetLufs) {
@@ -1523,12 +1838,14 @@ void Renderer::prepareV2() {
     }
     // A mismatched stem set falls back to the dry deck, never to silence.
     v.stemsOn = any && sizesOk && !deck.finished;
-    v.filterV2 = !v.filterRes.empty() || !v.filterKnob.empty();
+    v.filterV2 = !v.filterRes.empty() || !v.filterKnob.empty() || v.sweep.enabled || deck.rollFxActive;
     v.hpQLast = v.lpQLast = -1.f;
     v.phaser.reset();
     v.gate.reset();
     v.pump.reset();
     v.riser.reset();
+    v.impact.reset();
+    v.impactActive = v.impact.enabled;
     v.riser.startSec = 1e18;
     {
       const Envelope& e = v.riserLevel;
@@ -1539,9 +1856,12 @@ void Renderer::prepareV2() {
           break;
         }
       }
+      if (v.riser.startSec > 1e15 && v.riser.explicitStartSec >= 0.0) {
+        v.riser.startSec = v.riser.explicitStartSec;
+      }
     }
     if (v.brake.enabled && !v.brakeProgress.empty()) {
-      // Size the varispeed ring for the envelope's own span (worker thread).
+      // Align span with brakeProgress envelope when explicit progress is supplied (worker thread).
       const Envelope& e = v.brakeProgress;
       const size_t n = std::min(e.times.size(), e.values.size());
       bool haveStart = false;
@@ -1559,13 +1879,24 @@ void Renderer::prepareV2() {
         }
       }
       if (!haveEnd && n > 0) end = e.times[n - 1];
-      if (haveStart && end - start > v.brake.lengthSec) v.brake.setup(sr, start, end - start, v.brake.spinback);
+      if (haveStart && end - start > v.brake.lengthSec) {
+        if (v.brake.mode == v2::BrakeMode::SPINBACK) {
+          v.brake.setupSpinback(sr, start, end - start, v.brake.peakReverseSpeed, v.brake.silenceGapSec);
+        } else if (v.brake.mode == v2::BrakeMode::TAPE_STOP) {
+          v.brake.setupTapeStop(sr, start, end - start, v.brake.wowDepth, v.brake.wowRateHz,
+                                v.brake.lpfStartHz, v.brake.lpfEndHz, v.brake.endFadeSec * 1000.0);
+        } else {
+          v.brake.setupBrakeEx(sr, start, end - start, float(v.brake.endRate),
+                               v.brake.lpfStartHz, v.brake.lpfEndHz, v.brake.endFadeSec * 1000.0);
+        }
+      }
     }
     v.brake.reset();
     v.meter.setup(sr);
     v.matchDb = 0.f;
     v.match0 = v.match1 = 1.f;
-    v.fxActive = v.phaser.enabled || v.gate.enabled || v.pump.enabled || v.riser.enabled || v.brake.enabled;
+    v.fxActive = v.phaser.enabled || v.gate.enabled || v.pump.enabled ||
+                 v.riser.enabled || v.brake.enabled || v.impactActive;
   }
 
   // Beat grid: the longest run of regular knot intervals (knots are on the mix's beats).
@@ -1629,7 +1960,7 @@ void Renderer::prepareV2() {
 void Renderer::fillStemInput(Deck& deck, int64_t from, int count, int64_t mixFrameBase, double refFrame,
                              double refHeard, double rate, int available) {
   const double sr = sampleRate_;
-  const int seam = std::max(1, int(std::lround(kLoopSeamSeconds * sr)));
+  const int seam = std::clamp(int(std::lround((deck.loopSeamMs * 0.001) * sr)), 1, std::max(1, int(kLoopSeamSeconds * sr)));
   const double invRate = 1.0 / std::clamp(rate, 0.5, 2.0);
   const DeckV2& v = deck.v2;
   // Input sample u is heard at mix frame refFrame + (u - refHeard) / rate (the
@@ -1766,8 +2097,8 @@ void Renderer::limitTruePeak(int frames) {
     limit(frames);
     return;
   }
-  constexpr float kCeiling = 0.89125094f;
-  constexpr float kKnee = 0.794f;
+  const float kCeiling = truePeakCeiling_;
+  const float kKnee = kCeiling * 0.89088f;
   const int look = std::max(1, int(std::lround(0.0015 * sampleRate_)));
   const float release = 1.f - std::exp(-1.f / (0.08f * float(sampleRate_)));
   for (int k = 0; k < H; ++k) {

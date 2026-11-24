@@ -1,0 +1,295 @@
+{
+  "schema": 2,
+  "id": "C5",
+  "name": "Loop extend",
+  "description": "Beat-locked outgoing outro loop holds under the incoming intro",
+  "level": "CLUB",
+  "family": "BLEND",
+  "abruptness": "SMOOTH",
+  "requirements": {
+    "maxTempoGap": 0.06,
+    "requiresBeatMatch": true,
+    "requiresHarmony": false,
+    "genreAffinity": {
+      "DANCE": 0.2,
+      "POP": 0.14,
+      "UNKNOWN": 0.12
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": true,
+    "requiredStems": [],
+    "minStemCount": 0,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 4.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    8,
+    16
+  ],
+  "placementPrefs": {
+    "swapRule": "LATE_PHRASE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": true,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP",
+      "params": {
+        "bars": 4.0,
+        "seamCrossfadeMs": 8.0,
+        "holdPhrases": 1.0
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 1.0
+          },
+          "value": 160.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 90.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 400.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "LOOP",
+      "params": {
+        "bars": 4.0,
+        "seamCrossfadeMs": 8.0,
+        "holdPhrases": 1.0
+      }
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "SWAP",
+            "offsetBeats": 1.0,
+            "maxAt": "RELEASE"
+          },
+          "value": 1.0
+        }
+      ],
+      "steps": 16
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "SWAP_BACK_A",
+            "param": 1.0
+          },
+          "value": 160.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 20.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 90.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 400.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}

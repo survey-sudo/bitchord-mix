@@ -1,0 +1,495 @@
+{
+  "schema": 2,
+  "id": "F4",
+  "name": "Acapella mashup",
+  "description": "Outgoing vocal mashed over incoming beat with pump, reverb, and echo",
+  "level": "FESTIVAL",
+  "family": "SWAP",
+  "abruptness": "SMOOTH",
+  "requirements": {
+    "maxTempoGap": 0.08,
+    "requiresBeatMatch": true,
+    "requiresHarmony": true,
+    "genreAffinity": {
+      "POP": 0.28,
+      "HIPHOP": 0.26,
+      "DANCE": 0.14
+    },
+    "requiresDrops": false,
+    "requiresOutDrop": false,
+    "requiresOutLoop": false,
+    "requiredStems": [
+      {
+        "deck": "OUT",
+        "stem": "VOCALS"
+      },
+      {
+        "deck": "OUT",
+        "stem": "BASS"
+      }
+    ],
+    "minStemCount": 2,
+    "minGridConfidence": 0.5,
+    "minOverlapBars": 4.0,
+    "requiredCapabilities": [],
+    "requiresTempoOrGenreJump": false
+  },
+  "lengthOptionsBars": [
+    16,
+    32
+  ],
+  "placementPrefs": {
+    "swapRule": "EARLY_PHRASE",
+    "preferOutroExit": true,
+    "preferIntroEntry": true,
+    "preferDropEntry": false,
+    "maxEntrySkipBars": 0,
+    "avoidVocalExit": false,
+    "avoidVocalEntry": true,
+    "avoidBuildExit": true,
+    "preferPostSwapPhraseBars": 4
+  },
+  "steps": [
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 1.0
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "STEM_OTHER",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "STEM_DRUMS",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 0.5
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "STEM_VOCALS",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetSec": -0.02
+          },
+          "value": 1.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": true
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "PUMP",
+      "requiredCap": "PUMP",
+      "flag": true,
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.25
+          },
+          "value": 0.45
+        },
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.5,
+        "damping": 0.5,
+        "wet": 0.45
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.55
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.4,
+            "minAt": "SWAP"
+          },
+          "value": 0.55
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.6,
+        "wet": 0.52,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.3,
+            "minAt": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    }
+  ],
+  "noStemSteps": [
+    {
+      "type": "enable_isolator"
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_RISE",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "A_PLUS_CAPPED_S",
+            "param": 1.0
+          },
+          "value": 1.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "GAIN",
+      "shape": "EQUAL_POWER_FALL",
+      "points": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 1.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "HIGH_PASS_HZ",
+      "shape": "EXPONENTIAL",
+      "points": [
+        {
+          "time": {
+            "anchor": "IN_AUDIBLE"
+          },
+          "value": 20.0
+        },
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 420.0
+        }
+      ]
+    },
+    {
+      "type": "lane_curve",
+      "deck": "IN",
+      "kind": "MID_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "ZERO"
+          },
+          "value": -6.0
+        },
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": -6.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetSec": -0.02
+          },
+          "value": 0.0
+        }
+      ],
+      "holdNeutralAtStart": false
+    },
+    {
+      "type": "lane_curve",
+      "deck": "OUT",
+      "kind": "MID_DB",
+      "shape": "LINEAR",
+      "points": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": -12.0
+        }
+      ]
+    },
+    {
+      "type": "swap_lows",
+      "at": {
+        "anchor": "SWAP"
+      },
+      "widthBeats": 0.25,
+      "inLowBeforeDb": -24.0,
+      "outLowAfterDb": -24.0,
+      "useBassStems": false
+    },
+    {
+      "type": "configure_fx",
+      "deck": "IN",
+      "fx": "PUMP",
+      "requiredCap": "PUMP",
+      "flag": true,
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "SWAP"
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.25
+          },
+          "value": 0.45
+        },
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "REVERB",
+      "params": {
+        "roomSize": 2.5,
+        "damping": 0.5,
+        "wet": 0.45
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.55
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.4,
+            "minAt": "SWAP"
+          },
+          "value": 0.55
+        },
+        {
+          "time": {
+            "anchor": "OUT_STOP"
+          },
+          "value": 0.0
+        }
+      ]
+    },
+    {
+      "type": "configure_fx",
+      "deck": "OUT",
+      "fx": "ECHO",
+      "params": {
+        "delayBeats": 0.5,
+        "feedback": 0.6,
+        "wet": 0.52,
+        "wetHpfHz": 250.0,
+        "wetLpfHz": 6000.0,
+        "pingPong": 1.0
+      },
+      "wetCurve": [
+        {
+          "time": {
+            "anchor": "POST_FRAC",
+            "param": 0.65
+          },
+          "value": 0.0
+        },
+        {
+          "time": {
+            "anchor": "RELEASE",
+            "offsetBeats": -0.3,
+            "minAt": "SWAP"
+          },
+          "value": 0.85
+        },
+        {
+          "time": {
+            "anchor": "RELEASE"
+          },
+          "value": 0.0
+        }
+      ]
+    }
+  ],
+  "energyDelta": 0.0,
+  "enabled": true
+}
