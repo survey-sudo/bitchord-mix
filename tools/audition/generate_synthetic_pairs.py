@@ -263,7 +263,9 @@ class TrackSynth:
             seg_t = np.arange(m, dtype=np.float64) / SR
             for member in chord_roots(self.root, bar):
                 for det in (0.0, 3.0, -3.0):
-                    f0 = midi_to_freq(member) * (1.0 + det / 1200.0)
+                    # Place pad an octave above the bass root (>250 Hz) so its
+                    # 80 ms slow attack on bar downbeats doesn't mask kick peaks.
+                    f0 = midi_to_freq(member + 12) * (1.0 + det / 1200.0)
                     pad[idx : idx + m] += np.sin(2 * np.pi * f0 * seg_t) * (0.045 + 0.02 * self.energy)
             # slow attack/release per bar
             attack = int(round(min(0.08, self.bar_sec * 0.15) * SR))
@@ -345,6 +347,14 @@ class TrackSynth:
         return np.sin(2 * np.pi * freq * seg_t) * np.exp(-seg_t * 18.0)
 
 
+def effective_in_tempo(bpm_out: float, bpm_in: float, genre_jump: bool) -> tuple[float, float, bool]:
+    """ADR 0010 beatmatch rule: time-stretch IN to bpm_out within 8% (genre jump) / 10%."""
+    max_pct = 8.0 if genre_jump else 10.0
+    if bpm_out > 0.0 and bpm_in > 0.0 and abs(bpm_in - bpm_out) / bpm_out * 100.0 <= max_pct:
+        return bpm_out / bpm_in, bpm_out, True
+    return 1.0, bpm_in, False
+
+
 def build_script(pair: dict, recipe_id: str) -> dict:
     """TransitionScriptV1-compatible (schema=1) script for one pair x recipe."""
     out_pcm = pair["outF32"]
@@ -353,6 +363,7 @@ def build_script(pair: dict, recipe_id: str) -> dict:
     dur_in = pair["inDurationSec"]
     bpm_out = pair["bpmOut"]
     bpm_in = pair["bpmIn"]
+    pa = 60.0 / bpm_in
     exit_sec = pair["exitSec"]
     entry_sec = pair["entrySec"]
     fade_sec = pair.get("fadeSec", 4.0)
@@ -361,11 +372,25 @@ def build_script(pair: dict, recipe_id: str) -> dict:
     fade_start = max(exit_sec - fade_sec / 2.0, 0.0)
     fade_end = fade_start + fade_sec
 
+    rate_in, bpm_in_eff, stretched = effective_in_tempo(
+        bpm_out, bpm_in, bool(pair.get("genreJump", False))
+    )
+    if stretched:
+        hold_until = fade_start
+    else:
+        k_beats = max(1, int(round((exit_sec - fade_start) / pa)))
+        hold_until = max(0.0, exit_sec - k_beats * pa)
+    in_end_mix = hold_until + dur_in / rate_in
+
     # GAIN envelopes: equal-power crossfade over [fade_start, fade_end].
     steps = 9
     ts = [round(fade_start + (fade_end - fade_start) * (k / (steps - 1)), 4) for k in range(steps)]
     out_vals = [round(math.cos((k / (steps - 1)) * math.pi / 2.0), 5) for k in range(steps)]
     in_vals = [round(math.sin((k / (steps - 1)) * math.pi / 2.0), 5) for k in range(steps)]
+    if hold_until < fade_start - 1e-4:
+        ts = [round(hold_until, 4)] + ts
+        out_vals = [1.0] + out_vals
+        in_vals = [0.0] + in_vals
     envelopes = [
         {"deck": "OUT", "kind": "GAIN", "timesSec": ts, "values": out_vals, "exponential": False},
         {"deck": "IN", "kind": "GAIN", "timesSec": ts, "values": in_vals, "exponential": False},
@@ -418,8 +443,12 @@ def build_script(pair: dict, recipe_id: str) -> dict:
         "outRegion": region("OUT", pair.get("outF32"), dur_out, 0, pair["outTrackId"]),
         "inRegion": region("IN", pair.get("inF32"), dur_in, 0, pair["inTrackId"]),
         "knots": [
-            {"mixTimeMs": 0, "trackPosMs": int(round(exit_sec * 1000)), "bpm": bpm_out},
-            {"mixTimeMs": int(round(fade_end * 1000)), "trackPosMs": int(round(exit_sec * 1000 + fade_sec * 1000)), "bpm": bpm_out},
+            {"mixTimeMs": 0, "trackPosMs": 0, "bpm": bpm_out},
+            {"mixTimeMs": int(round(dur_out * 1000)), "trackPosMs": int(round(dur_out * 1000)), "bpm": bpm_out},
+        ],
+        "inKnots": [
+            {"mixTimeMs": int(round(hold_until * 1000)), "trackPosMs": 0, "bpm": round(bpm_in_eff, 3)},
+            {"mixTimeMs": int(round(in_end_mix * 1000)), "trackPosMs": int(round(dur_in * 1000)), "bpm": round(bpm_in_eff, 3)},
         ],
         "loopBounds": None,
         "envelopes": envelopes,
@@ -512,6 +541,7 @@ def main() -> int:
             "reason": "Exit after final chorus · Entry at intro bar 1 · no vocal overlap",
         }
         # Per-recipe scripts + meta (TransitionScriptV1 + mixq metadata).
+        _, bpm_in_eff, _ = effective_in_tempo(bpm_out, bpm_in, pair["genreJump"])
         for rid in recipes:
             script = build_script(pair, rid)
             script_path = out_dir / f"{pair_id}_{rid}.script.json"
@@ -523,7 +553,7 @@ def main() -> int:
                 "transitionStartSec": round(max(exit_sec - fade_sec / 2.0, 0.0), 3),
                 "transitionEndSec": round(exit_sec + fade_sec / 2.0, 3),
                 "swapSec": round(swap_sec, 3),
-                "bpmOut": bpm_out, "bpmIn": bpm_in,
+                "bpmOut": bpm_out, "bpmIn": round(bpm_in_eff, 3), "bpmInNative": bpm_in,
                 "level": recipe_meta["level"],
                 "abruptness": recipe_meta["abruptness"],
                 "recipeId": rid.replace("AUTO-", ""),

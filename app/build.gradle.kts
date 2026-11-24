@@ -109,6 +109,9 @@ android {
         // the same GitHub release, told apart by file name. See
         // AppUpdateChecker.apkAssetUrl.
         buildConfigField("String", "UPDATE_APK_PREFIX", "\"BitChord-\"")
+        // FORK-HOOK(gradle-djmix): AE3 automix engine version (B16), surfaced to
+        // BuildConfig for diagnostics and the DJ Mix settings screen.
+        buildConfigField("String", "ENGINE_VERSION", "\"3.0.0\"")
     }
 
     splits {
@@ -177,6 +180,15 @@ android {
                 storePassword = signing.getProperty("storePassword")
                 keyAlias = signing.getProperty("keyAlias")
                 keyPassword = signing.getProperty("keyPassword")
+                // Explicit APK signature schemes: v2 + v3 signed natively by
+                // AGP, so :app:assembleProdRelease needs no manual apksigner
+                // re-signing pass. v1 stays on for minSdk 26-era installers
+                // that predate v2; v4 (incremental) is off — no Play-induced
+                // requirement, and it would only bloat the output.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = false
             }
         }
     }

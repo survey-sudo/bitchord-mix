@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  BitChord NPU add-on v73 (Part B4.3): code-less Hexagon V73 (SM8635) add-on.
+
+  Deliberately NOT registered in the root settings.gradle.kts: it is a
+  standalone Gradle project (its own settings.gradle.kts) built by the
+  manual `.github/workflows/npu-addon.yml` workflow, which publishes an
+  installable APK as release `npu-v73-N` with an `npu-addons.json` manifest.
+
+  The app loads it only from this known package name, only through
+  PackageManager-resolved nativeLibraryDir, and only after its self-test
+  passes (Part B4.2/B14). It prefers its own add-on and accepts Orchard's
+  (`dev.sfg.orchard.npu.v73`) when this one is absent.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.music.bitchord.loopfix.npu.v73" />

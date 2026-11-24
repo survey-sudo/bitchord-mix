@@ -325,15 +325,17 @@ def refine_beat_period(onset_times: np.ndarray, period: float) -> float:
     return best
 
 
-def lowband_beat_estimate(mag: np.ndarray, freqs: np.ndarray, hop: int):
+def lowband_beat_estimate(
+    mag: np.ndarray, freqs: np.ndarray, hop: int, n_fft: int = 2048
+):
     """Kick-train beat estimate from the 20-250 Hz band energy peaks.
 
     Kicks are the strongest on-grid element in DJ material, so the median
     peak-to-peak interval recovers the beat more reliably than onset
     autocorrelation (which can lock onto the two-beat snare cycle).
-    Peak positions are refined by parabolic interpolation, and the period
-    is refined again by DFT phase-resultant length (events must sit near
-    a common grid phase) to survive syncopated kicks.
+    Normalises against the 95th-percentile lowband envelope (capped at 2.0)
+    so a single transition impact boom does not swamp normal kicks, and
+    stamps peak times at the STFT window centre (``pos * hop + n_fft / 2``).
     Returns (period_sec, peak_times_sec) or (None, fewer times).
     """
     band = (freqs >= 20.0) & (freqs <= 250.0)
@@ -343,8 +345,12 @@ def lowband_beat_estimate(mag: np.ndarray, freqs: np.ndarray, hop: int):
     peak_env = float(np.max(env))
     if peak_env <= 0:
         return None, np.zeros(0, dtype=float)
-    peaks = pick_peaks(env / peak_env, min_dist=14, thresh_frac=0.5)
+    ref = float(np.percentile(env, 95)) or peak_env
+    norm_env = np.minimum(env / ref, 2.0)
+    peaks = pick_peaks(norm_env, min_dist=14, thresh_frac=0.45)
     frame_sec = hop / SR
+    n_fft_est = int(2 * (len(freqs) - 1)) if len(freqs) > 2 else int(hop)
+    centre_sec = (n_fft_est / 2.0) / SR if n_fft_est > hop else 0.0
     times = []
     weights = []
     for k in peaks:
@@ -357,14 +363,14 @@ def lowband_beat_estimate(mag: np.ndarray, freqs: np.ndarray, hop: int):
                 delta = 0.5 * (a - c) / denom
                 if -1.0 <= delta <= 1.0:
                     pos += delta
-        times.append(pos * frame_sec)
+        times.append(pos * frame_sec + centre_sec)
         weights.append(float(env[k]))
     times = np.array(times, dtype=float)
     weights = np.array(weights, dtype=float)
     if len(times) < 6:
         return None, times
     intervals = np.diff(times)
-    intervals = intervals[(intervals > 0.25) & (intervals < 1.4)]
+    intervals = intervals[(intervals > 0.25) & (intervals < 2.1)]
     if len(intervals) < 5:
         return None, times
     median_iv = float(np.median(intervals))
@@ -394,40 +400,67 @@ def beat_phase_error_ms(
     swap_sec: float,
     period_after: float,
 ) -> tuple[float, float]:
-    """Phase error (ms) of measured onsets vs the expected downbeat grid.
+    """Phase error (ms) of the measured beat trains across ``swap_sec``.
 
-    Two-sided grid anchored at ``swap_sec``: onsets before the swap follow
-    the outgoing period, onsets after it the incoming period (equal for
-    beat-matched pairs, different across a tempo/genre jump). The outgoing
-    side is only graded up to the pre-swap extent, so a jump does not
-    fabricate drift. Returns (median_ms, p95_ms) over onset peaks within
-    +-2 beats of the swap.
+    Optionally absorbs a tight, bounded steady-state pre-swap offset (up to
+    +-20 ms with MAD <= 4 ms across >= 3 outgoing kicks in [1, 8] beats
+    before swap) so constant render/attack latencies do not penalise both
+    decks while mistimings or shifted downbeats cannot hide behind the anchor.
+    Each side is graded separately over a 4 -> 6 -> 8 beat window (falling
+    back to the nearest six onsets), using the worst side's (median, p95).
     """
     if onset_times.size == 0 or period_before <= 0 or period_after <= 0:
         return 0.0, 0.0
     beat_sec = max(period_after, period_before)
-    half = 2.0 * beat_sec
-    sel = onset_times[np.abs(onset_times - swap_sec) <= half]
-    if sel.size < 2:
-        sel = onset_times
-    offs = []
-    for t in sel:
-        period = period_before if t < swap_sec else period_after
-        phase = (t - swap_sec) % period
-        off = min(phase, period - phase) * 1000.0
-        if off <= 0.5 * period * 1000.0:
-            offs.append(off)
-    if not offs:
+    cutoff_ms = 0.15 * beat_sec * 1000.0
+
+    def wrap_signed(times: np.ndarray, period: float, anchor: float = 0.0) -> np.ndarray:
+        ph = (times - swap_sec) % period
+        ph = ((ph + 0.5 * period) % period) - 0.5 * period  # [-p/2, p/2)
+        ms = ph * 1000.0 - anchor
+        ms = ((ms + 0.5 * period * 1000.0) % (period * 1000.0)) - 0.5 * period * 1000.0
+        return ms
+
+    pre = onset_times[onset_times < swap_sec]
+    post = onset_times[onset_times >= swap_sec]
+
+    anchor_ms = 0.0
+    if pre.size:
+        win = pre[(pre >= swap_sec - 8.0 * period_before) & (pre <= swap_sec - 1.0 * period_before)]
+        if win.size >= 3:
+            w = wrap_signed(win, period_before)
+            med_w = float(np.median(w))
+            mad_w = float(np.median(np.abs(w - med_w)))
+            if abs(med_w) <= 20.0 and mad_w <= 4.0:
+                anchor_ms = med_w
+
+    def side_stats(times: np.ndarray, period: float) -> tuple[float, float] | None:
+        if times.size == 0:
+            return None
+        sel = None
+        for mult in (4.0, 6.0, 8.0):
+            w = times[np.abs(times - swap_sec) <= mult * period]
+            if w.size >= 3:
+                sel = w
+                break
+        if sel is None:
+            if times.size < 2:
+                return None
+            order = np.argsort(np.abs(times - swap_sec))
+            sel = np.sort(times[order[: min(6, times.size)]])
+        ms = np.abs(wrap_signed(sel, period, anchor_ms))
+        core = ms[ms <= cutoff_ms]
+        vals = core if core.size >= 2 else ms
+        return float(np.median(vals)), float(np.percentile(vals, 95))
+
+    pre_stat = side_stats(pre, period_before)
+    post_stat = side_stats(post, period_after)
+    stats = [s for s in (pre_stat, post_stat) if s is not None]
+    if not stats:
         return 0.0, 0.0
-    arr = np.array(offs, dtype=np.float64)
-    # Reject deliberate off-grid events (offbeat bass/hat attacks land a
-    # half beat out); the gate grades the *beat* grid, so only residuals
-    # within a quarter beat count as beat evidence.
-    cutoff_ms = 0.25 * beat_sec * 1000.0
-    core = arr[arr <= cutoff_ms]
-    if core.size < 2:
-        core = arr
-    return float(np.median(core)), float(np.percentile(core, 95))
+    med = max(s[0] for s in stats)
+    p95 = max(s[1] for s in stats)
+    return med, p95
 
 
 def k_weight_db(freqs: np.ndarray) -> np.ndarray:
@@ -830,7 +863,8 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     # ---- STFT shared by several metrics ---------------------------------
     freqs, mag, hop = stft_mag(mono, n_fft=2048, hop=512)
     onset = onset_envelope(mag)
-    frame_times = np.arange(len(onset)) * (hop / SR)
+    # Centre timestamp: frame k spans [k*hop, k*hop+2048), centre +1024.
+    frame_times = (np.arange(len(onset)) * hop + 1024) / SR
 
     # ---- 1. True peak ----------------------------------------------------
     try:

@@ -77,3 +77,60 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization") version "2.3.20" apply false
     id("org.jetbrains.compose") version "1.10.3" apply false
 }
+
+/*
+ * Bump the djmix version (Part B11.2 / ADR 0004): increments
+ * `bitchordVersionCode` and the `djmixNN` suffix of `bitchordVersionName`
+ * together, e.g. `1.10-djmix53` (95) -> `1.10-djmix54` (96), editing this
+ * file in place. Refuses when the working tree is dirty, so a bump can
+ * never be half-committed. The current values are left untouched until
+ * the M11 release cut runs this task.
+ */
+tasks.register("bumpDjmix") {
+    group = "bitchord"
+    description = "Increment bitchordVersionCode and the djmixNN suffix together (refuses on a dirty tree)."
+
+    doLast {
+        val rootDir = project.rootDir
+
+        fun runGit(vararg args: String): String {
+            val proc = ProcessBuilder("git", "-C", rootDir.absolutePath, *args)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText()
+            val rc = proc.waitFor()
+            check(rc == 0) { "git ${args.joinToString(" ")} failed (exit $rc): $out" }
+            return out
+        }
+
+        val status = runGit("status", "--porcelain")
+        if (status.isNotBlank()) {
+            throw GradleException(
+                "bumpDjmix: refusing — the working tree is dirty. " +
+                    "Commit or stash first.\n$status"
+            )
+        }
+
+        val file = rootDir.resolve("build.gradle.kts")
+        val text = file.readText()
+        val codeRe = Regex("""(extra\["bitchordVersionCode"\]\s*=\s*)(\d+)""")
+        val nameRe = Regex("""(extra\["bitchordVersionName"\]\s*=\s*")([^"]+djmix)(\d+)(")""")
+        val codeMatch = codeRe.find(text)
+            ?: throw GradleException("bumpDjmix: bitchordVersionCode assignment not found in build.gradle.kts")
+        val nameMatch = nameRe.find(text)
+            ?: throw GradleException("bumpDjmix: bitchordVersionName with a djmixNN suffix not found in build.gradle.kts")
+
+        val newCode = codeMatch.groupValues[2].toInt() + 1
+        val newDjmix = nameMatch.groupValues[3].toInt() + 1
+        val newName = nameMatch.groupValues[2] + newDjmix.toString().padStart(2, '0') + nameMatch.groupValues[4]
+
+        val updated = codeRe.replaceFirst(text) { m -> m.groupValues[1] + newCode.toString() }
+            .let { middle ->
+                Regex("""(extra\["bitchordVersionName"\]\s*=\s*")([^"]+djmix)(\d+)(")""")
+                    .replaceFirst(middle) { m -> m.groupValues[1] + m.groupValues[2] + newDjmix.toString().padStart(2, '0') + m.groupValues[4] }
+            }
+        file.writeText(updated)
+        println("bumpDjmix: versionCode ${codeMatch.groupValues[2]} -> $newCode, " +
+            "versionName -> $newName. Commit build.gradle.kts.")
+    }
+}

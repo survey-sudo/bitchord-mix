@@ -61,9 +61,12 @@ jobs:
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test_asan
           /tmp/vocal_spectrogram_test_asan
-          echo "--- loopmix renderer A/B selftest ---"
+          echo "--- loopmix renderer A/B selftest (ADR 0008 deterministic flags) ---"
+          # ADR 0008: -fno-fast-math -ffp-contract=off -Wall -Wextra so the
+          # host CLI renders bit-identically to the device renderer (B1.3),
+          # matching bitchord_dsd in app/src/main/cpp/CMakeLists.txt.
           if [ -f native/loopmix/loop_mix_renderer_ab_main.cpp ]; then
-            g++ -std=c++17 -O2 -I native -I native/third_party \
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
                 native/loopmix/loop_mix_renderer.cpp \
                 native/loopmix/loop_mix_renderer_ab_main.cpp \
                 -o /tmp/loop_mix_renderer_ab_main
@@ -74,6 +77,21 @@ jobs:
             /tmp/loop_mix_renderer_ab_main --v2-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
+          fi
+          echo "--- phrase isolator ---"
+          if [ -f native/loopmix/phrase_isolator_test.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/loopmix \
+                native/loopmix/phrase_isolator_test.cpp \
+                -o /tmp/phrase_isolator_test
+            /tmp/phrase_isolator_test
+          fi
+          echo "--- loopmix startup probe ---"
+          if [ -f native/loopmix/loop_mix_renderer_startup_probe.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_startup_probe.cpp \
+                -o /tmp/loopmix_startup_probe
+            /tmp/loopmix_startup_probe
           fi
 
       # >>> AUTOMIX-V2(B): stem separation DSP self-test (Stream B owns this block)
@@ -89,6 +107,71 @@ jobs:
               -o /tmp/stem_dsp_test_asan
           /tmp/stem_dsp_test_asan
       # <<< AUTOMIX-V2(B)
+
+      # B13/ADR 0008: ASan+UBSan on the loopmix host probes (the analyzer
+      # already had a sanitizer pass; loopmix did not). Covers all 5 probe
+      # flags plus the phrase isolator and startup probes.
+      - name: Native loopmix sanitizer tests
+        run: |
+          set -euo pipefail
+          CXXFLAGS="-std=c++17 -O1 -g -fsanitize=address,undefined -fno-fast-math -ffp-contract=off -Wall -Wextra"
+          if [ -f native/loopmix/loop_mix_renderer_ab_main.cpp ]; then
+            g++ $CXXFLAGS -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_ab_main.cpp \
+                -o /tmp/loop_mix_renderer_ab_main_asan
+            /tmp/loop_mix_renderer_ab_main_asan --selftest
+            /tmp/loop_mix_renderer_ab_main_asan --reverb-stop-probe
+            /tmp/loop_mix_renderer_ab_main_asan --loop-domain-probe
+            /tmp/loop_mix_renderer_ab_main_asan --lp-bypass-probe
+            /tmp/loop_mix_renderer_ab_main_asan --v2-probe
+          fi
+          if [ -f native/loopmix/phrase_isolator_test.cpp ]; then
+            g++ $CXXFLAGS -I native/loopmix \
+                native/loopmix/phrase_isolator_test.cpp \
+                -o /tmp/phrase_isolator_test_asan
+            /tmp/phrase_isolator_test_asan
+          fi
+          if [ -f native/loopmix/loop_mix_renderer_startup_probe.cpp ]; then
+            g++ $CXXFLAGS -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_startup_probe.cpp \
+                -o /tmp/loopmix_startup_probe_asan
+            /tmp/loopmix_startup_probe_asan
+          fi
+
+      # B6.6: 10-pair synthetic host render + mixq gate. Generated in-repo
+      # (no copyrighted audio); a representative S1/C2/F1 subset per pair
+      # renders in CI, the full 8-recipe render runs on the devbox via
+      # tools/audition/audition_render.py.
+      - name: Synthetic host render + mixq gate (B6.6)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet numpy
+          g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
+              native/loopmix/loop_mix_renderer.cpp \
+              native/loopmix/loop_mix_renderer_ab_main.cpp \
+              -o /tmp/loop_mix_renderer_ab_main
+          rm -rf /tmp/synthetic-pairs /tmp/synthetic-renders
+          python3 tools/audition/generate_synthetic_pairs.py \
+              --out /tmp/synthetic-pairs --recipes S1,C2,F1
+          mkdir -p /tmp/synthetic-renders
+          for script in /tmp/synthetic-pairs/pair*_*.script.json; do
+            base="$(basename "$script" .script.json)"
+            echo "render $base"
+            /tmp/loop_mix_renderer_ab_main --render "$script" --out "/tmp/synthetic-renders/${base}.wav"
+            cp "/tmp/synthetic-pairs/${base}.meta.json" "/tmp/synthetic-renders/${base}.meta.json"
+          done
+          python3 tools/mixq/mixq.py check /tmp/synthetic-renders \
+              -o /tmp/synthetic-renders/mixq-results.json
+
+      # B10/B13: fork hooks must survive merges; no allocation/logging on
+      # the audio thread.
+      - name: Fork hooks + @AudioThread alloc lint
+        run: |
+          set -euo pipefail
+          bash tools/upstream-sync/hooks-check.sh
+          python3 tools/check_audiothread_alloc.py
 
       # The runner image is ~14 GB free and the NDK alone is ~2 GB.
       - name: Free disk space
@@ -118,6 +201,9 @@ jobs:
       - name: shared jvmTest
         run: ./gradlew :shared:jvmTest --max-workers=2 --no-daemon --stacktrace
 
+      - name: djmix-core jvmTest
+        run: ./gradlew :djmix-core:jvmTest --max-workers=2 --no-daemon --stacktrace
+
       - name: app unit tests
         run: ./gradlew :app:testProdDebugUnitTest --max-workers=2 --no-daemon --stacktrace
 
@@ -128,6 +214,7 @@ jobs:
           name: test-reports
           path: |
             shared/build/reports/tests/
+            djmix-core/build/reports/tests/
             app/build/reports/tests/
           if-no-files-found: ignore
           retention-days: 14
@@ -155,9 +242,12 @@ jobs:
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test
           /tmp/vocal_spectrogram_test
-          echo "--- loopmix renderer A/B selftest ---"
+          echo "--- loopmix renderer A/B selftest (ADR 0008 deterministic flags) ---"
+          # ADR 0008: -fno-fast-math -ffp-contract=off -Wall -Wextra so the
+          # host CLI renders bit-identically to the device renderer (B1.3),
+          # matching bitchord_dsd in app/src/main/cpp/CMakeLists.txt.
           if [ -f native/loopmix/loop_mix_renderer_ab_main.cpp ]; then
-            g++ -std=c++17 -O2 -I native -I native/third_party \
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
                 native/loopmix/loop_mix_renderer.cpp \
                 native/loopmix/loop_mix_renderer_ab_main.cpp \
                 -o /tmp/loop_mix_renderer_ab_main
@@ -168,6 +258,21 @@ jobs:
             /tmp/loop_mix_renderer_ab_main --v2-probe
           else
             echo "loop_mix_renderer_ab_main.cpp not present yet — skipping (Lane B)."
+          fi
+          echo "--- phrase isolator ---"
+          if [ -f native/loopmix/phrase_isolator_test.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/loopmix \
+                native/loopmix/phrase_isolator_test.cpp \
+                -o /tmp/phrase_isolator_test
+            /tmp/phrase_isolator_test
+          fi
+          echo "--- loopmix startup probe ---"
+          if [ -f native/loopmix/loop_mix_renderer_startup_probe.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/loop_mix_renderer_startup_probe.cpp \
+                -o /tmp/loopmix_startup_probe
+            /tmp/loopmix_startup_probe
           fi
 
       - name: Free disk space

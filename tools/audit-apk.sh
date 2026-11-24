@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full release audit for BitChord 1.10-djmix52 (vc94).
+# Full release audit for BitChord 1.10-djmix53 (vc95) / AE 3.0.0.
 #
 #   ./audit-apk.sh path/to/app.apk
 #
@@ -9,6 +9,10 @@
 # smoke checks: there tool absence degrades to a warning, but every payload defect
 # (including ELF page alignment, which needs no SDK tool) still fails, and it never
 # prints AUDIT PASSED and never exits 0.
+#
+# Expected versionName/versionCode default to the current release
+# (1.10-djmix53 / 95) and can be overridden for the next cut:
+#   AUDIT_EXPECTED_VERSION_NAME=1.10-djmix54 AUDIT_EXPECTED_VERSION_CODE=96 ./audit-apk.sh app.apk
 set -uo pipefail
 
 STRUCTURAL_ONLY=0
@@ -37,10 +41,11 @@ need_tool() {
 
 [ -f "$APK" ] || { echo "no such file: $APK"; exit 2; }
 
-# Release identity, pinned once.
+# Release identity, pinned once. Defaults track the current release cut
+# (AE3 ships 1.10-djmix53 / 95, ADR 0004); override via env after bumpDjmix.
 EXPECTED_PACKAGE="com.music.bitchord.loopfix"
-EXPECTED_VERSION_CODE="94"
-EXPECTED_VERSION_NAME="1.10-djmix52"
+EXPECTED_VERSION_CODE="${AUDIT_EXPECTED_VERSION_CODE:-95}"
+EXPECTED_VERSION_NAME="${AUDIT_EXPECTED_VERSION_NAME:-1.10-djmix53}"
 # The published onnxruntime-android:1.31.0 AAR's arm64 core, after Gradle's
 # default release native stripping. The companion libonnxruntime4j_jni.so is
 # the Java bridge, NOT a second core.
@@ -80,14 +85,62 @@ fi
 # --- payload ----------------------------------------------------------------
 listing=$(unzip -l "$APK") || { echo "unzip failed"; exit 2; }
 
-# djmix52 ships no ONNX weights: all three are delivered and verified by the
-# model coordinator (filesDir), never from the APK.
-if printf '%s\n' "$listing" | grep -qiE '[^[:space:]]*\.onnx$'; then
-  bad "ONNX file(s) still packaged:"
-  printf '%s\n' "$listing" | grep -iE '[^[:space:]]*\.onnx$' | sed 's/^/        /'
+# AE3 bundles its CPU models as APK assets (Part A section 3.1): Nirovi
+# (beat) + Syvenu (vocal presence), verified against models.json. Still
+# forbid stray .onnx anywhere under assets/: QNN weights belong in the
+# add-on (Part B4.3), never in the main APK.
+if printf '%s\n' "$listing" | grep -qiE '^[[:space:]]*[0-9]+[[:space:]].*assets/[^[:space:]]*\.onnx$'; then
+  bad "stray .onnx file(s) under assets/:"
+  printf '%s\n' "$listing" | grep -iE '^[[:space:]]*[0-9]+[[:space:]].*assets/[^[:space:]]*\.onnx$' | sed 's/^/        /'
 else
-  ok "no .onnx files anywhere in the APK"
+  ok "no stray .onnx files under assets/"
 fi
+
+# The two pinned AE3 .ort assets (sha256 + bytes from models.json).
+check_ort_asset() {
+  # $1 = assets/<name>  $2 = expected bytes  $3 = expected sha256
+  local name="$1" want_bytes="$2" want_sha="$3"
+  if grep -q "assets/${name}\$" <<< "$listing"; then
+    ok "bundled asset present: assets/$name"
+  else
+    bad "bundled asset MISSING: assets/$name"
+    return
+  fi
+  local got_bytes
+  got_bytes=$(printf '%s\n' "$listing" | awk -v a="assets/$name" '$NF==a{print $1}' | head -1)
+  [ "$got_bytes" = "$want_bytes" ] && ok "assets/$name is $want_bytes B" || bad "assets/$name is ${got_bytes:-?} B, expected $want_bytes"
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/bitchord-ort-asset.XXXXXX")
+  if unzip -p "$APK" "assets/$name" > "$tmp" 2>/dev/null; then
+    local got_sha
+    got_sha=$(sha256sum "$tmp" | cut -d' ' -f1)
+    [ "$got_sha" = "$want_sha" ] && ok "assets/$name SHA-256 matches models.json" || bad "assets/$name SHA-256 $got_sha, expected $want_sha"
+  else
+    bad "could not extract assets/$name"
+  fi
+  rm -f "$tmp"
+}
+check_ort_asset "nirovi_int8.ort" "7948784" "7454d98ab6a88c0b7fe5e91c556b4766ebfabfe3d31ebd61187a033fed489387"
+check_ort_asset "syvenu.ort" "2349304" "1866a5955ed6b0e80f807cb49f56af530121064b8ea5322026566126eb3cd4f3"
+
+# Any other .ort asset is stray (stems/vocal fallback models ship via
+# the models-v1 release, not the APK).
+extra_ort=$(printf '%s\n' "$listing" | grep -iE '^[[:space:]]*[0-9]+[[:space:]].*assets/[^[:space:]]*\.ort$' | grep -vE 'assets/(nirovi_int8|syvenu)\.ort$' || true)
+if [ -n "$extra_ort" ]; then
+  bad "unexpected .ort asset(s) under assets/:"
+  printf '%s\n' "$extra_ort" | sed 's/^/        /'
+else
+  ok "no unexpected .ort assets"
+fi
+
+# Model registry + recipe library (Part B4.1/B5).
+if grep -q 'assets/models\.json$' <<< "$listing"; then
+  ok "model registry assets/models.json present"
+else
+  bad "model registry assets/models.json MISSING"
+fi
+recipe_count=$(printf '%s\n' "$listing" | grep -cE '^[[:space:]]*[0-9]+[[:space:]].*assets/recipes/[^[:space:]]*\.json$' || true)
+[ "$recipe_count" -eq 26 ] && ok "26 recipe JSONs under assets/recipes/" || bad "$recipe_count recipe JSONs under assets/recipes/ (expected 26)"
 
 # Exactly one ORT core, arm64 only. A second copy means a stale ABI or a duplicated
 # dependency; a wrong size/hash means the pinned 1.31.0 artifact was not the one used.

@@ -12,6 +12,7 @@ app/src/main/java/com/music/bitchord/playback/TransitionFilterProcessor.kt
 app/src/main/java/com/music/bitchord/playback/loopmix
 app/src/main/java/com/music/bitchord/playback/smart
 app/src/main/java/com/music/bitchord/playback/djmix
+app/src/main/java/com/music/bitchord/ui/djmix/
 app/src/main/res/values/automix_models.xml
 app/src/test/java/com/music/bitchord/playback/smart
 sharedUi/src/commonMain/composeResources/values/mix_inspector.xml
@@ -64,9 +65,20 @@ app/src/main/cpp
 # --- fork-only tooling, docs, assets ---
 app/src/main/assets/scnet.int8.onnx
 app/src/main/assets/licenses
+app/src/main/assets/recipes/
+app/src/main/assets/models.json
+app/src/main/assets/nirovi_int8.ort
+app/src/main/assets/syvenu.ort
 tools/npu
 tools/models
 tools/upstream-sync
+tools/mixq/
+tools/audition/
+tools/soak/
+tools/untangle/
+docs/adr/
+docs/untangle/
+docs/quality/
 tools/audit-apk.sh
 tools/vc75-gate.sh
 tools/vc91-build.sh
