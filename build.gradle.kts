@@ -124,10 +124,13 @@ tasks.register("bumpDjmix") {
         val newDjmix = nameMatch.groupValues[3].toInt() + 1
         val newName = nameMatch.groupValues[2] + newDjmix.toString().padStart(2, '0') + nameMatch.groupValues[4]
 
-        val updated = codeRe.replaceFirst(text) { m -> m.groupValues[1] + newCode.toString() }
+        val updated = codeRe.replaceFirst(text, codeMatch.groupValues[1] + newCode.toString())
             .let { middle ->
-                Regex("""(extra\["bitchordVersionName"\]\s*=\s*")([^"]+djmix)(\d+)(")""")
-                    .replaceFirst(middle) { m -> m.groupValues[1] + m.groupValues[2] + newDjmix.toString().padStart(2, '0') + m.groupValues[4] }
+                nameRe.replaceFirst(
+                    middle,
+                    nameMatch.groupValues[1] + nameMatch.groupValues[2] +
+                        newDjmix.toString().padStart(2, '0') + nameMatch.groupValues[4]
+                )
             }
         file.writeText(updated)
         println("bumpDjmix: versionCode ${codeMatch.groupValues[2]} -> $newCode, " +
