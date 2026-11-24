@@ -47,6 +47,8 @@ import com.music.bitchord.playback.smart.LocalBlendAdmission
 import com.music.bitchord.playback.smart.LyricCue
 import com.music.bitchord.playback.smart.shouldDeclineToMix
 import com.music.bitchord.playback.smart.PhraseConfig
+import com.music.bitchord.playback.smart.PhraseMaps
+import com.music.bitchord.playback.smart.SongMaps
 import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.TransitionMoves
 import com.music.bitchord.playback.smart.FILTER_ECHO_AT
@@ -1263,7 +1265,7 @@ class CrossfadeController(
                 "mix.classic.reason",
                 mapOf("reason" to reason, "planId" to planId, "generation" to generation, "stage" to "arm"),
             )
-            mixExecutor.dispatch(MixEvent.RendererError(FailureKind.RENDERER_UNAVAILABLE, reason, recoverable = false))
+            mixExecutor.dispatch(MixEvent.RendererError(FailureKind.RENDERER_PREPARE_ERROR, reason, recoverable = false))
             return@onControllerThread
         }
         val currentItem = player.currentMediaItem ?: return@onControllerThread
@@ -2723,7 +2725,7 @@ class CrossfadeController(
         } else if (!nativeAvailable && mState.pair != null && mState.stateKind in activePrepStates) {
             val reason = nativeUnavailabilityReason(player)
             classicFallbackReason = reason
-            mixExecutor.dispatch(MixEvent.RendererError(FailureKind.RENDERER_UNAVAILABLE, reason, recoverable = false))
+            mixExecutor.dispatch(MixEvent.RendererError(FailureKind.RENDERER_PREPARE_ERROR, reason, recoverable = false))
             mState = mixExecutor.currentState()
         }
 

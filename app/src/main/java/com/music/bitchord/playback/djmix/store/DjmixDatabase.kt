@@ -90,7 +90,7 @@ class DjmixDatabase(context: Context) :
         const val COL_SAMPLE_COUNT = "sample_count"
         const val COL_UPDATED_AT = "updated_at"
 
-        const val CREATE_TRACK_ANALYSIS = """
+        val CREATE_TRACK_ANALYSIS = """
             CREATE TABLE IF NOT EXISTS track_analysis(
               track_id TEXT NOT NULL,
               content_hash TEXT NOT NULL,
@@ -102,7 +102,7 @@ class DjmixDatabase(context: Context) :
               PRIMARY KEY (track_id, content_hash))
         """.trimIndent()
 
-        const val CREATE_STEM_INDEX = """
+        val CREATE_STEM_INDEX = """
             CREATE TABLE IF NOT EXISTS stem_index(
               track_id TEXT NOT NULL,
               window_start_ms INTEGER NOT NULL,
@@ -114,7 +114,7 @@ class DjmixDatabase(context: Context) :
               PRIMARY KEY (track_id, window_start_ms, window_end_ms, model_id))
         """.trimIndent()
 
-        const val CREATE_TRANSITION_HISTORY = """
+        val CREATE_TRANSITION_HISTORY = """
             CREATE TABLE IF NOT EXISTS transition_history(
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               out_id TEXT NOT NULL,
@@ -129,7 +129,7 @@ class DjmixDatabase(context: Context) :
               created_at INTEGER NOT NULL)
         """.trimIndent()
 
-        const val CREATE_PREFERENCE = """
+        val CREATE_PREFERENCE = """
             CREATE TABLE IF NOT EXISTS preference(
               pref_key TEXT PRIMARY KEY,
               weight REAL NOT NULL,

@@ -2160,7 +2160,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val vocalValues = if (includeVocals && spec != null) {
             synchronized(presenceLock) {
-                if (yieldOrStopped()) null else vocalPresence.track(it)
+                if (yieldOrStopped()) null else vocalPresence.track(spec)
             }
         } else {
             null
