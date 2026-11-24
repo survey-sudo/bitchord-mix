@@ -15,13 +15,13 @@
 | M1 Contracts + MixMachine | done | `4d92f84b` (`fbb7b0eb`, `fb39161e`, `35b36a39`) | `:djmix-core:jvmTest` 14 passed / 0 failed (matrix 3, property 2, replay 9), wall-clock 27 s, `hooks-check.sh` exit 0 | `djmix-core` pure KMP, B1.3 contracts, B2 reducer, B1.2#5 invariants; ADR 0010 musicality-first + ADR 0006 SQLite addendum; gate 100 percent table cells (220), 10k property green, core under 60 s. |
 | M2 Analysis + store | doing | `28b67dcf` | Nirovi+Syvenu offline models bundled (`nirovi_int8.ort`, `syvenu.ort` sha `1866a5955ed6b0e80f807cb49f56af530121064b8ea5322026566126eb3cd4f3`), UMX removed from analysis path, `djmix.db` WAL store + migration, `QueueAnalysisWorker`; compiled `:shared:compileKotlinJvm` + `:app:compileProdDebugKotlin` exit 0; `:djmix-core:jvmTest` 23/23; `DjmixStoreContractTest` 6/6; `hooks-check.sh` exit 0; `djmix-core` purity 0 matches | Part B3 store and migration plus B3.2 queue job code landed. Gate pending: 4-min track at or under 1.5 s CPU (`<= 1.5 s` timing to verify on phone after M4/APK) and store-survives-restart verified on device. May run with M3. |
 | M3 One brain | doing | `49d40a7f`, `b2c60e03`, `4934ab67`, `3af89502`, `832b54f7` | `djmix-core` musical planner (`PairPlanner`, ADR 0010 brake rationing) + `MixExecutor` driving `MixMachine`, One-Brain `PairPreparer` (containment/no-abort/2nd-executor `djmix-stems`, `requiredStems` overlap gating), `CrossfadeController` first strangler slice −770 lines (9,835 → 9,065 measured 2026-11-24); compiled `:shared:compileKotlinJvm` + `:app:compileProdDebugKotlin` exit 0; `:djmix-core:jvmTest` 23/23; `PairPreparerTest` 6/6; `StuckStateRecoveryTest` 4/4; `hooks-check.sh` exit 0; `plan ==` identity compares 0; `checkShownWatchdog`/`straightRescue` deleted (grep 0) | Gate pending: §10 rows 100 percent overlap, 0 broken, 100 percent frozen, 0 mid-vocal on a 24-transition device run at APK verification. |
-| M4 Render + recipes v2 + audition | doing | `a481d915` (+ fixes `0cabc409`, `e6260ebb`) | C++ DJ-FX rewrite per Part A §5, ADR 0008 FP flags, host `--render` CLI, 26 `RecipeV2` JSONs, `tools/mixq` + `tools/audition`; 6-pair audition pack + `gdrive:` upload in flight (Worker 6A-2-v2) | Gate pending: audition uploaded, owner ratings received (Owner Gate C4 #1), `mixq` green on the corpus. |
+| M4 Render + recipes v2 + audition | doing | `a481d915`, `0cabc409`, `e6260ebb`, `0f5b7bcd`, `30bdcfe4` | C++ DJ-FX rewrite per Part A §5, ADR 0008 FP flags, host `--render` CLI (`5/5` probes + ASan PASS), 26 `RecipeV2` JSONs, `LoopMixRenderer` M4 JNI + `@AudioThread` wired (`0f5b7bcd`), synthetic `S1,C2,F1` `mixq` **30/30 PASS** + negative shifts `-20/+15/+20 ms` FAIL (`30bdcfe4`), 6-pair real pack uploaded to `gdrive:djmix53-audition` (`171 objects, 288.513 MiB`) | Gate pending: Owner Gate C4 #1 ratings >= 3.5 / 0 drop on `gdrive:djmix53-audition`; unified Stage 8 Android/JNI compile. |
 | M5 Speed | todo | — | — | Partial inputs landed: `requiredStems` overlap gating + `LibraryAnalysisWorker` (`832b54f7`). Sc-net dynamic-int8 blocked: export prompt sent to owner; no `torch`/`onnx`/`onnxruntime` on local host or dvb. Gate READY p50 at or under 6 s / p95 at or under 15 s cold, warm at or under 3 s unmeasured. |
-| M6 NPU | doing | `ba482d98` (+ uncommitted `npu-addon/v73/` Stage 7) | `ModelRegistry`, `InferenceBackend`, Orchard V73 `npu_bridge`, `NpuSelfTestRunner`, `npu-addon.yml` | Gate pending: `ep=QNN` self-test PASS on device, NPU ms below CPU, measured numbers in `docs/NPU.md`. May run with M5. |
-| M7 UX | doing | `893c0a62` | Uncluttered AE3 Compose UI (`ui/djmix/*`) per Part A §7 chip + B9 Inspector/History/Settings skeletons; `7D` Compose wiring uncommitted | Gate pending: owner screenshot review "uncluttered". |
-| M8 Diagnostics + learning | doing | `893c0a62` | `TasteModel`, `TelemetryV3`, `DiagnosticsBundler`, `DjmixFlags` (+ `tools/analyze_telemetry_v3.py`, `tools/replay_bundle.py`, uncommitted Stage 7) | Gate pending: flagged bundle replays bit-exact on devbox; learning shifts a recipe weight after 3 thumbs-down. |
+| M6 NPU | doing | `ba482d98`, `0f5b7bcd`, `30bdcfe4` | `ModelRegistry`, `InferenceBackend`, Orchard V73 `npu_bridge`, `NpuSelfTestRunner`, `TrackAnalyzer` M6 wiring (`0f5b7bcd`), `npu-addon/v73/` + `.github/workflows/npu-addon.yml` (`30bdcfe4`) | Gate pending: Stage 8 CMake/NDK compile (`npu_bridge.cpp`), `ep=QNN` self-test PASS on device, NPU ms below CPU, measured numbers in `docs/NPU.md`. May run with M5. |
+| M7 UX | doing | `893c0a62`, `ec7251b6` | Uncluttered AE3 Compose UI (`ui/djmix/*`) per Part A §7 chip + B9 Inspector/History/Settings (`893c0a62`), Compose/AppSettings/PlayerHost wiring (`ec7251b6`, `hooks-check` exit 0) | Gate pending: Stage 8 compile/test + owner screenshot review "uncluttered". |
+| M8 Diagnostics + learning | doing | `893c0a62`, `0f5b7bcd`, `30bdcfe4` | `TasteModel`, `TelemetryV3Writer`, `DiagnosticsBundler`, `DjmixFlags` (`893c0a62`), `MixExecutor` M8 wiring (`0f5b7bcd`), `tools/analyze_telemetry_v3.py` (14/14 smoke) + `tools/replay_bundle.py` (20/20 smoke) (`30bdcfe4`) | Gate pending: flagged bundle `[PENDING DEVICE RUN]` bit-exact replay on devbox; learning shifts a recipe weight after 3 thumbs-down. |
 | M9 Hardening + untangle sweep | todo | — | — | Blueprint written: `/home/hfzhkn/Bitchord/work/m9-strangler-blueprint.md` (extraction map with worker slices). Today measured: `CrossfadeController.kt` 9,065 (target at or under 2,500), `PairPreparer.kt` 2,895, `TrackAnalyzer.kt` 2,623, `LoopMixSession.kt` 2,119 (targets at or under 1,500). B13 dead-code removal (vc93 QNN, `CountdownStabilizer`), D2 step 5 sweeps, B6.5 soak, B6.4 perf, B15 budgets; gate soak plus perf plus size plus D4 targets. Tests done last here. |
-| M10 Sync + release engineering + docs | doing | Stage 7 (uncommitted; `7A`+`7C`+`7F`+`7D`) | `.github/workflows/release.yml` + `npu-addon.yml` + `bumpDjmix` + `audit-apk.sh` on disk; 9 B12 docs in `docs/`; `CHANGELOG.md` started; sync dry-run **0 conflicts** vs `upstream/main` `21356206` (B10.4 gate PASSED, report `../Bitchord/work/ae3-sync-dryrun.md`); `hooks-check.sh` exit 0 (32/32 hooks) | Gate remaining: all of it verified green in CI after Stage 7 commits push; release pipeline APK from tag. |
+| M10 Sync + release engineering + docs | doing | `ec7251b6`, `0f5b7bcd`, `30bdcfe4` (+ docs commit) | `.github/workflows/{android-ci,release,npu-addon}.yml`, `app/build.gradle.kts` v1+v2+v3 signing, `bumpDjmix`, `tools/audit-apk.sh`, `tools/soak/soak.sh` (22/22 local smoke, `[PENDING DEVICE RUN]`), `tools/check_audiothread_alloc.py` (`1 @AudioThread`, exit 0), 9 B12 docs in `docs/` + `CHANGELOG.md`; sync dry-run **0 conflicts** vs `upstream/main` `21356206` (B10.4 gate PASSED, report `../Bitchord/work/ae3-sync-dryrun.md`); `hooks-check.sh` exit 0 (32/32 hooks) | Gate remaining: Stage 8 `dvb` Gates 1–3 + CI green after push; `bumpDjmix` + release APK after M9. |
 | M11 Release `1.10-djmix53` (AE 3.0.0) | todo | — | — | C3 checklist; gate owner final listening verdict. |
 
 ## Table 2 — Item Ledger (Parts A and B, plus Part D)
@@ -94,11 +94,11 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | A§8.1 Version bump | todo | — | — | `1.10-djmix53`, versionCode 95, `bitchordUpstreamBase 1.10`. |
 | A§8.2 Install rule | todo | — | — | `adb install -r` only; never uninstall or clear data. |
 | A§8.3 Keep invariants | todo | — | — | vc80 loop / handover, sticky pause, surviving-deck rule, bit-identical native probes when v2 setters unused. |
-| A§9.1 Host render CLI | todo | — | — | Extend `native/loopmix/loop_mix_renderer_ab_main.cpp` with `--render script.json --out file.wav`; same renderer code as app. |
-| A§9.2 JVM exporter | todo | — | — | `:shared:auditionExport` or test with `-Daudition=1`; ffmpeg decode, same analysis and scoring, force recipes, SCNet stems. |
-| A§9.3 Showcase six pairs | todo | — | — | EDM-EDM, house-house, pop-pop vocals, hip-hop-hip-hop, pop-EDM jump, ballad-ballad; every allowed recipe plus auto; `pair3_F1_riser-drop.wav` naming plus `index.md`. |
-| A§9.4 Self-check | todo | — | — | True peak at or under minus 1 dBTP; no NaN; LUFS within plus-minus 2 except Festival drops; Syvenu vocal overlap at or under 2 s. List failures in `index.md`. |
-| A§9.5 Upload audition | todo | — | — | Zip to Drive as `djmix53-audition/`; report link; owner picks; tune, re-render, then build APK. |
+| A§9.1 Host render CLI | done | `a481d915` | `native/loopmix/loop_mix_renderer_ab_main.cpp` `--render script.json --out file.wav`; 5/5 probe + ASan suites PASS; 30/30 synthetic WAVs rendered | Same `Renderer` C++ engine as Android JNI. |
+| A§9.2 JVM exporter | doing | `a481d915`, `30bdcfe4` | `tools/audition/` + `tools/audition/generate_synthetic_pairs.py` (`30bdcfe4`) + real audition harness (`6A-2-v2`) | Real 6-pair audition exported & uploaded (`gdrive:djmix53-audition`); JVM `-Daudition=1` tie-in pending Stage 8. |
+| A§9.3 Showcase six pairs | done | `6A-2-v2` (Drive upload) | 78/79 real WAVs (after deleting orphan `pair1_F2`) across 6 pairs uploaded (`171 objects, 288.513 MiB`) to `gdrive:djmix53-audition` | Ready for Owner Gate C4 #1 listening ratings. |
+| A§9.4 Self-check | doing | `30bdcfe4` | Synthetic CI corpus `S1,C2,F1` **30/30 PASS** + negative shifts `-20/+15/+20 ms` FAIL (`beatPhase`); real corpus `mixq-results.json` uploaded | Real corpus includes MP3 `beatgrid.py` phase offsets flagged strictly by separated pre/post `mixq`. |
+| A§9.5 Upload audition | doing | `6A-2-v2` (Drive upload) | `gdrive:djmix53-audition` (`171 objects, 288.513 MiB`, incl. `djmix53-audition.zip` + `index.md` + `mixq-report.html`) | Uploaded; awaiting Owner Gate C4 #1 ratings before tuning/APK cut. |
 | A§10.1 Festival 12 | todo | — | — | Cold start, Festival, 12 natural transitions, skip to about 60 s before exit; telemetry plus logcat. |
 | A§10.2 Club 12 | todo | — | — | Club under same protocol. |
 | A§10.3 Subtle 12 | todo | — | — | Subtle under same protocol. |
@@ -139,44 +139,44 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B5.4 Recipe Lab | todo | — | — | Developer settings: pick 2 tracks plus recipe/Auto, exit/entry over waveforms, Preview renders 30 s offline; debug live reload from `Android/data/.../files/recipes/`. |
 | B5.5 20 plus 6 library | todo | — | — | 20 fixed per §5; add C8 Loop roll out, C9 Filter ping-pong, F9 Backspin into drop, F10 Echo freeze, F11 Riser plus impact cut, S6 Breakdown blend; each audition render plus Inspector one-liner. |
 | B6.1 Corpus | todo | — | — | `golden-pairs/` devbox only, never git, `pairs.json`; 40 pairs all genres with 6 jumps, 4 tempo over 8 percent, 4 album, 4 silent intros; owner adds via Flag. |
-| B6.2 mixq metrics | todo | — | — | `tools/mixq/` Python on host WAVs; 8 gates per B6.2; `mixq report` HTML per pair/recipe plus aggregate to `docs/quality/AE3-<build>.html`. |
+| B6.2 mixq metrics | doing | `a481d915`, `30bdcfe4` | `tools/mixq/mixq.py`: Part B6.2 gates enforced (`med<=10 ms`, `p95<=25 ms`, `<= -1 dBTP`); synthetic `S1,C2,F1` **30/30 PASS**, negative shifts (`-20/+15/+20 ms`) FAIL (`18.59/14.95/21.02 ms`) | HTML per-pair report integrated; real devbox golden corpus run pending. |
 | B6.3 Listening gate | todo | — | — | `tools/audition/` HTML per pair, 1–5 stars, keep/fix/drop, notes to `ratings.json`; Drive `AE3-audition-<build>/`; gate average at least 3.5, no drop votes ship enabled. |
 | B6.4 Perf benchmarks | todo | — | — | 6 macrobenchmark metrics on owner phone over ADB to `docs/perf/AE3-<build>.md`; regression over 20 percent fails gate. |
-| B6.5 Soak test | todo | — | — | `tools/soak/soak.sh` 2-hour 40-track Festival autoplay with random seek/skip/pause/edit/level/BT/foreground; 0 crashes/ANRs, 0 broken, 100 percent overlap, under 50 MB, no stuck. |
-| B6.6 CI | todo | — | — | Core tests, native gates incl `--v2-probe` identity, 10 synthetic in-repo pairs SHA plus `mixq`, APK audit; real corpus via `make ae3-quality` on devbox. |
-| B7.1 Flag bundle | todo | — | — | Inspector plus History row menu; zip to `.../files/djmix-reports/<ts>.zip` with Plan, Script, 5-min events, analysis, 40 s FLAC ring capture; share sheet to Drive. |
-| B7.2 Replay | todo | — | — | `djmix-render replay <bundle.zip> --out replay.wav` bit-exact given source PCM; MixEvent log through MixMachine. |
-| B7.3 Telemetry v3 | todo | — | — | One JSONL schema `engine=3.0.0`, planId, generation, state; rotation 10 MB x 3; `tools/analyze_telemetry.py` produces §10 table. |
-| B7.4 Developer settings | todo | — | — | 7-tap About: force level/recipe, grid, Details, diagnostics export, model/backend status plus self-tests plus clear stem cache, Safe mode S1/S5 rollback. |
+| B6.5 Soak test | doing | `30bdcfe4` | `tools/soak/soak.sh` verified 22/22 local smoke checks (charge guard, clock `-T`, exit handling) | `[PENDING DEVICE RUN]` 2-hour 40-track POCO F6 soak after M9/Stage 8 APK. |
+| B6.6 CI | doing | `30bdcfe4` | `.github/workflows/android-ci.yml`: core tests, ASan/UBSan native probes, synthetic `S1,C2,F1` `mixq` (**30/30 PASS** locally), `hooks-check`, `@AudioThread`, APK audit | Stage 8 `dvb` local gates & GitHub CI run pending push. |
+| B7.1 Flag bundle | doing | `893c0a62`, `0f5b7bcd`, `ec7251b6` | `DiagnosticsBundler` wired into `MixExecutor` (`0f5b7bcd`) and Flag UI (`ec7251b6`) | `[PENDING DEVICE RUN]` Flag export on POCO F6. |
+| B7.2 Replay | doing | `30bdcfe4` | `tools/replay_bundle.py` verified 20/20 local smoke checks | `[PENDING DEVICE RUN]` Bit-exact devbox replay of a real Flag bundle. |
+| B7.3 Telemetry v3 | doing | `893c0a62`, `0f5b7bcd`, `30bdcfe4` | `TelemetryV3Writer` wired into `MixExecutor` (`0f5b7bcd`); `tools/analyze_telemetry_v3.py` 14/14 smoke checks (`30bdcfe4`) | `[PENDING DEVICE RUN]` for real 36+10 transition §10 table. |
+| B7.4 Developer settings | doing | `893c0a62`, `ec7251b6` | `DjmixDeveloperSettingsSheet` wired in `SettingsSheet.kt` (`ec7251b6`) | Pending Stage 8 compile + device check. |
 | B8.1 Signals | todo | — | — | Explicit thumbs up/down; implicit skip within 15 s after mix minus 1, seek back into OUT minus 1, 3 consecutive full plays plus 0.2 each. |
 | B8.2 Model bounded | todo | — | — | Per-recipe and per-(recipe, genre) weights in `preference`, bounded Beta/Elo so no recipe exceeds plus-minus 0.3 of score; separate inspectable scorer term. |
 | B8.3 Controls | todo | — | — | Settings Automix Learn toggle default on, Reset learned preferences. |
 | B8.4 Determinism | todo | — | — | Learning off or reset gives same pick for same pair/level fixed seed; Inspector shows taste offset e.g. plus 0.12 when on. |
-| B9.1 Player chip only | todo | — | — | Single chip from A§7; no other automix UI on player. |
-| B9.2 Inspector final | todo | — | — | Header, Timeline (waveforms, overlap shade, swap mark, FX lanes, live playhead), Readiness row, Why plus taste, Actions (Try another, thumbs, Flag), Details hidden. |
-| B9.3 Mix History | todo | — | — | Settings Automix History: last 100 with time, pair, recipe, level, rating, flag; tap summary, long-press flag/rate. |
-| B9.4 Settings reorg | todo | — | — | 7 items: on/off, level with one-liners, Stem mixing, NPU row plus add-on prompt, Learn, History; Safe mode Developer only. |
-| B9.5 First run | todo | — | — | One-screen explainer of 3 levels plus chip, no tour. |
+| B9.1 Player chip only | doing | `893c0a62`, `ec7251b6` | `AutomixStatusChip` wired in `MiniPlayer.kt` / `PlayerControls.kt` (`ec7251b6`) | Pending owner screenshot review "uncluttered". |
+| B9.2 Inspector final | doing | `893c0a62`, `ec7251b6` | `MixInspectorSheetV3` wired in `MixViewPopup.kt` / `AndroidPlayerHost.kt` (`ec7251b6`) | Pending Stage 8 + owner UI check. |
+| B9.3 Mix History | doing | `893c0a62`, `ec7251b6` | `MixHistoryScreen` wired via `SettingsSheet.kt` (`ec7251b6`) | Pending Stage 8 + device run. |
+| B9.4 Settings reorg | doing | `ec7251b6` | `SettingsSheet.kt` + `AppSettings.kt` reorganized for AE3 (`hooks-check` exit 0) | Pending Stage 8 + owner check. |
+| B9.5 First run | doing | `893c0a62`, `ec7251b6` | `AutomixFirstRunDialog` wired in Stage 7 (`ec7251b6`) | Pending Stage 8 + device run. |
 | B9.6 Accessibility | todo | — | — | Content descriptions, no color-only info, reduced-motion honoured for timeline. |
-| B10.1 Fork hooks | todo | — | — | Every fork change in upstream-owned files is `FORK-HOOK(id)`; `hooks-check.sh` passes in CI. |
-| B10.2 fork-owned.txt | todo | — | — | Lists `djmix-*` modules plus fork docs and tools. |
+| B10.1 Fork hooks | doing | `30bdcfe4`, `ec7251b6` | `tools/upstream-sync/hooks-check.sh` exit 0, **32/32 hooks** ok across Stage 7 commits | Re-verified after Stage 7 UI & runtime commits. |
+| B10.2 fork-owned.txt | done | `30bdcfe4` | `tools/upstream-sync/fork-owned.txt` updated with AE3 modules, docs, and tools; `hooks-check.sh` 32/32 ok | — |
 | B10.3 Daily bot | todo | — | — | `upstream-sync.yml` enabled with `SYNC_TOKEN`; ask owner to create it. |
-| B10.4 Dry run | todo | — | — | `sync.sh` vs upstream `main` HEAD dry run; report conflicts at or under 5 hotspots; 1.11 under an hour plus soak. |
-| B10.5 Versioning base | todo | — | — | `bitchordUpstreamBase` maintained by `sync.sh`; versionName `<upstream>-djmix<N>`. |
-| B11.1 Release pipeline | todo | — | — | `release.yml` manual tag `ae3-*`: build, gates, sign, changelog from conventional commits, attach APK + `models.json` + quality HTML. Heavy work stays devbox, linked. |
-| B11.2 bumpDjmix | todo | — | — | `./gradlew bumpDjmix` bumps djmix number and versionCode together, refuses dirty tree. |
-| B11.3 CHANGELOG | todo | — | — | `CHANGELOG.md` in owner language, one short section per build. |
+| B10.4 Dry run | done | `../Bitchord/work/ae3-sync-dryrun.md` | Worker 7F `sync.sh` dry-run vs `upstream/main` `21356206`: **0 conflicts** (gate `<=5` PASS) | 1.11 live merge still post-1.10-djmix53. |
+| B10.5 Versioning base | doing | `30bdcfe4` | `app/build.gradle.kts` `ENGINE_VERSION = "3.0.0"`, v1+v2+v3 signing, `bitchordUpstreamBase = "1.10"` | Version bump to `1.10-djmix53` / vc95 via `bumpDjmix` at M10. |
+| B11.1 Release pipeline | doing | `30bdcfe4` | `.github/workflows/release.yml` + `tools/audit-apk.sh` committed (`30bdcfe4`) | Trigger on `ae3-*` tag at M10. |
+| B11.2 bumpDjmix | doing | `30bdcfe4` | `bumpDjmix` Gradle task in `build.gradle.kts` (`30bdcfe4`) | Execute at M10 clean-tree release cut. |
+| B11.3 CHANGELOG | doing | docs commit | `CHANGELOG.md` created for AE 3.0.0 (`1.10-djmix53`) | Final release notes updated at M10 tag. |
 | B11.4 Rollback | todo | — | — | No downgrade via `install -r`, never uninstall; rollback is Safe mode plus flags plus fix-forward; keep last 3 signed APKs. |
-| B11.5 Feature flags | todo | — | — | One `DjmixFlags`: defaults, optional `flags.json` in models release Wi-Fi only SHA-verified, Developer overrides; every v2 kill switch moves here. |
-| B12.1 ARCHITECTURE.md | todo | — | — | Modules, data flow, threads, dependency rules, one diagram. |
-| B12.2 ENGINE_CONTRACTS.md | todo | — | — | All schemas with examples, versioning policy. |
-| B12.3 MIXMACHINE.md | todo | — | — | State and event table with invariants. |
-| B12.4 RECIPES.md | todo | — | — | Author, lint, preview, audition; full recipe table. |
-| B12.5 QUALITY.md | todo | — | — | Corpus, metrics, gates; how to run `mixq`, audition, perf, soak. |
-| B12.6 NPU.md | todo | — | — | Backends, add-on, measured numbers, troubleshooting. |
-| B12.7 SYNC.md | todo | — | — | Upstream sync playbook updated. |
-| B12.8 RELEASE.md | todo | — | — | Release checklist C3, versioning, rollback. |
-| B12.9 TUNING.md | todo | — | — | Symptom to knob table, updated for AE3. |
+| B11.5 Feature flags | doing | `893c0a62`, `0f5b7bcd` | `DjmixFlags` wired into `TrackAnalyzer` + `MixExecutor` (`0f5b7bcd`) | Safe-mode / remote `flags.json` exercise pending M11. |
+| B12.1 ARCHITECTURE.md | done | docs commit | `docs/ARCHITECTURE.md` created in Stage 7 (`7C`) | Cross-checked against modules & ADRs. |
+| B12.2 ENGINE_CONTRACTS.md | done | docs commit | `docs/ENGINE_CONTRACTS.md` created in Stage 7 (`7C`) | Schemas & versioning documented. |
+| B12.3 MIXMACHINE.md | done | docs commit | `docs/MIXMACHINE.md` created in Stage 7 (`7C`) | 11x20 state/event table & invariants documented. |
+| B12.4 RECIPES.md | done | docs commit | `docs/RECIPES.md` created in Stage 7 (`7C`) | 26 RecipeV2 entries & authoring guide documented. |
+| B12.5 QUALITY.md | done | docs commit | `docs/QUALITY.md` synced with `7B-v3` telemetry/soak/replay tools & B6.2 `mixq` | Updated after `7B-v3` smoke suite (56/56 checks). |
+| B12.6 NPU.md | doing | docs commit | `docs/NPU.md` created in Stage 7 (`7C`) | Pending on-device POCO F6 benchmark numbers (M6/M11 gate). |
+| B12.7 SYNC.md | done | docs commit | `docs/SYNC.md` created in Stage 7 (`7C`) | Includes 0-conflict `upstream/main` dry-run workflow. |
+| B12.8 RELEASE.md | done | docs commit | `docs/RELEASE.md` created in Stage 7 (`7C`) | C3 checklist, signing, rollback, `bumpDjmix`. |
+| B12.9 TUNING.md | done | docs commit | `docs/TUNING.md` created in Stage 7 (`7C`) | Symptom-to-knob table updated for AE3. |
 | B12.10 adr/ 0001–0007 | done | ae3 bootstrap | `docs/adr/0001-one-brain-pair-preparer.md`, `0002-prepared-only-execution.md`, `0003-orchard-models-and-addon.md`, `0004-version-scheme.md`, `0005-mixmachine-reducer.md`, `0006-room-analysis-store.md`, `0007-recipes-as-data.md` | 7 ADRs created this step (10–20 lines each, Context/Decision/Consequences). Full ADR set grows via decisions as needed (B12 requires at least these 7). |
 | B12.11 AE3_LEDGER.md | done | ae3 bootstrap | `docs/AE3_LEDGER.md` (this file) | Created this step with Tables 1–3 covering all M0–M11 and A/B items. |
 | B12.12 Archive contradictions | todo | — | — | Delete or archive anything contradicting B12 docs, including old handover and parity vc80-era statements. |
@@ -184,7 +184,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B13.2 Delete vc91 rungs | todo | — | — | Unreachable rungs after planner moves into `djmix-core`. |
 | B13.3 Delete CountdownStabilizer | todo | — | — | Paths superseded by MixMachine. |
 | B13.4 Delete rescue and watchdog | todo | — | — | `straightRescue`, plus 1.2 s watchdog. |
-| B13.5 Thread annotations | doing | 7E-v2 (uncommitted Stage 7) | `app/src/main/java/com/music/bitchord/playback/djmix/ThreadAnnotations.kt` in tree; `tools/check_audiothread_alloc.py` present | `@AudioThread` / `@PrepThread` / `@MainThread` in `djmix-render` and `djmix-android`; lint forbids allocation APIs and `Log` inside audio functions. Verification pending Stage 8 build. |
+| B13.5 Thread annotations | doing | `0f5b7bcd`, `30bdcfe4` | `ThreadAnnotations.kt` + `@AudioThread` on `LoopMixRenderer.render` (`0f5b7bcd`); `python3 tools/check_audiothread_alloc.py` (`132 Kotlin files, 1 @AudioThread regions`, exit 0) | Full Stage 8 Gradle compile + additional M9 `@AudioThread` annotations pending. |
 | B13.6 Native warnings/sanitizers | todo | — | — | `-Wall -Wextra` zero new warnings in `native/loopmix` and `native/analyzer`; ASan/UBSan on loopmix host probes as done for analyzer. |
 | B13.7 Kotlin size and KDoc | todo | — | — | No `djmix-*` file over 1,500 lines (Recipes data excepted); public APIs get KDoc. |
 | B14.1 No secrets in git | todo | — | — | Signing in CI secrets and devbox keystore only. |
