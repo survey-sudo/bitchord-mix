@@ -156,7 +156,7 @@ data class PlacementPrefsV2(
 )
 
 /**
- * Data-driven recipe contract (`schema = 2`, B5). Recipes are loaded from `recipes/*.json`
+ * Data-driven recipe contract (`schema = 2`, B5). Recipes are loaded from the recipes folder
  * and interpreted by `djmix-core/recipes` into [TransitionScriptV1] instances.
  */
 @Serializable

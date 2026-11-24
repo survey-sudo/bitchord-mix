@@ -346,7 +346,7 @@ object MixMachine {
     private fun onRendererError(state: MixState, event: MixEvent.RendererError, config: MixMachineConfig): Pair<MixState, List<MixEffect>> {
         if (state.stateKind !in ACTIVE_NON_TERMINAL) return state to emptyList()
         val detail = event.message.ifEmpty { event.code.name }
-        val cleanup = if (state is MixState.Running || state is MixState.HandingOver) {
+        val cleanup: List<MixEffect> = if (state is MixState.Running || state is MixState.HandingOver) {
             listOf(MixEffect.Retire(DeckTarget.OUT, state.generation, preserveSurvivor = true))
         } else {
             buildList {
