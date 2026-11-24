@@ -1,0 +1,131 @@
+{
+  "schema": 1,
+  "minEngine": "3.0.0",
+  "models": [
+    {
+      "id": "nirovi-cpu",
+      "version": "int8-1",
+      "fileName": "nirovi_int8.ort",
+      "bytes": 7948784,
+      "sha256": "7454d98ab6a88c0b7fe5e91c556b4766ebfabfe3d31ebd61187a033fed489387",
+      "source": "asset:nirovi_int8.ort",
+      "frontend": "beat-mel-22k-1024-441-128",
+      "io": {
+        "inputs": [{ "name": "input_spectrogram", "shape": [1, 1500, 128], "type": "FLOAT" }],
+        "outputs": [
+          { "name": "beat", "shape": [1, 1500], "type": "FLOAT" },
+          { "name": "downbeat", "shape": [1, 1500], "type": "FLOAT" }
+        ]
+      },
+      "backends": ["cpu-ort"],
+      "role": "beat",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "nirovi-qnn",
+      "version": "a8w8-1",
+      "fileName": "nirovi_qnn.onnx",
+      "bytes": null,
+      "sha256": null,
+      "checksumStatus": "addon-verified-pending",
+      "source": "addon-asset:nirovi_qnn.onnx",
+      "frontend": "beat-mel-22k-1024-441-128",
+      "io": {
+        "inputs": [{ "name": "input_spectrogram", "shape": [1, 1500, 128], "type": "FLOAT" }],
+        "outputs": [
+          { "name": "beat", "shape": [1, 1500], "type": "FLOAT" },
+          { "name": "downbeat", "shape": [1, 1500], "type": "FLOAT" }
+        ]
+      },
+      "backends": ["qnn-v73"],
+      "role": "beat",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "syvenu-cpu",
+      "version": "int8-1",
+      "fileName": "syvenu.ort",
+      "bytes": 2349304,
+      "sha256": "1866a5955ed6b0e80f807cb49f56af530121064b8ea5322026566126eb3cd4f3",
+      "source": "asset:syvenu.ort",
+      "frontend": "beat-mel-22k-1024-441-128",
+      "io": {
+        "inputs": [{ "name": "mel", "shape": [1, -1, 128], "type": "FLOAT" }],
+        "outputs": [{ "name": "presence", "shape": [-1, -1], "type": "FLOAT" }]
+      },
+      "backends": ["cpu-ort"],
+      "role": "vocal",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "syvenu-qnn",
+      "version": "a8w8-1",
+      "fileName": "syvenu_qnn.onnx",
+      "bytes": null,
+      "sha256": null,
+      "checksumStatus": "addon-verified-pending",
+      "source": "addon-asset:syvenu_qnn.onnx",
+      "frontend": "beat-mel-22k-1024-441-128",
+      "io": {
+        "inputs": [{ "name": "mel", "shape": [1, -1, 128], "type": "FLOAT" }],
+        "outputs": [{ "name": "presence", "shape": [-1, -1], "type": "FLOAT" }]
+      },
+      "backends": ["qnn-v73"],
+      "role": "vocal",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "scnet-dyn-int8",
+      "version": "dyn-int8-placeholder",
+      "fileName": "scnet_dyn_int8.onnx",
+      "bytes": null,
+      "sha256": null,
+      "checksumStatus": "unpinned-placeholder",
+      "source": "release:models-v1/scnet_dyn_int8.onnx",
+      "frontend": "stft-scnet",
+      "io": null,
+      "backends": ["cpu-ort"],
+      "role": "stems",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "scnet-int8",
+      "version": "int8-1",
+      "fileName": "scnet.int8.onnx",
+      "bytes": 12900277,
+      "sha256": "98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845",
+      "source": "release:models-v1/scnet.int8.onnx",
+      "frontend": "stft-scnet",
+      "io": null,
+      "backends": ["cpu-ort"],
+      "role": "stems",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "vocals-umxhq-int8",
+      "version": "int8-1",
+      "fileName": "vocals_umxhq_int8.onnx",
+      "bytes": 9054206,
+      "sha256": "a2be987b55a29bc149d3a6ae99b08175d81f85ee292a8ea21f96c3a473bc94cb",
+      "source": "release:models-v1/vocals_umxhq_int8.onnx",
+      "frontend": "stft-umx",
+      "io": null,
+      "backends": ["cpu-ort"],
+      "role": "vocal",
+      "minEngine": "3.0.0"
+    },
+    {
+      "id": "beat-this-q8",
+      "version": "final0-q8",
+      "fileName": "beat_this_final0_q8.onnx",
+      "bytes": 23138816,
+      "sha256": "7801f9c1adfd5ff193f37ececa3320bf1fda1ddee2bf7de341cea4c25ffd0acd",
+      "source": "release:models-v1/beat_this_final0_q8.onnx",
+      "frontend": "beat-mel-22k-1024-441-128",
+      "io": null,
+      "backends": ["cpu-ort"],
+      "role": "beat",
+      "minEngine": "3.0.0"
+    }
+  ]
+}

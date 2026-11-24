@@ -32,6 +32,9 @@ add_library(bitchord_analysis SHARED
     jni/mel_jni.cpp
     jni/vocal_jni.cpp
     jni/npu_jni.cpp
+    # AUTOMIX-V2(A): dlopen bridge to the Orchard NPU add-on runtime. Opened by
+    # absolute path at runtime, never linked, so it drops to CPU if absent.
+    jni/npu_bridge.cpp
     # AUTOMIX-V2(B)
     jni/stem_jni.cpp
 )
@@ -46,7 +49,8 @@ target_include_directories(bitchord_analysis PRIVATE
 target_compile_options(bitchord_analysis PRIVATE -O3 -fno-fast-math -ffp-contract=off -Wall -Wextra -fvisibility=hidden)
 
 find_library(log-lib log)
-target_link_libraries(bitchord_analysis ${log-lib})
+find_library(dl-lib dl)
+target_link_libraries(bitchord_analysis ${log-lib} ${dl-lib})
 
 # 16KB page-size support (Android 15+ 16KB kernels, Play requirement): align
 # LOAD segments to 16KB. A superset of 4KB alignment, so 4KB devices are
