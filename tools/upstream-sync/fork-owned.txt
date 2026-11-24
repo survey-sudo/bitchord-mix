@@ -4,6 +4,7 @@
 # Git pathspecs; directories are recursive.
 
 # --- automix engine (fork rewrite since v1.9.1) ---
+djmix-core/
 app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
 app/src/main/java/com/music/bitchord/playback/AutomixTelemetry.kt
 app/src/main/java/com/music/bitchord/playback/MixDebug.kt
