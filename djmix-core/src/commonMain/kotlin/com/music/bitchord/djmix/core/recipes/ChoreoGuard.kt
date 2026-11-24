@@ -139,10 +139,10 @@ object ChoreoGuard {
         if (script.schema != 1) return "TransitionScriptV1 schema must be 1, got ${script.schema}"
         if (plan.overlapDurationMs <= 0L) return "overlapDurationMs must be positive"
         if (plan.barDurationMs <= 0L) return "barDurationMs must be positive"
-        if (!script.outRegion.levelGain.isFinite() || script.outRegion.levelGain <= 0f) {
+        if (!script.outRegion.levelGain.isFinite() || script.outRegion.levelGain < 0f) {
             return "Invalid outRegion levelGain=${script.outRegion.levelGain}"
         }
-        if (!script.inRegion.levelGain.isFinite() || script.inRegion.levelGain <= 0f) {
+        if (!script.inRegion.levelGain.isFinite() || script.inRegion.levelGain < 0f) {
             return "Invalid inRegion levelGain=${script.inRegion.levelGain}"
         }
         if (!script.loudness.targetLufs.isFinite() ||
@@ -157,11 +157,24 @@ object ChoreoGuard {
         checkFxParams(script.fxParams, plan)?.let { return it }
 
         val releaseSec = plan.overlapDurationMs / 1000.0
-        val outStopSec = (script.outRegion.stopAtMixMs ?: plan.overlapDurationMs) / 1000.0
+        val outStopSec = script.renderGeometry?.out?.stopAtMixSec
+            ?: (script.outRegion.stopAtMixMs ?: plan.overlapDurationMs) / 1000.0
         if (outStopSec < releaseSec - 1e-6) {
             return "OUT stopAtMix (${outStopSec}s) precedes release (${releaseSec}s)"
         }
 
+        return checkExecutionLanes(script, releaseSec, outStopSec, requireStemsOnStemLanes,
+            if (swapsBass) plan.barDurationMs / 4000.0 else null)
+    }
+
+    /** Checks native lane/boundary invariants without inventing a plan for serialized replay. */
+    internal fun checkExecutionLanes(
+        script: TransitionScriptV1,
+        releaseSec: Double,
+        outStopSec: Double,
+        requireStemsOnStemLanes: Boolean = true,
+        bassBeatSec: Double? = null,
+    ): String? {
         val seenKeys = HashSet<Pair<DeckTarget, EnvelopeKind>>(script.envelopes.size)
         val outLanes = LinkedHashMap<EnvelopeKind, EnvelopeLane>()
         val inLanes = LinkedHashMap<EnvelopeKind, EnvelopeLane>()
@@ -180,8 +193,8 @@ object ChoreoGuard {
             return it
         }
 
-        if (swapsBass) {
-            checkBassClash(outLanes, inLanes, releaseSec, plan.barDurationMs / 4000.0)?.let {
+        if (bassBeatSec != null) {
+            checkBassClash(outLanes, inLanes, releaseSec, bassBeatSec)?.let {
                 return it
             }
         }
@@ -243,6 +256,7 @@ object ChoreoGuard {
     ): String? {
         val ts = lane.timesSec
         val vs = lane.values
+        if (ts.isEmpty() || ts.size != vs.size) return "Malformed envelope lane ${lane.deck} ${lane.kind}"
         for (i in ts.indices) {
             if (!ts[i].isFinite()) return "Non-finite time in ${lane.deck} ${lane.kind} at index $i"
             if (!vs[i].isFinite()) return "Non-finite value in ${lane.deck} ${lane.kind} at index $i"

@@ -218,6 +218,8 @@ data class StemRegionRef(
     val startMs: Long,
     val endMs: Long,
     val pcmPath: String? = null,
+    /** Actual resampled PCM rate; execution requires the owning deck's rate. */
+    val sampleRateHz: Int = 48_000,
 ) {
     init {
         require(startMs >= 0L) { "Stem startMs must be non-negative, got $startMs" }
@@ -272,6 +274,9 @@ data class SweepFxParams(
     val qEnd: Float = 1.6f,
     val bars: Int = 8,
     val exponential: Boolean = true,
+    /** Null in legacy descriptive metadata; executable sweeps require both resolved times. */
+    val startMixSec: Double? = null,
+    val endMixSec: Double? = null,
 )
 
 /** Typed parameters for the tempo-synced stereo jet flanger. */
@@ -433,10 +438,14 @@ data class ScriptFxParams(
     val reverb: ReverbFxParams? = null,
     val pump: PumpFxParams? = null,
     val isolate: Boolean = false,
+    /** Explicit base native setSvfQ values; sweep metadata never implies this setter. */
+    val outSvfQ: Float? = null,
+    val inSvfQ: Float? = null,
 )
 
 /**
- * Complete, self-contained transition execution script (`schema = 1`).
+ * Transition script (`schema = 1`). Legacy scripts without [renderGeometry] remain inspectable,
+ * but complete execution must pass ScriptExecutionGuard before preparation/export/render/replay.
  * Shared contract between the device renderer, host CLI `--render`, replay, and audition.
  */
 @Serializable
@@ -454,6 +463,7 @@ data class TransitionScriptV1(
     val stems: List<StemRegionRef> = emptyList(),
     val loudness: LoudnessSettings = LoudnessSettings(),
     val dropWindowMs: TimeRangeMs? = null,
+    val renderGeometry: RenderGeometryV1? = null,
 ) {
     init {
         require(schema == 1) { "TransitionScriptV1 requires schema == 1, got $schema" }

@@ -38,7 +38,7 @@ object RecipeRegistry {
     /** Returns all active recipes (`S1..S6`, `C1..C9`, `F1..F11`, plus any custom IDs) in canonical order. */
     fun all(): List<RecipeV2> {
         val current = overridesById
-        if (current.isEmpty()) return builtInList
+        if (current.isEmpty()) return builtInList.map { it.frozenCopy() }
         val merged = ArrayList<RecipeV2>(builtInList.size + current.size)
         val seen = HashSet<String>(builtInList.size + current.size)
         for (recipe in builtInList) {
@@ -48,7 +48,7 @@ object RecipeRegistry {
         for ((id, extra) in current) {
             if (id !in seen) merged += extra
         }
-        return merged
+        return merged.map { it.frozenCopy() }
     }
 
     /** Returns all enabled active recipes allowed at [level] (`level.atLeast(recipe.level)`). */
@@ -56,10 +56,10 @@ object RecipeRegistry {
         all().filter { it.enabled && level.atLeast(it.level) }
 
     /** Looks up an active recipe by [id] (`S1..F11` or custom override). */
-    fun byId(id: String): RecipeV2? = overridesById[id] ?: builtInById[id]
+    fun byId(id: String): RecipeV2? = (overridesById[id] ?: builtInById[id])?.frozenCopy()
 
     /** Returns the original bundled built-in recipe for [id], ignoring overrides. */
-    fun builtIn(id: String): RecipeV2? = builtInById[id]
+    fun builtIn(id: String): RecipeV2? = builtInById[id]?.frozenCopy()
 
     /** Decodes [jsonText] into a [RecipeV2] without installing an override. */
     fun parseJson(jsonText: String): MixOutcome<RecipeV2> {
@@ -107,7 +107,7 @@ object RecipeRegistry {
             )
         }
         val next = LinkedHashMap(overridesById)
-        next[id] = parsed
+        next[id] = parsed.frozenCopy()
         overridesById = next
         return MixOutcome.Ok(parsed)
     }

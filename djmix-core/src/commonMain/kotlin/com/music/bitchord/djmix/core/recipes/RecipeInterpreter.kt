@@ -23,6 +23,7 @@ import com.music.bitchord.djmix.core.contracts.RecipeAnchor
 import com.music.bitchord.djmix.core.contracts.RecipeFxType
 import com.music.bitchord.djmix.core.contracts.RecipeStepV2
 import com.music.bitchord.djmix.core.contracts.RecipeV2
+import com.music.bitchord.djmix.core.contracts.RenderGeometryV1
 import com.music.bitchord.djmix.core.contracts.RefusalReason
 import com.music.bitchord.djmix.core.contracts.ReverbFxParams
 import com.music.bitchord.djmix.core.contracts.RiserFxParams
@@ -50,7 +51,8 @@ import kotlin.math.sin
 
 /**
  * Pure-KMP interpreter converting a declarative [RecipeV2] and frozen [TransitionPlanV1]
- * into a renderer-ready [TransitionScriptV1], validated by [ChoreoGuard].
+ * into a [TransitionScriptV1]. Complete execution uses [compileFrozen]; [interpret] is the
+ * compatibility/metadata/linter path and cannot execute until exact geometry is supplied.
  */
 object RecipeInterpreter {
 
@@ -71,6 +73,49 @@ object RecipeInterpreter {
         useNoStemVariant: Boolean = false,
         dropWindowMs: TimeRangeMs? = null,
         availableCapabilities: Set<FxCapability> = FxCapability.entries.toSet(),
+    ): MixOutcome<TransitionScriptV1> = compile(
+        recipe, plan, outRegion, inRegion, stems, useNoStemVariant, dropWindowMs,
+        availableCapabilities, geometry = null,
+    )
+
+    /**
+     * Compiles the exact recipe and final geometry retained by a frozen generation. The shared
+     * compiler resolves anchors against that geometry; it never extends a stop or invents loops.
+     * Region execution fields must already be checked rounded-ms projections of [geometry].
+     */
+    fun compileFrozen(
+        recipe: RecipeV2,
+        plan: TransitionPlanV1,
+        geometry: RenderGeometryV1,
+        outRegion: AudioRegionRef,
+        inRegion: AudioRegionRef,
+        stems: List<StemRegionRef> = emptyList(),
+        useNoStemVariant: Boolean = false,
+        availableCapabilities: Set<FxCapability> = FxCapability.entries.toSet(),
+        dropWindowMs: TimeRangeMs? = null,
+    ): MixOutcome<TransitionScriptV1> {
+        if (recipe.lengthOptionsBars.isEmpty() || recipe.lengthOptionsBars.any { it <= 0 }) {
+            return MixOutcome.Refused(RefusalReason.CHOREOGRAPHY_UNAVAILABLE, "recipe_length_options_invalid")
+        }
+        return compile(
+            recipe.frozenCopy(), plan, outRegion, inRegion, stems.toList(), useNoStemVariant,
+            dropWindowMs, availableCapabilities.toSet(), geometry.copy(
+                out = geometry.out.copy(knotFrames = geometry.out.knotFrames.toList(), knotPositions = geometry.out.knotPositions.toList()),
+                inbound = geometry.inbound.copy(knotFrames = geometry.inbound.knotFrames.toList(), knotPositions = geometry.inbound.knotPositions.toList()),
+            ),
+        )
+    }
+
+    private fun compile(
+        recipe: RecipeV2,
+        plan: TransitionPlanV1,
+        outRegion: AudioRegionRef,
+        inRegion: AudioRegionRef,
+        stems: List<StemRegionRef>,
+        useNoStemVariant: Boolean,
+        dropWindowMs: TimeRangeMs?,
+        availableCapabilities: Set<FxCapability>,
+        geometry: RenderGeometryV1?,
     ): MixOutcome<TransitionScriptV1> {
         if (!recipe.enabled) {
             return MixOutcome.Refused(
@@ -106,6 +151,17 @@ object RecipeInterpreter {
         }
 
         val stepList = if (useNoStemVariant) recipe.noStemSteps else recipe.steps
+        if (geometry != null) {
+            ScriptExecutionGuard.recipeRefusal(recipe, plan, stepList, useNoStemVariant, availableCapabilities)?.let { return it }
+            if (recipe.requirements.requiresOutLoop && geometry.out.loopEndFrame <= geometry.out.loopStartFrame) {
+                return MixOutcome.Refused(RefusalReason.HANDOFF_INVALID_GEOMETRY, "frozen_recipe_requires_out_loop")
+            }
+            val setup = TransitionScriptV1(
+                planId = plan.planId, generation = plan.generation, sampleRateHz = outRegion.sampleRateHz,
+                outRegion = outRegion, inRegion = inRegion, stems = stems, renderGeometry = geometry,
+            )
+            ScriptExecutionGuard.geometryRefusal(setup, plan)?.let { return it }
+        }
         if (stepList.isEmpty()) {
             val reason = if (useNoStemVariant) {
                 RefusalReason.NO_STEM_RECIPE_UNAVAILABLE
@@ -117,6 +173,9 @@ object RecipeInterpreter {
 
         val effectiveStems = if (useNoStemVariant) emptyList() else stems
         if (!useNoStemVariant) {
+            if (geometry != null && effectiveStems.map { it.deck to it.stem }.toSet().size < recipe.requirements.minStemCount) {
+                return MixOutcome.Refused(RefusalReason.STEM_DUCK_UNAVAILABLE, "recipe_min_stem_count_unavailable")
+            }
             for (req in recipe.requirements.requiredStems) {
                 if (effectiveStems.none { it.deck == req.deck && it.stem == req.stem }) {
                     return MixOutcome.Refused(
@@ -134,13 +193,15 @@ object RecipeInterpreter {
             useNoStemVariant = useNoStemVariant,
             availableCapabilities = availableCapabilities,
             stepList = stepList,
+            geometry = geometry,
         )
         for (step in stepList) {
             compiler.apply(step)
         }
+        compiler.refusal?.let { return it }
 
         val outStopMs = (compiler.ctx.outStopSec * 1000.0).roundToLong().coerceAtLeast(plan.overlapDurationMs)
-        val finalOutRegion = if (outRegion.stopAtMixMs != null && outRegion.stopAtMixMs >= outStopMs) {
+        val finalOutRegion = if (geometry != null || (outRegion.stopAtMixMs != null && outRegion.stopAtMixMs >= outStopMs)) {
             outRegion
         } else {
             outRegion.copy(stopAtMixMs = outStopMs)
@@ -152,15 +213,17 @@ object RecipeInterpreter {
             sampleRateHz = outRegion.sampleRateHz,
             outRegion = finalOutRegion,
             inRegion = inRegion,
-            knots = plan.tempoKnots,
-            loopBounds = compiler.loopBounds,
+            knots = if (geometry != null) emptyList() else plan.tempoKnots,
+            loopBounds = if (geometry != null) null else compiler.loopBounds,
             envelopes = compiler.orderedLanes(),
             fxParams = compiler.fxParams,
             stems = effectiveStems,
             loudness = LoudnessSettings(dropBumpLu = dropBump),
             dropWindowMs = dropWindowMs,
+            renderGeometry = geometry,
         )
 
+        if (geometry != null) return ScriptExecutionGuard.validateFrozen(script, plan, availableCapabilities)
         return ChoreoGuard.validate(
             script = script,
             plan = plan,
@@ -216,28 +279,36 @@ object RecipeInterpreter {
         private val useNoStemVariant: Boolean,
         private val availableCapabilities: Set<FxCapability>,
         stepList: List<RecipeStepV2>,
+        private val geometry: RenderGeometryV1?,
     ) {
         val ctx: AnchorContext
         var fxParams: ScriptFxParams = ScriptFxParams()
         var loopBounds: LoopBounds? = null
+        var refusal: MixOutcome.Refused? = null
         private val lanes = LinkedHashMap<Pair<DeckTarget, EnvelopeKind>, EnvelopeLane>()
 
         init {
             val rSec = plan.overlapDurationMs / 1000.0
-            val barSec = (plan.barDurationMs / 1000.0).coerceAtLeast(0.25)
+            val barSec = if (geometry != null) plan.barDurationMs / 1000.0 else (plan.barDurationMs / 1000.0).coerceAtLeast(0.25)
             val beatSec = barSec / 4.0
             val sSec = ((plan.swapDownbeatMs - plan.frozenExitMs).coerceIn(0L, plan.overlapDurationMs)) / 1000.0
-            val aSec = (plan.recipeParams["incomingHoldSec"] ?: 0.0)
-                .coerceIn(0.0, max(0.0, sSec - 0.05))
+            val aSec = if (geometry != null) plan.recipeParams["incomingHoldSec"] ?: 0.0 else {
+                (plan.recipeParams["incomingHoldSec"] ?: 0.0).coerceIn(0.0, max(0.0, sSec - 0.05))
+            }
             val vocalEntrySec = (plan.recipeParams["vocalEntrySec"] ?: sSec).coerceIn(0.0, rSec)
-            val fadeSec = (plan.recipeParams["fadeSec"] ?: (2.0 * barSec)).coerceIn(0.5, rSec)
+            val fadeSec = (plan.recipeParams["fadeSec"] ?: (2.0 * barSec)).coerceIn(min(0.5, rSec), rSec)
             val fadeStartSec = (rSec - fadeSec).coerceIn(0.0, max(0.0, rSec - 0.2))
             val hasPostReleaseTail = stepList.any { step ->
                 step is RecipeStepV2.ConfigureFx && step.deck == DeckTarget.OUT &&
                     (step.fx == RecipeFxType.ECHO || step.fx == RecipeFxType.REVERB || step.fallbackFx == RecipeFxType.ECHO)
             } && sSec + 0.15 > rSec
             val baseOutStop = max(rSec, (outRegion.stopAtMixMs ?: plan.overlapDurationMs) / 1000.0)
-            val outStopSec = if (hasPostReleaseTail) max(baseOutStop, sSec + 0.20) else baseOutStop
+            val requiredStopSec = if (hasPostReleaseTail) max(rSec, sSec + 0.20) else rSec
+            val outStopSec = geometry?.out?.stopAtMixSec
+                ?: if (hasPostReleaseTail) max(baseOutStop, sSec + 0.20) else baseOutStop
+            if (geometry != null && outStopSec < requiredStopSec - 1e-9) {
+                refusal = MixOutcome.Refused(RefusalReason.HANDOFF_RENDER_BUDGET, "frozen_out_stop_cannot_cover_recipe_tail")
+            }
             ctx = AnchorContext(
                 rSec = rSec,
                 sSec = sSec,
@@ -253,6 +324,7 @@ object RecipeInterpreter {
         fun orderedLanes(): List<EnvelopeLane> = lanes.values.toList()
 
         fun apply(step: RecipeStepV2) {
+            if (refusal != null) return
             when (step) {
                 is RecipeStepV2.EnableIsolator -> {
                     fxParams = fxParams.copy(isolate = true)
@@ -267,6 +339,9 @@ object RecipeInterpreter {
             if (step.kind.isStem) {
                 val stemKind = ChoreoGuard.stemKindFor(step.kind) ?: return
                 if (useNoStemVariant || stems.none { it.deck == step.deck && it.stem == stemKind }) {
+                    if (geometry != null) refusal = MixOutcome.Refused(
+                        RefusalReason.STEM_DUCK_UNAVAILABLE, "stem_lane_unavailable:${step.deck}/$stemKind",
+                    )
                     return
                 }
             }
@@ -285,6 +360,8 @@ object RecipeInterpreter {
         }
 
         private fun maybeAttachSweepMetadata(deck: DeckTarget, kind: EnvelopeKind, lane: EnvelopeLane) {
+            // A lane is already executable automation, never a second inferred native sweep.
+            if (geometry != null) return
             val isHp = when (kind) {
                 EnvelopeKind.HIGH_PASS_HZ, EnvelopeKind.FILTER_KNOB -> true
                 EnvelopeKind.LOW_PASS_HZ -> false
@@ -384,6 +461,13 @@ object RecipeInterpreter {
                     holdPhrases = (p["holdPhrases"] ?: 0.0).toInt().coerceAtLeast(0),
                 ),
             )
+            if (geometry != null) {
+                val deck = if (step.deck == DeckTarget.OUT) geometry.out else geometry.inbound
+                if (deck.loopEndFrame <= deck.loopStartFrame) {
+                    refusal = MixOutcome.Refused(RefusalReason.HANDOFF_INVALID_GEOMETRY, "frozen_loop_required_${step.deck}")
+                }
+                return
+            }
             if (step.deck == DeckTarget.OUT &&
                 (plan.geometry == TransitionGeometry.LOOP || outRegion.endMs > outRegion.startMs)
             ) {
@@ -427,6 +511,13 @@ object RecipeInterpreter {
         private fun configureSweep(step: RecipeStepV2.ConfigureFx, p: Map<String, Double>) {
             val base = if (step.deck == DeckTarget.OUT) fxParams.sweep else fxParams.incomingSweep
             val isHp = !step.flag
+            val end = step.endTime?.let { ctx.resolve(it, step.deck) } ?: ctx.sSec
+            val start = step.startTime?.let { ctx.resolve(it, step.deck) }
+                ?: max(0.0, end - (p["bars"] ?: 8.0) * ctx.barSec)
+            if (geometry != null && end <= start) {
+                refusal = MixOutcome.Refused(RefusalReason.CHOREOGRAPHY_UNAVAILABLE, "sweep_interval_empty")
+                return
+            }
             val updated = (base ?: SweepFxParams(deck = step.deck)).copy(
                 enabled = true,
                 deck = step.deck,
@@ -436,6 +527,8 @@ object RecipeInterpreter {
                 qStart = (p["qStart"] ?: 0.707).toFloat(),
                 qEnd = (p["qEnd"] ?: 1.2).toFloat(),
                 bars = (p["bars"] ?: 8.0).toInt().coerceAtLeast(1),
+                startMixSec = if (geometry != null) start else null,
+                endMixSec = if (geometry != null) end else null,
             )
             fxParams = if (step.deck == DeckTarget.OUT) {
                 fxParams.copy(sweep = updated)
@@ -445,17 +538,11 @@ object RecipeInterpreter {
         }
 
         private fun configureSvfQ(step: RecipeStepV2.ConfigureFx, p: Map<String, Double>) {
-            val qVal = (p["q"] ?: 0.9).toFloat().coerceIn(0.25f, 6.0f)
-            val base = if (step.deck == DeckTarget.OUT) fxParams.sweep else fxParams.incomingSweep
-            val updated = (base ?: SweepFxParams(enabled = true, deck = step.deck)).copy(
-                enabled = true,
-                deck = step.deck,
-                qEnd = qVal,
-            )
+            val qVal = (p["q"] ?: 0.9).toFloat()
             fxParams = if (step.deck == DeckTarget.OUT) {
-                fxParams.copy(sweep = updated)
+                fxParams.copy(outSvfQ = qVal)
             } else {
-                fxParams.copy(incomingSweep = updated)
+                fxParams.copy(inSvfQ = qVal)
             }
         }
 
@@ -470,9 +557,11 @@ object RecipeInterpreter {
                     enabled = true,
                     deck = step.deck,
                     delayBeats = p["delayBeats"] ?: 0.5,
-                    delaySec = p["delaySec"] ?: 0.0,
-                    feedback = (p["feedback"] ?: 0.60).toFloat().coerceIn(0f, 0.95f),
-                    wet = ((p["wet"] ?: 0.55) * depth).toFloat().coerceIn(0f, 1.2f),
+                    delaySec = if (geometry != null && (p["delaySec"] ?: 0.0) == 0.0) {
+                        (p["delayBeats"] ?: 0.5) * ctx.beatSec
+                    } else p["delaySec"] ?: 0.0,
+                    feedback = legacyClamp((p["feedback"] ?: 0.60).toFloat(), 0f, 0.95f),
+                    wet = legacyClamp(((p["wet"] ?: 0.55) * depth).toFloat(), 0f, 1.2f),
                     wetHpfHz = (p["wetHpfHz"] ?: 250.0).toFloat(),
                     wetLpfHz = (p["wetLpfHz"] ?: 6000.0).toFloat(),
                     pingPong = (p["pingPong"] ?: if (step.flag) 1.0 else 0.0) >= 0.5,
@@ -493,7 +582,7 @@ object RecipeInterpreter {
                     deck = step.deck,
                     roomSize = (p["roomSize"] ?: 2.2).toFloat(),
                     damping = (p["damping"] ?: 0.55).toFloat(),
-                    wet = ((p["wet"] ?: 0.35) * depth).toFloat().coerceIn(0f, 1.2f),
+                    wet = legacyClamp(((p["wet"] ?: 0.35) * depth).toFloat(), 0f, 1.2f),
                 ),
             )
             addWetLane(step.deck, EnvelopeKind.REVERB_SEND, rawCurve, depth)
@@ -510,10 +599,12 @@ object RecipeInterpreter {
                     enabled = true,
                     deck = step.deck,
                     lfoCyclesPerBars = p["lfoCyclesPerBars"] ?: 2.0,
-                    lfoHz = p["lfoHz"] ?: 0.0,
+                    lfoHz = if (geometry != null && (p["lfoHz"] ?: 0.0) == 0.0) {
+                        1.0 / ((p["lfoCyclesPerBars"] ?: 2.0) * ctx.barSec)
+                    } else p["lfoHz"] ?: 0.0,
                     depthSec = p["depthSec"] ?: 0.003,
-                    feedback = (p["feedback"] ?: 0.64).toFloat().coerceIn(0f, 0.95f),
-                    wetPeak = ((p["wetPeak"] ?: 0.60) * depth).toFloat().coerceIn(0f, 1.2f),
+                    feedback = legacyClamp((p["feedback"] ?: 0.64).toFloat(), 0f, 0.95f),
+                    wetPeak = legacyClamp(((p["wetPeak"] ?: 0.60) * depth).toFloat(), 0f, 1.2f),
                     stereoOffsetDeg = (p["stereoOffsetDeg"] ?: 90.0).toFloat(),
                 ),
             )
@@ -532,9 +623,9 @@ object RecipeInterpreter {
                     deck = step.deck,
                     stages = (p["stages"] ?: 6.0).toInt().coerceIn(2, 12),
                     rateBeats = p["rateBeats"] ?: 4.0,
-                    depth = ((p["depth"] ?: 0.70) * depth).toFloat().coerceIn(0f, 1.0f),
-                    feedback = (p["feedback"] ?: 0.60).toFloat().coerceIn(0f, 0.95f),
-                    wetPeak = ((p["wetPeak"] ?: 0.70) * depth).toFloat().coerceIn(0f, 1.2f),
+                    depth = legacyClamp(((p["depth"] ?: 0.70) * depth).toFloat(), 0f, 1.0f),
+                    feedback = legacyClamp((p["feedback"] ?: 0.60).toFloat(), 0f, 0.95f),
+                    wetPeak = legacyClamp(((p["wetPeak"] ?: 0.70) * depth).toFloat(), 0f, 1.2f),
                     stereoOffsetDeg = (p["stereoOffsetDeg"] ?: 90.0).toFloat(),
                 ),
             )
@@ -555,7 +646,7 @@ object RecipeInterpreter {
                     lengthBeats = p["lengthBeats"] ?: 16.0,
                     noiseSweepStartHz = (p["noiseSweepStartHz"] ?: 300.0).toFloat(),
                     noiseSweepEndHz = (p["noiseSweepEndHz"] ?: 8000.0).toFloat(),
-                    noiseLevelPeak = ((p["noiseLevelPeak"] ?: 0.70) * depth).toFloat().coerceIn(0f, 1.4f),
+                    noiseLevelPeak = legacyClamp(((p["noiseLevelPeak"] ?: 0.70) * depth).toFloat(), 0f, 1.4f),
                     uplifterOctaves = (p["uplifterOctaves"] ?: 1.0).toFloat(),
                     includeSnareRoll = (p["includeSnareRoll"] ?: 1.0) >= 0.5,
                     reverseReverbTailBeats = p["reverseReverbTailBeats"] ?: 1.0,
@@ -591,7 +682,7 @@ object RecipeInterpreter {
                     enabled = true,
                     deck = step.deck,
                     startMixSec = startSec,
-                    lengthSec = max(0.05, endSec - startSec),
+                    lengthSec = if (geometry != null) endSec - startSec else max(0.05, endSec - startSec),
                     endRate = (p["endRate"] ?: 0.05).toFloat(),
                     lpfStartHz = (p["lpfStartHz"] ?: 18000.0).toFloat(),
                     lpfEndHz = (p["lpfEndHz"] ?: 800.0).toFloat(),
@@ -614,7 +705,7 @@ object RecipeInterpreter {
                     enabled = true,
                     deck = step.deck,
                     startMixSec = startSec,
-                    lengthSec = max(0.05, endSec - startSec),
+                    lengthSec = if (geometry != null) endSec - startSec else max(0.05, endSec - startSec),
                     wowDepth = (p["wowDepth"] ?: 0.03).toFloat(),
                     wowRateHz = (p["wowRateHz"] ?: 5.0).toFloat(),
                     lpfStartHz = (p["lpfStartHz"] ?: 18000.0).toFloat(),
@@ -639,7 +730,7 @@ object RecipeInterpreter {
                     enabled = true,
                     deck = step.deck,
                     startMixSec = startSec,
-                    lengthSec = max(0.05, endSec - startSec),
+                    lengthSec = if (geometry != null) endSec - startSec else max(0.05, endSec - startSec),
                     peakReverseSpeed = p["peakReverseSpeed"] ?: 3.0,
                     silenceGapBeats = p["silenceGapBeats"] ?: 1.0,
                 ),
@@ -661,7 +752,7 @@ object RecipeInterpreter {
                     divisionStepsPerBeat = (p["divisionStepsPerBeat"] ?: 4.0).toFloat(),
                     swing = (p["swing"] ?: 0.0).toFloat(),
                     isStutter = (p["isStutter"] ?: if (step.flag) 1.0 else 0.0) >= 0.5,
-                    depthPeak = ((p["depthPeak"] ?: 1.0) * depth).toFloat().coerceIn(0f, 1.0f),
+                    depthPeak = legacyClamp(((p["depthPeak"] ?: 1.0) * depth).toFloat(), 0f, 1.0f),
                     rampBars = p["rampBars"] ?: 2.0,
                 ),
             )
@@ -736,6 +827,10 @@ object RecipeInterpreter {
             } else if (deck == DeckTarget.OUT && kind == EnvelopeKind.GAIN &&
                 resolved.first().first <= 0.002 && !ChoreoGuard.isNeutral(EnvelopeKind.GAIN, resolved.first().second)
             ) {
+                if (geometry != null) {
+                    refusal = MixOutcome.Refused(RefusalReason.CHOREOGRAPHY_UNAVAILABLE, "out_gain_splice_non_neutral")
+                    return null
+                }
                 resolved[0] = 0.0 to 1f
             }
 
@@ -748,19 +843,20 @@ object RecipeInterpreter {
             val normalized = normalizeStrictTimes(resolved, minTime = 0.0, maxTime = maxTime)
             if (normalized.isEmpty()) return null
             val expanded = expandShape(normalized, shape, steps)
-            val withPreroll = if (deck == DeckTarget.OUT && kind == EnvelopeKind.GAIN) {
+            val preroll = geometry?.out?.prerollSec ?: PREROLL_SEC
+            val withPreroll = if (deck == DeckTarget.OUT && kind == EnvelopeKind.GAIN && preroll > 0.0) {
                 val head = expanded.first()
                 if (head.first > 0.0) {
-                    listOf(-PREROLL_SEC to 0f, 0.0 to 1f) + expanded
+                    listOf(-preroll to 0f, 0.0 to 1f) + expanded
                 } else {
-                    listOf(-PREROLL_SEC to 0f, 0.0 to 1f) + expanded.drop(1)
+                    listOf(-preroll to 0f, 0.0 to 1f) + expanded.drop(1)
                 }
             } else {
                 expanded
             }
             val strictFinal = normalizeStrictTimes(
                 withPreroll,
-                minTime = if (deck == DeckTarget.OUT && kind == EnvelopeKind.GAIN) -PREROLL_SEC else 0.0,
+                minTime = if (deck == DeckTarget.OUT && kind == EnvelopeKind.GAIN) -preroll else 0.0,
                 maxTime = maxTime,
             )
             return EnvelopeLane(
@@ -852,6 +948,9 @@ object RecipeInterpreter {
             }
             return out
         }
+
+        private fun legacyClamp(value: Float, lo: Float, hi: Float): Float =
+            if (geometry == null) value.coerceIn(lo, hi) else value
 
         private fun dbToLinear(db: Float): Float =
             if (!db.isFinite() || db <= -48f) 0f else 10.0.pow(db / 20.0).toFloat()
