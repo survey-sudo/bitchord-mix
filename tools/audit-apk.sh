@@ -113,7 +113,7 @@ fi
 
 # The companion libonnxruntime4j_jni.so is the official Java JNI bridge,
 # not a duplicate core: require it (post-strip size below).
-if printf '%s\n' "$listing" | grep -q 'lib/arm64-v8a/libonnxruntime4j_jni\.so$'; then
+if grep -q 'lib/arm64-v8a/libonnxruntime4j_jni\.so$' <<< "$listing"; then
   jni_size=$(printf '%s\n' "$listing" | awk '/lib\/arm64-v8a\/libonnxruntime4j_jni\.so$/{print $1}' | head -1)
   [ "$jni_size" = "92064" ] && ok "ORT Java JNI bridge present (92064 B)" || bad "libonnxruntime4j_jni.so is ${jni_size:-?} B, expected 92064"
 else
@@ -148,7 +148,7 @@ fi
 
 # --- signature --------------------------------------------------------------
 if [ -n "${APKSIGNER:-}" ] && [ -x "$APKSIGNER" ]; then
-  if "$APKSIGNER" verify --print-certs "$APK" >/tmp/bitchord-apksig.txt 2>&1; then
+  if "$APKSIGNER" verify --verbose --print-certs "$APK" >/tmp/bitchord-apksig.txt 2>&1; then
     ok "signature verifies"
     sed -n 's/^Signer #1 certificate DN: /        cert: /p' /tmp/bitchord-apksig.txt
     if grep -q "^Signer #1 certificate DN: .*CN=BitChord loop fix" /tmp/bitchord-apksig.txt; then
