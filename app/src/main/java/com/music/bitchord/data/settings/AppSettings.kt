@@ -310,6 +310,13 @@ object AppSettings {
     val automixStemsEnabled = MutableStateFlow(true)
     /** AUTOMIX-V2(orch): Snapdragon NPU inference (falls back to CPU automatically). */
     val automixNpuEnabled = MutableStateFlow(true)
+    // AE3 (M7): first-run explainer shown once; learning gate; dev unlock;
+    // cached NPU status line for Settings; inspector visibility toggle.
+    val automixFirstRunShown = MutableStateFlow(false)
+    val automixLearnFromReactions = MutableStateFlow(true)
+    val automixDeveloperUnlocked = MutableStateFlow(false)
+    val automixNpuStatusText = MutableStateFlow<String?>(null)
+    val automixInspectorEnabled = MutableStateFlow(true)
     val skipSilence = MutableStateFlow(false)
 
     /** Requested PCM representation at the Android AudioTrack boundary. */
@@ -1095,6 +1102,11 @@ object AppSettings {
         automixStemsEnabled.value = prefs.getBoolean(KEY_AUTOMIX_STEMS, true)
         com.music.bitchord.playback.smart.AutomixV2Stems.enabled = automixStemsEnabled.value
         automixNpuEnabled.value = prefs.getBoolean(KEY_AUTOMIX_NPU, true)
+        automixFirstRunShown.value = prefs.getBoolean(KEY_AUTOMIX_FIRST_RUN_SHOWN, false)
+        automixLearnFromReactions.value = prefs.getBoolean(KEY_AUTOMIX_LEARN_FROM_REACTIONS, true)
+        automixDeveloperUnlocked.value = prefs.getBoolean(KEY_AUTOMIX_DEVELOPER_UNLOCKED, false)
+        automixNpuStatusText.value = prefs.getString(KEY_AUTOMIX_NPU_STATUS_TEXT, null)
+        automixInspectorEnabled.value = prefs.getBoolean(KEY_AUTOMIX_INSPECTOR_ENABLED, true)
         skipSilence.value = prefs.getBoolean(KEY_SKIP_SILENCE, false)
         outputPcmMode.value = runCatching {
             OutputPcmMode.valueOf(
@@ -1479,6 +1491,32 @@ object AppSettings {
     fun setAutomixNpuEnabled(value: Boolean) {
         automixNpuEnabled.value = value
         prefs.edit().putBoolean(KEY_AUTOMIX_NPU, value).apply()
+    }
+
+    // AE3 (M7): persisted Automix UI state for Settings / About / Inspector.
+    fun setAutomixFirstRunShown(value: Boolean) {
+        automixFirstRunShown.value = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_FIRST_RUN_SHOWN, value).apply()
+    }
+
+    fun setAutomixLearnFromReactions(value: Boolean) {
+        automixLearnFromReactions.value = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_LEARN_FROM_REACTIONS, value).apply()
+    }
+
+    fun setAutomixDeveloperUnlocked(value: Boolean) {
+        automixDeveloperUnlocked.value = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_DEVELOPER_UNLOCKED, value).apply()
+    }
+
+    fun setAutomixNpuStatusText(value: String?) {
+        automixNpuStatusText.value = value
+        prefs.edit().putString(KEY_AUTOMIX_NPU_STATUS_TEXT, value).apply()
+    }
+
+    fun setAutomixInspectorEnabled(value: Boolean) {
+        automixInspectorEnabled.value = value
+        prefs.edit().putBoolean(KEY_AUTOMIX_INSPECTOR_ENABLED, value).apply()
     }
 
     fun setSkipSilence(value: Boolean) {
@@ -2485,6 +2523,12 @@ object AppSettings {
     private const val KEY_AUTOMIX_DJ_LEVEL = "automix_dj_level"
     private const val KEY_AUTOMIX_STEMS = "automix_stems_v2"
     private const val KEY_AUTOMIX_NPU = "automix_npu"
+    // AE3 (M7)
+    private const val KEY_AUTOMIX_FIRST_RUN_SHOWN = "automix_first_run_shown"
+    private const val KEY_AUTOMIX_LEARN_FROM_REACTIONS = "automix_learn_from_reactions"
+    private const val KEY_AUTOMIX_DEVELOPER_UNLOCKED = "automix_developer_unlocked"
+    private const val KEY_AUTOMIX_NPU_STATUS_TEXT = "automix_npu_status_text"
+    private const val KEY_AUTOMIX_INSPECTOR_ENABLED = "automix_inspector_enabled"
     private const val KEY_SKIP_SILENCE = "skip_silence"
     private const val KEY_OUTPUT_PCM_MODE = "output_pcm_mode"
     private const val KEY_PREFER_USB_DAC = "prefer_usb_dac"

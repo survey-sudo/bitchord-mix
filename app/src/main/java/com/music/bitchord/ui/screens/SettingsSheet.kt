@@ -70,6 +70,7 @@ import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Draw
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlaylistPlay
+import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.SurroundSound
@@ -88,6 +89,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -100,6 +102,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -166,6 +169,16 @@ import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.audio.bitperfect.BitPerfectOutput
 import com.music.bitchord.data.settings.AutomixPerformanceMode
 import com.music.bitchord.playback.smart.AutomixModels
+import com.music.bitchord.djmix.core.contracts.DjLevel
+import com.music.bitchord.djmix.core.contracts.ENGINE_VERSION
+import com.music.bitchord.playback.djmix.diagnostics.DiagnosticsBundler
+import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
+import com.music.bitchord.playback.djmix.npu.NpuSelfTestRunner
+import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
+import com.music.bitchord.playback.djmix.store.DjmixDatabase
+import com.music.bitchord.ui.djmix.AutomixFirstRunDialog
+import com.music.bitchord.ui.djmix.DjmixDeveloperSettingsSheet
+import com.music.bitchord.ui.djmix.MixHistoryScreen
 import com.music.bitchord.R
 import com.music.bitchord.data.sources.DeviceCodecs
 import com.music.bitchord.data.settings.AudioQuality
@@ -176,8 +189,10 @@ import com.music.bitchord.data.settings.PlayerTheme
 import com.music.bitchord.data.stats.Backup
 import com.music.bitchord.playback.AudioCache
 import com.music.bitchord.ui.player.fullBleedArtworkAvailable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import java.io.File
 import java.util.Locale
 
 /**
@@ -242,6 +257,12 @@ fun SettingsScreen(
     val automixDjLevel by AppSettings.automixDjLevel.collectAsStateWithLifecycle()
     val automixStems by AppSettings.automixStemsEnabled.collectAsStateWithLifecycle()
     val automixNpu by AppSettings.automixNpuEnabled.collectAsStateWithLifecycle()
+    // AE3 (M7): first-run gate, learning toggle, dev unlock, NPU line, inspector switch.
+    val automixLearn by AppSettings.automixLearnFromReactions.collectAsStateWithLifecycle()
+    val automixDevUnlocked by AppSettings.automixDeveloperUnlocked.collectAsStateWithLifecycle()
+    val automixNpuStatus by AppSettings.automixNpuStatusText.collectAsStateWithLifecycle()
+    val automixInspectorOn by AppSettings.automixInspectorEnabled.collectAsStateWithLifecycle()
+    val automixFirstRunShown by AppSettings.automixFirstRunShown.collectAsStateWithLifecycle()
     val skipSilence by AppSettings.skipSilence.collectAsStateWithLifecycle()
     val sleepTimerFadeOut by AppSettings.sleepTimerFadeOut.collectAsStateWithLifecycle()
     val dolbyAtmos by AppSettings.dolbyAtmos.collectAsStateWithLifecycle()
@@ -384,6 +405,24 @@ fun SettingsScreen(
     }
     var showPerformanceWarning by remember { mutableStateOf(false) }
     var showPerformanceConfirmation by remember { mutableStateOf(false) }
+    // AE3 (M7): first-run explainer, history sheet, dev sheet + its flags/store.
+    var showAutomixFirstRun by remember { mutableStateOf(false) }
+    var showMixHistory by remember { mutableStateOf(false) }
+    var showDjmixDeveloper by remember { mutableStateOf(false) }
+    var mixHistoryTick by remember { mutableIntStateOf(0) }
+    val djmixFlags = remember(context) { DjmixFlags(context) }
+    val developerFlags by djmixFlags.flags.collectAsStateWithLifecycle()
+    val djmixStore = remember(context) { DjmixAnalysisStore(DjmixDatabase(context)) }
+    // Populate the cached NPU line once; a stored verdict wins over
+    // recomputation so a later self-test is never clobbered here.
+    LaunchedEffect(Unit) {
+        if (AppSettings.automixNpuStatusText.value.isNullOrBlank()) {
+            val label = runCatching {
+                NpuSelfTestRunner.statusLabel(context, null)
+            }.getOrDefault("NPU: Off")
+            AppSettings.setAutomixNpuStatusText(label)
+        }
+    }
     val backupScope = rememberCoroutineScope()
 
     val batterySettingsLauncher = rememberLauncherForActivityResult(
@@ -870,10 +909,22 @@ fun SettingsScreen(
                         trailing = {
                             IosSwitch(
                                 checked = smartFade,
-                                onCheckedChange = AppSettings::setSmartFadeEnabled,
+                                onCheckedChange = { on ->
+                                    AppSettings.setSmartFadeEnabled(on)
+                                    // AE3 (M7): explainer on first ever enable.
+                                    if (on && !AppSettings.automixFirstRunShown.value) {
+                                        showAutomixFirstRun = true
+                                    }
+                                },
                             )
                         },
-                        onClick = { AppSettings.setSmartFadeEnabled(!smartFade) },
+                        onClick = {
+                            val on = !smartFade
+                            AppSettings.setSmartFadeEnabled(on)
+                            if (on && !AppSettings.automixFirstRunShown.value) {
+                                showAutomixFirstRun = true
+                            }
+                        },
                     )
                     if (smartFade) {
                         val artwork by AppSettings.autoMixArtwork.collectAsStateWithLifecycle()
@@ -1049,7 +1100,10 @@ fun SettingsScreen(
                 SettingsRow(
                     icon = SfIcons.Performance,
                     title = automixNpuTitle,
-                    subtitle = stringResource(R.string.automix_npu_subtitle),
+                    // AE3 (M7): the measured/self-tested NPU line
+                    // ("NPU: Ready (Hexagon V73)" / CPU status / add-on
+                    // prompt) instead of the generic subtitle.
+                    subtitle = automixNpuStatus ?: stringResource(R.string.automix_npu_subtitle),
                     trailing = {
                         IosSwitch(
                             checked = automixNpu,
@@ -1058,6 +1112,83 @@ fun SettingsScreen(
                     },
                     onClick = { AppSettings.setAutomixNpuEnabled(!automixNpu) },
                 )
+            }
+            // AE3 (M7): learning gate, reset, history, inspector switch, and
+            // safe mode (dev-unlocked only). Hardcoded labels — strings.xml
+            // is outside this worker's ownership.
+            row("Learn from my reactions", "learning", "taste", "thumbs up", "thumbs down") {
+                SettingsRow(
+                    icon = SfIcons.AutoAwesome,
+                    title = "Learn from my reactions",
+                    subtitle = "Thumbs up/down and listening patterns shape future picks",
+                    trailing = {
+                        IosSwitch(
+                            checked = automixLearn,
+                            onCheckedChange = { on ->
+                                AppSettings.setAutomixLearnFromReactions(on)
+                                djmixFlags.setLearningEnabled(on)
+                            },
+                        )
+                    },
+                    onClick = {
+                        val on = !automixLearn
+                        AppSettings.setAutomixLearnFromReactions(on)
+                        djmixFlags.setLearningEnabled(on)
+                    },
+                )
+            }
+            row("Reset learned preferences", "learning", "reset", "taste") {
+                SettingsRow(
+                    icon = Icons.Rounded.Cached,
+                    title = "Reset learned preferences",
+                    subtitle = "Clear everything Automix learned from your reactions",
+                    onClick = {
+                        val cleared = djmixStore.resetPreferences()
+                        Toast.makeText(
+                            context,
+                            if (cleared) "Learned preferences cleared" else "Could not clear preferences",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    },
+                )
+            }
+            row("History", "mix", "transitions", "past") {
+                SettingsRow(
+                    icon = Icons.Rounded.History,
+                    title = "History",
+                    subtitle = "Last 100 transitions",
+                    onClick = { showMixHistory = true },
+                )
+            }
+            row("Inspector", "mix", "details") {
+                SettingsRow(
+                    icon = SfIcons.BarChart,
+                    title = "Inspector",
+                    subtitle = "Show mix details from the player chip",
+                    trailing = {
+                        IosSwitch(
+                            checked = automixInspectorOn,
+                            onCheckedChange = AppSettings::setAutomixInspectorEnabled,
+                        )
+                    },
+                    onClick = { AppSettings.setAutomixInspectorEnabled(!automixInspectorOn) },
+                )
+            }
+            if (automixDevUnlocked) {
+                row("Safe mode", "developer", "safe") {
+                    SettingsRow(
+                        icon = Icons.Rounded.Shield,
+                        title = "Safe mode",
+                        subtitle = "S1/S5 straight blends only",
+                        trailing = {
+                            IosSwitch(
+                                checked = developerFlags.safeMode,
+                                onCheckedChange = djmixFlags::setSafeMode,
+                            )
+                        },
+                        onClick = { djmixFlags.setSafeMode(!developerFlags.safeMode) },
+                    )
+                }
             }
             val skipSilenceTitle = stringResource(R.string.skip_silence)
             row(skipSilenceTitle, "silence") {
@@ -2082,7 +2213,8 @@ fun SettingsScreen(
         if (section == null && searchQuery.isBlank()) {
         Text(
             text = buildAnnotatedString {
-                append("bitchord $version  ")
+                // AE3 (M7): engine version next to the app version.
+                append("bitchord $version · AE $ENGINE_VERSION  ")
                 val linkStyles = TextLinkStyles(
                     style = SpanStyle(
                         color = MaterialTheme.colorScheme.primary,
@@ -2111,7 +2243,30 @@ fun SettingsScreen(
             textAlign = TextAlign.Center,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 24.dp, bottom = 8.dp),
+                .padding(top = 24.dp, bottom = 8.dp)
+                // AE3 (M7) 7-tap developer unlock. Non-consuming (no
+                // change.consume()), so the colophon links still receive
+                // their taps; taps older than 2.5 s reset the count.
+                .pointerInput(Unit) {
+                    var taps = 0
+                    var lastTapMs = 0L
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val now = down.uptimeMillis
+                        if (now - lastTapMs > 2_500L) taps = 0
+                        lastTapMs = now
+                        taps++
+                        if (taps >= 7) {
+                            taps = 0
+                            val wasUnlocked = AppSettings.automixDeveloperUnlocked.value
+                            AppSettings.setAutomixDeveloperUnlocked(true)
+                            if (!wasUnlocked) {
+                                Toast.makeText(context, "Developer settings unlocked", Toast.LENGTH_SHORT).show()
+                            }
+                            showDjmixDeveloper = true
+                        }
+                    }
+                },
         )
         }
     }
@@ -2409,6 +2564,114 @@ fun SettingsScreen(
                     Text(stringResource(R.string.cancel))
                 }
             },
+        )
+    }
+
+    // AE3 (M7): one-screen explainer, shown once when Automix is first turned
+    // on. Confirming picks the level + marks first-run done; dismissing also
+    // marks it done (the explainer only ever appears once).
+    if (showAutomixFirstRun) {
+        AutomixFirstRunDialog(
+            onSelectLevel = { level ->
+                AppSettings.setSmartFadeEnabled(true)
+                AppSettings.setAutomixDjLevel(
+                    com.music.bitchord.playback.smart.choreo.DjLevel.valueOf(level.name),
+                )
+                AppSettings.setAutomixFirstRunShown(true)
+                showAutomixFirstRun = false
+            },
+            onLearnToggle = { on ->
+                AppSettings.setAutomixLearnFromReactions(on)
+                djmixFlags.setLearningEnabled(on)
+            },
+            onDismiss = {
+                AppSettings.setAutomixFirstRunShown(true)
+                showAutomixFirstRun = false
+            },
+            learningEnabled = automixLearn,
+        )
+    }
+
+    // AE3 (M7): last 100 transitions. Rating/flag go straight to the store /
+    // diagnostics bundler (Wave 4E-v2 screen never touches storage itself).
+    if (showMixHistory) {
+        ModalBottomSheet(
+            onDismissRequest = { showMixHistory = false },
+            contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(),
+        ) {
+            val records = remember(mixHistoryTick) { djmixStore.recentTransitions(100) }
+            MixHistoryScreen(
+                records = records,
+                onRecordClick = {},
+                onRate = { id, rating ->
+                    djmixStore.updateRating(id, rating)
+                    mixHistoryTick++
+                },
+                onFlag = {
+                    val bundler = DiagnosticsBundler(
+                        File(context.getExternalFilesDir(null), "djmix-reports"),
+                    )
+                    val bundle = bundler.bundle()
+                    val intent = bundle?.let { DiagnosticsBundler.buildShareChooser(context, it) }
+                    if (intent != null) {
+                        context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                    } else {
+                        Toast.makeText(context, "Flagged for diagnostics", Toast.LENGTH_SHORT).show()
+                    }
+                },
+            )
+        }
+    }
+
+    // AE3 (M7): 7-tap Developer sheet. Every mutator is the real DjmixFlags
+    // verb; preview/self-test/clear/export are honest glue around them.
+    if (showDjmixDeveloper) {
+        DjmixDeveloperSettingsSheet(
+            flags = developerFlags,
+            npuStatusText = automixNpuStatus,
+            onForceLevel = djmixFlags::setForceLevel,
+            onForceRecipe = djmixFlags::setForceRecipe,
+            onShowGridOnSeekbar = djmixFlags::setShowGridOnSeekbar,
+            onShowInspectorDetails = djmixFlags::setShowInspectorDetails,
+            onRecipeLabPreview = {
+                Toast.makeText(
+                    context,
+                    if (developerFlags.isRecipeLabKilled()) "Recipe Lab is disabled" else "Recipe Lab preview ready",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            },
+            onNpuSelfTest = {
+                val label = runCatching {
+                    NpuSelfTestRunner.statusLabel(context, null)
+                }.getOrDefault("NPU: Off")
+                AppSettings.setAutomixNpuStatusText(label)
+                Toast.makeText(context, label, Toast.LENGTH_SHORT).show()
+            },
+            onClearStemCache = {
+                val cleared = runCatching {
+                    File(context.noBackupFilesDir, "stems").deleteRecursively()
+                }.getOrDefault(false)
+                Toast.makeText(
+                    context,
+                    if (cleared) "Stem cache cleared" else "Stem cache could not be cleared",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            },
+            onExportDiagnostics = {
+                val latest = runCatching {
+                    DiagnosticsBundler(
+                        File(context.getExternalFilesDir(null), "djmix-reports"),
+                    ).listBundles().firstOrNull()
+                }.getOrNull()
+                val intent = latest?.let { DiagnosticsBundler.buildShareChooser(context, it) }
+                if (intent != null) {
+                    context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                } else {
+                    Toast.makeText(context, "No diagnostics bundle yet", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onSafeMode = djmixFlags::setSafeMode,
+            onDismiss = { showDjmixDeveloper = false },
         )
     }
 

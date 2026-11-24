@@ -61,8 +61,7 @@ import com.music.bitchord.ui.components.thumbnailBorder
 import com.music.bitchord.ui.haptics.Haptic
 import com.music.bitchord.ui.haptics.rememberHaptics
 import com.music.bitchord.playback.MusicOnlyPlayback
-import com.music.bitchord.playback.smart.MixInspectorState
-import com.music.bitchord.playback.smart.choreo.DjLevel
+import com.music.bitchord.ui.player.automixChipLabel
 import com.music.bitchord.ui.player.PlayerDock
 import com.music.bitchord.ui.player.PlayerSkipGlyph
 import com.music.bitchord.ui.player.PlayerSkipMotion
@@ -71,6 +70,8 @@ import com.music.bitchord.ui.player.PlayerPlayPauseGlyph
 import com.music.bitchord.ui.player.rememberPlayerPlayPauseMotion
 import com.music.bitchord.ui.player.AndroidMusicVideo
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.animation.core.animateDpAsState
 import dev.chrisbanes.haze.HazeState
@@ -78,8 +79,6 @@ import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
 import dev.chrisbanes.haze.materials.HazeMaterials
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -473,7 +472,9 @@ fun MiniPlayer(
                     badgeColor = MaterialTheme.colorScheme.onSurfaceVariant,
                     fadeOverflow = true,
                 )
-                // FORK-HOOK(mini-player-mix): active Festival recipe, with the artist line's existing styling.
+                // FORK-HOOK(mini-player-mix): AE3 one clean Automix chip text
+                // (Part A §7), with the artist line's existing styling. No
+                // rung/tempo/"locked" clutter, no extra buttons on the bar.
                 MiniPlayerSubtitle(
                     song = song,
                     style = MaterialTheme.typography.bodyMedium,
@@ -532,26 +533,28 @@ fun MiniPlayer(
 }
 
 /**
- * Keep the artist line's size, colour and overflow
- * treatment. Only an engine-reported active Festival recipe replaces its text;
- * either side of the metadata handoff belongs to that same transition.
- * Shared here so the separate glass-nav consumer can opt in without restyling.
+ * Keep the artist line's size, colour and overflow treatment. While Automix
+ * is in an active phase the single clean chip text (AE3 / Part A §7 — see
+ * [automixChipLabel]) replaces it; one line, no rung/tempo/"locked" tags,
+ * no extra buttons on the bar. Shared here so the separate glass-nav
+ * consumer can opt in without restyling.
  */
 @Composable
 internal fun MiniPlayerSubtitle(song: Song, style: TextStyle, color: Color) {
-    val recipe by remember(song.videoId) {
-        AppSettings.mixInspector
-            .map { festivalRecipeLabel(it, song.videoId) }
-            .distinctUntilChanged()
-    }.collectAsStateWithLifecycle(initialValue = festivalRecipeLabel(AppSettings.mixInspector.value, song.videoId))
-    FadingLine(text = recipe ?: song.artist, style = style, color = color)
+    val inspector by AppSettings.mixInspector.collectAsStateWithLifecycle()
+    val status by AppSettings.automixStatus.collectAsStateWithLifecycle()
+    val chip = automixChipLabel(status, inspector)
+    FadingLine(
+        text = chip ?: song.artist,
+        style = style,
+        color = color,
+        modifier = if (chip != null) {
+            Modifier.semantics { contentDescription = "Automix: $chip" }
+        } else {
+            Modifier
+        },
+    )
 }
-
-private fun festivalRecipeLabel(state: MixInspectorState?, mediaId: String): String? =
-    state?.takeIf {
-        it.mixActive && it.level == DjLevel.FESTIVAL &&
-            (mediaId == it.current.mediaId || mediaId == it.next.mediaId)
-    }?.recipeName?.takeIf { it.isNotBlank() }
 
 @Composable
 internal fun MiniPlayerArtwork(song: Song, autoMixArtwork: (@Composable (String?, Modifier) -> Unit)?) {

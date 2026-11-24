@@ -26,6 +26,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -53,8 +55,14 @@ import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.Flag
+import androidx.compose.material.icons.rounded.ThumbDown
+import androidx.compose.material.icons.rounded.ThumbUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -113,6 +121,7 @@ import coil3.compose.LocalPlatformContext
 import coil3.SingletonImageLoader
 import com.music.bitchord.data.settings.MixDeck
 import com.music.bitchord.data.settings.MixTransitionView
+import com.music.bitchord.playback.smart.AutomixStatus
 import com.music.bitchord.playback.smart.MixInspectorPhase
 import com.music.bitchord.playback.smart.MixInspectorState
 import com.music.bitchord.playback.smart.MixInspectorTrack
@@ -163,6 +172,75 @@ private val InspectorText = Color.White.copy(alpha = 0.88f)
 private const val UnknownMeasurement = "—"
 
 /**
+ * AE3 (M7): single source of truth for the player Automix chip text
+ * (Part A §7 / B9.1). Derived ONLY from the shared [AutomixStatus] +
+ * [MixInspectorState] feeds, so `:sharedUi` stays pure KMP and never needs the
+ * `djmix-core` [com.music.bitchord.djmix.core.contracts.MixUiState] directly —
+ * the engine publishes the same wording through `AutomixStatus.headline`
+ * (minus the legacy `" · locked"` tag, stripped here).
+ *
+ * - `PREPARING` -> `"Preparing mix · XX%"` (from [AutomixStatus.progress]).
+ * - `READY` / `ARMED` -> `"<RecipeName> in m:ss"` (headline, uncluttered).
+ * - `MOVED` -> `"Moved to m:ss · stems ready soon"` (headline). The engine
+ *   bounds the `MOVED` phase itself, so the READY text takes over as soon as
+ *   the machine advances — no UI-side timer needed.
+ * - `RUNNING` -> `"Mixing · <RecipeName>"`.
+ * - `LAST_RESORT` (`state == "echo"`) -> `"Ending with echo-out"`.
+ *
+ * No rung, tempo or "locked" clutter. Returns null outside the active arc
+ * (`IDLE` / `DONE` / `CANCELLED` / `suspended`) so the player shows nothing.
+ */
+fun automixChipLabel(status: AutomixStatus?, inspector: MixInspectorState?): String? {
+    if (status == null) return null
+    val phase = inspector?.phase
+    if (phase == MixInspectorPhase.IDLE ||
+        phase == MixInspectorPhase.DONE ||
+        phase == MixInspectorPhase.CANCELLED
+    ) return null
+    val recipe = status.planType.takeIf { it.isNotBlank() }
+        ?: inspector?.recipeName?.takeIf { it.isNotBlank() }
+    val cleanHeadline = status.headline.trimEnd('.').removeSuffix(" · locked").trim()
+    return when (status.state) {
+        "echo" -> "Ending with echo-out"
+        "suspended" -> null
+        "mixing" -> recipe?.let { "Mixing · $it" }
+            ?: cleanHeadline.takeIf { it.isNotBlank() }
+        "ready", "arming" -> cleanHeadline.takeIf { it.isNotBlank() }
+            ?: recipe
+        "preparing" -> if (status.style == "moved") {
+            cleanHeadline.takeIf { it.isNotBlank() }
+        } else {
+            "Preparing mix · ${(status.progress * 100f).roundToInt().coerceIn(0, 100)}%"
+        }
+        else -> cleanHeadline.takeIf { it.isNotBlank() }
+    }
+}
+
+/** Short "why this rung" line shared by the player status and the mix popup. */
+internal fun automixReasonLine(status: AutomixStatus?): String {
+    if (status == null || status.rung.isBlank()) return ""
+    val overlap = if (status.overlapBars > 0) "${status.overlapBars} bars" else "no overlap"
+    val reason = status.reason
+    // A bare rung reads as a list item; adding the reason reads as an excuse.
+    return if (reason.isBlank()) "${status.rung}, $overlap" else "${status.rung} — $overlap ($reason)"
+}
+
+/**
+ * AE3 (M7): bridge for platform-owned inspector actions (thumbs / flag).
+ * `:sharedUi` cannot import `app/` classes, and [PlayerHost] has no
+ * rating/flag hooks, so Android installs its handlers here once and the
+ * popup shows the buttons only when a handler is present (desktop: hidden).
+ * Only read here; installed by `AndroidPlayerHost`.
+ */
+object MixInspectorActions {
+    /** Rating for the inspected pair: `1` = thumbs up, `-1` = thumbs down. */
+    var thumbs: ((state: MixInspectorState, rating: Int) -> Unit)? = null
+
+    /** Flag the inspected transition for diagnostics. */
+    var flag: ((state: MixInspectorState) -> Unit)? = null
+}
+
+/**
  * Where the blend sits across the deck's width. Matches the controller's
  * MIX_VIEW_CONTEXT: the waveforms cover the overlap plus 0.24 of it either side.
  */
@@ -198,6 +276,11 @@ internal fun MixViewPopup(
     inspector: MixInspectorState? = null,
     onRemix: (() -> Boolean)? = null,
     inspectorHeld: Boolean = false,
+    // AE3 (M7): optional so desktop (no store) hides the actions it cannot
+    // answer. Android supplies them via [MixInspectorActions] in the overlay.
+    onThumbsUp: (() -> Unit)? = null,
+    onThumbsDown: (() -> Unit)? = null,
+    onFlag: (() -> Unit)? = null,
 ) {
     val progress = PlayerSettings.smartMixProgress.collectAsStateWithLifecycle()
     var shown by remember { mutableStateOf(false) }
@@ -299,10 +382,12 @@ internal fun MixViewPopup(
                         .verticalScroll(rememberScrollState())
                         .padding(bottom = 16.dp),
                 ) {
-                    if (inspector != null) MixInspectorContent(inspector, inspectorHeld)
+                    // AE3 (M7) order (Part A §7 / B9.2): header → dual-waveform
+                    // timeline → readiness → why → actions → Details.
+                    if (inspector != null) InspectorHeader(inspector, inspectorHeld)
                     if (view != null || inspector == null) {
                         if (inspector != null) {
-                            Spacer(Modifier.height(20.dp))
+                            Spacer(Modifier.height(12.dp))
                             InspectorSectionTitle(
                                 stringResource(Res.string.mix_inspector_waveforms),
                                 Modifier.padding(horizontal = 16.dp),
@@ -314,9 +399,23 @@ internal fun MixViewPopup(
                             progress,
                             live = live && view != null,
                             showStatusReason = inspector == null,
+                            reduceMotion = reduceAnimation,
                         )
                     }
-                    if (inspector == null) {
+                    if (inspector != null && inspector.effects.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        InspectorFxChips(inspector.effects)
+                    }
+                    if (inspector != null) {
+                        Spacer(Modifier.height(16.dp))
+                        MixInspectorDetailsContent(
+                            inspector,
+                            onRemix = onRemix,
+                            onThumbsUp = onThumbsUp,
+                            onThumbsDown = onThumbsDown,
+                            onFlag = onFlag,
+                        )
+                    } else {
                         Spacer(Modifier.height(12.dp))
                         Text(
                             text = stringResource(Res.string.mix_inspector_details_unavailable),
@@ -325,20 +424,6 @@ internal fun MixViewPopup(
                             modifier = Modifier.padding(horizontal = 16.dp),
                         )
                     }
-                    if (inspector != null && !inspector.remixAvailable &&
-                        !inspector.remixUnavailableReason.isNullOrBlank()
-                    ) {
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            text = inspector.remixUnavailableReason.orEmpty(),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = SecondaryText,
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                        )
-                    }
-                }
-                if (inspector?.remixAvailable == true && onRemix != null) {
-                    MixInspectorRemixControl(inspector, onRemix)
                 }
             }
         }
@@ -348,7 +433,7 @@ internal fun MixViewPopup(
 // FORK-HOOK(mix-inspector): stage-edge snapshots only; the audio-clock progress
 // stays in MixViewContent's Canvas rather than recomposing these measurements.
 @Composable
-private fun MixInspectorContent(state: MixInspectorState, held: Boolean) {
+private fun InspectorHeader(state: MixInspectorState, held: Boolean) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
         Column(
             modifier = Modifier
@@ -404,34 +489,127 @@ private fun MixInspectorContent(state: MixInspectorState, held: Boolean) {
             fontWeight = FontWeight.SemiBold,
             color = Color.White,
         )
-        if (!state.recipeName.isNullOrBlank() && !state.recipeId.isNullOrBlank() &&
-            state.recipeId != state.recipeName
-        ) {
+        // One-line description for the chosen recipe (Part A §7 header);
+        // the placement "Why" itself lives further down.
+        val oneLiner = state.topCandidates.firstOrNull { it.recipeId == state.recipeId }?.reason
+            ?.takeIf { it.isNotBlank() }
+            ?: state.reason?.takeIf { it.isNotBlank() }
+        if (oneLiner != null) {
+            Spacer(Modifier.height(6.dp))
             Text(
-                text = state.recipeId.orEmpty(),
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                color = SecondaryText,
+                text = oneLiner,
+                style = MaterialTheme.typography.bodyMedium,
+                color = InspectorText,
             )
         }
-        Spacer(Modifier.height(6.dp))
+    }
+}
+@Composable
+private fun MixInspectorDetailsContent(
+    state: MixInspectorState,
+    onRemix: (() -> Boolean)?,
+    onThumbsUp: (() -> Unit)?,
+    onThumbsDown: (() -> Unit)?,
+    onFlag: (() -> Unit)?,
+) {
+    var detailsExpanded by remember(state.key) { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+        // Readiness bar (Part A §7): stage completion at a glance.
         Text(
-            text = state.reason?.takeIf { it.isNotBlank() }
-                ?: stringResource(Res.string.mix_inspector_reason_pending),
+            text = inspectorReadinessText(state),
+            style = MaterialTheme.typography.labelLarge,
+            color = Color.White,
+            modifier = Modifier.semantics {
+                contentDescription = "Readiness: " + inspectorReadinessText(state)
+            },
+        )
+        Spacer(Modifier.height(6.dp))
+        // One-line placement "Why" (optionally suffixed with a taste note
+        // when the feed already carries one).
+        val why = state.reason?.takeIf { it.isNotBlank() }
+            ?: stringResource(Res.string.mix_inspector_reason_pending)
+        Text(
+            text = why,
             style = MaterialTheme.typography.bodyMedium,
             color = InspectorText,
         )
-        Spacer(Modifier.height(14.dp))
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(PanelColor.copy(alpha = 0.65f))
-                .padding(horizontal = 12.dp, vertical = 4.dp),
+        Spacer(Modifier.height(6.dp))
+        // Actions: "Try another mix" (engine-gated; no recipe check here),
+        // thumbs, flag. Hidden entirely where a platform has no handler.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(0.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            InspectorDetailRow(
-                stringResource(Res.string.mix_inspector_path),
-                state.path?.takeIf { it.isNotBlank() } ?: UnknownMeasurement,
+            if (state.remixAvailable && onRemix != null) {
+                TextButton(onClick = {
+                    if (!onRemix()) PlayerPlatform.host.showMessage(
+                        stringResource(Res.string.mix_inspector_remix_rejected),
+                    )
+                }) { Text("Try another mix") }
+            }
+            Spacer(Modifier.weight(1f))
+            if (onThumbsUp != null) {
+                IconButton(onClick = onThumbsUp) {
+                    Icon(Icons.Rounded.ThumbUp, contentDescription = "This mix worked")
+                }
+            }
+            if (onThumbsDown != null) {
+                IconButton(onClick = onThumbsDown) {
+                    Icon(Icons.Rounded.ThumbDown, contentDescription = "This mix didn't work")
+                }
+            }
+            if (onFlag != null) {
+                IconButton(onClick = onFlag) {
+                    Icon(Icons.Rounded.Flag, contentDescription = "Flag this mix")
+                }
+            }
+        }
+        if (!state.remixAvailable && !state.remixUnavailableReason.isNullOrBlank()) {
+            Text(
+                text = state.remixUnavailableReason.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                color = SecondaryText,
             )
+        }
+        Spacer(Modifier.height(4.dp))
+        // Collapsible Details, collapsed by default: raw scores table,
+        // timings, execution path, fallback reason.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Details",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f).semantics { heading() },
+            )
+            IconButton(onClick = { detailsExpanded = !detailsExpanded }) {
+                Icon(
+                    if (detailsExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                    contentDescription = if (detailsExpanded) "Hide details" else "Show details",
+                )
+            }
+        }
+        if (detailsExpanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(PanelColor.copy(alpha = 0.65f))
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+            ) {
+                // The recipe id stays behind Details (raw debug value).
+                if (!state.recipeId.isNullOrBlank() && state.recipeId != state.recipeName) {
+                    InspectorDetailRow(
+                        stringResource(Res.string.mix_inspector_recipe),
+                        state.recipeId.orEmpty(),
+                    )
+                }
+                InspectorDetailRow(
+                    stringResource(Res.string.mix_inspector_path),
+                    state.path?.takeIf { it.isNotBlank() } ?: UnknownMeasurement,
+                )
             if (!state.plannedPath.isNullOrBlank() && state.plannedPath != state.path) {
                 InspectorDetailRow(
                     stringResource(Res.string.mix_inspector_planned_path),
@@ -606,6 +784,7 @@ private fun MixInspectorContent(state: MixInspectorState, held: Boolean) {
                 if (index < minOf(state.topCandidates.size, 3) - 1) Spacer(Modifier.height(8.dp))
             }
         }
+        }
     }
 }
 
@@ -727,36 +906,58 @@ private fun inspectorPhaseLabel(phase: MixInspectorPhase): String = stringResour
 private fun inspectorMs(value: Long?): String =
     value?.let { stringResource(Res.string.mix_inspector_ms, it) } ?: UnknownMeasurement
 
+/**
+ * Readiness bar text (Part A §7 / B9.2): `"Analysis ✓ · Plan ✓ · Stems x/y ·
+ * Renderer ✓"`. Derived only from the feed: measured timings mark a stage
+ * done, otherwise the phase ordinal does; stem counts come straight from
+ * [MixInspectorState.stemCount] / [MixInspectorState.stemsReady], never
+ * inferred from phase alone.
+ */
+private fun inspectorReadinessText(state: MixInspectorState): String {
+    fun mark(done: Boolean) = if (done) "✓" else "✗"
+    val analysisDone = state.analysisMs != null || state.phase.ordinal >= MixInspectorPhase.PLANNED.ordinal
+    val planDone = state.planMs != null || state.phase.ordinal >= MixInspectorPhase.PREPARED.ordinal
+    val required = state.stemCount ?: 0
+    val ready = when (state.stemsReady) {
+        true -> required
+        else -> 0
+    }
+    val rendererDone = state.path?.isNotBlank() == true ||
+        state.phase.ordinal >= MixInspectorPhase.BUILDING.ordinal
+    return "Analysis ${mark(analysisDone)} · Plan ${mark(planDone)} · " +
+        "Stems $ready/$required · Renderer ${mark(rendererDone)}"
+}
+
+/**
+ * Labelled FX lanes (Part A §7): one chip per active effect, its colour
+ * paired with its text label so colour is never the sole information.
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun MixInspectorRemixControl(state: MixInspectorState, onRemix: () -> Boolean) {
-    var requested by remember(state.key) { mutableStateOf(false) }
-    val rejected = stringResource(Res.string.mix_inspector_remix_rejected)
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(PopupColor)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+private fun InspectorFxChips(effects: List<String>) {
+    val palette = listOf(
+        Color(0xFF7C4DFF), Color(0xFF00B0FF), Color(0xFF00C853),
+        Color(0xFFFF9100), Color(0xFFE040FB), Color(0xFF00B8D4),
+    )
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
     ) {
-        Button(
-            onClick = {
-                if (onRemix()) requested = true
-                else PlayerPlatform.host.showMessage(rejected)
-            },
-            enabled = !requested,
-            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-            shape = RoundedCornerShape(12.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                disabledContainerColor = Color.White.copy(alpha = 0.08f),
-                disabledContentColor = InspectorText,
-            ),
-        ) {
+        effects.forEachIndexed { index, effect ->
+            val color = palette[index % palette.size]
             Text(
-                text = stringResource(
-                    if (requested) Res.string.mix_inspector_remix_pending else Res.string.mix_inspector_remix,
-                ),
-                textAlign = TextAlign.Center,
+                text = effect.uppercase(),
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = color,
+                maxLines = 1,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(color.copy(alpha = 0.18f))
+                    .border(0.5.dp, color.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
+                    .semantics { contentDescription = "Effect: $effect" },
             )
         }
     }
@@ -794,9 +995,11 @@ internal fun MixViewContent(
     progress: State<Float>,
     live: Boolean = true,
     showStatusReason: Boolean = true,
+    reduceMotion: Boolean = false,
 ) {
     val sweep = rememberSkeletonSweep(
-        view.outgoing.analysing || view.incoming.analysing || view.outgoing.decoding || view.incoming.decoding,
+        active = (view.outgoing.analysing || view.incoming.analysing ||
+            view.outgoing.decoding || view.incoming.decoding) && !reduceMotion,
     )
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         DeckHeader(view.outgoing, sweep, Modifier.padding(horizontal = 14.dp))
@@ -995,6 +1198,19 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
             val bottomDeck = size.height - DeckBottomInset.toPx() - deckHeight
             drawDeck(view, outgoing = true, top = topDeck, height = deckHeight, colors = outColors, sweep = sweep)
             drawDeck(view, outgoing = false, top = bottomDeck, height = deckHeight, colors = inColors, sweep = sweep)
+            // The bass-swap downbeat (Part A §7): a marker, labelled
+            // "SWAP" by the Compose overlay below — colour is never the
+            // sole information.
+            val swap = view.bassSwapAt
+            if (swap >= 0f) {
+                val x = size.width * (BoxStart + (BoxEnd - BoxStart) * swap.coerceIn(0f, 1f))
+                drawLine(
+                    color = FrameColor,
+                    start = Offset(x, topDeck - 6.dp.toPx()),
+                    end = Offset(x, bottomDeck + deckHeight + 6.dp.toPx()),
+                    strokeWidth = 2.dp.toPx(),
+                )
+            }
             // The playhead, through both decks at once: they are the same moment.
             // Gone once the blend is over rather than parked at its end.
             if (live) {
@@ -1006,6 +1222,25 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                     strokeWidth = 1.5.dp.toPx(),
                 )
             }
+        }
+        // The swap marker's label, paired with the canvas line above.
+        if (view.bassSwapAt >= 0f) {
+            Text(
+                text = "SWAP",
+                color = FrameColor,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            (width * (BoxStart + (BoxEnd - BoxStart) * view.bassSwapAt) +
+                                4.dp.toPx()).toInt(),
+                            (DeckTop - 18.dp).toPx().toInt(),
+                        )
+                    }
+                    .semantics { contentDescription = "Swap downbeat marker" },
+            )
         }
         Row(
             modifier = Modifier
@@ -1456,6 +1691,39 @@ internal fun MixViewOverlay(hazeState: HazeState) {
                 val latest = PlayerSettings.mixInspector.value
                 MixViewRequest.open && latest?.key == snapshot.key && latest?.remixAvailable == true &&
                     PlayerPlatform.host.remixCurrentTransition(snapshot.key)
+            }
+        },
+        // AE3 (M7): thumbs/flag callbacks come from the platform-registered
+        // bridge (AndroidPlayerHost → MixInspectorActions); desktop registers
+        // nothing and the buttons stay hidden. Key-checked at the tap.
+        onThumbsUp = displayedInspector?.let { snapshot ->
+            MixInspectorActions.thumbs?.let { handler ->
+                {
+                    val latest = PlayerSettings.mixInspector.value
+                    if (MixViewRequest.open && latest?.key == snapshot.key) {
+                        handler(latest, 1)
+                    }
+                }
+            }
+        },
+        onThumbsDown = displayedInspector?.let { snapshot ->
+            MixInspectorActions.thumbs?.let { handler ->
+                {
+                    val latest = PlayerSettings.mixInspector.value
+                    if (MixViewRequest.open && latest?.key == snapshot.key) {
+                        handler(latest, -1)
+                    }
+                }
+            }
+        },
+        onFlag = displayedInspector?.let { snapshot ->
+            MixInspectorActions.flag?.let { handler ->
+                {
+                    val latest = PlayerSettings.mixInspector.value
+                    if (MixViewRequest.open && latest?.key == snapshot.key) {
+                        handler(latest)
+                    }
+                }
             }
         },
     )

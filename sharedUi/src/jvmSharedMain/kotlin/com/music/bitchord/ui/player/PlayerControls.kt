@@ -9,7 +9,6 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.unit.isSpecified
 import com.music.bitchord.playback.smart.AutomixStatus
-import com.music.bitchord.playback.smart.MixInspectorPhase
 import com.music.bitchord.data.model.ArtistCredit
 import com.music.bitchord.data.model.CreditSegment
 import com.music.bitchord.data.model.creditSegments
@@ -324,8 +323,13 @@ internal fun PlayerScrubber(
 @Composable
 private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
     val openLabel = stringResource(Res.string.mix_inspector_open)
+    // The one clean Automix chip text (AE3 M7 / Part A §7), e.g.
+    // "Mixing · <RecipeName>" while the blend runs.
+    val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
+    val inspector by PlayerSettings.mixInspector.collectAsStateWithLifecycle()
+    val label = automixChipLabel(status, inspector) ?: stringResource(Res.string.mixing)
     Text(
-        text = stringResource(Res.string.mixing),
+        text = label,
         modifier = modifier
             // Opens the mix view. Plain text that takes taps: no padding, no
             // ripple, so it lays out exactly as the label always did and
@@ -336,6 +340,7 @@ private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
                 role = Role.Button,
                 onClickLabel = openLabel,
             ) { MixViewRequest.open = true }
+            .semantics { contentDescription = "Automix: $label" }
             .graphicsLayer {
                 alpha = pulse.cover * pulse.alpha(1f, restShare = MIXING_LABEL_REST)
                 // A buffer to fade through would cut the blend below off from the backdrop.
@@ -362,22 +367,21 @@ private fun UpcomingTransitionChip(mixing: Boolean) {
     val enabled by PlayerSettings.smartFadeEnabled.collectAsStateWithLifecycle()
     if (!enabled) return
     val inspector by PlayerSettings.mixInspector.collectAsStateWithLifecycle()
-    val snapshot = inspector ?: return
-    val upcoming = !mixing && !snapshot.mixActive &&
-        snapshot.phase != MixInspectorPhase.DONE && snapshot.phase != MixInspectorPhase.CANCELLED
+    val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
+    // The one clean Automix chip text (AE3 M7 / Part A §7): null outside the
+    // active arc, so no chip renders before a mix exists or after it ends.
+    val label = automixChipLabel(status, inspector)
     Box(
         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
         contentAlignment = Alignment.Center,
     ) {
-        if (!upcoming) return@Box
-        val recipe = snapshot.recipeName?.takeIf { it.isNotBlank() }
-        val label = if (recipe == null) stringResource(Res.string.mix_inspector_upcoming)
-        else stringResource(Res.string.mix_inspector_upcoming_recipe, recipe)
+        if (label == null) return@Box
         val openLabel = stringResource(Res.string.mix_inspector_upcoming_open)
         Box(
             modifier = Modifier
                 .widthIn(max = 300.dp)
                 .heightIn(min = 48.dp)
+                .semantics { contentDescription = "Automix: $label" }
                 .clickable(
                     role = Role.Button,
                     onClickLabel = openLabel,
@@ -562,21 +566,30 @@ private fun AutomixStatusLine(
         return
     }
     val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
+    val inspector by PlayerSettings.mixInspector.collectAsStateWithLifecycle()
     var expanded by remember { mutableStateOf(false) }
     val color = automixStyleColor(status?.style)
+    // The one clean Automix chip text (AE3 M7 / Part A §7) — no rung, tempo
+    // or "locked" tag on the headline. The rung/reason line survives only in
+    // the expanded diagnostics below (behind the tap).
+    val chip = automixChipLabel(status, inspector)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-            enabled = status != null,
-        ) { expanded = !expanded },
+        modifier = Modifier
+            .semantics {
+                contentDescription = "Automix: ${chip ?: status?.headline ?: fallback}"
+            }
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                enabled = status != null,
+            ) { expanded = !expanded },
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AutomixMark(color = color, progress = status?.progress ?: -1f)
             Spacer(Modifier.width(6.dp))
             Text(
-                text = status?.headline ?: fallback,
+                text = chip ?: status?.headline ?: fallback,
                 style = textStyle,
                 color = Color.White.copy(alpha = 0.72f),
                 maxLines = 1,
@@ -584,23 +597,11 @@ private fun AutomixStatusLine(
                 textAlign = TextAlign.Center,
             )
         }
-        // One extra line: why the planner chose this rung. Same style as the
-        // diagnostic text, always visible so a degraded mix explains itself.
-        val why = automixReasonLine(status)
-        if (why.isNotBlank()) {
-            Text(
-                text = why,
-                style = textStyle,
-                color = Color.White.copy(alpha = 0.5f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-            )
-        }
         if (expanded && status != null) {
             Spacer(Modifier.height(2.dp))
+            val why = automixReasonLine(status)
             Text(
-                text = status?.detail.orEmpty(),
+                text = (if (why.isNotEmpty()) "$why · " else "") + status.detail,
                 style = textStyle,
                 color = Color.White.copy(alpha = 0.5f),
                 maxLines = 6,
@@ -611,14 +612,12 @@ private fun AutomixStatusLine(
     }
 }
 
-/** Short "why this rung" line shared by the player status and the mix popup. */
-internal fun automixReasonLine(status: AutomixStatus?): String {
-    if (status == null || status.rung.isBlank()) return ""
-    val overlap = if (status.overlapBars > 0) "${status.overlapBars} bars" else "no overlap"
-    val reason = status.reason
-    // A bare rung reads as a list item; adding the reason reads as an excuse.
-    return if (reason.isBlank()) "${status.rung}, $overlap" else "${status.rung} — $overlap ($reason)"
-}
+/**
+ * AE3 (M7): the "why" helper and the single Automix chip text now live in
+ * `MixViewPopup.kt` ([automixReasonLine] / [automixChipLabel]) so this file
+ * depends one way on the popup and the file cycle is gone. No rung, tempo
+ * or "locked" reaches the player headline — see [AutomixStatusLine].
+ */
 
 @Composable
 private fun AutomixMark(color: Color, progress: Float) {

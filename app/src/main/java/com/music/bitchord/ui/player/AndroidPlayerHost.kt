@@ -2,6 +2,7 @@ package com.music.bitchord.ui.player
 
 import com.music.bitchord.wear.WearBridge
 import android.content.Context
+import android.content.Intent
 import android.database.ContentObserver
 import android.media.AudioManager
 import android.os.Handler
@@ -27,8 +28,15 @@ import com.music.bitchord.playback.MusicOnlyPlayback
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.AudioRouting
 import com.music.bitchord.playback.AutoMixVisualFeed
+import com.music.bitchord.playback.djmix.diagnostics.DiagnosticsBundler
+import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
+import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
+import com.music.bitchord.playback.djmix.store.DjmixDatabase
+import com.music.bitchord.playback.djmix.store.TransitionRecord
 import com.music.bitchord.playback.smart.MixInspectorFeed
 import com.music.bitchord.playback.smart.MixInspectorKey
+import com.music.bitchord.playback.smart.MixInspectorState
+import java.io.File
 import com.music.bitchord.playback.audio.bitperfect.BitPerfectOutput
 import com.music.bitchord.playback.audio.bitperfect.DacVolume
 import com.music.bitchord.playback.cast.CastController
@@ -78,6 +86,93 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
     ): Modifier = androidAutoMixIncomingReveal(eased, reducedMotion, generation, blur)
 
     override val supportsAutoMixCanvas: Boolean get() = true
+
+    // AE3 (M7) inspector/history/rating/flag/developer glue. Playback ownership
+    // (CrossfadeController / MixExecutor) stays untouched — everything here
+    // goes through the read-only [MixInspectorFeed] / [AppSettings] feeds, the
+    // store, DjmixFlags and the diagnostics bundler.
+    val djmixFlags: DjmixFlags by lazy { DjmixFlags(app) }
+    val djmixStore: DjmixAnalysisStore by lazy { DjmixAnalysisStore(DjmixDatabase(app)) }
+    private val diagnosticsBundler: DiagnosticsBundler by lazy {
+        DiagnosticsBundler(File(app.getExternalFilesDir(null), "djmix-reports"))
+    }
+
+    init {
+        // :sharedUi cannot import app/ and PlayerHost has no rating/flag
+        // hooks, so the Mix Inspector popup reads these handlers from
+        // [MixInspectorActions] (simple same-package bridge, KMP-safe).
+        MixInspectorActions.thumbs = { state, rating -> rateTransition(state, rating) }
+        MixInspectorActions.flag = { state -> flagTransition(state) }
+    }
+
+    /**
+     * Persist a `👍`/`👎` for the pair the inspector is showing. The store's
+     * own `updateRating` verb owns the semantics (1 = up, -1 = down, 0 =
+     * unrated); nothing here invents a second rating path.
+     */
+    fun rateTransition(state: MixInspectorState, rating: Int) {
+        val record = djmixStore.recentTransitions(100)
+            .firstOrNull { it.outId == state.current.mediaId && it.inId == state.next.mediaId }
+        if (record == null) {
+            showMessage("No recorded transition for this pair yet")
+            return
+        }
+        val saved = djmixStore.updateRating(record.id, rating)
+        showMessage(
+            when {
+                !saved -> "Rating not saved"
+                rating >= 0 -> "Rated up"
+                else -> "Rated down"
+            },
+        )
+    }
+
+    /** Flag the inspected transition: write a diagnostics bundle and share it. */
+    fun flagTransition(state: MixInspectorState) {
+        bundleAndShare()
+    }
+
+    /** Flag a history row (Settings → History long-press / menu). */
+    fun flagRecord(record: TransitionRecord) {
+        bundleAndShare()
+    }
+
+    /** Newest-first transition history for Settings → History (last 100). */
+    fun historyRecords(limit: Int = 100): List<TransitionRecord> = djmixStore.recentTransitions(limit)
+
+    /** Re-rate a history row; `1` up, `-1` down, `0` clear. */
+    fun updateHistoryRating(id: Long, rating: Int): Boolean = djmixStore.updateRating(id, rating)
+
+    /** Clear all learned taste weights (Settings → "Reset learned preferences"). */
+    fun resetLearnedPreferences(): Boolean = djmixStore.resetPreferences()
+
+    /** Share the newest diagnostics bundle, if one exists. */
+    fun shareLatestDiagnostics(): Boolean {
+        val latest = diagnosticsBundler.listBundles().firstOrNull() ?: run {
+            showMessage("No diagnostics bundle yet")
+            return false
+        }
+        return shareFile(latest)
+    }
+
+    private fun bundleAndShare() {
+        val bundle = diagnosticsBundler.bundle()
+        if (bundle == null) {
+            showMessage("Diagnostics bundle not written")
+            return
+        }
+        shareFile(bundle)
+        showMessage("Flagged for diagnostics")
+    }
+
+    private fun shareFile(file: File): Boolean {
+        val intent = DiagnosticsBundler.buildShareChooser(app, file)
+        if (intent == null) return false
+        return runCatching {
+            app.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+            true
+        }.getOrDefault(false)
+    }
 
 
     override val settings: PlayerSettingsSource = object : PlayerSettingsSource {
