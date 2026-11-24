@@ -20,6 +20,7 @@ import okhttp3.Request
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.StandardCopyOption
@@ -70,24 +71,39 @@ internal fun modelNetworkAllowed(metered: Boolean?, allowMetered: Boolean): Bool
     metered == false || (metered == true && allowMetered)
 
 /**
- * The single Android delivery coordinator for the three pinned models-v1 weights.
- * All SHA work and HTTP run on IO workers. Trackers and the Android StemModelStore
- * only receive paths whose verified inode/timestamps still match. vc93's filesDir
- * copies and the old filesDir/stems copies are checked before any network request.
+ * Android delivery coordinator for Automix weights:
+ * - Bundled offline APK assets (`nirovi_int8.ort`, `syvenu.ort`) unpacked to `filesDir` and
+ *   SHA-256 verified so the first mix works completely offline without waiting for downloads.
+ * - Optional `models-v1` on-demand downloads (`scnet.int8.onnx` for 4-stem mixing,
+ *   `beat_this_final0_q8.onnx` fallback, and `vocals_umxhq_int8.onnx` 2-stem render fallback).
  *
  * Enabling Automix requests preparation, not metered consent. Consent is ephemeral,
  * applies only to the current batch, and is cleared on completion, failure or delete.
  */
 object AutomixModels : StemModelCoordinator {
-    class Model(val fileName: String, val bytes: Long, val sha256: String) {
+    class Model(val fileName: String, val bytes: Long, val sha256: String, val bundled: Boolean = false) {
         val url: String get() = RELEASE_URL + fileName
     }
 
-    /** Compatibility for the existing settings wrapper; no asset-unpacking mode remains. */
+    /**
+     * Kept `false` so [SettingsSheet] continues to expose download/delete controls for the
+     * optional `models-v1` stem/fallback pack (`SCNET`, `BEAT`, `VOCALS`), while bundled
+     * analysis assets (`NIROVI`, `SYVENU`) are always verified and ready offline.
+     */
     const val BUNDLED_ASSETS_ACTIVE = false
     private const val RELEASE_URL =
         "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/"
 
+    val NIROVI = Model(
+        "nirovi_int8.ort", 7_948_784L,
+        "7454d98ab6a88c0b7fe5e91c556b4766ebfabfe3d31ebd61187a033fed489387",
+        bundled = true,
+    )
+    val SYVENU = Model(
+        "syvenu.ort", 2_349_304L,
+        "1866a5955ed6b0e80f807cb49f56af530121064b8ea5322026566126eb3cd4f3",
+        bundled = true,
+    )
     val BEAT = Model(
         "beat_this_final0_q8.onnx", 23_138_816L,
         "7801f9c1adfd5ff193f37ececa3320bf1fda1ddee2bf7de341cea4c25ffd0acd",
@@ -100,8 +116,9 @@ object AutomixModels : StemModelCoordinator {
         "scnet.int8.onnx", 12_900_277L,
         "98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845",
     )
+    private val BUNDLED = listOf(NIROVI, SYVENU)
     private val ALL = listOf(BEAT, VOCALS, SCNET)
-    val totalBytes: Long = ALL.sumOf { it.bytes } // 45,093,299 B; no unpinned fourth model.
+    val totalBytes: Long = ALL.sumOf { it.bytes } // 45,093,299 B; models-v1 downloadable pack.
 
     sealed interface State {
         data object Ready : State
@@ -118,13 +135,15 @@ object AutomixModels : StemModelCoordinator {
     private val _state = MutableStateFlow<State>(State.Missing)
     val state: StateFlow<State> = _state.asStateFlow()
     private val _availabilityGeneration = MutableStateFlow(0L)
-    /** A new verified all-model availability lets failed analysis attempts retry. */
+    /** Increments when bundled analysis models or downloaded models verify ready. */
     val availabilityGeneration: StateFlow<Long> = _availabilityGeneration.asStateFlow()
 
     private const val TAG = "AutomixModels"
     private const val RETRY_AFTER_MS = 2 * 60_000L
+    private const val BUNDLED_RETRY_AFTER_MS = 5_000L
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Any()
+    private val bundledLock = Any()
     @Volatile private var filesDir: File? = null
     @Volatile private var application: Context? = null
     private data class VerifiedFile(val file: File, val identity: ModelFileIdentity)
@@ -133,7 +152,10 @@ object AutomixModels : StemModelCoordinator {
     private val observed = mutableMapOf<String, ModelFileIdentity?>()
     private var verifiedRevision = 0L
     private var readyRevision = -1L
+    private var analysisReadyRevision = -1L
     private var working = false
+    private var bundledWorking = false
+    private var bundledFailedAt = 0L
     private var failedAt = 0L
     private var activeCall: Call? = null
 
@@ -153,6 +175,8 @@ object AutomixModels : StemModelCoordinator {
             application = context.applicationContext
             filesDir = context.applicationContext.filesDir
         }
+        // Unpack & SHA-verify bundled Nirovi + Syvenu offline right away.
+        ensureBundledAsync()
         // Always verify/reuse local upgrade copies, including when offline or disabled.
         request(force = true, downloadMissing = false)
         scope.launch {
@@ -167,21 +191,32 @@ object AutomixModels : StemModelCoordinator {
 
     /** No hashing here. A changed/missing file is refused and queued for IO verification. */
     fun path(model: Model): String {
-        if (model !in ALL) throw FileNotFoundException("Not a models-v1 release model: ${model.fileName}")
+        if (model !in BUNDLED && model !in ALL) {
+            throw FileNotFoundException("Not a managed Automix model: ${model.fileName}")
+        }
         synchronized(lock) { trustedLocked(model)?.let { return it.absolutePath } }
-        request(force = false)
+        if (model in BUNDLED) ensureBundledAsync() else request(force = false)
         throw FileNotFoundException("${model.fileName} is not verified yet (Preparing models)")
     }
 
-    /** Cheap identity checks only; safe at the analysis request gate, before claiming renditions. */
+    /** Non-throwing lookup for optional/fallback weights without triggering a download batch. */
+    fun verifiedPathOrNull(model: Model): String? {
+        if (model !in BUNDLED && model !in ALL) return null
+        return synchronized(lock) { trustedLocked(model)?.absolutePath }
+    }
+
+    /**
+     * Cheap identity check for analysis readiness: true offline once bundled Nirovi + Syvenu
+     * are unpacked & verified (or if the Beat This! fallback model is verified).
+     */
     fun isReady(): Boolean {
         synchronized(lock) {
-            if (allTrustedLocked()) {
-                readyLocked()
+            if (analysisTrustedLocked()) {
+                analysisReadyLocked()
                 return true
             }
         }
-        request(force = false)
+        ensureBundledAsync()
         return false
     }
 
@@ -193,7 +228,7 @@ object AutomixModels : StemModelCoordinator {
         request(force = true, allowMetered = allowMetered)
     }
 
-    /** Deletes only our three exact filenames and their partials, never a directory/cache. */
+    /** Deletes only the downloadable models-v1 filenames and partials; bundled analysis assets stay ready. */
     fun delete(): Boolean = deleteModels(ALL)
 
     // Every independent Android stem store entry delegates here; there is no second HTTP installer.
@@ -217,7 +252,8 @@ object AutomixModels : StemModelCoordinator {
     }
 
     private fun copies(model: Model): List<File> = filesDir?.let {
-        listOf(File(it, model.fileName), File(File(it, "stems"), model.fileName))
+        if (model.bundled) listOf(File(it, model.fileName))
+        else listOf(File(it, model.fileName), File(File(it, "stems"), model.fileName))
     }.orEmpty()
 
     private fun trustedLocked(model: Model): File? {
@@ -225,15 +261,27 @@ object AutomixModels : StemModelCoordinator {
         if (modelFileIdentity(copy.file) == copy.identity) return copy.file
         verified.remove(model.fileName)
         verifiedRevision++
-        if (_state.value == State.Ready) _state.value = State.Verifying
+        if (!model.bundled && _state.value == State.Ready) _state.value = State.Verifying
         return null
     }
 
+    private fun bundledTrustedLocked(): Boolean = BUNDLED.all { trustedLocked(it) != null }
+
+    private fun analysisTrustedLocked(): Boolean = bundledTrustedLocked() || trustedLocked(BEAT) != null
+
     private fun allTrustedLocked(): Boolean = ALL.map { trustedLocked(it) != null }.all { it }
+
+    private fun analysisReadyLocked() {
+        if (analysisReadyRevision != verifiedRevision) {
+            analysisReadyRevision = verifiedRevision
+            _availabilityGeneration.value += 1L
+        }
+    }
 
     private fun readyLocked() {
         if (readyRevision != verifiedRevision) {
             readyRevision = verifiedRevision
+            analysisReadyRevision = verifiedRevision
             _availabilityGeneration.value += 1L
         }
         failedAt = 0L
@@ -259,6 +307,7 @@ object AutomixModels : StemModelCoordinator {
             pending = null
             var removed = true
             for (model in models.distinct()) {
+                if (model.bundled) continue
                 if (verified.remove(model.fileName) != null) verifiedRevision++
                 for (file in copies(model)) {
                     for (target in listOf(file, File(file.parentFile, file.name + ".part"), File(file.parentFile, file.name + ".tmp"))) {
@@ -271,6 +320,107 @@ object AutomixModels : StemModelCoordinator {
             _state.value = State.Missing
             Log.i(TAG, "Automix model delete completed=$removed")
             return removed
+        }
+    }
+
+    private fun ensureBundledAsync() {
+        synchronized(lock) {
+            if (filesDir == null || application == null) return
+            if (bundledTrustedLocked()) {
+                analysisReadyLocked()
+                return
+            }
+            if (bundledWorking) return
+            val now = SystemClock.elapsedRealtime()
+            if (bundledFailedAt != 0L && now - bundledFailedAt < BUNDLED_RETRY_AFTER_MS) return
+            bundledWorking = true
+        }
+        scope.launch {
+            try {
+                prepareBundled()
+            } finally {
+                synchronized(lock) { bundledWorking = false }
+            }
+        }
+    }
+
+    private fun prepareBundled() {
+        synchronized(bundledLock) {
+            prepareBundledLocked()
+        }
+    }
+
+    private fun prepareBundledLocked() {
+        val app = application ?: return
+        val dir = filesDir ?: return
+        for (model in BUNDLED) {
+            if (synchronized(lock) { trustedLocked(model) } != null) continue
+            val target = File(dir, model.fileName)
+            val existing = verifiedModelIdentity(target, model.bytes, model.sha256)
+            if (existing != null) {
+                synchronized(lock) {
+                    verified[model.fileName] = VerifiedFile(target, existing)
+                    verifiedRevision++
+                }
+                continue
+            }
+            val tmp = File(dir, model.fileName + ".asset.tmp")
+            try {
+                dir.mkdirs()
+                if (tmp.exists()) tmp.delete()
+                var copied = 0L
+                app.assets.open(model.fileName).use { input ->
+                    tmp.outputStream().use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = input.read(buffer)
+                            if (n < 0) break
+                            copied += n
+                            output.write(buffer, 0, n)
+                        }
+                        output.fd.sync()
+                    }
+                }
+                if (copied != model.bytes) {
+                    throw IOException("Asset ${model.fileName} is $copied bytes, expected ${model.bytes}")
+                }
+                val sourceIdentity = verifiedModelIdentity(tmp, model.bytes, model.sha256)
+                    ?: throw IOException("Asset ${model.fileName} failed SHA-256 verification")
+                try {
+                    Files.move(
+                        tmp.toPath(), target.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                }
+                val installedIdentity = modelFileIdentity(target)
+                    ?: throw IOException("Cannot stat bundled ${model.fileName}")
+                if (installedIdentity.device != sourceIdentity.device ||
+                    installedIdentity.inode != sourceIdentity.inode ||
+                    installedIdentity.bytes != sourceIdentity.bytes ||
+                    installedIdentity.modified != sourceIdentity.modified
+                ) {
+                    throw IOException("Bundled ${model.fileName} changed during installation")
+                }
+                synchronized(lock) {
+                    verified[model.fileName] = VerifiedFile(target, installedIdentity)
+                    verifiedRevision++
+                }
+                Log.i(TAG, "Bundled asset ${model.fileName} verified (${model.bytes} B)")
+            } catch (error: Throwable) {
+                Log.w(TAG, "Failed to unpack bundled model ${model.fileName}", error)
+            } finally {
+                tmp.delete()
+            }
+        }
+        synchronized(lock) {
+            if (bundledTrustedLocked()) {
+                bundledFailedAt = 0L
+                analysisReadyLocked()
+            } else {
+                bundledFailedAt = SystemClock.elapsedRealtime()
+            }
         }
     }
 
@@ -328,6 +478,7 @@ object AutomixModels : StemModelCoordinator {
     private fun prepare(batch: Batch) {
         var resumeWhenAuthorized = false
         try {
+            prepareBundled()
             for (model in ALL) {
                 if (synchronized(lock) { trustedLocked(model) } != null) continue
                 for (file in copies(model)) {
@@ -348,6 +499,7 @@ object AutomixModels : StemModelCoordinator {
             }
             synchronized(lock) {
                 observeLocked()
+                if (analysisTrustedLocked()) analysisReadyLocked()
                 if (allTrustedLocked()) {
                     readyLocked()
                     return
@@ -375,7 +527,7 @@ object AutomixModels : StemModelCoordinator {
                 if (!allTrustedLocked()) throw IOException("A model changed before preparation completed")
                 readyLocked()
             }
-            Log.i(TAG, "All three Automix models verified")
+            Log.i(TAG, "All three models-v1 Automix models verified")
         } catch (failure: Exception) {
             synchronized(lock) {
                 observeLocked()

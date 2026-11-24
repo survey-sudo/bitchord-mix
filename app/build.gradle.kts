@@ -318,6 +318,8 @@ val newPipeExtractorStripped = tasks.register<org.gradle.api.tasks.bundling.Jar>
 dependencies {
     implementation(project(":shared"))
     implementation(project(":sharedUi"))
+    // FORK-HOOK(app-djmix-deps): AE3 djmix-core contracts & state machine
+    implementation(project(":djmix-core"))
 
     // ---- Compose (Material 3) ----
     val composeBom = platform("androidx.compose:compose-bom:2024.12.01")

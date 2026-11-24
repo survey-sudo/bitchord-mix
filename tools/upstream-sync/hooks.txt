@@ -31,3 +31,5 @@ mix-inspector|sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/Mix
 mini-player-mix|app/src/main/java/com/music/bitchord/ui/components/MiniPlayer.kt|1
 automix-model-consent|app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt|2
 djmix-modules|settings.gradle.kts|1
+app-djmix-deps|app/build.gradle.kts|1
+djmix-queue-worker|app/src/main/java/com/music/bitchord/playback/PlaybackService.kt|1

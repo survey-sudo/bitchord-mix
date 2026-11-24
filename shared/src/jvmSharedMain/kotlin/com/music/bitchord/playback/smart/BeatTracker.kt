@@ -24,23 +24,22 @@ package com.music.bitchord.playback.smart
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Beat and downbeat tracking with the Beat This! model (CPJKU, ISMIR 2024).
+ * Beat and downbeat tracking, defaulting to Nirovi (`nirovi_int8.ort`) with Beat This!
+ * (`beat_this_final0_q8.onnx`) as explicit fallback when Nirovi is unavailable or fails.
  *
- * Why a model at all: tempo and *meter* are different problems. Autocorrelation reads tempo well,
- * but nothing in an autocorrelation says which of four beats is beat one, and a mix that enters on
- * beat three sounds wrong even when every beat lines up.
- *
- * Beat This! is the one that can be shipped: both its code and its trained weights are MIT. Most
- * published MIR weights, Essentia's included, are CC BY-NC-SA.
+ * Both models share the identical [MelSpectrogram] front end (22,050 Hz, FFT 1024, hop 441 / 50 fps,
+ * 128 Slaney mel bands 30–11,000 Hz, `log1p(1000 * mag)`).
  *
  * Everything here is optional. A missing model, an unreadable graph, a rate mismatch, too few
  * peaks, all resolve to null, and the caller keeps whatever it had. A missing beat tracker
@@ -48,21 +47,18 @@ import kotlin.math.roundToInt
  */
 class BeatTracker(
     /**
-     * Where the model lives, resolved lazily.
-     *
-     * A path rather than a [Context]: this is the only thing the tracker ever
-     * wanted the platform for, and each application already knows how to put
-     * its own copy of the weights somewhere readable — unpacked from assets on
-     * Android, from the jar's resources on the desktop.
+     * Where the primary model lives, resolved lazily (bundled `nirovi_int8.ort` by default).
      */
     private val modelPath: () -> String,
-    /** How many threads inference may use; the beat and downbeat pass is the expensive one. */
-    private val inferenceThreads: () -> Int,
+    /** How many threads inference may use (Nirovi uses 2 intra-op threads). */
+    private val inferenceThreads: () -> Int = { DEFAULT_INTRA_OP_THREADS },
     /** NPU (vc69): QNN configuration, vendor detection, backend path, and context cache dir. Defaults are CPU-safe. */
     private val npuConfig: () -> NpuSupport.NpuConfig = { NpuSupport.NpuConfig() },
     private val npuVendor: () -> NpuSupport.Vendor = { NpuSupport.Vendor.NONE },
     private val npuBackendPath: () -> String? = { null },
     private val npuCacheDir: () -> File? = { null },
+    /** Optional fallback model path (e.g. downloaded `beat_this_final0_q8.onnx` from `models-v1`). */
+    private val fallbackModelPath: () -> String? = { null },
 ) {
 
     /** A tracked grid on the analysed audio's own timeline, in seconds. */
@@ -77,30 +73,55 @@ class BeatTracker(
 
     @Volatile private var session: OrtSession? = null
     @Volatile private var sessionThreads = 0
+    @Volatile private var activeIsFallback = false
+
+    /** Model tag recorded on the last session open / inference (`"nirovi"` or `"beat_this"`). */
+    @Volatile var lastModelTag: String = MODEL_TAG_NIROVI
+        private set
+
     private val lock = Any()
 
     /** Parsing the graph is far too expensive to repeat per track, so one session is kept. */
-    private fun session(): OrtSession? {
-        val threads = inferenceThreads()
-        // AUTOMIX-V2(A): drop a QNN session once the NPU is switched off or auto-disabled.
-        session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
-        synchronized(lock) {
+    private fun session(forceFallback: Boolean = false): OrtSession? {
+        val threads = inferenceThreads().coerceIn(1, 4)
+        if (!forceFallback) {
             session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
+        }
+        synchronized(lock) {
+            if (!forceFallback) {
+                session?.takeIf { sessionThreads == threads && NpuQnnSession.stillAllowed(it) }?.let { return it }
+            }
             runCatching { session?.close() }
             session = null
-            return runCatching {
-                val file = File(modelPath())
-                // AUTOMIX-V2(A): beat_this_final0_qdq(.ctx).onnx on QNN when allowed; otherwise the legacy CPU open.
-                NpuQnnSession.open(
-                    file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
-                    acceptsFixedShape = true,
-                )
-                    .also {
-                        session = it
-                        sessionThreads = threads
-                    }
-            }.onFailure { AnalysisLog.warn("Beat model unavailable; falling back to no grid", it) }
-                .getOrNull()
+
+            val candidates = buildList {
+                if (!forceFallback) {
+                    runCatching { modelPath() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { add(it to false) }
+                }
+                runCatching { fallbackModelPath() }.getOrNull()?.takeIf { it.isNotBlank() }?.let { add(it to true) }
+            }.distinctBy { it.first }
+
+            for ((path, isFallback) in candidates) {
+                val file = File(path)
+                if (!file.isFile || file.length() <= 0L) continue
+                val opened = runCatching {
+                    NpuQnnSession.open(
+                        file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
+                        acceptsFixedShape = true,
+                    )
+                }.onFailure {
+                    AnalysisLog.warn("Beat model open failed for ${file.name}", it)
+                }.getOrNull()
+                if (opened != null) {
+                    session = opened
+                    sessionThreads = threads
+                    activeIsFallback = isFallback
+                    lastModelTag = modelTagFor(file, isFallback)
+                    return opened
+                }
+            }
+            AnalysisLog.warn("Beat model unavailable; falling back to no grid")
+            return null
         }
     }
 
@@ -114,16 +135,47 @@ class BeatTracker(
         val melStarted = System.currentTimeMillis()
         val spectrogram = MelSpectrogram.compute(pcm) ?: return null
         val melMs = System.currentTimeMillis() - melStarted
-        val active = session() ?: return null
+        return track(spectrogram, offsetSeconds, melMs)
+    }
+
+    /**
+     * Tracks a precomputed [MelSpectrogram.Spectrogram] so downstream models such as [VocalPresence]
+     * can share the exact same spectrogram with zero duplicate STFT/mel work.
+     */
+    fun track(
+        spectrogram: MelSpectrogram.Spectrogram,
+        offsetSeconds: Double = 0.0,
+        melMs: Long = 0L,
+    ): Grid? {
+        if (spectrogram.frames <= 0 || spectrogram.mels <= 0) return null
+        var active = session() ?: return null
 
         val beatLogits = FloatArray(spectrogram.frames)
         val downbeatLogits = FloatArray(spectrogram.frames)
         val inferStarted = System.currentTimeMillis()
-        if (!infer(active, spectrogram, beatLogits, downbeatLogits)) return null
+        if (!infer(active, spectrogram, beatLogits, downbeatLogits)) {
+            if (!activeIsFallback) {
+                val fallback = session(forceFallback = true)
+                if (fallback != null) {
+                    active = fallback
+                    beatLogits.fill(0f)
+                    downbeatLogits.fill(0f)
+                    if (!infer(active, spectrogram, beatLogits, downbeatLogits)) return null
+                } else {
+                    return null
+                }
+            } else {
+                return null
+            }
+        }
+        val inferMs = System.currentTimeMillis() - inferStarted
         NpuQnnSession.onRunSuccess(active) // AUTOMIX-V2(A): ends a QNN failure streak
-        AnalysisLog.warn("mel ${melMs}ms (${spectrogram.frames} frames) " +
-                "infer ${System.currentTimeMillis() - inferStarted}ms",
+        AnalysisLog.warn(
+            "analysis.ms=$inferMs model=$lastModelTag mel=${melMs}ms (${spectrogram.frames} frames)",
         )
+
+        convertProbabilitiesToLogitsIfNeeded(beatLogits)
+        convertProbabilitiesToLogitsIfNeeded(downbeatLogits)
 
         val fps = MelSpectrogram.frameRate
         val beatFrames = pickPeaks(beatLogits)
@@ -157,13 +209,14 @@ class BeatTracker(
     }
 
     /**
-     * Runs the model over the spectrogram in chunks, writing logits into the output arrays.
+     * Runs the model over the spectrogram in 1500-frame chunks with [BORDER_FRAMES] borders,
+     * zero-padding short inputs or fixed-shape graphs.
      *
-     * The model reads 1500-frame chunks and has no context at their edges, so [BORDER_FRAMES] are
-     * discarded from each side and chunks advance by the difference. The first and last chunk keep
-     * their outer border, since there is no neighbouring chunk to supply it.
+     * Inspected contracts:
+     * - `nirovi_int8.ort`: input `input_spectrogram` float32`[1, 1500, 128]` (static),
+     *   outputs `beat` float32`[1, 1500]` and `downbeat` float32`[1, 1500]` (logits).
+     * - `beat_this_final0_q8.onnx`: dynamic `[1, frames, 128]`, outputs `beat` / `downbeat`.
      */
-    @Suppress("UNCHECKED_CAST")
     private fun infer(
         session: OrtSession,
         spectrogram: MelSpectrogram.Spectrogram,
@@ -172,40 +225,77 @@ class BeatTracker(
     ): Boolean = runCatching {
         val environment = OrtEnvironment.getEnvironment()
         val mels = spectrogram.mels
-        val name = session.inputNames.first()
-        // AUTOMIX-V2(A): an HTP graph has a fixed time dimension; every chunk is exactly that long.
-        val fixed = NpuQnnSession.fixedInputFrames(session)
+        val inputNames = session.inputNames.toList()
+        val inputName = inputNames.firstOrNull { it.equals("input_spectrogram", ignoreCase = true) }
+            ?: inputNames.first()
+        val inputInfo = session.inputInfo[inputName]?.info as? TensorInfo
+        val inputShape = inputInfo?.shape
+
+        if (inputShape != null && inputShape.isNotEmpty()) {
+            val expectedMels = inputShape.last()
+            if (expectedMels > 0 && expectedMels != mels.toLong()) {
+                AnalysisLog.warn("Beat model mel mismatch: expected $expectedMels, got $mels")
+                return false
+            }
+        }
+
+        val inputRank = inputShape?.size ?: 3
+        val fixed = fixedFramesFromShape(inputShape) ?: NpuQnnSession.fixedInputFrames(session)
         val chunkFrames = fixed ?: CHUNK_FRAMES
-        val stride = chunkFrames - 2 * BORDER_FRAMES
+        val stride = (chunkFrames - 2 * BORDER_FRAMES).coerceAtLeast(1)
+
+        val outNames = session.outputNames.toList()
+        val beatOutIdx = outNames.indexOfFirst { it.equals("beat", ignoreCase = true) }.let { if (it >= 0) it else 0 }
+        val downOutIdx = outNames.indexOfFirst { it.equals("downbeat", ignoreCase = true) }.let {
+            if (it >= 0) it else min(1, outNames.lastIndex)
+        }
 
         var start = 0
         while (start < spectrogram.frames) {
-            // Fixed shape: the last chunk is aligned to the end (overlapping, never short); a track
-            // shorter than one chunk is zero-padded and only its real frames are kept.
+            // Fixed shape (e.g. Nirovi [1, 1500, 128]): align tail chunk to end when audio is >= chunkFrames
+            // so edge frames keep real audio context; shorter tracks/regions are zero-padded to chunkFrames.
             if (fixed != null && start > 0 && start + chunkFrames > spectrogram.frames) {
                 start = max(0, spectrogram.frames - chunkFrames)
             }
             val length = min(chunkFrames, spectrogram.frames - start)
-            // A chunk shorter than the border padding carries no usable centre.
             if (length <= 2 * BORDER_FRAMES && start > 0) break
 
             val fedFrames = if (fixed != null) chunkFrames else length
             val chunk = FloatArray(fedFrames * mels)
             spectrogram.values.copyInto(chunk, 0, start * mels, (start + length) * mels)
-            val shape = longArrayOf(1, fedFrames.toLong(), mels.toLong())
+            val shape = if (inputRank == 2) {
+                longArrayOf(fedFrames.toLong(), mels.toLong())
+            } else {
+                longArrayOf(1L, fedFrames.toLong(), mels.toLong())
+            }
 
             OnnxTensor.createTensor(environment, FloatBuffer.wrap(chunk), shape).use { tensor ->
-                session.run(mapOf(name to tensor)).use { outputs ->
-                    val beat = (outputs.get(0).value as Array<FloatArray>)[0]
-                    val downbeat = (outputs.get(1).value as Array<FloatArray>)[0]
-
+                session.run(mapOf(inputName to tensor)).use { outputs ->
                     val keepFrom = if (start == 0) 0 else BORDER_FRAMES
                     val keepTo = if (start + length >= spectrogram.frames) length else length - BORDER_FRAMES
-                    for (index in keepFrom until keepTo) {
-                        val target = start + index
-                        if (target >= beatLogits.size) break
-                        beatLogits[target] = beat[index]
-                        downbeatLogits[target] = downbeat[index]
+                    if (outputs.size() >= 2) {
+                        val beatBuf = (outputs.get(beatOutIdx) as OnnxTensor).floatBuffer
+                        val downBuf = (outputs.get(downOutIdx) as OnnxTensor).floatBuffer
+                        for (index in keepFrom until keepTo) {
+                            val target = start + index
+                            if (target >= beatLogits.size) break
+                            beatLogits[target] = beatBuf.get(index)
+                            downbeatLogits[target] = downBuf.get(index)
+                        }
+                    } else {
+                        val packed = outputs.get(0) as OnnxTensor
+                        val packedShape = packed.info.shape
+                        val buf = packed.floatBuffer
+                        if (packedShape.lastOrNull() == 2L) {
+                            for (index in keepFrom until keepTo) {
+                                val target = start + index
+                                if (target >= beatLogits.size) break
+                                beatLogits[target] = buf.get(index * 2)
+                                downbeatLogits[target] = buf.get(index * 2 + 1)
+                            }
+                        } else {
+                            return false
+                        }
                     }
                 }
             }
@@ -215,7 +305,7 @@ class BeatTracker(
         }
         true
     }.onFailure {
-        AnalysisLog.warn("Beat inference failed", it)
+        AnalysisLog.warn("Beat inference failed (model=$lastModelTag)", it)
         // AUTOMIX-V2(A): QNN failure (e.g. ENGINE_ERROR after a DSP restart) -> count it, recreate next time.
         if (NpuQnnSession.onRunFailure(session, it)) release()
     }.getOrDefault(false)
@@ -225,26 +315,32 @@ class BeatTracker(
             runCatching { session?.close() }
             session = null
             sessionThreads = 0
+            activeIsFallback = false
         }
     }
 
     companion object {
         private const val TAG = "BitChordBeatTracker"
-        /**
-         * The weights this tracker needs, named once for every build that ships them.
-         *
-         * The official final0 checkpoint with only its MatMuls quantized (int8, per channel); the
-         * convolutions stay float. The earlier `beat_this_int8.onnx` quantized the convolutions
-         * too and found no beats at all. A new name rather than the old one because the app
-         * unpacks assets once by name and would keep serving the stale copy.
-         */
-        const val MODEL_ASSET = "beat_this_final0_q8.onnx"
+
+        const val MODEL_TAG_NIROVI = "nirovi"
+        const val MODEL_TAG_BEAT_THIS = "beat_this"
+
+        /** Bundled CPU Nirovi model (AE3 M2-A). */
+        const val NIROVI_MODEL_ASSET = "nirovi_int8.ort"
+
+        /** On-demand Beat This! fallback model (`models-v1`). */
+        const val BEAT_THIS_MODEL_ASSET = "beat_this_final0_q8.onnx"
+
+        /** Default bundled beat/downbeat asset. */
+        const val MODEL_ASSET = NIROVI_MODEL_ASSET
 
         /** The broken earlier export, whose unpacked copy is deleted on first use of the new one. */
         const val RETIRED_MODEL_ASSET = "beat_this_int8.onnx"
+
         /** The window the model was trained on, and the margin discarded from each chunk's edges. */
         const val CHUNK_FRAMES = 1500
         const val BORDER_FRAMES = 6
+        const val DEFAULT_INTRA_OP_THREADS = 2
 
         /**
          * Window length that costs exactly one inference. A window longer than this splits into
@@ -259,6 +355,45 @@ class BeatTracker(
         /** Plausible musical tempo, used only to reject a grid the model clearly did not find. */
         private const val MIN_TEMPO = 40.0
         private const val MAX_TEMPO = 220.0
+
+        private fun modelTagFor(file: File, isFallback: Boolean): String =
+            if (isFallback || file.name.contains("beat_this", ignoreCase = true)) {
+                MODEL_TAG_BEAT_THIS
+            } else {
+                MODEL_TAG_NIROVI
+            }
+
+        private fun fixedFramesFromShape(shape: LongArray?): Int? {
+            if (shape == null) return null
+            val frameDim = when {
+                shape.size >= 3 -> shape[1]
+                shape.size == 2 -> shape[0]
+                else -> -1L
+            }
+            return frameDim.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+        }
+
+        /**
+         * Nirovi and Beat This! emit raw logits (non-beat frames are negative). If a graph ever
+         * emits sigmoid probabilities in `[0, 1]` instead, convert them to logits so [pickPeaks]
+         * and [gridConfidence] stay calibrated.
+         */
+        internal fun convertProbabilitiesToLogitsIfNeeded(values: FloatArray) {
+            if (values.isEmpty()) return
+            var minVal = Float.POSITIVE_INFINITY
+            var maxVal = Float.NEGATIVE_INFINITY
+            for (v in values) {
+                if (!v.isFinite()) continue
+                if (v < minVal) minVal = v
+                if (v > maxVal) maxVal = v
+            }
+            if (minVal >= 0f && maxVal <= 1f && maxVal > 0f) {
+                for (i in values.indices) {
+                    val p = values[i].coerceIn(1e-6f, 1f - 1e-6f)
+                    values[i] = ln(p / (1f - p))
+                }
+            }
+        }
 
         private fun median(values: List<Double>): Double {
             if (values.isEmpty()) return 0.0

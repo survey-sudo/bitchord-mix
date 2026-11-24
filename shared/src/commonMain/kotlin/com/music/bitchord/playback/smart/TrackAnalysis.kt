@@ -136,6 +136,11 @@ data class TrackAnalysis(
      * [vocalWindows], reusing [CurveWindow] so planners read one shape.
      */
     val instrumentalWindows: List<CurveWindow> = emptyList(),
+    /**
+     * Syvenu frame-level vocal presence probabilities (`0..1`) at 50 fps (hop 441 at 22,050 Hz),
+     * when measured. Empty when Syvenu did not run.
+     */
+    val vocalPresence50fps: List<Float> = emptyList(),
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing
