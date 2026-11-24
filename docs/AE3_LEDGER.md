@@ -20,9 +20,59 @@
 | M6 NPU | doing | `ba482d98`, `0f5b7bcd`, `30bdcfe4` | `ModelRegistry`, `InferenceBackend`, Orchard V73 `npu_bridge`, `NpuSelfTestRunner`, `TrackAnalyzer` M6 wiring (`0f5b7bcd`), `npu-addon/v73/` + `.github/workflows/npu-addon.yml` (`30bdcfe4`); **Stage 8** `assembleProdDebug` compiled `npu_bridge.cpp` into `libbitchord_analysis.so` (`611,832` B) and bundled `nirovi_int8.ort` + `syvenu.ort` | Gate pending: `ep=QNN` self-test PASS on POCO F6 (`1439ebea` currently disconnected), NPU ms below CPU, measured numbers in `docs/NPU.md`. May run with M5. |
 | M7 UX | doing | `893c0a62`, `ec7251b6`, `dd86c746`, `f0ba8bb8` | Uncluttered AE3 Compose UI (`ui/djmix/*`) per Part A §7 chip + B9 Inspector/History/Settings (`893c0a62`), Compose/AppSettings/PlayerHost wiring (`ec7251b6`, Compose fixes `dd86c746`, `f0ba8bb8`, `hooks-check` 32/32 ok); **Stage 8** `:app:compileProdDebugKotlin` & `assembleProdDebug` PASS | Gate pending: owner screenshot review "uncluttered" + device verification. |
 | M8 Diagnostics + learning | doing | `893c0a62`, `0f5b7bcd`, `30bdcfe4` | `TasteModel`, `TelemetryV3Writer`, `DiagnosticsBundler`, `DjmixFlags` (`893c0a62`), `MixExecutor` M8 wiring (`0f5b7bcd`), `tools/analyze_telemetry_v3.py` (14/14 smoke) + `tools/replay_bundle.py` (20/20 smoke) (`30bdcfe4`); **Stage 8** unit-test compile & APK build PASS | Gate pending: flagged bundle `[PENDING DEVICE RUN]` bit-exact replay on devbox; learning shifts a recipe weight after 3 thumbs-down. |
-| M9 Hardening + untangle sweep | doing | `8c87f8c7`, `a065cb34`, `f7c3387a`, `b517ae51` | Blueprint: `/home/hfzhkn/Bitchord/work/m9-strangler-blueprint.md`. **Wave 1 extractions landed (14 files, every one at or under 1,500 lines, verified `wc -l` on `dvb` at `b517ae51`):** L-1..L-2 `LoopQualification.kt` 268 + `DeckKnotBuilder.kt` 545 out of `LoopMixSession.kt` (2,119 → **1,474**, `8c87f8c7`); P-1..P-4 `TransitionPlanSelector.kt` 566 + `PreparedSessionManager.kt` 223 + `StemWindowPlanner.kt` 993 + `ChoreoScriptBuilder.kt` 190 + `djmix/store/TrackStoreBridge.kt` 158 out of `PairPreparer.kt` (2,895 → **1,220**, `a065cb34`); T-1..T-5 `StemAvailability.kt` 415 + `HeadAnalyzer.kt` 362 + `AudioMath.kt` 261 + `WholeTrackPipeline.kt` 528 out of `TrackAnalyzer.kt` (2,623 → **1,053**, `f7c3387a`); `fix(m9)` `b517ae51` gives `headAnalyzer`/`wholeTrackPipeline` explicit property types (their lambdas call each other, so inferred types were recursive). **`dvb` verification at `b517ae51`:** Gate 1 `BUILD SUCCESSFUL`, RC 0 (`:djmix-core:jvmTest` **23/23**, `:shared:compileKotlinJvm`, `:app:compileProdDebugKotlin`, `:app:compileProdDebugUnitTestKotlin`); Gate 2 RC 0 — 6 suites, **37 tests, 0 failures, 0 errors, 4 skipped** (`LoopCrownNativeSessionTest` host-JNI `Assume.assumeTrue`), **33 passed** (`PairPreparerTest` 6/6, `DjmixStoreContractTest` 6/6, `StuckStateRecoveryTest` 4/4, `Djmix26AppTest` 12/12, `Djmix32AppTest` 5/5). Invariants: `hooks-check.sh` 32/32, `check_audiothread_alloc.py` exit 0, 0 `CrossfadeController` imports in `playback/{loopmix,djmix,smart}` | Remaining: `CrossfadeController.kt` 9,065 → at or under 2,500 (Wave 2 C-1..C-3); B13.1/B13.3/B13.4 dead-code removal; D2 step 5 sweeps; B6.5 soak + B6.4 perf + B15 budgets; D1 Bucket C test cleanup LAST. |
-| M10 Sync + release engineering + docs | doing | `ec7251b6`, `0f5b7bcd`, `30bdcfe4`, `77a0fcaf`, `34eac976`, `dd86c746`, `f0ba8bb8` | CI/release/`npu-addon` workflows, v1+v2+v3 signing, `bumpDjmix` (`34eac976`), `soak.sh` (22/22 smoke, `[PENDING DEVICE RUN]`), `check_audiothread_alloc.py` (exit 0), B12 docs + `CHANGELOG.md` (`77a0fcaf`), 0-conflict dry run (`21356206`), `hooks-check.sh` (32/32); **Stage 8 `dvb` Gates 1–3 (`f0ba8bb8`):** Gate 1 PASS (`1m 30s`, `:djmix-core:jvmTest` 23/23); Gate 2 `1,569/1,590` PASS (all AE3 suites green: `PairPreparerTest` 6/6, `DjmixStoreContractTest` 6/6, `StuckStateRecoveryTest` 4/4, `Djmix18–32` 88/88; 21 failures in 7 legacy Bucket C suites reserved for M9 D1); Gate 3 `:app:assembleProdDebug` PASS (`3m 54s`, `app-prod-arm64-v8a-debug.apk` `105,858,834` B) | Gate remaining: GitHub CI green after push; M9 cleanup + Bucket C tests LAST; `bumpDjmix` + release APK after M9. |
+| M9 Hardening + untangle sweep | doing | `8c87f8c7`, `a065cb34`, `f7c3387a`, `b517ae51`, `c6b7b0a7`, `c6970dbc` | Blueprint: `/home/hfzhkn/Bitchord/work/m9-strangler-blueprint.md`. **Wave 1 extractions landed (14 files, every one at or under 1,500 lines, verified `wc -l` on `dvb` at `b517ae51`):** L-1..L-2 `LoopQualification.kt` 268 + `DeckKnotBuilder.kt` 545 out of `LoopMixSession.kt` (2,119 → **1,474**, `8c87f8c7`); P-1..P-4 `TransitionPlanSelector.kt` 566 + `PreparedSessionManager.kt` 223 + `StemWindowPlanner.kt` 993 + `ChoreoScriptBuilder.kt` 190 + `djmix/store/TrackStoreBridge.kt` 158 out of `PairPreparer.kt` (2,895 → **1,220**, `a065cb34`); T-1..T-5 `StemAvailability.kt` 415 + `HeadAnalyzer.kt` 362 + `AudioMath.kt` 261 + `WholeTrackPipeline.kt` 528 out of `TrackAnalyzer.kt` (2,623 → **1,053**, `f7c3387a`); `fix(m9)` `b517ae51` gives `headAnalyzer`/`wholeTrackPipeline` explicit property types. **Wave 2a C-1..C-2 landed (`c6b7b0a7`):** extracted `FadeRideCurves.kt` (**795** lines) + `EaseTempoEngine.kt` (**658** lines) out of `CrossfadeController.kt` (9,065 → **7,776** lines; net −1,289 lines); `FadeRideCurvesMaskTest` (2/2), `EaseTempoEngineCancellationTest` (10/10), ADR 0010 Festival fallback test fix in `RecipesTest` (F5/C2). **B13.1 vc93 NPU cleanup (`c6970dbc`):** deleted dormant `NpuQnnSession`, `NpuSelfTest`, `NpuQdqSelfTest`; routed `NpuSession` CPU diagnostics and descriptor. **`dvb` verification (`c6b7b0a7`+`c6970dbc`+`7e1b1241`):** Gate 1 `BUILD SUCCESSFUL in 1m 15s` (`:djmix-core:jvmTest` **38/38**, `:shared:jvmTest` **648/648**, `:app:compileProdDebugKotlin` & `:app:compileProdDebugUnitTestKotlin` clean); Gate 2 `BUILD SUCCESSFUL in 3m 44s` (`--rerun-tasks`, 8 suites, **49 tests: 45 passed, 0 failures, 0 errors, 4 skipped**). Invariants: `hooks-check.sh` 32/32, `check_audiothread_alloc.py` exit 0, 0 `CrossfadeController` imports in `playback/{loopmix,djmix,smart}`, 0 deleted NPU references | Remaining: `CrossfadeController.kt` 7,776 → at or under 2,500 (Wave 2 C-3..); B13.3/B13.4 dead-code removal; D2 step 5 sweeps; B6.5 soak + B6.4 perf + B15 budgets; D1 Bucket C test cleanup LAST. |
+| M10 Sync + release engineering + docs | doing | `ec7251b6`, `0f5b7bcd`, `30bdcfe4`, `77a0fcaf`, `34eac976`, `dd86c746`, `f0ba8bb8`, `56b64546` | CI/release/`npu-addon` workflows, v1+v2+v3 signing, `bumpDjmix` (`34eac976`), `soak.sh` (22/22 smoke, `[PENDING DEVICE RUN]`), `check_audiothread_alloc.py` (exit 0), B12 docs + `CHANGELOG.md` (`77a0fcaf`), 0-conflict dry run (`21356206`), `hooks-check.sh` (32/32); **B11.1 fail-closed release gates (`56b64546`):** `tools/release/release-gates.sh` + `tools/release/test-release-gates.py` (**50/50 PASS**), strict signing secret checks, explicit single-APK & report hashing, untrusted tag rejection; **Stage 8 `dvb` Gates 1–3 (`f0ba8bb8`):** Gate 1 PASS (`1m 30s`, `:djmix-core:jvmTest` 23/23); Gate 2 `1,569/1,590` PASS (all AE3 suites green: `PairPreparerTest` 6/6, `DjmixStoreContractTest` 6/6, `StuckStateRecoveryTest` 4/4, `Djmix18–32` 88/88; 21 failures in 7 legacy Bucket C suites reserved for M9 D1); Gate 3 `:app:assembleProdDebug` PASS (`3m 54s`, `app-prod-arm64-v8a-debug.apk` `105,858,834` B) | Gate remaining: GitHub CI green after push; M9 cleanup + Bucket C tests LAST; `bumpDjmix` + release APK after M9. |
 | M11 Release `1.10-djmix53` (AE 3.0.0) | todo | — | — | C3 checklist; gate owner final listening verdict. |
+
+## 2026-11-25 evidence correction and active acceptance batch
+
+The milestone and item statuses below remain gated statuses. File existence, component-local wiring,
+an uploaded audition pack, and generated `.class` timestamps do not establish working production
+integration. This checkpoint supersedes any implementation-only wording above that implies the
+following missing runtime paths are merely awaiting device verification.
+
+- **Current source batch verified & committed:**
+  - `c6b7b0a7` (refactor): C-1/C-2 controller extraction (`CrossfadeController.kt` **7,776**,
+    `FadeRideCurves.kt` **795**, `EaseTempoEngine.kt` **658**), cancellation hardening tests
+    (10/10), mask tests (2/2), ADR 0010 Festival fallback test alignment in `RecipesTest` (F5/C2).
+  - `c6970dbc` (refactor): B13.1 vc93 NPU deletion (`NpuQnnSession`, `NpuSelfTest`, `NpuQdqSelfTest`)
+    and safe ORT session diagnostics routing.
+  - `7e1b1241` (feat): ADR 0011 lossless canonical script geometry contracts, `RenderGeometryV1`,
+    `FrozenRecipe` compiler, `ScriptExecutionGuard`, and core unit tests (38/38 PASS).
+  - `56b64546` (ci): B11.1 fail-closed release gates (`test-release-gates.py` 50/50 PASS), signing
+    validation, artifact hashing, and injection protection in `.github/workflows/release.yml`.
+  - Verification: `dvb` Gate 1 PASS (`:djmix-core:jvmTest` 38/38, `:shared:jvmTest` 648/648),
+    `dvb` Gate 2 PASS (`--rerun-tasks`: 49 tests across 8 suites, 45 passed, 4 skipped host-JNI,
+    0 failures, 0 errors). Controller is down to **7,776** lines; still above **2,500** target (Wave 2 C-3..).
+- **Recipe authority remains a code gap (M3/M4/B5):** `ChoreoScriptBuilder.kt:62–77` still chooses
+  legacy choreography; `TransitionPlanSelector` maps the six new recipe IDs to legacy substitutes.
+  A frozen JSON-recipe ID is not yet proof that its specified script executes. Required engine
+  Gradle modules are also incomplete: `settings.gradle.kts` includes `:djmix-core`, with the
+  `:djmix-analysis`, `:djmix-render`, and `:djmix-android` boundaries still outstanding.
+- **Audition quality is not passed (M4/A§9/B6):** the saved companion artifact
+  `../Bitchord/work/djmix53-audition/index.md:5` reports **2/79 passing**, not a passing real corpus.
+  Its scripts are generated separately from the live Nirovi/Syvenu/planner/stem pipeline. The
+  synthetic **30/30** result is separate evidence and does not cure these real-pipeline gaps.
+  Correct shared-pipeline exports and objective quality gates must precede release acceptance.
+- **Live services remain disconnected (M7/M8/B7/B8):** production `CrossfadeController` constructs
+  `MixExecutor` with `store = null` (`:1161–1165`) and does not supply its optional taste, flags,
+  telemetry, or diagnostics services. `AndroidPlayerHost.kt:159` calls `bundle()` without the
+  transition context. History production, persisted learning that affects planning, complete Flag
+  capture, and bit-exact replay are code/integration work, followed by their required proof.
+- **Historical test-count correction:** retained Stage 8 Gate 2 logs establish **1,556 passed,
+  13 skipped, 21 failed = 1,590**. The earlier `1,569/1,590 PASS` phrase counts skipped cases as
+  non-failing; it must not be read as 1,569 executed passes. Wave 1 focused results remain **33
+  passed, 4 skipped, 0 failures**. Wave 2 focused results on `dvb` are **45 passed, 4 skipped, 0 failures = 49**.
+- **Release input checks repair (M10/B11.1):** `release.yml` and `tools/release/release-gates.sh`
+  fail closed on missing secrets, unsigned APKs, missing quality reports, and untrusted tags.
+  Validated with 50/50 automated test cases.
+
+Evidence inspected: actual source/artifacts above, the read-only plan-to-runtime audit at base
+`9ade9a25`, and `../Bitchord/evidence/ae3-resume-20261125/validation-phase1-readiness.md` plus its
+raw logs/manifests. Remote readiness confirmed on `dvb` `/home/boxes/bitchord-mix`. Independent reviews,
+one serialized validation owner, and the full master-plan gap audit govern the next acceptance batch.
+D1 legacy-test cleanup stays **LAST**, after the final M9 untangle sweep; no safety-net test has been
+removed by this checkpoint.
 
 ## Table 2 — Item Ledger (Parts A and B, plus Part D)
 
@@ -163,7 +213,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B10.3 Daily bot | todo | — | — | `upstream-sync.yml` enabled with `SYNC_TOKEN`; ask owner to create it. |
 | B10.4 Dry run | done | `../Bitchord/work/ae3-sync-dryrun.md` | Worker 7F `sync.sh` dry-run vs `upstream/main` `21356206`: **0 conflicts** (gate `<=5` PASS) | 1.11 live merge still post-1.10-djmix53. |
 | B10.5 Versioning base | doing | `30bdcfe4` | `app/build.gradle.kts` `ENGINE_VERSION = "3.0.0"`, v1+v2+v3 signing, `bitchordUpstreamBase = "1.10"` | Version bump to `1.10-djmix53` / vc95 via `bumpDjmix` at M10. |
-| B11.1 Release pipeline | doing | `30bdcfe4` | `.github/workflows/release.yml` + `tools/audit-apk.sh` committed (`30bdcfe4`) | Trigger on `ae3-*` tag at M10. |
+| B11.1 Release pipeline | doing | `30bdcfe4`, `56b64546` | `.github/workflows/release.yml` fail-closed gates + `tools/release/release-gates.sh` + `tools/release/test-release-gates.py` (50/50 PASS) (`56b64546`) | Trigger on `ae3-*` tag at M10. |
 | B11.2 bumpDjmix | doing | `30bdcfe4` | `bumpDjmix` Gradle task in `build.gradle.kts` (`30bdcfe4`) | Execute at M10 clean-tree release cut. |
 | B11.3 CHANGELOG | doing | docs commit | `CHANGELOG.md` created for AE 3.0.0 (`1.10-djmix53`) | Final release notes updated at M10 tag. |
 | B11.4 Rollback | todo | — | — | No downgrade via `install -r`, never uninstall; rollback is Safe mode plus flags plus fix-forward; keep last 3 signed APKs. |
@@ -177,16 +227,16 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B12.7 SYNC.md | done | docs commit | `docs/SYNC.md` created in Stage 7 (`7C`) | Includes 0-conflict `upstream/main` dry-run workflow. |
 | B12.8 RELEASE.md | done | docs commit | `docs/RELEASE.md` created in Stage 7 (`7C`) | C3 checklist, signing, rollback, `bumpDjmix`. |
 | B12.9 TUNING.md | done | docs commit | `docs/TUNING.md` created in Stage 7 (`7C`) | Symptom-to-knob table updated for AE3. |
-| B12.10 adr/ 0001–0007 | done | ae3 bootstrap | `docs/adr/0001-one-brain-pair-preparer.md`, `0002-prepared-only-execution.md`, `0003-orchard-models-and-addon.md`, `0004-version-scheme.md`, `0005-mixmachine-reducer.md`, `0006-room-analysis-store.md`, `0007-recipes-as-data.md` | 7 ADRs created this step (10–20 lines each, Context/Decision/Consequences). Full ADR set grows via decisions as needed (B12 requires at least these 7). |
+| B12.10 adr/ 0001–0011 | done | ae3 bootstrap, `7e1b1241` | ADRs 0001–0011 created (including ADR 0011 lossless canonical script geometry, `7e1b1241`) | Full ADR set covers architecture, contracts, and geometry. |
 | B12.11 AE3_LEDGER.md | done | ae3 bootstrap | `docs/AE3_LEDGER.md` (this file) | Created this step with Tables 1–3 covering all M0–M11 and A/B items. |
 | B12.12 Archive contradictions | todo | — | — | Delete or archive anything contradicting B12 docs, including old handover and parity vc80-era statements. |
-| B13.1 Delete vc93 NPU leftovers | todo | — | — | `NpuQnnSession`, `NpuQdqSelfTest`, Maven QNN remnants once replacement ships. |
+| B13.1 Delete vc93 NPU leftovers | done | `c6970dbc` | `NpuQnnSession.kt`, `NpuSelfTest.kt`, `NpuQdqSelfTest.kt` deleted; `NpuSession` routing & describe verified (`c6970dbc`) | Completed in Wave 2. |
 | B13.2 Delete vc91 rungs | todo | — | — | Unreachable rungs after planner moves into `djmix-core`. |
 | B13.3 Delete CountdownStabilizer | todo | — | — | Paths superseded by MixMachine. |
 | B13.4 Delete rescue and watchdog | todo | — | — | `straightRescue`, plus 1.2 s watchdog. |
 | B13.5 Thread annotations | doing | `0f5b7bcd`, `30bdcfe4` | `ThreadAnnotations.kt` + `@AudioThread` on `LoopMixRenderer.render` (`0f5b7bcd`); `python3 tools/check_audiothread_alloc.py` (`132 Kotlin files, 1 @AudioThread regions`, exit 0) | Full Stage 8 Gradle compile + additional M9 `@AudioThread` annotations pending. |
 | B13.6 Native warnings/sanitizers | todo | — | — | `-Wall -Wextra` zero new warnings in `native/loopmix` and `native/analyzer`; ASan/UBSan on loopmix host probes as done for analyzer. |
-| B13.7 Kotlin size and KDoc | doing | `8c87f8c7`, `a065cb34`, `f7c3387a`, `b517ae51` | No file over 1,500 lines in `playback/{djmix,loopmix,smart}` or `djmix-core/src` (`find … -exec wc -l`, empty result, `dvb` `b517ae51`); Wave 1 max is `LoopMixSession.kt` 1,474. Extracted classes carry KDoc headers. `CrossfadeController.kt` is 9,065, still over its M9 target of 2,500 (Wave 2, outside the `djmix-*` set) | KDoc pass on remaining public APIs; `CrossfadeController` split in M9 Wave 2. |
+| B13.7 Kotlin size and KDoc | doing | `8c87f8c7`, `a065cb34`, `f7c3387a`, `b517ae51`, `c6b7b0a7` | Wave 1 landed (all 14 files <= 1,500). Wave 2a C-1/C-2 landed (`c6b7b0a7`): `CrossfadeController.kt` reduced from 9,065 to 7,776 lines (`FadeRideCurves.kt` 795, `EaseTempoEngine.kt` 658) | `CrossfadeController` split continues toward <= 2,500 lines target in Wave 2 C-3.. |
 | B14.1 No secrets in git | todo | — | — | Signing in CI secrets and devbox keystore only. |
 | B14.2 Bundles only on Flag | todo | — | — | Diagnostics from owner device written only on owner tap, never automatically. |
 | B14.3 Add-on known packages | todo | — | — | Load only from known packages ours-first then Orchard; `nativeLibraryDir` via PackageManager; never arbitrary paths. |
