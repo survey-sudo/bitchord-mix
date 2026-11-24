@@ -122,7 +122,7 @@ class PairPreparerTest {
             scope = scope,
             analysisFor = { analyses[it] ?: TrackAnalysis(trackId = it) },
             analysisUpdates = updates,
-            analysisRunningFor = { id -> id !in analyses },
+            analysisRunningFor = { id -> !analyses.containsKey(id) },
             songMapFor = { id, a -> SongMaps.fromAnalysis(id, a) },
             canUseStems = { true },
             planSelector = TransitionPlanSelector { input ->
