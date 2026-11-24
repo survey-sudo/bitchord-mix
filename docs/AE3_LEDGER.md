@@ -9,7 +9,7 @@
 
 | milestone | status | commit | evidence | notes |
 |---|---|---|---|---|
-| M0 Baseline capture | todo | — | — | Done-next: djmix52 on-phone 12 per level plus 1 stress run; forms the before column. Branch `ae3` created from `djmix52` `b3408283`, pushed `origin/ae3`, `dvb` synced to `origin/ae3`. |
+| M0 Baseline capture | blocked | this commit | `docs/AE3_BASELINE.md`, `../Bitchord/evidence/ae3-m0/m0-metrics.json`, `../Bitchord/evidence/ae3-m0/analyze-djmix52-vc94-combined.md` | Partial vc94 (`1.10-djmix52`) Festival capture (23 timed transitions, 1,088 telemetry events since install): 95.7% overlap proxy (22/23), 39.1% `v2-native` (9/23 timing; 10/19 `mix.fire` classic), analysis p95 2,750 ms (live logcat `infer` mean 949 ms, CPU only), 5 Festival recipes / 9 FX types, `fxCount>=2` 78.3%, `dev.sfg.orchard.npu.v73` confirmed installed. **Blocked:** Club (0), Subtle (0), and 20s-stress (0) require in-app level switch/seek not exposed via headless ADB. |
 | M0.5 Untangle inventory | todo | — | — | Part D2 steps 2–3 inventory first, no code changes; fills Table 3 M0.5 row, writes `docs/untangle/DECISION_LOG.md` and `deps.svg`. |
 | M1 Contracts + MixMachine | todo | — | — | `djmix-core`, B1.3 contracts, B2 reducer, B1.2 item 5 invariants; gate 100 percent table cells, 10k property green, core tests under 60 s. |
 | M2 Analysis + store | todo | — | — | Part A §3.1 plus B3 store and migration, B3.2 queue job; gate 4-min track at or under 1.5 s CPU, store survives restart. May run with M3. |
