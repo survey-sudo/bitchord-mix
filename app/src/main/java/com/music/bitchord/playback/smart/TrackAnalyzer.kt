@@ -40,6 +40,19 @@ import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.TrackMatcher
 import com.music.bitchord.playback.AudioCache
+import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
+import com.music.bitchord.playback.djmix.diagnostics.FlagsSnapshot
+import com.music.bitchord.playback.djmix.npu.AddonState
+import com.music.bitchord.playback.djmix.npu.CpuOrtBackend
+import com.music.bitchord.playback.djmix.npu.InferenceBackend
+import com.music.bitchord.playback.djmix.npu.ModelEntry
+import com.music.bitchord.playback.djmix.npu.ModelRegistry
+import com.music.bitchord.playback.djmix.npu.ModelSpec
+import com.music.bitchord.playback.djmix.npu.NpuAddon
+import com.music.bitchord.playback.djmix.npu.NpuSelfTestRunner
+import com.music.bitchord.playback.djmix.npu.OrchardNpuBridge
+import com.music.bitchord.playback.djmix.npu.QnnAddonBackend
+import com.music.bitchord.playback.djmix.npu.SelfTestRecord
 import com.music.bitchord.playback.djmix.store.AnalysisLookupResult
 import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
 import com.music.bitchord.playback.djmix.store.DjmixDatabase
@@ -158,6 +171,262 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             com.music.bitchord.playback.smart.NpuSupport.bundledBackendPath(it)
         }?.takeIf { java.io.File(it).exists() }
 
+    // ---- AE3 M6: add-on NPU wiring (models.json / OrchardNpuBridge) ---------------
+    //
+    // The M6 add-on flow beside the legacy vc93 bundled-runtime plumbing above:
+    // a SHA-256-pinned catalogue (assets/models.json, optionally overridden by
+    // a verified filesDir drop), trusted-package add-on resolution, a
+    // per-(add-on version, device fingerprint, app version) parity self-test
+    // persisted by NpuSelfTestRunner, and a selection that only ever offers
+    // QnnAddonBackend when the stored verdict is a current PASS. Everything
+    // else falls back to plain CPU ORT, transparently: no crash, no block.
+    //
+    // vc70 rule (see npuLibDir above): this analyzer is constructed before the
+    // service's base context is attached, so NOTHING here runs at construction
+    // time -- every context access defers to the I/O pool, resolves through
+    // applicationContext lazily, and maps any pre-attach failure to null.
+
+    /** vc70-safe application context: recomputed on every access, never cached. */
+    private fun npuAppContext(): Context? = runCatching { context.applicationContext }.getOrNull()
+
+    private val djmixFlagsLock = Any()
+    @Volatile private var djmixFlagsSource: DjmixFlags? = null
+
+    /**
+     * The [DjmixFlags] source for the M6 gates, built off the pre-attach window.
+     * A failed first build must not freeze null forever (the same reason
+     * [npuLibDir] documents), so this recomputes until one sticks.
+     */
+    private fun djmixFlagsOrNull(): DjmixFlags? {
+        djmixFlagsSource?.let { return it }
+        val app = npuAppContext() ?: return null
+        synchronized(djmixFlagsLock) {
+            djmixFlagsSource?.let { return it }
+            djmixFlagsSource = runCatching { DjmixFlags(app) }.getOrNull()
+            return djmixFlagsSource
+        }
+    }
+
+    /** Effective automix flag snapshot; code defaults when the flag source is unavailable. */
+    private fun djmixFlagsSnapshot(): FlagsSnapshot =
+        djmixFlagsOrNull()?.flags?.value ?: FlagsSnapshot.defaults()
+
+    /** models.json catalogue (bundled assets + verified filesDir override). */
+    @Volatile private var npuCatalogue: List<ModelEntry>? = null
+
+    /** Trusted add-on resolved this session, or null while none is installed. */
+    @Volatile private var npuAddonSnapshot: NpuAddon? = null
+
+    /** Persisted self-test verdict consulted this session (may be stale for the current tuple). */
+    @Volatile private var npuSelfTestRecord: SelfTestRecord? = null
+
+    /** App version the bridge pass cached for the current selection tuple. */
+    @Volatile private var npuAppVersionCode: Long = -1L
+
+    /** Reason of the most recent [selectInferenceBackend] decision. */
+    @Volatile private var npuStatusReason: String = "ep=CPU (self-test not run)"
+
+    @Volatile private var npuBridgeScheduled = false
+    @Volatile private var npuNextSetupAttemptElapsed = 0L
+    private val npuBridgeLock = Any()
+
+    /** Posts one bridge pass to the I/O pool; guarded, backoff-aware, and cheap on the tick path. */
+    private fun scheduleNpuBridgeSetupOnce() {
+        if (npuBridgeScheduled || SystemClock.elapsedRealtime() < npuNextSetupAttemptElapsed) return
+        synchronized(npuBridgeLock) {
+            if (npuBridgeScheduled || SystemClock.elapsedRealtime() < npuNextSetupAttemptElapsed) return
+            npuBridgeScheduled = true
+        }
+        try {
+            ioExecutor.execute { runNpuBridgeSetup() }
+        } catch (error: Throwable) {
+            npuBridgeScheduled = false
+            Log.w(TAG, "BitChordNPU bridge dispatch failed", error)
+        }
+    }
+
+    /** Marks this pass as retryable no sooner than [retryMs] from now. */
+    private fun deferNpuBridgeSetup(retryMs: Long) {
+        npuNextSetupAttemptElapsed = SystemClock.elapsedRealtime() + retryMs
+        npuBridgeScheduled = false
+    }
+
+    /**
+     * One M6 bridge pass on the I/O pool: loads the catalogue, resolves the
+     * trusted add-on, and when one is installed consults (or runs) the
+     * parity self-test. A current PASS or FAIL verdict ends scheduling for
+     * this process -- the record is cached per (add-on version, device
+     * fingerprint, app version), and a changed tuple invalidates it. Never
+     * throws; every failure path means plain CPU ORT.
+     */
+    private fun runNpuBridgeSetup() {
+        val app = npuAppContext()
+        if (app == null) {
+            // vc70 pre-attach window: a later request() tick retries.
+            deferNpuBridgeSetup(NPU_SETUP_RETRY_MS)
+            return
+        }
+        try {
+            if (npuCatalogue == null) npuCatalogue = ModelRegistry.load(app)
+            if (npuAppVersionCode <= 0L) npuAppVersionCode = npuAppVersionCodeOf(app)
+            val addon = OrchardNpuBridge.resolveAddon(app)
+            npuAddonSnapshot = addon
+            if (addon == null) {
+                Log.i(TAG, "BitChordNPU add-on not installed: CPU execution provider")
+                deferNpuBridgeSetup(NPU_SETUP_RETRY_MS)
+                return
+            }
+            if (!AppSettings.automixNpuEnabled.value || djmixFlagsSnapshot().isNpuKilled()) {
+                Log.i(TAG, "BitChordNPU ep=CPU (disabled by user setting or flags kill switch)")
+                deferNpuBridgeSetup(NPU_SETUP_RETRY_SLOW_MS)
+                return
+            }
+            val record = NpuSelfTestRunner.load(app)
+            npuSelfTestRecord = record
+            val addonState = AddonState(installed = true, versionCode = addon.versionCode)
+            if (npuAppVersionCode > 0L &&
+                ModelRegistry.qnnAllowed(addonState, record, Build.FINGERPRINT, npuAppVersionCode)
+            ) {
+                Log.i(TAG, "BitChordNPU ep=QNN: self-test PASS for add-on ${addon.versionCode}")
+                return
+            }
+            if (stopped || overheated) {
+                // A party or a hot phone: never start inference work there.
+                deferNpuBridgeSetup(NPU_SETUP_RETRY_SLOW_MS)
+                return
+            }
+            Log.i(TAG, "BitChordNPU scheduling add-on self-test (v${addon.versionCode})")
+            runNpuSelfTest(app, addon)
+        } catch (error: Throwable) {
+            // Zero crashes / zero blocks: any failure means CPU ORT and a later retry.
+            Log.w(TAG, "BitChordNPU bridge setup failed: CPU execution provider", error)
+            deferNpuBridgeSetup(NPU_SETUP_RETRY_SLOW_MS)
+        }
+    }
+
+    /**
+     * Runs the Nirovi QNN-vs-CPU parity and timing self-test at most once per
+     * process and persists the verdict with [NpuSelfTestRunner.save], so later
+     * consults read the cached record instead of re-running inference. Never
+     * throws; an infrastructure failure simply leaves no record (the next
+     * process start retries).
+     */
+    private fun runNpuSelfTest(app: Context, addon: NpuAddon) {
+        runCatching {
+            val entries = npuCatalogue ?: ModelRegistry.load(app).also { npuCatalogue = it }
+            val spec = verifiedNpuModelSpec(entries, "beat")
+            if (spec == null) {
+                Log.w(TAG, "BitChordNPU self-test skipped: no SHA-256 verified CPU beat model")
+                return@runCatching
+            }
+            CpuOrtBackend().open(spec).use { cpu ->
+                QnnAddonBackend(app) { npuAddonSnapshot ?: addon }.open(spec).use { qnn ->
+                    val record = NpuSelfTestRunner.run(app, cpu, qnn, spec, addon.versionCode)
+                    npuSelfTestRecord = record
+                    NpuSelfTestRunner.save(app, record)
+                    Log.i(
+                        TAG,
+                        "BitChordNPU self-test verdict=${if (record.passed) "PASS" else "FAIL"} (${record.reason})",
+                    )
+                }
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "BitChordNPU self-test failed: CPU execution provider", error)
+        }
+    }
+
+    /**
+     * Builds the CPU [ModelSpec] for [role] out of the models.json catalogue,
+     * cross-checking the entry against the compiled-in [AutomixModels]
+     * identity and handing back only the SHA-256-verified on-disk copy, so a
+     * tampered catalogue can never redirect inference to an unverified file.
+     */
+    private fun verifiedNpuModelSpec(entries: List<ModelEntry>, role: String): ModelSpec? {
+        val entry = entries.firstOrNull {
+            it.role == role && "cpu-ort" in it.backends &&
+                !it.inputName.isNullOrBlank() && !it.outputName.isNullOrBlank() && it.inputShape != null
+        } ?: return null
+        val model = when (role) {
+            "beat" -> AutomixModels.NIROVI
+            "vocal" -> AutomixModels.SYVENU
+            else -> return null
+        }
+        if (entry.fileName != model.fileName) return null
+        if (!entry.sha256.equals(model.sha256, ignoreCase = true)) return null
+        val verifiedPath = AutomixModels.verifiedPathOrNull(model) ?: return null
+        return ModelSpec(
+            id = entry.id,
+            fileName = entry.fileName,
+            file = java.io.File(verifiedPath),
+            inputName = entry.inputName!!,
+            inputShape = entry.inputShape!!,
+            outputName = entry.outputName!!,
+        )
+    }
+
+    /** This app's version code via the package manager; -1 on any failure. */
+    private fun npuAppVersionCodeOf(app: Context): Long = runCatching {
+        val info = app.packageManager.getPackageInfo(app.packageName, 0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info.longVersionCode else {
+            @Suppress("DEPRECATION")
+            info.versionCode.toLong()
+        }
+    }.getOrDefault(-1L)
+
+    /** The trusted add-on resolved this session, or null (M7 glue / diagnostics). */
+    fun npuAddon(): NpuAddon? = npuAddonSnapshot
+
+    /** The persisted self-test verdict consulted this session (M7 glue / diagnostics). */
+    fun npuSelfTestVerdict(): SelfTestRecord? = npuSelfTestRecord
+
+    /** M6 status line for Settings / the Mix Inspector; mirrors [NpuSelfTestRunner.statusLabel]. */
+    fun npuStatusLabel(): String {
+        val addon = npuAddonSnapshot ?: return "NPU: Not installed"
+        val app = npuAppContext() ?: return "NPU: Not tested"
+        return runCatching { NpuSelfTestRunner.statusLabel(app, addon.versionCode) }
+            .getOrDefault("NPU: Not tested")
+    }
+
+    /** Human-readable reason for the most recent backend decision (diagnostics). */
+    fun npuSelectionDetail(): String = npuStatusReason
+
+    /**
+     * The M6 backend for [role] ("beat" / "vocal"): [QnnAddonBackend] only
+     * when a trusted add-on is installed, the user setting and
+     * `DjmixFlags.npu_qnn` kill switch allow it, and the persisted
+     * self-test verdict is a current PASS; the [CpuOrtBackend] reference
+     * implementation otherwise (transparent fallback). Pure decision on
+     * cached state: no I/O, no session is opened here.
+     */
+    fun selectInferenceBackend(role: String): InferenceBackend {
+        val app = npuAppContext()
+        val entries = npuCatalogue
+        if (app == null || entries == null) {
+            npuStatusReason = "ep=CPU (bridge not resolved yet)"
+            return CpuOrtBackend()
+        }
+        val addon = npuAddonSnapshot
+        val gated = !AppSettings.automixNpuEnabled.value || djmixFlagsSnapshot().isNpuKilled()
+        val addonState = AddonState(installed = addon != null, versionCode = addon?.versionCode ?: 0L)
+        val selection = ModelRegistry.select(
+            entries, role, addonState, npuSelfTestRecord, Build.FINGERPRINT, npuAppVersionCode,
+        )
+        if (selection == null) {
+            npuStatusReason = "ep=CPU (no model for role $role)"
+            return CpuOrtBackend()
+        }
+        if (selection.backendId == "qnn-v73" && gated) {
+            npuStatusReason = "ep=CPU (disabled by user setting or flags kill switch)"
+            return CpuOrtBackend()
+        }
+        npuStatusReason = selection.reason
+        return if (selection.backendId == "qnn-v73" && addon != null) {
+            QnnAddonBackend(app) { npuAddonSnapshot }
+        } else {
+            CpuOrtBackend()
+        }
+    }
+
     private val tracker = BeatTracker(
         modelPath = { AutomixModels.path(AutomixModels.NIROVI) },
         inferenceThreads = { BeatTracker.DEFAULT_INTRA_OP_THREADS },
@@ -248,19 +517,14 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // this; with no sink they went nowhere on the phone, which is how a
         // beat model that found nothing went unnoticed.
         AnalysisLog.install { message, error -> Log.w(TAG, message, error) }
-        // The release-availability gate precedes policy installation, asset resolvers,
-        // preflight and both self-tests. A persisted opt-in cannot activate any of them.
-        if (NpuRuntime.RUNTIME_AVAILABLE) {
-            runCatching {
-                NpuAndroid.install(context) { AppSettings.automixNpuEnabled.value }
-                if (NpuRuntime.runtimeEnabled()) NpuQdqSelfTest.schedule(context, { npuVendor })
-            }.onFailure { Log.w(TAG, "NPU init skipped", it) }
-        }
-        if (NpuSupport.QNN_ENABLED && NpuRuntime.runtimeEnabled()) {
-            NpuSelfTest.schedule(context, { npuVendor }, { ensureNpuPreflight() })
-        } else {
-            Log.i(TAG, "BitChordNPU unavailable in djmix52: CPU execution provider")
-        }
+        // AE3 M6: the bundled vc93 QNN runtime preflight / self-test scheduling
+        // that used to run here is replaced by the add-on bridge above. It is
+        // deliberately NOT armed in <init>: this analyzer is constructed
+        // before the service's base context is attached (vc70), and the
+        // bridge needs PackageManager, the assets catalogue and the
+        // self-test's filesDir store. request() / ensureFullAnalysis() post
+        // the (cheap, backoff-guarded) bridge pass once per process instead,
+        // entirely on the I/O pool.
     }
 
     /**
@@ -554,6 +818,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         if (trackId.isBlank()) return false
         triggerDjmixMigrationOnce()
         ensureQueuePrepRegistered()
+        // AE3 M6: cheap guarded post of the add-on NPU bridge pass (catalogue
+        // load, trusted add-on resolution, self-test consult/schedule).
+        scheduleNpuBridgeSetupOnce()
         if (results[trackId]?.quality == TrackAnalysis.QUALITY_FULL && results[trackId]?.isUsable == true) {
             return true
         }
@@ -956,6 +1223,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // on ioExecutor; registration is a null-checked volatile write).
         triggerDjmixMigrationOnce()
         ensureQueuePrepRegistered()
+        // AE3 M6: same pattern for the add-on NPU bridge (guarded, once per
+        // process, on the I/O pool; consults/schedules the parity self-test).
+        scheduleNpuBridgeSetupOnce()
         if (trackId in running) return
         if (overheated) {
             restoreOnce(trackId)
@@ -2518,6 +2788,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
         /** How long a handover keeps analysis off the cores, from the moment it is asked. */
         const val PLAYBACK_FIRST_MS = 2_000L
+
+        /** M6 bridge-pass retry cadence: pre-attach build, no add-on yet, or a gated/thermal deferral. */
+        const val NPU_SETUP_RETRY_MS = 60_000L
+
+        /** M6 bridge-pass retry cadence after an unexpected setup failure (visible, never spammy). */
+        const val NPU_SETUP_RETRY_SLOW_MS = 5 * 60_000L
 
         /**
          * What an unmeasured instant reads as. Below the policy's VOCAL_ACTIVE_THRESHOLD by

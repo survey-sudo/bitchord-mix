@@ -1,6 +1,9 @@
 package com.music.bitchord.playback.loopmix
 
 import android.util.Log
+import com.music.bitchord.playback.djmix.AudioThread
+import com.music.bitchord.playback.djmix.MainThread
+import com.music.bitchord.playback.djmix.PrepThread
 import com.music.bitchord.playback.smart.StemKind
 import com.music.bitchord.playback.smart.StemSet
 import kotlin.math.pow
@@ -98,7 +101,14 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
     /** The earliest mix frame anything renders at; negative, before t0. */
     fun firstFrame(): Long = readout?.firstFrame() ?: nativeFirstFrame(handle)
 
-    /** Renders [frames] stereo frames from mix frame [frame] into [interleaved] at frame [offset]. */
+    /**
+     * Renders [frames] stereo frames from mix frame [frame] into [interleaved] at frame [offset].
+     *
+     * Realtime audio thread: pointer-swap only. No allocation, no logging, no
+     * locks the setup path may hold; everything expensive was built on a
+     * [PrepThread] during READY (see `tools/check_audiothread_alloc.py`).
+     */
+    @AudioThread
     fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) {
         if (readout != null) readout.render(frame, interleaved, offset, frames)
         else nativeRender(handle, frame, interleaved, offset, frames)
@@ -242,6 +252,131 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
     /** The bus loudness guard's gain right now, dB. */
     fun loudnessGuardDb(): Float = if (handle != 0L) nativeLoudnessGuardDb(handle) else 0f
 
+    // ---- M4 Part A §5 FX & 40 s capture ------------------------------------------------
+    // Setup-time setters (PrepThread / MainThread). Each is a no-op on a dead handle or
+    // when the fx switch is off, matching the AUTOMIX-V2(C) wrappers above.
+
+    /** Loop seam crossfade length in ms on [index]. */
+    @PrepThread
+    fun setLoopSeamMs(index: Int, seamMs: Double) {
+        if (handle != 0L) nativeSetLoopSeamMs(handle, index, seamMs)
+    }
+
+    /** Beat-quantised loop roll with HPF sweep, boost and optional downbeat stop. [scheduleBeats] may be null. */
+    @PrepThread
+    fun setLoopRollEx(
+        index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double,
+        totalRollBeats: Double, hpfStartHz: Float, hpfEndHz: Float, boostDb: Float,
+        stopOnDownbeat: Boolean, scheduleBeats: DoubleArray?,
+    ) {
+        if (handle != 0L && AutomixV2Render.fx) {
+            nativeSetLoopRollEx(
+                handle, index, enabled, rollStartSec, beatSec, releaseSec, totalRollBeats,
+                hpfStartHz, hpfEndHz, boostDb, stopOnDownbeat, scheduleBeats,
+            )
+        }
+    }
+
+    /** Extended ping-pong echo: wet HPF/LPF and ping-pong toggle. */
+    @PrepThread
+    fun setEchoEx(
+        index: Int, delaySeconds: Double, feedback: Float, wet: Float,
+        wetHpfHz: Float, wetLpfHz: Float, pingPong: Boolean,
+    ) {
+        if (handle != 0L) nativeSetEchoEx(handle, index, delaySeconds, feedback, wet, wetHpfHz, wetLpfHz, pingPong)
+    }
+
+    /** Extended flanger with stereo offset. */
+    @PrepThread
+    fun setFlangerEx(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float, stereoOffsetDeg: Float) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetFlangerEx(handle, index, lfoHz, depthSeconds, feedback, wet, stereoOffsetDeg)
+    }
+
+    /** Extended phaser with stage count and stereo offset. */
+    @PrepThread
+    fun setPhaserEx(index: Int, rateBeats: Double, depth: Float, feedback: Float, stages: Int, stereoOffsetDeg: Float) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetPhaserEx(handle, index, rateBeats, depth, feedback, stages, stereoOffsetDeg)
+    }
+
+    /** Extended riser: noise band, level, uplifter, optional snare roll and reverse reverb. */
+    @PrepThread
+    fun setRiserEx(
+        index: Int, beatSec: Double, lengthBeats: Double, noiseStartHz: Float, noiseEndHz: Float,
+        noiseLevelPeak: Float, uplifterOctaves: Float, includeSnareRoll: Boolean,
+        reverseReverbBeats: Double, startSec: Double,
+    ) {
+        if (handle != 0L && AutomixV2Render.fx) {
+            nativeSetRiserEx(
+                handle, index, beatSec, lengthBeats, noiseStartHz, noiseEndHz, noiseLevelPeak,
+                uplifterOctaves, includeSnareRoll, reverseReverbBeats, startSec,
+            )
+        }
+    }
+
+    /** One-shot impact hit at [triggerMixSec]. */
+    @PrepThread
+    fun setImpact(index: Int, triggerMixSec: Double, peakDbfs: Float, lowThumpHz: Float, noiseBurstMs: Double) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetImpact(handle, index, triggerMixSec, peakDbfs, lowThumpHz, noiseBurstMs)
+    }
+
+    /** Gate with separate start/end division and a time window. */
+    @PrepThread
+    fun setGateEx(index: Int, beatSec: Double, divStart: Float, divEnd: Float, swing: Float, startSec: Double, endSec: Double) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetGateEx(handle, index, beatSec, divStart, divEnd, swing, startSec, endSec)
+    }
+
+    /** Vinyl brake with end rate, LPF sweep and end fade. */
+    @PrepThread
+    fun setBrakeEx(index: Int, startSec: Double, lengthSec: Double, endRate: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetBrakeEx(handle, index, startSec, lengthSec, endRate, lpfStartHz, lpfEndHz, endFadeMs)
+    }
+
+    /** Tape stop with wow depth/rate and LPF sweep. */
+    @PrepThread
+    fun setTapeStop(index: Int, startSec: Double, lengthSec: Double, wowDepth: Float, wowRateHz: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) {
+        if (handle != 0L && AutomixV2Render.fx) {
+            nativeSetTapeStop(handle, index, startSec, lengthSec, wowDepth, wowRateHz, lpfStartHz, lpfEndHz, endFadeMs)
+        }
+    }
+
+    /** Spinback (reverse varispeed) with peak reverse speed and silence gap. */
+    @PrepThread
+    fun setSpinback(index: Int, startSec: Double, lengthSec: Double, peakReverseSpeed: Double, silenceGapSec: Double) {
+        if (handle != 0L && AutomixV2Render.fx) nativeSetSpinback(handle, index, startSec, lengthSec, peakReverseSpeed, silenceGapSec)
+    }
+
+    /** Filter sweep (HPF or LPF) with Q ramp over [startSec, endSec]. */
+    @PrepThread
+    fun setSweep(index: Int, isHighPass: Boolean, startHz: Float, endHz: Float, qStart: Float, qEnd: Float, startSec: Double, endSec: Double, exponential: Boolean) {
+        if (handle != 0L && AutomixV2Render.fx) {
+            nativeSetSweep(handle, index, isHighPass, startHz, endHz, qStart, qEnd, startSec, endSec, exponential)
+        }
+    }
+
+    /** True-peak limiter ceiling in dBTP. */
+    @PrepThread
+    fun setTruePeakCeilingDb(ceilingDbtp: Float) {
+        if (handle != 0L) nativeSetTruePeakCeilingDb(handle, ceilingDbtp)
+    }
+
+    /** Arms or disarms the 40 s ring-buffer capture of the output bus. */
+    @MainThread
+    fun setCaptureEnabled(enabled: Boolean) {
+        if (handle != 0L) nativeSetCaptureEnabled(handle, enabled)
+    }
+
+    /** Frames captured so far (0 when capture is off or the handle is dead). */
+    @MainThread
+    fun capturedFrames(): Long = if (handle != 0L) nativeCapturedFrames(handle) else 0L
+
+    /**
+     * Copies up to [maxFrames] captured stereo frames into [out] (interleaved, length >= 2*maxFrames).
+     * Returns the number of frames copied. Called from the diagnostics path, never from render.
+     */
+    @MainThread
+    fun readCapturedAudio(out: FloatArray, maxFrames: Int): Int =
+        if (handle != 0L) nativeReadCapturedAudio(handle, out, maxFrames) else 0
+
     companion object {
         const val OUT = 0
         const val IN = 1
@@ -370,6 +505,62 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         @JvmStatic private external fun nativeSetReverb(handle: Long, index: Int, roomSize: Float, damping: Float, wet: Float)
         @JvmStatic private external fun nativeSetSvfQ(handle: Long, index: Int, q: Float)
         @JvmStatic private external fun nativeExitGateViolations(handle: Long): Int
+
+        // ---- M4 Part A §5 FX & 40 s capture ---------------------------------------------
+
+        @JvmStatic private external fun nativeSetLoopSeamMs(handle: Long, index: Int, seamMs: Double)
+        @JvmStatic private external fun nativeSetLoopRollEx(
+            handle: Long, index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double,
+            releaseSec: Double, totalRollBeats: Double, hpfStartHz: Float, hpfEndHz: Float,
+            boostDb: Float, stopOnDownbeat: Boolean, scheduleBeats: DoubleArray?,
+        )
+        @JvmStatic private external fun nativeSetEchoEx(
+            handle: Long, index: Int, delaySeconds: Double, feedback: Float, wet: Float,
+            wetHpfHz: Float, wetLpfHz: Float, pingPong: Boolean,
+        )
+        @JvmStatic private external fun nativeSetFlangerEx(
+            handle: Long, index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float,
+            wet: Float, stereoOffsetDeg: Float,
+        )
+        @JvmStatic private external fun nativeSetPhaserEx(
+            handle: Long, index: Int, rateBeats: Double, depth: Float, feedback: Float,
+            stages: Int, stereoOffsetDeg: Float,
+        )
+        @JvmStatic private external fun nativeSetRiserEx(
+            handle: Long, index: Int, beatSec: Double, lengthBeats: Double, noiseStartHz: Float,
+            noiseEndHz: Float, noiseLevelPeak: Float, uplifterOctaves: Float,
+            includeSnareRoll: Boolean, reverseReverbBeats: Double, startSec: Double,
+        )
+        @JvmStatic private external fun nativeSetImpact(
+            handle: Long, index: Int, triggerMixSec: Double, peakDbfs: Float,
+            lowThumpHz: Float, noiseBurstMs: Double,
+        )
+        @JvmStatic private external fun nativeSetGateEx(
+            handle: Long, index: Int, beatSec: Double, divStart: Float, divEnd: Float,
+            swing: Float, startSec: Double, endSec: Double,
+        )
+        @JvmStatic private external fun nativeSetBrakeEx(
+            handle: Long, index: Int, startSec: Double, lengthSec: Double, endRate: Float,
+            lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double,
+        )
+        @JvmStatic private external fun nativeSetTapeStop(
+            handle: Long, index: Int, startSec: Double, lengthSec: Double, wowDepth: Float,
+            wowRateHz: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double,
+        )
+        @JvmStatic private external fun nativeSetSpinback(
+            handle: Long, index: Int, startSec: Double, lengthSec: Double,
+            peakReverseSpeed: Double, silenceGapSec: Double,
+        )
+        @JvmStatic private external fun nativeSetSweep(
+            handle: Long, index: Int, isHighPass: Boolean, startHz: Float, endHz: Float,
+            qStart: Float, qEnd: Float, startSec: Double, endSec: Double, exponential: Boolean,
+        )
+        @JvmStatic private external fun nativeSetTruePeakCeilingDb(handle: Long, ceilingDbtp: Float)
+        @JvmStatic private external fun nativeSetCaptureEnabled(handle: Long, enabled: Boolean)
+        @JvmStatic private external fun nativeCapturedFrames(handle: Long): Long
+        @JvmStatic private external fun nativeReadCapturedAudio(
+            handle: Long, outInterleaved: FloatArray, maxFrames: Int,
+        ): Int
     }
 }
 
