@@ -56,13 +56,20 @@ class TransitionPlannerCoreTest {
         (outcome as? MixOutcome.Refused)?.reason ?: error("Expected Refused, got $outcome")
 
     @Test
-    fun midVocalHardRejectsExitAndSubtleClubEntry() {
+    fun midVocalExitOnlyViaAcapellaRecipeAndEntryHardRejects() {
         val loudVocal = List(6_000) { 0.8f }
-        val exitRes = PairPlanner.plan(
-            PlannerRequest(1L, makeTrack("out-v", vocalFrames = loudVocal), makeTrack("in-c"), djLevel = DjLevel.CLUB, positionMs = 0L),
+        // A§4.4 hard-rejects mid-vocal exit for every recipe EXCEPT the deliberate acapella
+        // techniques (C3 Acapella ride at CLUB, F4 Acapella mashup at FESTIVAL), which isolate
+        // and ride the outgoing vocal by design. Here C3 is the only eligible winner.
+        val exitOk = requireOk(
+            PairPlanner.plan(
+                PlannerRequest(1L, makeTrack("out-v", vocalFrames = loudVocal), makeTrack("in-c"), djLevel = DjLevel.CLUB, positionMs = 0L),
+            ),
         )
-        assertEquals(RefusalReason.EXIT_MID_VOCAL, requireRefused(exitRes))
+        assertEquals("C3", exitOk.recipeId)
+        assertTrue(exitOk.placementReasons.isNotEmpty())
 
+        // Mid-vocal entry has no exception: hard-refused at SUBTLE and CLUB.
         val outClean = makeTrack("out-c")
         val inVocal = makeTrack("in-v", vocalFrames = loudVocal)
         assertEquals(RefusalReason.ENTRY_MID_VOCAL, requireRefused(PairPlanner.plan(PlannerRequest(2L, outClean, inVocal, djLevel = DjLevel.SUBTLE, positionMs = 0L))))
