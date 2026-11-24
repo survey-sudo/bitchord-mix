@@ -8,6 +8,7 @@ import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
 import com.music.bitchord.djmix.core.contracts.TransitionScriptV1
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
 import com.music.bitchord.playback.smart.AnalysisLog
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -48,7 +49,7 @@ data class AnalysisSummary(
     val planId: String? = null,
     val recipeId: String? = null,
     val out: AnalysisSummaryTrack? = null,
-    val in: AnalysisSummaryTrack? = null,
+    @SerialName("in") val inbound: AnalysisSummaryTrack? = null,
 )
 
 /**
@@ -115,7 +116,7 @@ class DiagnosticsBundler(
                 planId = plan?.planId,
                 recipeId = plan?.recipeId,
                 out = outAnalysis?.let { summarize(it) },
-                in = inAnalysis?.let { summarize(it) },
+                inbound = inAnalysis?.let { summarize(it) },
             )
             zip.putNextEntry(ZipEntry("analysis_summary.json"))
             zip.write(json.encodeToString(AnalysisSummary.serializer(), summary).toByteArray(Charsets.UTF_8))

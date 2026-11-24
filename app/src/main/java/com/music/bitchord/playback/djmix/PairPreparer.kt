@@ -2817,7 +2817,7 @@ class PairPreparer(
                 val required = planV1.requiredStems.size
                 val completed = planV1.requiredStems.count { req ->
                     val deckStems = if (req.deck == CoreDeckTarget.OUT) outStems else inStems
-                    val sharedKind = when (req.kind) {
+                    val sharedKind = when (req.stem) {
                         CoreStemKind.VOCALS -> StemKind.VOCALS
                         CoreStemKind.DRUMS -> StemKind.DRUMS
                         CoreStemKind.BASS -> StemKind.BASS
