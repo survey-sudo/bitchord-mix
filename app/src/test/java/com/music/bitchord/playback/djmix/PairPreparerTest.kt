@@ -1,6 +1,12 @@
 package com.music.bitchord.playback.djmix
 
 import androidx.media3.common.MediaItem
+import com.music.bitchord.djmix.core.contracts.DeckStemRequirement
+import com.music.bitchord.djmix.core.contracts.DeckTarget as CoreDeckTarget
+import com.music.bitchord.djmix.core.contracts.DjLevel as CoreDjLevel
+import com.music.bitchord.djmix.core.contracts.StemKind as CoreStemKind
+import com.music.bitchord.djmix.core.contracts.TransitionGeometry
+import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
 import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.AutomixV2Stems
 import com.music.bitchord.playback.smart.BeatSide
@@ -19,6 +25,7 @@ import com.music.bitchord.playback.smart.choreo.AutomixV2Choreo
 import com.music.bitchord.playback.smart.choreo.ChoreoCaps
 import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
 import com.music.bitchord.playback.smart.choreo.DjLevel
+import com.music.bitchord.playback.smart.choreo.StemAdapter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -35,6 +42,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -100,7 +108,7 @@ class PairPreparerTest {
         val dispatcher = StandardTestDispatcher(scheduler)
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val updates = MutableSharedFlow<String>(extraBufferCapacity = 8)
-        val analyses = HashMap<String, TrackAnalysis>()
+        val analyses = ConcurrentHashMap<String, TrackAnalysis>()
         val stemLock = Any()
         val nowClock = AtomicLong(1_000L)
         val decodeCalls = AtomicInteger(0)
@@ -497,6 +505,173 @@ class PairPreparerTest {
             AutomixV2Stems.legacyFallbackEnabled = savedLegacy
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun requiredStemsGatingSkipsUnneededDecksAndSeparatesOnlyOverlapWindow() {
+        val scheduler = TestCoroutineScheduler()
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val analyses = ConcurrentHashMap(
+            mapOf("A" to usableAnalysis("A", 120.0), "B" to usableAnalysis("B", 120.0)),
+        )
+        val separatedCalls = CopyOnWriteArrayList<Triple<String, Int, Double>>()
+        val decodedSizes = ConcurrentHashMap<String, Int>()
+
+        val preparer = PairPreparer(
+            scope = scope,
+            analysisFor = { analyses.getValue(it) },
+            analysisUpdates = MutableSharedFlow(),
+            songMapFor = { id, a -> SongMaps.fromAnalysis(id, a) },
+            canUseStems = { true },
+            planSelector = TransitionPlanSelector { input ->
+                val plan = LoopMix.Plan(
+                    out = LoopMix.Pick(160.0, 168.0, 4, 0.5, 120.0, 0.0, LoopMix.Check.MASK),
+                    inn = LoopMix.Pick(8.0, 16.0, 4, 0.5, 120.0, 0.0, LoopMix.Check.MASK),
+                    fold = 1.0,
+                    enterBars = 4,
+                    rampBars = 8,
+                    exitBars = 4,
+                    totalBars = 16,
+                )
+                val v1 = TransitionPlanV1(
+                    planId = "plan-out-only",
+                    generation = 1L,
+                    outTrackId = input.outTrack.id,
+                    inTrackId = input.inTrack.id,
+                    djLevel = CoreDjLevel.CLUB,
+                    geometry = TransitionGeometry.BRIDGE,
+                    frozenExitMs = 160_000L,
+                    frozenEntryMs = 8_000L,
+                    swapDownbeatMs = 176_000L,
+                    overlapDurationMs = 32_000L,
+                    barDurationMs = 2_000L,
+                    recipeId = "C3",
+                    recipeName = "Acapella ride",
+                    requiredStems = setOf(
+                        DeckStemRequirement(CoreDeckTarget.OUT, CoreStemKind.VOCALS),
+                        DeckStemRequirement(CoreDeckTarget.OUT, CoreStemKind.BASS),
+                    ),
+                )
+                val prep = ChoreoSessionGlue.Prep(
+                    plan = plan,
+                    forced = null,
+                    forcedRecipe = com.music.bitchord.playback.smart.choreo.RecipeId.C3,
+                    caps = ChoreoCaps.ALL,
+                    level = input.djLevel,
+                    outStructure = com.music.bitchord.playback.smart.choreo.StructureView.best(input.outSongMap, input.outAnalysis),
+                    inStructure = com.music.bitchord.playback.smart.choreo.StructureView.best(input.inSongMap, input.inAnalysis),
+                    pairKey = "A->B",
+                    albumOrder = false,
+                    note = "",
+                )
+                SelectedPlan(plan = plan, v2Prep = prep, transitionPlanV1 = v1, pathHint = "v2-native")
+            },
+            decodeRegion = { track, from, to, rate ->
+                val frames = ((to - from).coerceAtLeast(1.0) * rate).toInt()
+                decodedSizes[track.id] = frames
+                LoopRegion(FloatArray(frames), FloatArray(frames), from)
+            },
+            separateStems = { trackId, left, _, rate, start, _ ->
+                separatedCalls += Triple(trackId, left.size, start)
+                dummyStems(left.size, rate, start, count = 4)
+            },
+            capabilities = { ChoreoCaps.ALL },
+            fullPreferredWaitMs = 0L,
+        )
+
+        preparer.trigger(PrepRequest(PrepTrack("A", 200.0), PrepTrack("B", 200.0), DjLevel.CLUB, 10.0, 8_000))
+        val snap = AtomicReferenceLatch().await { preparer.state.value?.takeIf { it.state == PrepState.PREPARED } }
+        assertNotNull(snap)
+        val outCalls = separatedCalls.filter { it.first == "A" }
+        val inCalls = separatedCalls.filter { it.first == "B" }
+        assertEquals("Only OUT deck requires stems for C3", 1, outCalls.size)
+        assertEquals("IN deck has zero required stems and must skip SCNet separation", 0, inCalls.size)
+        val decodedOutFrames = decodedSizes.getValue("A")
+        assertTrue(
+            "SCNet must separate only overlap ± 1 bar (${outCalls.single().second}), strictly smaller than decoded region ($decodedOutFrames)",
+            outCalls.single().second < decodedOutFrames,
+        )
+        assertNotNull(snap!!.outStems)
+        assertNull(snap.inStems)
+        assertTrue(
+            "Composited outStems must remain aligned to outRegion",
+            StemAdapter.matchesRegion(snap.outStems, snap.outRegion!!.left.size, 8_000),
+        )
+
+        preparer.release()
+        scope.cancel()
+    }
+
+    @Test
+    fun emptyRequiredStemsSkipsAllStemSeparationEvenOnClub() {
+        val scheduler = TestCoroutineScheduler()
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val analyses = ConcurrentHashMap(
+            mapOf("A" to usableAnalysis("A", 120.0), "B" to usableAnalysis("B", 120.0)),
+        )
+        val stemCalls = AtomicInteger(0)
+
+        val preparer = PairPreparer(
+            scope = scope,
+            analysisFor = { analyses.getValue(it) },
+            analysisUpdates = MutableSharedFlow(),
+            songMapFor = { id, a -> SongMaps.fromAnalysis(id, a) },
+            canUseStems = { true },
+            planSelector = TransitionPlanSelector { input ->
+                val plan = testPlan()
+                val v1 = TransitionPlanV1(
+                    planId = "plan-no-stems",
+                    generation = 1L,
+                    outTrackId = input.outTrack.id,
+                    inTrackId = input.inTrack.id,
+                    djLevel = CoreDjLevel.CLUB,
+                    geometry = TransitionGeometry.BRIDGE,
+                    frozenExitMs = 160_000L,
+                    frozenEntryMs = 8_000L,
+                    swapDownbeatMs = 172_000L,
+                    overlapDurationMs = 24_000L,
+                    barDurationMs = 2_000L,
+                    recipeId = "C2",
+                    recipeName = "Filter wash + echo",
+                    requiredStems = emptySet(),
+                )
+                val prep = ChoreoSessionGlue.Prep(
+                    plan = plan,
+                    forced = null,
+                    forcedRecipe = com.music.bitchord.playback.smart.choreo.RecipeId.C2,
+                    caps = ChoreoCaps.ALL,
+                    level = input.djLevel,
+                    outStructure = com.music.bitchord.playback.smart.choreo.StructureView.best(input.outSongMap, input.outAnalysis),
+                    inStructure = com.music.bitchord.playback.smart.choreo.StructureView.best(input.inSongMap, input.inAnalysis),
+                    pairKey = "A->B",
+                    albumOrder = false,
+                    note = "",
+                )
+                SelectedPlan(plan = plan, v2Prep = prep, transitionPlanV1 = v1, pathHint = "v2-native")
+            },
+            decodeRegion = { _, from, to, rate ->
+                val frames = ((to - from).coerceAtLeast(1.0) * rate).toInt()
+                LoopRegion(FloatArray(frames), FloatArray(frames), from)
+            },
+            separateStems = { _, _, _, _, _, _ ->
+                stemCalls.incrementAndGet()
+                null
+            },
+            capabilities = { ChoreoCaps.ALL },
+            fullPreferredWaitMs = 0L,
+        )
+
+        preparer.trigger(PrepRequest(PrepTrack("A", 200.0), PrepTrack("B", 200.0), DjLevel.CLUB, 10.0, 8_000))
+        val snap = AtomicReferenceLatch().await { preparer.state.value?.takeIf { it.state == PrepState.PREPARED } }
+        assertNotNull(snap)
+        assertEquals(0, stemCalls.get())
+        assertNull(snap!!.outStems)
+        assertNull(snap.inStems)
+
+        preparer.release()
+        scope.cancel()
     }
 
     private class AtomicReferenceLatch {

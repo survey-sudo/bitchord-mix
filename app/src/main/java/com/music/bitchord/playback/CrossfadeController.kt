@@ -2773,9 +2773,37 @@ class CrossfadeController(
                 ),
             )
         }
+        val pairKey = "${currentItem.mediaId}->${nextItem.mediaId}"
         val currentAnalysis = analysisFor(currentItem)
         val nextAnalysis = analysisFor(nextItem)
         val analysisState = AppSettings.smartAnalysis.value
+        val recoveryRequired = countdownStabilizer.hasFailedCommittedNative(pairKey, scrubEpoch)
+        val bothAnalyzed = currentAnalysis.isUsable && nextAnalysis.isUsable
+        val coarseDecline = bothAnalyzed && shouldDeclineToMix(currentAnalysis, nextAnalysis)
+
+        if (failedPlan == null && !recoveryRequired && (!bothAnalyzed || coarseDecline)) {
+            val naturalPlan = TransitionPlan(
+                shouldStart = false,
+                markerVisible = false,
+                blocked = true,
+                reason = if (!bothAnalyzed) "classic:analysis-pending" else "classic:declined",
+                transitionStart = duration / 1000.0,
+                transitionEnd = duration / 1000.0,
+                fadeSeconds = 0.0,
+                transitionStyle = TransitionStyle.NATURAL,
+                beatSeconds = 0.0,
+                mixSummary = "Natural handoff ($reason)",
+            )
+            lastSmartPlan = naturalPlan
+            lastSmartPlanStartMs = 0L
+            planGeneratedAtMs = nowMs()
+            plannedTransition = null
+            AppSettings.smartTransitionWindow.value = null
+            acceptRoute(naturalPlan, classicRouteFields(naturalPlan) + ("technique" to "natural"))
+            publishMixPreview(currentItem, nextItem, duration, nextDuration, currentAnalysis, nextAnalysis, analysisState, naturalPlan, true)
+            return
+        }
+
         val fallbackSec = configuredFadeMs().takeIf { it > 0L }?.div(1000.0) ?: DEFAULT_SMART_FALLBACK_SECONDS
         val outEndMs = failedPlan?.let { (it.frozenExitMs + it.overlapDurationMs).coerceIn(1_500L, duration) }
             ?: (currentAnalysis.contentEndTime.takeIf { it.isFinite() && it > 1.0 }?.times(1000.0))
@@ -2783,7 +2811,8 @@ class CrossfadeController(
             ?: duration
         val rawFadeMs = failedPlan?.overlapDurationMs?.takeIf { it >= 1_200L }
             ?: (fallbackSec * 1000.0).roundToLong()
-        val fadeMs = minOf(rawFadeMs, (outEndMs - 500L).coerceAtLeast(1_200L)).coerceAtLeast(1_200L)
+        val maxFadeForMode = if (failedPlan == null && recoveryRequired && coarseDecline) 4_000L else rawFadeMs
+        val fadeMs = minOf(rawFadeMs, maxFadeForMode, (outEndMs - 500L).coerceAtLeast(1_200L)).coerceAtLeast(1_200L)
         val startMs = (outEndMs - fadeMs).coerceAtLeast(0L)
         val beatSec = currentAnalysis.beatInterval.takeIf { it.isFinite() && it in 0.25..1.5 }
             ?: currentAnalysis.bpm.takeIf { it.isFinite() && it > 40.0 }?.let { 60.0 / it }
@@ -2791,23 +2820,52 @@ class CrossfadeController(
         val inCueMs = failedPlan?.frozenEntryMs
             ?: (nextAnalysis.mixInTime.takeIf { it.isFinite() && it >= 0.0 }?.times(1000.0))?.roundToLong()
             ?: 0L
-        val classicPlan = TransitionPlan(
-            shouldStart = true,
-            markerVisible = true,
-            blocked = false,
-            reason = "classic:$reason",
-            transitionStart = startMs / 1000.0,
-            transitionEnd = outEndMs / 1000.0,
-            fadeSeconds = fadeMs / 1000.0,
-            transitionStyle = TransitionStyle.EQUAL_POWER,
-            incomingCueTime = inCueMs / 1000.0,
-            incomingPlaybackRate = 1.0,
-            outgoingPlaybackRate = 1.0,
-            bassSwap = false,
-            beatSeconds = beatSec,
-            phaseLock = false,
-            mixSummary = "Classic crossfade ($reason)",
-        )
+        val classicPlan = if (failedPlan == null && recoveryRequired) {
+            TransitionPlan(
+                shouldStart = true,
+                markerVisible = true,
+                blocked = false,
+                reason = if (coarseDecline) "classic:decline-recovery:$reason" else "classic:native-recovery:$reason",
+                transitionStart = startMs / 1000.0,
+                transitionEnd = outEndMs / 1000.0,
+                fadeSeconds = fadeMs / 1000.0,
+                transitionStyle = TransitionStyle.DJ_FILTER,
+                incomingCueTime = inCueMs / 1000.0,
+                incomingPlaybackRate = 1.0,
+                outgoingPlaybackRate = 1.0,
+                bassSwap = !coarseDecline,
+                filterSweep = 1.0,
+                filterVariant = if (coarseDecline) FilterTransitionVariant.DECLINE else FilterTransitionVariant.SWEEP,
+                beatSeconds = beatSec,
+                phaseLock = false,
+                echoSeconds = 0.0,
+                djEffect = com.music.bitchord.playback.smart.DjEffect.NONE,
+                mixSummary = if (coarseDecline) "Filter decline ($reason)" else "Recovery crossfade ($reason)",
+            )
+        } else {
+            val classicStyle = if (failedPlan == null && bothAnalyzed && !coarseDecline) {
+                TransitionStyle.DJ_BLEND
+            } else {
+                TransitionStyle.EQUAL_POWER
+            }
+            TransitionPlan(
+                shouldStart = true,
+                markerVisible = true,
+                blocked = false,
+                reason = "classic:$reason",
+                transitionStart = startMs / 1000.0,
+                transitionEnd = outEndMs / 1000.0,
+                fadeSeconds = fadeMs / 1000.0,
+                transitionStyle = classicStyle,
+                incomingCueTime = inCueMs / 1000.0,
+                incomingPlaybackRate = 1.0,
+                outgoingPlaybackRate = 1.0,
+                bassSwap = classicStyle == TransitionStyle.DJ_BLEND,
+                beatSeconds = beatSec,
+                phaseLock = false,
+                mixSummary = "Classic crossfade ($reason)",
+            )
+        }
         lastSmartPlan = classicPlan
         lastSmartPlanStartMs = startMs
         planGeneratedAtMs = nowMs()

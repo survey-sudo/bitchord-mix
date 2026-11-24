@@ -6,10 +6,12 @@ import androidx.media3.common.MediaItem
 import com.music.bitchord.djmix.core.contracts.AnalysisLevel
 import com.music.bitchord.djmix.core.contracts.CandidateScoreSummary
 import com.music.bitchord.djmix.core.contracts.DeckStemRequirement
+import com.music.bitchord.djmix.core.contracts.DeckTarget as CoreDeckTarget
 import com.music.bitchord.djmix.core.contracts.DjLevel as CoreDjLevel
 import com.music.bitchord.djmix.core.contracts.FailureKind
 import com.music.bitchord.djmix.core.contracts.MixOutcome
 import com.music.bitchord.djmix.core.contracts.RefusalReason
+import com.music.bitchord.djmix.core.contracts.StemKind as CoreStemKind
 import com.music.bitchord.djmix.core.contracts.TempoKnot
 import com.music.bitchord.djmix.core.contracts.TimeRangeMs
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
@@ -677,6 +679,10 @@ data class PreparedPair(
     val preparedSession: LoopMixSession? = null,
     val preparedSessionNoStem: Boolean = false,
     val lastRefusalReason: RefusalReason? = null,
+    internal val outStemWindowStartSec: Double? = null,
+    internal val outStemWindowEndSec: Double? = null,
+    internal val inStemWindowStartSec: Double? = null,
+    internal val inStemWindowEndSec: Double? = null,
 )
 
 /**
@@ -1447,7 +1453,10 @@ class PairPreparer(
         val sig = analysisSignature(rawOut, rawIn)
         val outMap = if (rawOut.isUsable) songMapFor(request.outTrack.id, rawOut) else cur.outSongMap
         val inMap = if (rawIn.isUsable) songMapFor(request.inTrack.id, rawIn) else cur.inSongMap
-        if (sig == cur.analysisSignature && outMap == cur.outSongMap && inMap == cur.inSongMap) return
+        if (sig == cur.analysisSignature &&
+            songMapsEquivalent(outMap, cur.outSongMap) &&
+            songMapsEquivalent(inMap, cur.inSongMap)
+        ) return
         if (!rawOut.isUsable || !rawIn.isUsable) return
 
         val outA = rawOut.copy(duration = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawOut.duration)
@@ -1703,12 +1712,14 @@ class PairPreparer(
             ?: decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
         if (isAborted()) return
 
-        val coverageReason = effectivePlan?.let {
+        val coverageReason = if (effectivePlan == null) {
+            "prepared_script_geometry_missing"
+        } else {
             LoopMixSession.preparedCoverageRefusal(
-                it, request.sampleRate, outRegion, inRegion,
+                effectivePlan, request.sampleRate, outRegion, inRegion,
                 outA, inA, selected.straightRateMode, request.djLevel,
             )
-        } ?: "prepared_script_geometry_missing"
+        }
         if (coverageReason != null) {
             publishIfCurrent(gen) {
                 it.copy(
@@ -1735,9 +1746,12 @@ class PairPreparer(
             if (isAborted()) return
         }
 
+        val authoritativeV1 = selected.transitionPlanV1 != null && planV1 != null
         val (needOutStems, needInStems) = if (stemsAllowed && (outRegion != null || inRegion != null)) {
-            if (planV1 != null && selected.transitionPlanV1 != null && planV1.requiredStems.isEmpty()) {
-                false to false
+            if (authoritativeV1) {
+                val outReq = planV1!!.requiredStems.any { it.deck == CoreDeckTarget.OUT }
+                val inReq = planV1.requiredStems.any { it.deck == CoreDeckTarget.IN }
+                outReq to inReq
             } else {
                 requiredStemSides(
                     effectivePlan = effectivePlan,
@@ -1758,30 +1772,70 @@ class PairPreparer(
             false to false
         }
 
-        // Containment reuse of already-separated stems when the window fits inside prior StemSet.
-        val slicedOutStems = if (needOutStems && outRegion != null) {
-            sliceStemSet(
-                reusableSamePair?.outStems,
-                outRegion.start,
-                outRegion.start + outRegion.left.size.toDouble() / request.sampleRate,
-            )?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
+        // M5 §3.3.2: separate only the overlap window (± 1 bar) per required deck, not the full padded decode region.
+        val (outStemBounds, inStemBounds) = computeStemOverlapWindows(
+            effectivePlan = effectivePlan,
+            outRegion = outRegion,
+            inRegion = inRegion,
+            outA = outA,
+            inA = inA,
+            sampleRate = request.sampleRate,
+            straightRateMode = selected.straightRateMode,
+            level = request.djLevel,
+            windowStartSec = windowStartSec,
+            windowEndSec = windowEndSec,
+            entryCueSec = entryCueSec,
+        )
+        val outStemInput = if (needOutStems && outRegion != null && outStemBounds != null) {
+            sliceLoopRegion(outRegion, request.sampleRate, outStemBounds.first, outStemBounds.second) ?: outRegion
         } else null
-        val slicedInStems = if (needInStems && inRegion != null) {
-            sliceStemSet(
-                reusableSamePair?.inStems,
-                inRegion.start,
-                inRegion.start + inRegion.left.size.toDouble() / request.sampleRate,
-            )?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
+        val inStemInput = if (needInStems && inRegion != null && inStemBounds != null) {
+            sliceLoopRegion(inRegion, request.sampleRate, inStemBounds.first, inStemBounds.second) ?: inRegion
+        } else null
+        val outStemStartSec = outStemInput?.start ?: 0.0
+        val outStemEndSec = outStemInput?.let { it.start + it.left.size.toDouble() / request.sampleRate } ?: 0.0
+        val inStemStartSec = inStemInput?.start ?: 0.0
+        val inStemEndSec = inStemInput?.let { it.start + it.left.size.toDouble() / request.sampleRate } ?: 0.0
+
+        // Containment reuse of already-separated stems when the overlap stem window fits inside prior StemSet.
+        val halfSampleSec = 0.5 / request.sampleRate.coerceAtLeast(1)
+        val reusableOutCovers = reusableSamePair?.outStems != null && outStemInput != null && (
+            (reusableSamePair.outStemWindowStartSec == null || reusableSamePair.outStemWindowEndSec == null) ||
+                (outStemStartSec + halfSampleSec >= reusableSamePair.outStemWindowStartSec &&
+                    outStemEndSec - halfSampleSec <= reusableSamePair.outStemWindowEndSec)
+            )
+        val slicedOutStems = if (needOutStems && outRegion != null && outStemInput != null && reusableOutCovers) {
+            sliceStemSet(reusableSamePair?.outStems, outStemStartSec, outStemEndSec)
+                ?.takeIf { StemAdapter.matchesRegion(it, outStemInput.left.size, request.sampleRate) }
+                ?.let { compositeStemSetForRegion(outRegion, it, request.sampleRate) }
+                ?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
+        } else null
+        val reusableInCovers = reusableSamePair?.inStems != null && inStemInput != null && (
+            (reusableSamePair.inStemWindowStartSec == null || reusableSamePair.inStemWindowEndSec == null) ||
+                (inStemStartSec + halfSampleSec >= reusableSamePair.inStemWindowStartSec &&
+                    inStemEndSec - halfSampleSec <= reusableSamePair.inStemWindowEndSec)
+            )
+        val slicedInStems = if (needInStems && inRegion != null && inStemInput != null && reusableInCovers) {
+            sliceStemSet(reusableSamePair?.inStems, inStemStartSec, inStemEndSec)
+                ?.takeIf { StemAdapter.matchesRegion(it, inStemInput.left.size, request.sampleRate) }
+                ?.let { compositeStemSetForRegion(inRegion, it, request.sampleRate) }
+                ?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
         } else null
 
-        val needSepOut = needOutStems && slicedOutStems == null && outRegion != null &&
-            outRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
-        val needSepIn = needInStems && slicedInStems == null && inRegion != null &&
-            inRegion.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
+        val needSepOut = needOutStems && slicedOutStems == null && outRegion != null && outStemInput != null &&
+            outStemInput.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
+        val needSepIn = needInStems && slicedInStems == null && inRegion != null && inStemInput != null &&
+            inStemInput.left.size / request.sampleRate.toDouble() <= AutomixV2Choreo.MAX_STEM_REGION_SEC
 
         if (!needSepOut && !needSepIn) {
-            val initialCompleted = (if (slicedOutStems != null) 1 else 0) + (if (slicedInStems != null) 1 else 0)
-            val totalRequired = maxOf(initialCompleted, planV1?.requiredStems?.size ?: 0)
+            val (initialCompleted, totalRequired) = countCompletedAndRequiredStems(
+                authoritativeV1 = authoritativeV1,
+                planV1 = planV1,
+                needOutStems = needOutStems,
+                needInStems = needInStems,
+                outStems = slicedOutStems,
+                inStems = slicedInStems,
+            )
             finalizePreparedPair(
                 gen = gen,
                 request = request,
@@ -1799,6 +1853,10 @@ class PairPreparer(
                 inRegion = inRegion,
                 outStems = slicedOutStems,
                 inStems = slicedInStems,
+                outStemWindowStartSec = outStemStartSec.takeIf { slicedOutStems != null },
+                outStemWindowEndSec = outStemEndSec.takeIf { slicedOutStems != null },
+                inStemWindowStartSec = inStemStartSec.takeIf { slicedInStems != null },
+                inStemWindowEndSec = inStemEndSec.takeIf { slicedInStems != null },
                 stemMsOut = 0L,
                 stemMsIn = 0L,
                 stemsCompleted = initialCompleted,
@@ -1819,42 +1877,54 @@ class PairPreparer(
                 var stemMsOut = 0L
                 var stemMsIn = 0L
 
-                if (needSepOut && outRegion != null) {
+                if (needSepOut && outRegion != null && outStemInput != null) {
                     val t0 = nowMs()
-                    outStems = synchronized(stemLock) {
+                    val rawOutStems = synchronized(stemLock) {
                         if (isAborted()) null
                         else separateStems(
                             request.outTrack.id,
-                            outRegion.left,
-                            outRegion.right,
+                            outStemInput.left,
+                            outStemInput.right,
                             request.sampleRate,
-                            outRegion.start,
+                            outStemInput.start,
                             ::isAborted,
                         )
-                    }?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
+                    }?.takeIf { StemAdapter.matchesRegion(it, outStemInput.left.size, request.sampleRate) }
+                    outStems = rawOutStems
+                        ?.let { compositeStemSetForRegion(outRegion, it, request.sampleRate) }
+                        ?.takeIf { StemAdapter.matchesRegion(it, outRegion.left.size, request.sampleRate) }
                     stemMsOut = (nowMs() - t0).coerceAtLeast(0L)
                 }
                 if (isAborted()) return@execute
 
-                if (needSepIn && inRegion != null) {
+                if (needSepIn && inRegion != null && inStemInput != null) {
                     val t0 = nowMs()
-                    inStems = synchronized(stemLock) {
+                    val rawInStems = synchronized(stemLock) {
                         if (isAborted()) null
                         else separateStems(
                             request.inTrack.id,
-                            inRegion.left,
-                            inRegion.right,
+                            inStemInput.left,
+                            inStemInput.right,
                             request.sampleRate,
-                            inRegion.start,
+                            inStemInput.start,
                             ::isAborted,
                         )
-                    }?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
+                    }?.takeIf { StemAdapter.matchesRegion(it, inStemInput.left.size, request.sampleRate) }
+                    inStems = rawInStems
+                        ?.let { compositeStemSetForRegion(inRegion, it, request.sampleRate) }
+                        ?.takeIf { StemAdapter.matchesRegion(it, inRegion.left.size, request.sampleRate) }
                     stemMsIn = (nowMs() - t0).coerceAtLeast(0L)
                 }
                 if (isAborted()) return@execute
 
-                val required = (if (needOutStems) 1 else 0) + (if (needInStems) 1 else 0)
-                val completed = (if (outStems != null) 1 else 0) + (if (inStems != null) 1 else 0)
+                val (completed, required) = countCompletedAndRequiredStems(
+                    authoritativeV1 = authoritativeV1,
+                    planV1 = planV1,
+                    needOutStems = needOutStems,
+                    needInStems = needInStems,
+                    outStems = outStems,
+                    inStems = inStems,
+                )
                 finalizePreparedPair(
                     gen = gen,
                     request = request,
@@ -1872,10 +1942,14 @@ class PairPreparer(
                     inRegion = inRegion,
                     outStems = outStems,
                     inStems = inStems,
+                    outStemWindowStartSec = outStemStartSec.takeIf { outStems != null },
+                    outStemWindowEndSec = outStemEndSec.takeIf { outStems != null },
+                    inStemWindowStartSec = inStemStartSec.takeIf { inStems != null },
+                    inStemWindowEndSec = inStemEndSec.takeIf { inStems != null },
                     stemMsOut = stemMsOut,
                     stemMsIn = stemMsIn,
                     stemsCompleted = completed,
-                    stemsRequired = planV1?.requiredStems?.size ?: required,
+                    stemsRequired = required,
                     analysisMs = analysisMs,
                     planMs = planMs,
                     windowStartSec = windowStartSec,
@@ -1901,6 +1975,10 @@ class PairPreparer(
         inRegion: LoopRegion?,
         outStems: StemSet?,
         inStems: StemSet?,
+        outStemWindowStartSec: Double? = null,
+        outStemWindowEndSec: Double? = null,
+        inStemWindowStartSec: Double? = null,
+        inStemWindowEndSec: Double? = null,
         stemMsOut: Long,
         stemMsIn: Long,
         stemsCompleted: Int,
@@ -1963,6 +2041,10 @@ class PairPreparer(
                 topCandidates = top3,
                 outStems = usedOutStems,
                 inStems = usedInStems,
+                outStemWindowStartSec = outStemWindowStartSec.takeIf { usedOutStems != null },
+                outStemWindowEndSec = outStemWindowEndSec.takeIf { usedOutStems != null },
+                inStemWindowStartSec = inStemWindowStartSec.takeIf { usedInStems != null },
+                inStemWindowEndSec = inStemWindowEndSec.takeIf { usedInStems != null },
                 outRegion = outRegion,
                 inRegion = inRegion,
                 preparedAtMs = readyAtMs,
@@ -2573,6 +2655,182 @@ class PairPreparer(
 
         internal fun analysisSignature(out: TrackAnalysis, inn: TrackAnalysis): String =
             "${out.status}:${out.quality}:${(out.bpm * 10).toInt()}|${inn.status}:${inn.quality}:${(inn.bpm * 10).toInt()}"
+
+        private fun songMapsEquivalent(a: SongMap?, b: SongMap?): Boolean {
+            if (a === b) return true
+            if (a == null || b == null) return false
+            return a.schema == b.schema &&
+                a.trackKey == b.trackKey &&
+                a.bpm == b.bpm &&
+                a.beatsPerBar == b.beatsPerBar &&
+                a.downbeats.contentEquals(b.downbeats) &&
+                a.gridConfidence == b.gridConfidence &&
+                a.tempoStable == b.tempoStable &&
+                a.phraseAnchor == b.phraseAnchor &&
+                a.phraseLen == b.phraseLen &&
+                a.anchors.contentEquals(b.anchors) &&
+                a.sections == b.sections &&
+                a.sungBars.contentEquals(b.sungBars) &&
+                a.vocalEnergy.contentEquals(b.vocalEnergy) &&
+                a.firstVocalBar == b.firstVocalBar &&
+                a.lastVocalBar == b.lastVocalBar &&
+                a.startKind == b.startKind &&
+                a.endingKind == b.endingKind &&
+                a.contentEndSec == b.contentEndSec &&
+                a.drops == b.drops &&
+                a.builds == b.builds &&
+                a.breakdowns == b.breakdowns &&
+                a.chorusRepeats == b.chorusRepeats &&
+                a.structureVersion == b.structureVersion
+        }
+
+        private fun computeStemOverlapWindows(
+            effectivePlan: LoopMix.Plan?,
+            outRegion: LoopRegion?,
+            inRegion: LoopRegion?,
+            outA: TrackAnalysis,
+            inA: TrackAnalysis,
+            sampleRate: Int,
+            straightRateMode: StraightRateMode?,
+            level: DjLevel,
+            windowStartSec: Double,
+            windowEndSec: Double,
+            entryCueSec: Double,
+        ): Pair<Pair<Double, Double>?, Pair<Double, Double>?> {
+            val sr = sampleRate.coerceAtLeast(1).toDouble()
+            val outBarSec = barSeconds(outA.bpm, effectivePlan?.out?.beatSec ?: 0.5)
+            val inBarSec = barSeconds(inA.bpm, effectivePlan?.inn?.beatSec ?: 0.5)
+            val outRegionEnd = outRegion?.let { it.start + it.left.size.toDouble() / sr } ?: 0.0
+            val inRegionEnd = inRegion?.let { it.start + it.left.size.toDouble() / sr } ?: 0.0
+
+            if (effectivePlan == null) {
+                val span = (windowEndSec - windowStartSec).coerceAtLeast(4.0)
+                val outBounds = outRegion?.let {
+                    val from = (windowStartSec - outBarSec).coerceIn(it.start, outRegionEnd)
+                    val to = (windowEndSec + outBarSec).coerceIn(from, outRegionEnd)
+                    if (to > from + 0.05) from to to else it.start to outRegionEnd
+                }
+                val inBounds = inRegion?.let {
+                    val from = (entryCueSec - inBarSec).coerceIn(it.start, inRegionEnd)
+                    val to = (entryCueSec + span + inBarSec).coerceIn(from, inRegionEnd)
+                    if (to > from + 0.05) from to to else it.start to inRegionEnd
+                }
+                return outBounds to inBounds
+            }
+
+            val clock = LoopMix.Clock(effectivePlan)
+            val knots = runCatching {
+                val echoHold = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
+                val outStop = clock.releaseAt + 0.05 + echoHold + effectivePlan.exitTailSeconds
+                val tailRate = if (clock.beats >= 1) {
+                    val b0 = clock.beatTimes[clock.beats - 1]
+                    val b1 = clock.beatTimes[clock.beats]
+                    (effectivePlan.out.beatSec / (b1 - b0).coerceAtLeast(1e-6)).coerceIn(0.85, 1.15)
+                } else 1.0
+                val outHasTailKnot = !effectivePlan.outLoops && outStop > clock.releaseAt + 1e-6
+                LoopMixSession.buildDeckKnots(
+                    effectivePlan, clock, sampleRate, outA, inA,
+                    outHasTailKnot, outStop, tailRate, straightRateMode, level,
+                )
+            }.getOrNull()
+
+            val outOverlapStart = effectivePlan.out.loopStart
+            val outOverlapEnd = if (effectivePlan.outLoops) {
+                effectivePlan.out.loopEnd
+            } else {
+                val releasePos = knots?.let {
+                    interpolateKnots(it.outFrames, it.outPositionsSec, clock.releaseAt * sr)
+                } ?: (outOverlapStart + clock.releaseAt)
+                maxOf(effectivePlan.out.loopEnd, releasePos)
+            }
+
+            val inOverlapStart = effectivePlan.inn.loopStart
+            val inOverlapEnd = if (effectivePlan.inLoops) {
+                effectivePlan.inn.loopEnd
+            } else {
+                val releasePos = knots?.let {
+                    interpolateKnots(it.inFrames, it.inPositionsSec, clock.releaseAt * sr)
+                } ?: (inOverlapStart + clock.releaseAt)
+                maxOf(effectivePlan.inn.loopEnd, releasePos)
+            }
+
+            val outBounds = outRegion?.let {
+                val from = (outOverlapStart - outBarSec).coerceIn(it.start, outRegionEnd)
+                val to = (outOverlapEnd + outBarSec).coerceIn(from, outRegionEnd)
+                if (to > from + 0.05) from to to else it.start to outRegionEnd
+            }
+            val inBounds = inRegion?.let {
+                val from = (inOverlapStart - inBarSec).coerceIn(it.start, inRegionEnd)
+                val to = (inOverlapEnd + inBarSec).coerceIn(from, inRegionEnd)
+                if (to > from + 0.05) from to to else it.start to inRegionEnd
+            }
+            return outBounds to inBounds
+        }
+
+        private fun compositeStemSetForRegion(
+            region: LoopRegion,
+            overlapStems: StemSet,
+            sampleRate: Int,
+        ): StemSet {
+            val totalFrames = region.left.size
+            if (overlapStems.frames == totalFrames &&
+                abs(overlapStems.regionStartSec - region.start) <= 0.5 / sampleRate.coerceAtLeast(1)
+            ) {
+                return overlapStems
+            }
+            val offset = ((overlapStems.regionStartSec - region.start) * sampleRate)
+                .roundToLong().toInt().coerceIn(0, totalFrames)
+            val copyLen = minOf(overlapStems.frames, totalFrames - offset).coerceAtLeast(0)
+            val leftMap = HashMap<StemKind, FloatArray>(overlapStems.left.size)
+            val rightMap = HashMap<StemKind, FloatArray>(overlapStems.right.size)
+            for ((kind, srcL) in overlapStems.left) {
+                val srcR = overlapStems.right[kind] ?: continue
+                val dstL = if (kind == StemKind.OTHER) region.left.copyOf() else FloatArray(totalFrames)
+                val dstR = if (kind == StemKind.OTHER) region.right.copyOf() else FloatArray(totalFrames)
+                if (copyLen > 0) {
+                    System.arraycopy(srcL, 0, dstL, offset, minOf(copyLen, srcL.size))
+                    System.arraycopy(srcR, 0, dstR, offset, minOf(copyLen, srcR.size))
+                }
+                leftMap[kind] = dstL
+                rightMap[kind] = dstR
+            }
+            return StemSet(
+                sampleRate = overlapStems.sampleRate,
+                frames = totalFrames,
+                regionStartSec = region.start,
+                left = leftMap,
+                right = rightMap,
+                stemCount = overlapStems.stemCount,
+                confidence = overlapStems.confidence,
+            )
+        }
+
+        private fun countCompletedAndRequiredStems(
+            authoritativeV1: Boolean,
+            planV1: TransitionPlanV1?,
+            needOutStems: Boolean,
+            needInStems: Boolean,
+            outStems: StemSet?,
+            inStems: StemSet?,
+        ): Pair<Int, Int> {
+            if (authoritativeV1 && planV1 != null) {
+                val required = planV1.requiredStems.size
+                val completed = planV1.requiredStems.count { req ->
+                    val deckStems = if (req.deck == CoreDeckTarget.OUT) outStems else inStems
+                    val sharedKind = when (req.kind) {
+                        CoreStemKind.VOCALS -> StemKind.VOCALS
+                        CoreStemKind.DRUMS -> StemKind.DRUMS
+                        CoreStemKind.BASS -> StemKind.BASS
+                        CoreStemKind.OTHER -> StemKind.OTHER
+                    }
+                    deckStems?.left?.containsKey(sharedKind) == true
+                }
+                return completed to required
+            }
+            val required = (if (needOutStems) 1 else 0) + (if (needInStems) 1 else 0)
+            val completed = (if (outStems != null) 1 else 0) + (if (inStems != null) 1 else 0)
+            return completed to required
+        }
 
         internal fun paddedWindow(
             coreFrom: Double,
