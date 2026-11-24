@@ -18,6 +18,9 @@ package com.music.bitchord.playback.smart
 
 import java.io.File
 import java.io.FileInputStream
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
@@ -26,8 +29,9 @@ enum class StemLayout(val native: Int) { SCNET_CAC(0), UMX_MAGNITUDE(1) }
 
 /**
  * One weight file. [sha256] empty = not pinned yet (only usable with
- * [AutomixV2Stems.allowUnpinnedModels]). [bundledAsset] names an APK asset that already carries
- * the file; [url] is where an on-demand install fetches it from.
+ * [AutomixV2Stems.allowUnpinnedModels]). [bundledAsset] is an optional embedded-file
+ * adapter for other platforms; Android djmix52 ships no ONNX assets. [url] is the
+ * pinned release location, accessed through the platform's delivery coordinator.
  */
 class StemModelFile(
     val fileName: String,
@@ -73,10 +77,7 @@ object StemModels {
                 fileName = "scnet.int8.onnx",
                 sha256 = "98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845",
                 bytes = 12_900_277L,
-                // Mirror onto BitChord's own release assets before shipping (tools/models/MODELS.md).
-                url = "https://huggingface.co/audiojs/scnet/resolve/main/scnet.int8.onnx",
-                // AUTOMIX-V2(orch): bundled in the APK (sha256-verified at unpack) so 4 stems work offline on first run.
-                bundledAsset = "scnet.int8.onnx",
+                url = "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/scnet.int8.onnx",
                 licence = "MIT (starrytong/SCNet; weights MIT per starrytong/SCNet#35); trained on MUSDB18-HQ",
             ),
         ),
@@ -84,7 +85,8 @@ object StemModels {
 
     /**
      * SCNet exported by tools/models/export_scnet.py with ORT dynamic int8 (real int8 MatMul/Conv
-     * kernels, faster on CPU). Pin [StemModelFile.sha256] after the export passes its SNR gate.
+     * kernels, faster on CPU). This unpinned, no-URL experiment is NOT a fourth models-v1
+     * release/download. Pin it only after a later export passes its SNR gate.
      */
     val SCNET_DYN_INT8 = StemModelSpec(
         id = "scnet-musdb18-dynint8",
@@ -107,7 +109,7 @@ object StemModels {
 
     /**
      * Open-Unmix UMX-HQ, four independent targets (MIT weights, Zenodo 3370489). Vocals is the
-     * graph the APK already ships; drums/bass/other come from tools/models/export_umx.py.
+     * graph delivered by models-v1; drums/bass/other are unpublished local experiments.
      */
     val UMXHQ4_INT8 = StemModelSpec(
         id = "umxhq4-int8",
@@ -122,8 +124,7 @@ object StemModels {
                 fileName = "vocals_umxhq_int8.onnx",
                 sha256 = "a2be987b55a29bc149d3a6ae99b08175d81f85ee292a8ea21f96c3a473bc94cb",
                 bytes = 9_054_206L,
-                url = null,
-                bundledAsset = "vocals_umxhq_int8.onnx",
+                url = "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/vocals_umxhq_int8.onnx",
                 licence = "MIT (sigsep/open-unmix-pytorch umxhq)",
             ),
             StemModelFile("drums_umxhq_int8.onnx", "", 0L, null, licence = "MIT (sigsep umxhq)"),
@@ -141,20 +142,34 @@ fun interface StemModelDownloader {
 }
 
 /**
+ * Platform delivery authority. Android supplies AutomixModels: resolve returns only
+ * identity-checked, previously SHA-verified paths; install queues its one gated batch
+ * (and returns false while preparing); uninstall also goes through that authority.
+ * A configured coordinator is exclusive: the store NEVER falls back to its own HTTP.
+ */
+interface StemModelCoordinator {
+    fun resolve(model: StemModelFile): File?
+    fun install(spec: StemModelSpec): Boolean
+    fun uninstall(spec: StemModelSpec)
+}
+
+/**
  * Where stem weights live on the device, and whether they can be trusted.
  *
  * Delivery is on-demand (see NOTES.md): files go to [directory] (app filesDir/stems) and are
- * only ever used after their SHA-256 matches the pin in [StemModels]. Bundled assets are still
- * honoured through [bundled] (it unpacks an APK asset and returns the file), so a build that
- * chooses to ship a model in `assets/stems/` needs no code change.
+ * only ever used after their SHA-256 matches the pin in [StemModels]. [bundled] is a
+ * compatibility local-file resolver (also called by filename without asset metadata).
+ * Root filesDir copies are retained alongside the old stems directory for upgrades.
  *
- * [resolve] never touches the network; [install] does, through [downloader], and belongs on a
- * worker thread the orchestrator chooses (e.g. after the user enables stem automix on Wi-Fi).
+ * Without [coordinator], resolve/verification and install belong on worker threads.
+ * With Android's coordinator, lookups never hash or do HTTP: missing paths may queue
+ * its IO preparation, and every install obeys its unmetered/explicit-consent gate.
  */
 class StemModelStore(
     private val directory: () -> File?,
     private val bundled: (assetName: String) -> File? = { null },
     private val downloader: StemModelDownloader? = null,
+    private val coordinator: StemModelCoordinator? = null,
 ) {
     /** path -> "length:lastModified:sha" of files already hashed this process. */
     private val verified = ConcurrentHashMap<String, String>()
@@ -187,6 +202,7 @@ class StemModelStore(
      * Returns true when [spec] is ready afterwards.
      */
     fun install(spec: StemModelSpec): Boolean {
+        coordinator?.let { return it.install(spec) }
         val dir = directory() ?: return false
         if (!dir.exists() && !dir.mkdirs()) return false
         for (model in spec.files) {
@@ -215,21 +231,25 @@ class StemModelStore(
 
     /** Removes downloaded (not bundled) files of [spec], e.g. when the user turns stems off. */
     fun uninstall(spec: StemModelSpec) {
+        coordinator?.let { it.uninstall(spec); return }
         val dir = directory() ?: return
         for (model in spec.files) {
             if (model.bundledAsset != null) continue
             val file = File(dir, model.fileName)
             verified.remove(file.absolutePath)
             runCatching { file.delete() }
+            runCatching { File(dir, model.fileName + ".part").delete() }
         }
     }
 
     private fun locate(model: StemModelFile): File? {
-        model.bundledAsset?.let { asset ->
-            val file = runCatching { bundled(asset) }.getOrNull()
-            if (file != null && matches(file, model)) return file
-        }
+        coordinator?.let { return it.resolve(model) }
+        val local = runCatching { bundled(model.bundledAsset ?: model.fileName) }.getOrNull()
+        if (local != null && matches(local, model)) return local
         val dir = directory() ?: return null
+        // Removing bundledAsset metadata must not strand the vc93 root copy.
+        val rootCopy = dir.parentFile?.let { File(it, model.fileName) }
+        if (rootCopy != null && matches(rootCopy, model)) return rootCopy
         val file = File(dir, model.fileName)
         if (!file.isFile) return null
         if (matches(file, model)) return file
@@ -244,12 +264,20 @@ class StemModelStore(
         if (!file.isFile || file.length() <= 0L) return false
         if (model.sha256.isEmpty()) return AutomixV2Stems.allowUnpinnedModels
         if (model.bytes > 0L && file.length() != model.bytes) return false
-        val stamp = "${file.length()}:${file.lastModified()}:${model.sha256}"
+        val stamp = stamp(file, model.sha256) ?: return false
         if (verified[file.absolutePath] == stamp) return true
-        val ok = sha256Hex(file)?.equals(model.sha256, ignoreCase = true) == true
+        val ok = sha256Hex(file)?.equals(model.sha256, ignoreCase = true) == true && stamp(file, model.sha256) == stamp
         if (ok) verified[file.absolutePath] = stamp
         return ok
     }
+
+    private fun stamp(file: File, hash: String): String? = runCatching {
+        val path = file.toPath()
+        val attrs = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        if (!attrs.isRegularFile) return@runCatching null
+        val ctime = runCatching { Files.getAttribute(path, "unix:ctime", LinkOption.NOFOLLOW_LINKS) }.getOrNull()
+        "${attrs.fileKey()}:${attrs.size()}:${attrs.lastModifiedTime()}:${attrs.creationTime()}:$ctime:$hash"
+    }.getOrNull()
 
     companion object {
         /** Streaming SHA-256 of [file] as lowercase hex, or null when unreadable. */

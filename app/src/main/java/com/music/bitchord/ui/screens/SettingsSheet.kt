@@ -361,6 +361,27 @@ fun SettingsScreen(
     var confirmOfficialImport by remember { mutableStateOf(false) }
     var confirmClearSongCache by remember { mutableStateOf(false) }
     var confirmDeleteAutomixModel by remember { mutableStateOf(false) }
+    // FORK-HOOK(automix-model-consent): transient, opened only by a deliberate tap, never by restore.
+    var confirmMeteredAutomixModels by remember { mutableStateOf(false) }
+    val requestAutomixModels: () -> Unit = {
+        if (AppSettings.meteredConnection.value == true) {
+            confirmMeteredAutomixModels = true
+        } else {
+            // The manager rechecks connectivity. A race onto a metered network
+            // must wait for consent, not inherit this Download/Retry tap as permission.
+            AutomixModels.download(allowMetered = false)
+        }
+    }
+    LaunchedEffect(automixModels) {
+        // Dismiss a stale confirmation if another request has already started
+        // or completed. State changes can close this dialog, but never open it.
+        if (automixModels == AutomixModels.State.Ready ||
+            automixModels == AutomixModels.State.Verifying ||
+            automixModels is AutomixModels.State.Downloading
+        ) {
+            confirmMeteredAutomixModels = false
+        }
+    }
     var showPerformanceWarning by remember { mutableStateOf(false) }
     var showPerformanceConfirmation by remember { mutableStateOf(false) }
     val backupScope = rememberCoroutineScope()
@@ -876,24 +897,65 @@ fun SettingsScreen(
                     }
                 }
             }
-            // The weights Automix analyses with live outside the APK (see
-            // AutomixModels): switching Automix on fetches them by itself,
-            // and this row lets them be fetched ahead of time, retried after
-            // a failure, or removed to free the space.
-            // FORK-HOOK(settings-section): hide model-download row while bundled .onnx assets are active (Step 2)
+            // All three models are managed as one verified batch. Enabling
+            // Automix can request an unmetered download, never metered consent.
+            // This row offers explicit Download/Retry, the network choice, and Delete.
+            // FORK-HOOK(settings-section): hide this row only while bundled models are active.
             if (!AutomixModels.BUNDLED_ASSETS_ACTIVE) {
-                val automixModelTitle = stringResource(R.string.automix_model)
-                row(automixModelTitle, "automix", "model", "download", "storage", "free space") {
+                val automixModelTitle = stringResource(R.string.automix_models_title)
+                row(
+                    automixModelTitle, "automix", "model", "download", "storage", "free space",
+                    "wifi", "wi-fi", "metered", "network", "cellular",
+                ) {
                     val modelMb = (AutomixModels.totalBytes / 1_000_000).toInt()
+                    // FORK-HOOK(automix-model-consent): render every model-manager state without an auto-prompt.
                     when (val model = automixModels) {
                         is AutomixModels.State.Downloading -> SettingsRow(
                             icon = SfIcons.Download,
                             title = automixModelTitle,
-                            subtitle = stringResource(
-                                R.string.automix_models_downloading,
-                                modelMb,
-                                (model.fraction * 100).toInt(),
-                            ),
+                            subtitleContent = {
+                                Text(
+                                    text = stringResource(
+                                        R.string.automix_models_preparing_download,
+                                        (model.fraction.coerceIn(0f, 1f) * 100).toInt(),
+                                        modelMb,
+                                    ),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            },
+                        )
+                        AutomixModels.State.Verifying -> SettingsRow(
+                            icon = SfIcons.Download,
+                            title = automixModelTitle,
+                            subtitle = stringResource(R.string.automix_models_preparing_verification),
+                        )
+                        AutomixModels.State.WaitingForNetwork -> SettingsRow(
+                            icon = SfIcons.Download,
+                            title = automixModelTitle,
+                            subtitleContent = {
+                                SubtitleWithAction(
+                                    stringResource(R.string.automix_models_waiting_network, modelMb),
+                                    stringResource(R.string.retry),
+                                    subtitleMaxLines = Int.MAX_VALUE,
+                                )
+                            },
+                            onClick = requestAutomixModels,
+                            trailing = {},
+                        )
+                        AutomixModels.State.AwaitingMeteredConsent -> SettingsRow(
+                            icon = SfIcons.Download,
+                            title = automixModelTitle,
+                            subtitleContent = {
+                                SubtitleWithAction(
+                                    stringResource(R.string.automix_models_waiting_wifi, modelMb),
+                                    stringResource(R.string.automix_models_use_metered),
+                                    subtitleMaxLines = Int.MAX_VALUE,
+                                )
+                            },
+                            // Still only a request to see the confirmation, not consent.
+                            onClick = { confirmMeteredAutomixModels = true },
+                            trailing = {},
                         )
                         // The action sits under the description rather than on the
                         // right, where it squeezed the title and the text.
@@ -902,11 +964,12 @@ fun SettingsScreen(
                             title = automixModelTitle,
                             subtitleContent = {
                                 SubtitleWithAction(
-                                    stringResource(R.string.automix_models_failed),
+                                    stringResource(R.string.automix_models_preparation_failed),
                                     stringResource(R.string.retry),
+                                    subtitleMaxLines = Int.MAX_VALUE,
                                 )
                             },
-                            onClick = AutomixModels::download,
+                            onClick = requestAutomixModels,
                             trailing = {},
                         )
                         AutomixModels.State.Ready -> SettingsRow(
@@ -914,9 +977,10 @@ fun SettingsScreen(
                             title = automixModelTitle,
                             subtitleContent = {
                                 SubtitleWithAction(
-                                    stringResource(R.string.automix_model_ready, modelMb),
+                                    stringResource(R.string.automix_models_ready, modelMb),
                                     stringResource(R.string.delete),
                                     actionColor = MaterialTheme.colorScheme.error,
+                                    subtitleMaxLines = Int.MAX_VALUE,
                                 )
                             },
                             onClick = { confirmDeleteAutomixModel = true },
@@ -927,11 +991,12 @@ fun SettingsScreen(
                             title = automixModelTitle,
                             subtitleContent = {
                                 SubtitleWithAction(
-                                    stringResource(R.string.automix_model_missing),
-                                    stringResource(R.string.automix_model_download, modelMb),
+                                    stringResource(R.string.automix_models_missing, modelMb),
+                                    stringResource(R.string.download),
+                                    subtitleMaxLines = Int.MAX_VALUE,
                                 )
                             },
-                            onClick = AutomixModels::download,
+                            onClick = requestAutomixModels,
                             trailing = {},
                         )
                     }
@@ -2075,16 +2140,51 @@ fun SettingsScreen(
         )
     }
 
-    // Deleting also turns Automix off: left on, its next analysis pass would
-    // simply download the model again.
+    // FORK-HOOK(automix-model-consent): the sole metered grant is inside this
+    // confirmation button. It applies to one batch; no setting is persisted.
+    if (confirmMeteredAutomixModels) {
+        AlertDialog(
+            onDismissRequest = { confirmMeteredAutomixModels = false },
+            title = { Text(stringResource(R.string.automix_models_metered_title)) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        stringResource(
+                            R.string.automix_models_metered_message,
+                            (AutomixModels.totalBytes / 1_000_000).toInt(),
+                        ),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmMeteredAutomixModels = false
+                    AutomixModels.download(allowMetered = true)
+                }) {
+                    Text(stringResource(R.string.automix_models_use_metered))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    confirmMeteredAutomixModels = false
+                    AutomixModels.download(allowMetered = false)
+                }) {
+                    Text(stringResource(R.string.automix_models_wait_for_wifi))
+                }
+            },
+        )
+    }
+
+    // Deleting also turns Automix off, so an automatic analysis request does
+    // not immediately ask for the removed models again.
     if (confirmDeleteAutomixModel) {
         AlertDialog(
             onDismissRequest = { confirmDeleteAutomixModel = false },
-            title = { Text(stringResource(R.string.automix_model_delete_title)) },
+            title = { Text(stringResource(R.string.automix_models_delete_title)) },
             text = {
                 Text(
                     stringResource(
-                        R.string.automix_model_delete_warning,
+                        R.string.automix_models_delete_warning,
                         (AutomixModels.totalBytes / 1_000_000).toInt(),
                     ),
                 )
@@ -2821,12 +2921,14 @@ private fun SubtitleWithAction(
     subtitle: String,
     action: String,
     actionColor: Color = MaterialTheme.colorScheme.primary,
+    /** Consent/network details must remain readable at larger font sizes. */
+    subtitleMaxLines: Int = 5,
 ) {
     Text(
         text = subtitle,
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 5,
+        maxLines = subtitleMaxLines,
     )
     Text(
         text = action,

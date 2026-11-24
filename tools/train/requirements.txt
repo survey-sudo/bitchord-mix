@@ -1,0 +1,26 @@
+# Track N (Kite & Lark) training pipeline.
+# Install with:  pip install -r requirements.txt
+# Optional teacher packages are documented in README.md and are NOT imported by this scaffold.
+
+# --- core numerics / IO -----------------------------------------------------
+numpy>=1.24,<3
+requests>=2.31
+tqdm>=4.66
+soundfile>=0.12
+scipy>=1.11
+pandas>=2.0
+
+# --- training --------------------------------------------------------------
+torch>=2.2,<3            # torch.ao.quantization (fake-quant QAT + QDQ export)
+
+# --- ONNX / inference -------------------------------------------------------
+onnx>=1.16               # static graph validation + uint16 QDQ rewrite
+onnxruntime>=1.18        # GTZAN evaluation gate / latency benchmark
+
+# --- Kite data + evaluation -------------------------------------------------
+datasets>=2.18           # CPJKU/beat_this_annotations (MIT) loader
+mir_eval>=0.8            # 70 ms beat / downbeat F1
+
+# --- teacher adapters (install separately, see README) ---------------------
+# beat_this @ git+https://github.com/CPJKU/beat_this.git   # MIT, Kite teacher
+# umx       @ git+https://github.com/facebookresearch/umx.git  # MIT, Lark teacher

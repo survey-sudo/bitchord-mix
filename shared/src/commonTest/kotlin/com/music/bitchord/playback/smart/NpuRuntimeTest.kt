@@ -8,13 +8,18 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** AUTOMIX-V2(A): runtime switch, auto-disable policy, QDQ routing, QNN options, self-test maths. */
+/**
+ * djmix52: the NPU route is dark in every configuration. These tests pin that
+ * down (no policy, persisted opt-in, self-test verdict or versionCode bump can
+ * open it) and keep the pure policy/routing/self-test maths under test.
+ */
 class NpuRuntimeTest {
 
     @AfterTest
     fun reset() {
         NpuRuntime.install(null)
         NpuRuntime.installSocModel(null)
+        NpuRuntime.installBackendProvider(null)
         AutomixV2Npu.enabled = true
         AutomixV2Npu.requireSelfTestPass = true
     }
@@ -26,59 +31,79 @@ class NpuRuntimeTest {
     }
 
     @Test
-    fun offWithoutPolicyAndFollowsUserSwitch() {
-        assertFalse(NpuSupport.runtimeEnabled())
-        val store = installed(enabled = true)
-        assertTrue(NpuSupport.runtimeEnabled())
-        store.enabled = false
+    fun releaseGateKeepsRuntimeOff() {
+        // Both compile-time gates are off, and RUNTIME_AVAILABLE wins over everything else.
+        assertFalse(NpuRuntime.RUNTIME_AVAILABLE)
+        assertFalse(NpuSupport.QNN_ENABLED)
         assertFalse(NpuRuntime.runtimeEnabled())
-        store.enabled = true
-        AutomixV2Npu.enabled = false
+        assertFalse(NpuRuntime.productionQnnAllowed())
+    }
+
+    @Test
+    fun persistedOptInCannotEnableTheNpu() {
+        installed(enabled = true)
+        AutomixV2Npu.enabled = true
         assertFalse(NpuRuntime.runtimeEnabled())
+        // A self-test PASS recorded by an older build still does not open the gate.
+        NpuRuntime.policy()!!.recordSelfTest(NpuVerdict.PASS, "stale")
+        assertFalse(NpuRuntime.runtimeEnabled())
+        assertFalse(NpuRuntime.productionQnnAllowed())
+        assertFalse(NpuRuntime.shouldAttemptQnn(NpuSupport.NpuConfig(), NpuSupport.Vendor.QUALCOMM))
     }
 
     @Test
     fun legacyCompileTimeGateStaysOff() {
-        // The v2 route never flips the legacy dynamic-int8 path on.
         installed()
         assertFalse(NpuSupport.QNN_ENABLED)
+        assertFalse(NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = true), NpuSupport.Vendor.QUALCOMM))
     }
 
     @Test
-    fun threeConsecutiveFailuresAutoDisableUntilVersionChanges() {
+    fun backendProviderIsNeverInvokedWhileDark() {
+        var calls = 0
+        installed()
+        NpuRuntime.installBackendProvider { calls++; "/data/app/lib/libQnnHtp.so" }
+        assertNull(NpuRuntime.backendPath())
+        assertEquals(0, calls)
+    }
+
+    @Test
+    fun policyStateMachineStillTracksFailuresAndVerdicts() {
+        // The persisted policy keeps working even though nothing can consume it.
         val store = installed()
         val policy = NpuRuntime.policy()!!
+        assertTrue(policy.enabled())
         assertFalse(policy.recordFailure("a"))
         policy.recordSuccess()
         assertFalse(policy.recordFailure("b"))
         assertFalse(policy.recordFailure("c"))
-        assertTrue(NpuRuntime.runtimeEnabled())
         assertTrue(policy.recordFailure("d"))
-        assertFalse(NpuRuntime.runtimeEnabled())
+        assertFalse(policy.enabled())
         assertTrue(store.state!!.autoDisabled)
-        // Persisted: a new process with the same versionCode stays disabled ...
+        // Persisted across a process restart with the same versionCode ...
         NpuRuntime.install(NpuPolicy(store, 92L))
-        assertFalse(NpuRuntime.runtimeEnabled())
-        // ... and a new versionCode resets it.
+        assertFalse(NpuRuntime.policy()!!.enabled())
+        // ... and reset by a new versionCode.
         NpuRuntime.install(NpuPolicy(store, 93L))
-        assertTrue(NpuRuntime.runtimeEnabled())
+        assertTrue(NpuRuntime.policy()!!.enabled())
         assertEquals(0, store.state!!.consecutiveFailures)
+        // None of that reaches the runtime gate.
+        assertFalse(NpuRuntime.runtimeEnabled())
     }
 
     @Test
-    fun selfTestVerdictsGateProduction() {
+    fun selfTestVerdictsAreRecordedButNeverUnlockProduction() {
         installed()
         val policy = NpuRuntime.policy()!!
-        assertFalse(NpuRuntime.productionQnnAllowed())
         policy.recordSelfTest(NpuVerdict.SLOW, "qnn slower")
-        assertFalse(NpuRuntime.productionQnnAllowed())
-        assertTrue(NpuRuntime.runtimeEnabled())
+        assertTrue(policy.selfTestDone())
+        assertFalse(policy.selfTestPassed())
         policy.recordSelfTest(NpuVerdict.PASS, "ok")
-        assertTrue(NpuRuntime.productionQnnAllowed())
-        assertTrue(NpuRuntime.shouldAttemptQnn(NpuSupport.NpuConfig(), NpuSupport.Vendor.QUALCOMM))
-        assertFalse(NpuRuntime.shouldAttemptQnn(NpuSupport.NpuConfig(), NpuSupport.Vendor.MEDIATEK))
+        assertTrue(policy.selfTestPassed())
+        assertFalse(NpuRuntime.productionQnnAllowed())
+        assertFalse(NpuRuntime.shouldAttemptQnn(NpuSupport.NpuConfig(), NpuSupport.Vendor.QUALCOMM))
         policy.recordSelfTest(NpuVerdict.MISMATCH, "maxAbs=9")
-        assertFalse(NpuRuntime.runtimeEnabled())
+        assertTrue(policy.state().autoDisabled)
         assertFalse(NpuRuntime.productionQnnAllowed())
     }
 

@@ -1,6 +1,7 @@
 package com.music.bitchord.playback.smart.choreo
 
 import android.util.Log
+import com.music.bitchord.playback.djmix.StraightRateMode
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.LoopMix
@@ -23,8 +24,8 @@ import kotlin.math.abs
  *     zero ONNX inference at build time, falling back cleanly when stems are
  *     not ready.
  *
- * Every step is runCatching'd; any failure returns null and the vc80
- * envelopes stand.
+ * A null result is a refusal, not an executed v2 transition. Production builders
+ * must not leave legacy envelopes installed and report v2 success.
  */
 object ChoreoSessionGlue {
     private const val TAG = "BitChordChoreo"
@@ -40,6 +41,9 @@ object ChoreoSessionGlue {
         val pairKey: String,
         val albumOrder: Boolean,
         val note: String,
+        val sampleRate: Int = 0,
+        val straightRateMode: StraightRateMode? = null,
+        val excludedRecipes: Set<RecipeId> = emptySet(),
     )
 
     class Result(
@@ -61,10 +65,13 @@ object ChoreoSessionGlue {
         sampleRate: Int,
         albumOrder: Boolean,
         stemsExpected: Boolean,
+        straightRateMode: StraightRateMode? = null,
+        excludedRecipes: Set<RecipeId> = emptySet(),
+        capsOverride: Int? = null,
     ): Prep? = runCatching {
         if (!AutomixV2Choreo.enabled) return null
         if (script != null && !AutomixV2Choreo.overridePhraseScripts) return null
-        val caps = ChoreoRendererBridge.capabilities()
+        val caps = capsOverride ?: ChoreoRendererBridge.capabilities()
         val outStructure = StructureView.best(outSongMap, outAnalysis)
         val inStructure = StructureView.best(inSongMap, inAnalysis)
         val pairKey = "$outId->$inId"
@@ -81,8 +88,10 @@ object ChoreoSessionGlue {
             pairKey = pairKey, history = AutomixV2Choreo.history.recent(pairKey),
             recipeHistory = recentRecipes, albumOrder = albumOrder,
             stemsExpected = stemsExpected,
+            excludedRecipes = excludedRecipes,
         )
-        val start = Choreographer.dropRetimeStart(inputs)
+        // Straight recipes finalize their vc91 cue and physical coverage before decode.
+        val start = if (straightRateMode == null) Choreographer.dropRetimeStart(inputs) else null
         if (start != null) {
             val verified = verifyRetime(plan, hold, start, inputs, sampleRate, outAnalysis, inAnalysis)
             if (verified != null) {
@@ -103,7 +112,9 @@ object ChoreoSessionGlue {
                 note = "retimed incoming ${plan.inn.loopStart} -> ${verified.inn.loopStart} for a drop"
             }
         }
-        Prep(chosen, forced, forcedRecipe, caps, level, outStructure, inStructure, pairKey, albumOrder, note)
+        if (forcedRecipe in excludedRecipes) { forcedRecipe = null; forced = null }
+        Prep(chosen, forced, forcedRecipe, caps, level, outStructure, inStructure, pairKey, albumOrder, note,
+            sampleRate, straightRateMode, excludedRecipes)
     }.onFailure { Log.w(TAG, "prepare failed", it) }.getOrNull()
 
     /**
@@ -138,7 +149,7 @@ object ChoreoSessionGlue {
             val held = if (hold != candidate.incomingHoldSec) candidate.copy(incomingHoldSec = hold) else candidate
             val clock = LoopMix.Clock(held)
             val knots = knotsFor(held, clock, sampleRate, outAnalysis, inAnalysis)
-            val pos = inClock(held, clock, knots).at(clock.beatTimes[k]) ?: return null
+            val pos = inClock(held, clock, knots, sampleRate).at(clock.beatTimes[k]) ?: return null
             val err = pos - drop
             if (abs(err) <= 0.03) return candidate
             start -= err
@@ -161,15 +172,19 @@ object ChoreoSessionGlue {
         preparedInStems: StemSet? = null,
         preparedScript: ChoreoScript? = null,
     ): Result? = runCatching {
+        if (prep.plan != plan || (prep.sampleRate > 0 && prep.sampleRate != sampleRate)) return null
         val wantStems = AutomixV2Choreo.useStems && ChoreoCaps.has(prep.caps, ChoreoCaps.STEMS)
-        val outStems = if (wantStems && StemAdapter.matchesRegion(preparedOutStems, outRegion.left.size, sampleRate)) {
+        val outStems = if (wantStems && StemAdapter.matchesRegion(preparedOutStems, outRegion.left.size, sampleRate) &&
+            preparedOutStems != null && abs(preparedOutStems.regionStartSec - outRegion.start) <= 0.5 / sampleRate) {
             preparedOutStems
         } else null
-        val inStems = if (wantStems && StemAdapter.matchesRegion(preparedInStems, inRegion.left.size, sampleRate)) {
+        val inStems = if (wantStems && StemAdapter.matchesRegion(preparedInStems, inRegion.left.size, sampleRate) &&
+            preparedInStems != null && abs(preparedInStems.regionStartSec - inRegion.start) <= 0.5 / sampleRate) {
             preparedInStems
         } else null
         if (preparedScript != null &&
             preparedScript.level == prep.level &&
+            RecipeId.fromCode(preparedScript.recipeId) !in prep.excludedRecipes &&
             (!preparedScript.outUsesStems || outStems != null) &&
             (!preparedScript.inUsesStems || inStems != null)
         ) {
@@ -180,7 +195,7 @@ object ChoreoSessionGlue {
                 if (preparedScript.inUsesStems) inStems else null,
             )
         }
-        val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis)
+        val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis, prep.straightRateMode, prep.level)
         fun inputs(withStems: Boolean) = ChoreoInputs(
             plan = plan, clock = clock, out = outAnalysis, inn = inAnalysis,
             outStructure = prep.outStructure, inStructure = prep.inStructure,
@@ -191,7 +206,8 @@ object ChoreoSessionGlue {
             recipeHistory = AutomixV2Choreo.history.recentRecipes(prep.pairKey),
             seed = AutomixV2Choreo.seed,
             sungOut = sungOut, sungIn = sungIn, albumOrder = prep.albumOrder,
-            outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots),
+            outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots, sampleRate),
+            excludedRecipes = prep.excludedRecipes,
         )
         val log = ArrayList<String>()
         val script = (if (prep.forcedRecipe != null) Choreographer.chooseRecipe(inputs(true), prep.forcedRecipe, log) else null)
@@ -214,7 +230,7 @@ object ChoreoSessionGlue {
         sungIn: List<LoopMix.Span>?,
         plannedRecipe: RecipeId? = prep.forcedRecipe,
     ): ChoreoScript? = runCatching {
-        val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis)
+        val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis, prep.straightRateMode, prep.level)
         val inputs = ChoreoInputs(
             plan = plan, clock = clock, out = outAnalysis, inn = inAnalysis,
             outStructure = prep.outStructure, inStructure = prep.inStructure,
@@ -223,7 +239,8 @@ object ChoreoSessionGlue {
             recipeHistory = AutomixV2Choreo.history.recentRecipes(prep.pairKey),
             sungOut = sungOut, sungIn = sungIn,
             albumOrder = prep.albumOrder,
-            outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots),
+            outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots, sampleRate),
+            excludedRecipes = prep.excludedRecipes,
         )
         (if (plannedRecipe != null) Choreographer.chooseRecipe(inputs, plannedRecipe) else null)
             ?: Choreographer.choose(inputs, prep.forced)
@@ -237,6 +254,8 @@ object ChoreoSessionGlue {
         sampleRate: Int,
         outAnalysis: TrackAnalysis?,
         inAnalysis: TrackAnalysis?,
+        straightRateMode: StraightRateMode? = null,
+        level: DjLevel = AutomixV2Choreo.level,
     ) = run {
         val echoHold = if (plan.echoTail) plan.out.beatSec * 8 else 0.0
         val outStop = clock.releaseAt + 0.05 + echoHold + plan.exitTailSeconds
@@ -246,7 +265,8 @@ object ChoreoSessionGlue {
             (plan.out.beatSec / (b1 - b0).coerceAtLeast(1e-6)).coerceIn(0.85, 1.15)
         } else 1.0
         val outHasTailKnot = !plan.outLoops && outStop > clock.releaseAt + 1e-6
-        LoopMixSession.buildDeckKnots(plan, clock, sampleRate, outAnalysis, inAnalysis, outHasTailKnot, outStop, tailRate)
+        LoopMixSession.buildDeckKnots(plan, clock, sampleRate, outAnalysis, inAnalysis, outHasTailKnot, outStop, tailRate,
+            straightRateMode, level)
     }
 
     private fun interpolate(frames: DoubleArray, positions: DoubleArray, frame: Double): Double? {
@@ -278,10 +298,10 @@ object ChoreoSessionGlue {
         }
     }
 
-    private fun inClock(plan: LoopMix.Plan, clock: LoopMix.Clock, knots: LoopMixSession.Companion.DeckKnots): TrackClock {
+    private fun inClock(plan: LoopMix.Plan, clock: LoopMix.Clock, knots: LoopMixSession.Companion.DeckKnots, sampleRate: Int): TrackClock {
         val frames = knots.inFrames
         val positions = knots.inPositionsSec
-        val sr = if (clock.beats >= 1 && clock.beatTimes[1] > 0.0) frames[1] / clock.beatTimes[1] else 48_000.0
+        val sr = sampleRate.toDouble()
         val geometry = LoopMixSession.incomingGeometry(plan, clock, knots)
         return TrackClock { mix ->
             if (mix < 0.0) null

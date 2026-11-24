@@ -9,6 +9,7 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.unit.isSpecified
 import com.music.bitchord.playback.smart.AutomixStatus
+import com.music.bitchord.playback.smart.MixInspectorPhase
 import com.music.bitchord.data.model.ArtistCredit
 import com.music.bitchord.data.model.CreditSegment
 import com.music.bitchord.data.model.creditSegments
@@ -65,10 +66,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -307,6 +310,8 @@ internal fun PlayerScrubber(
                 MixingLabel(mixPulse, Modifier.align(Alignment.Center))
             }
         }
+        // FORK-HOOK(mix-inspector): an early entry point independent of popup-only waveforms.
+        UpcomingTransitionChip(mixing = mixing)
     }
 }
 
@@ -318,6 +323,7 @@ internal fun PlayerScrubber(
  */
 @Composable
 private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
+    val openLabel = stringResource(Res.string.mix_inspector_open)
     Text(
         text = stringResource(Res.string.mixing),
         modifier = modifier
@@ -327,6 +333,8 @@ private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() },
+                role = Role.Button,
+                onClickLabel = openLabel,
             ) { MixViewRequest.open = true }
             .graphicsLayer {
                 alpha = pulse.cover * pulse.alpha(1f, restShare = MIXING_LABEL_REST)
@@ -341,6 +349,57 @@ private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
         color = chromeWhite(0.85f),
         maxLines = 1,
     )
+}
+
+/**
+ * An entry point before the waveform preview exists.
+ * Its lightweight feed is available even while the popup is closed. The slot
+ * stays through a running transition so the artwork/controls do not jump when
+ * the chip gives way to the existing "Mixing" label.
+ */
+@Composable
+private fun UpcomingTransitionChip(mixing: Boolean) {
+    val enabled by PlayerSettings.smartFadeEnabled.collectAsStateWithLifecycle()
+    if (!enabled) return
+    val inspector by PlayerSettings.mixInspector.collectAsStateWithLifecycle()
+    val snapshot = inspector ?: return
+    val upcoming = !mixing && !snapshot.mixActive &&
+        snapshot.phase != MixInspectorPhase.DONE && snapshot.phase != MixInspectorPhase.CANCELLED
+    Box(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (!upcoming) return@Box
+        val recipe = snapshot.recipeName?.takeIf { it.isNotBlank() }
+        val label = if (recipe == null) stringResource(Res.string.mix_inspector_upcoming)
+        else stringResource(Res.string.mix_inspector_upcoming_recipe, recipe)
+        val openLabel = stringResource(Res.string.mix_inspector_upcoming_open)
+        Box(
+            modifier = Modifier
+                .widthIn(max = 300.dp)
+                .heightIn(min = 48.dp)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = openLabel,
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                ) { MixViewRequest.open = true },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = Color.White.copy(alpha = 0.88f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(percent = 50))
+                    .background(Color.Black.copy(alpha = 0.30f))
+                    .border(0.5.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(percent = 50))
+                    .padding(horizontal = 12.dp, vertical = 5.dp),
+            )
+        }
+    }
 }
 
 /** How far "Upgrading quality" fades between breaths, and how long each half takes. */

@@ -13,7 +13,7 @@ Reference build: `vc73` on `bk-android`.
 | `versionCode` | `73` |
 | `versionName` | `2.2.3-djmix31` |
 | Signing cert SHA-256 | `20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c` |
-| `libonnxruntime.so` | exactly **1**, `34,208,672` B |
+| `libonnxruntime.so` | exactly **1**, `34,208,680` B |
 | QNN / HTP `.so` | **0** |
 | `libbitchord_analysis.so` | `486,288` B |
 | `libbitchord_loopmix.so` | `438,616` B |
@@ -63,7 +63,7 @@ sha256sum "$APK"
 # expect 20c66ad6ab1a1d1f14f4b31966e8cb0cc591e39356687006989a6f2172e3fe4c
 
 unzip -l "$APK" | grep -c 'libonnxruntime.so'          # expect 1
-unzip -l "$APK" | grep 'libonnxruntime.so'             # expect 34208672
+unzip -l "$APK" | grep 'libonnxruntime.so'             # expect 34208680
 unzip -l "$APK" | grep -icE 'libQnn|libHtp'            # expect 0
 unzip -l "$APK" | grep 'libbitchord_'                  # analysis + loopmix
 ```

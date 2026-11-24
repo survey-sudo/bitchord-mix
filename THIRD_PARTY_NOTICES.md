@@ -47,32 +47,38 @@ proprietary AI_DJ sources are not shipped either.
 The section labels, the Schroeder plate and the loop roll are original to
 this fork. They are not copied from those projects.
 
-## Qualcomm AI (QAIRT) HTP runtime
+## Qualcomm AI (QAIRT) HTP runtime — not shipped
 
-The Snapdragon NPU stack is the QAIRT 2.51.0.260929 HTP runtime, bundled
-in the APK under lib/arm64-v8a (libQnnHtp*, plus one Skel per Hexagon
-generation), built against the ONNX Runtime 1.31.0 source build in
-npu-addon/. Qualcomm AI Runtime is the property of Qualcomm
-Technologies, Inc. and/or its subsidiaries and is governed by the
-license in app/src/main/assets/licenses/Qualcomm-AI-Runtime-LICENSE.pdf
-and the notices in Qualcomm-AI-Runtime-QNN-NOTICE.txt. All rights
-reserved; no rights are granted except as stated in that license.
+No Qualcomm runtime, NPU model or vendor binary is part of this release. The
+`libQnnHtp*` libraries, the Hexagon skels and the QDQ beat models that earlier
+fork versions carried are gone from the build, and `npu-addon/` is off every
+`jniLibs` source set. Re-introducing any of them requires a separate delivery
+under Qualcomm's own licence terms; see `npu-addon/README.md`.
 
-## Automix v2 models (bundled / downloaded)
+## Automix v2 models (downloaded at first use, not packaged)
+
+The three ONNX weights are no longer bundled in the APK. The model
+coordinator verifies each file against a pinned SHA-256 before it is used, and
+fetches what is missing from the fork's pinned GitHub release
+(`models-v1`), so nothing is downloaded unless the user asks for it.
 
 SCNet: Sparse Compression Network for Music Source Separation, W. Tong et al., ICASSP 2024.
 Code and pretrained weights (c) 2024 starrytong, MIT License. ONNX export by audiojs.
-Bundled as `assets/scnet.int8.onnx` (SHA-256 98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845).
+`scnet.int8.onnx`, 12,900,277 B, SHA-256 98228931494151762a1c4ab1ec7899a894b1f81fd4a509921a9d2f9bacc50845.
+
+Beat This!: beat and downbeat tracking model, MIT License.
+`beat_this_final0_q8.onnx`, 23,138,816 B, SHA-256 7801f9c1adfd5ff193f37ececa3320bf1fda1ddee2bf7de341cea4c25ffd0acd.
 
 Open-Unmix (UMX-HQ), F.-R. Stöter, S. Uhlich, A. Liutkus, Y. Mitsufuji, JOSS 2019,
 (c) Inria / Sony, MIT License.
+`vocals_umxhq_int8.onnx`, 9,054,206 B, SHA-256 a2be987b55a29bc149d3a6ae99b08175d81f85ee292a8ea21f96c3a473bc94cb.
 
-Both models were trained on MUSDB18-HQ, which its authors license for research and educational use;
+All three were trained on MUSDB18-HQ, which its authors license for research and educational use;
 whether that reaches trained weights is unsettled and is recorded here for legal review.
 
-## Automix v2 NPU runtime
+## ONNX Runtime (CPU execution provider)
 
-ONNX Runtime with the QNN execution provider (`com.microsoft.onnxruntime:onnxruntime-android-qnn`), MIT License.
-Qualcomm AI Engine Direct / QAIRT runtime libraries (`com.qualcomm.qti:qnn-runtime`: libQnnHtp*, libQnnSystem),
-proprietary, (c) Qualcomm Technologies, Inc., redistributed under Qualcomm's licence terms shipped with that
-artifact. Review those terms before any public release.
+`com.microsoft.onnxruntime:onnxruntime-android:1.31.0`, MIT License, is the only
+inference runtime in the APK. The QNN execution provider, the `onnxruntime-android-qnn`
+artifact and the `com.qualcomm.qti:qnn-runtime` artifact are not dependencies of this
+release.

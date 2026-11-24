@@ -86,9 +86,8 @@ internal fun wholeTrackExecutor(): java.util.concurrent.ExecutorService =
 @UnstableApi
 class TrackAnalyzer(private val context: Context, private val cache: AudioCache) {
 
-    // vc69 NPU: Snapdragon QNN for beat and vocal models with CPU fallback.
-    // Auto-detected from the device; nothing to configure. The context cache
-    // lives in noBackupFilesDir so OS updates never invalidate it wrongly.
+    // Compatibility plumbing for a future separately delivered NPU runtime.
+    // djmix52 is CPU-only, regardless of the restored NPU user setting.
     private val npuVendor: com.music.bitchord.playback.smart.NpuSupport.Vendor =
         com.music.bitchord.playback.smart.NpuSupport.detectVendor(
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) android.os.Build.SOC_MANUFACTURER else "",
@@ -134,9 +133,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * NpuNative never throws, so neither does this.
      */
     private fun ensureNpuPreflight(): String? {
-        // Dormant by default: QNN_ENABLED=false means no dlopen and no
-        // backend path, so both trackers stay on the CPU provider.
-        if (!NpuSupport.QNN_ENABLED) return null
+        if (!NpuSupport.QNN_ENABLED || !NpuRuntime.runtimeEnabled()) return null
         val dir = npuLibDir ?: return null
         synchronized(npuPreflightLock) {
             if (!npuPreflightDone) {
@@ -147,9 +144,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         return dir
     }
 
-    // vc70 NPU: QNN backend is bundled in this APK nativeLibraryDir (QAIRT
-    // libQnnHtp.so). Only Qualcomm attempts QNN; everything else stays
-    // on the CPU execution provider, exactly as the fallback contract says.
+    // No backend ships in djmix52. These lazy adapters never preflight it while dark.
     private val npuBackendPath: String?
         get() = if (!NpuSupport.QNN_ENABLED || npuVendor != com.music.bitchord.playback.smart.NpuSupport.Vendor.QUALCOMM) null
         else ensureNpuPreflight()?.let {
@@ -157,40 +152,27 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }?.takeIf { java.io.File(it).exists() }
 
     private val tracker = BeatTracker(
-        modelPath = {
-            java.io.File(context.filesDir, BeatTracker.RETIRED_MODEL_ASSET).delete()
-            unpackedAsset(BeatTracker.MODEL_ASSET)
-        },
+        modelPath = { AutomixModels.path(AutomixModels.BEAT) },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
         npuVendor = { npuVendor },
         npuBackendPath = { npuBackendPath },
         npuCacheDir = { npuCacheDir },
     )
     private val vocals = VocalTracker(
-        modelPath = { unpackedAsset(VocalTracker.MODEL_ASSET) },
+        modelPath = { AutomixModels.path(AutomixModels.VOCALS) },
         inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
         npuVendor = { npuVendor },
         npuBackendPath = { npuBackendPath },
         npuCacheDir = { npuCacheDir },
     )
 
-    // AUTOMIX-V2(orch/B): 4-stem separation (SCNet, bundled asset) with the umxhq 2-stem fallback.
+    // 4-stem separation uses the coordinator's verified SCNet copy, with the umxhq 2-stem fallback.
     // All lazy: modelLock/executor are declared later in the class, and nothing may touch
     // the context before the service is attached.
     val stemModels by lazy {
         StemModelStore(
             directory = { java.io.File(context.filesDir, "stems").apply { mkdirs() } },
-            bundled = { asset -> runCatching { java.io.File(unpackedAsset(asset)) }.getOrNull() },
-            downloader = StemModelDownloader { url, destination ->
-                runCatching {
-                    okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(url).build()).execute().use { response ->
-                        if (!response.isSuccessful) return@use false
-                        val body = response.body ?: return@use false
-                        destination.outputStream().use { out -> body.byteStream().copyTo(out) }
-                        true
-                    }
-                }.getOrDefault(false)
-            },
+            coordinator = AutomixModels,
         )
     }
     private val stemEngines by lazy {
@@ -242,7 +224,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         return if (cachedOnly) stemSeparator.cachedOnly(trackId) else stemSeparator.forTrack(trackId)
     }
 
-    /** AUTOMIX-V2(orch): install the 4-stem model (worker thread). Bundled asset first, download second. */
+    /** Queues the coordinator's gated batch; true only when SCNet is already verified. No independent HTTP. */
     fun installStemModel(): Boolean = runCatching { stemModels.install(StemModels.SCNET_INT8) }.getOrDefault(false)
 
     init {
@@ -250,79 +232,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         // this; with no sink they went nowhere on the phone, which is how a
         // beat model that found nothing went unnoticed.
         AnalysisLog.install { message, error -> Log.w(TAG, message, error) }
-        // AUTOMIX-V2(A): NPU runtime switch (user setting + self-test + auto-disable), QDQ-only QNN route.
-        // Safe pre-attach: NpuAndroid touches the Context lazily and guarded.
-        runCatching {
-            NpuAndroid.install(context) { AppSettings.automixNpuEnabled.value }
-            NpuQdqSelfTest.schedule(context, { npuVendor })
-        }.onFailure { Log.w(TAG, "NPU v2 init skipped", it) }
-        // vc70 NPU: point the DSP library search at the bundled QAIRT libs
-        // (mirrors the Orchard qnn_runner ADSP_LIBRARY_PATH setup). Best
-        // effort: no NPU on the device, everything still runs on CPU.
-        // Last-resort guard: NPU init must never crash service
-        // construction (which happens at launch). The null that used to
-        // NPE here is now handled at its source (see npuLibDir /
-        // ensureNpuPreflight), so this boundary should never fire; it
-        // stays as a final barrier, not the fix.
-        try {
-            if (!NpuSupport.QNN_ENABLED) {
-                Log.i(TAG, "BitChordNPU disabled (QNN_ENABLED=false): CPU execution provider")
-            } else if (npuVendor == com.music.bitchord.playback.smart.NpuSupport.Vendor.QUALCOMM) {
-                // Deferred while this Service is unattached (null); the
-                // ADSP preflight then runs at first post-attach access via
-                // ensureNpuPreflight (see npuBackendPath) instead of
-                // throwing here.
-                val libDir = ensureNpuPreflight()
-                val soc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) android.os.Build.SOC_MODEL else android.os.Build.HARDWARE
-                if (libDir == null) {
-                    Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " libDir=unattached preflight=deferred")
-                } else {
-                    // NPU observability (one line): the SoC string, the
-                    // backend path, and the bundled Skel file(s) present in
-                    // nativeLibraryDir. QNN resolves the arch from the SoC
-                    // at backend open, so the present Skel(s) are the only
-                    // candidates the DSP can load; this line proves which
-                    // arch actually loaded. Dumped once at init, never
-                    // throwing.
-                    runCatching {
-                        val skels = java.io.File(libDir).list { _, name ->
-                            name.startsWith("libQnnHtpV") && name.endsWith("Skel.so")
-                        }?.joinToString(",") ?: "none"
-                        Log.i(TAG, "BitChordNPU vendor=QUALCOMM soc=" + soc + " backend=" + (npuBackendPath ?: "missing") + " skels=" + skels)
-                    }
-                }
-            } else {
-                Log.i(TAG, "BitChordNPU vendor=" + npuVendor + ": CPU execution provider")
-            }
-        } catch (failure: Throwable) {
-            Log.w(TAG, "BitChordNPU init failed; staying on CPU", failure)
+        // The release-availability gate precedes policy installation, asset resolvers,
+        // preflight and both self-tests. A persisted opt-in cannot activate any of them.
+        if (NpuRuntime.RUNTIME_AVAILABLE) {
+            runCatching {
+                NpuAndroid.install(context) { AppSettings.automixNpuEnabled.value }
+                if (NpuRuntime.runtimeEnabled()) NpuQdqSelfTest.schedule(context, { npuVendor })
+            }.onFailure { Log.w(TAG, "NPU init skipped", it) }
         }
-        // Bounded one-shot NPU self-test on a background thread (owned by
-        // NpuSelfTest): proves QNN dispatch without playback. Never
-        // throws, never blocks the UI, runs once per process.
-        com.music.bitchord.playback.smart.NpuSelfTest.schedule(
-            context,
-            { npuVendor },
-            { ensureNpuPreflight() },
-        )
-    }
-
-    /**
-     * A model's weights on disk, unpacked from assets the first time they are
-     * asked for.
-     *
-     * ONNX Runtime wants a file it can memory-map, and an asset inside the APK
-     * is not one. This used to live inside each tracker; it moved out when they
-     * became shared with the desktop build, which unpacks from the jar instead.
-     */
-    private fun unpackedAsset(name: String): String {
-        val file = java.io.File(context.filesDir, name)
-        if (!file.exists() || file.length() == 0L) {
-            context.assets.open(name).use { input ->
-                file.outputStream().use { output -> input.copyTo(output) }
-            }
+        if (NpuSupport.QNN_ENABLED && NpuRuntime.runtimeEnabled()) {
+            NpuSelfTest.schedule(context, { npuVendor }, { ensureNpuPreflight() })
+        } else {
+            Log.i(TAG, "BitChordNPU unavailable in djmix52: CPU execution provider")
         }
-        return file.absolutePath
     }
 
     /**
@@ -471,7 +393,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * afterwards — the one that would actually have produced a result — was then
      * refused for being smaller than a number belonging to a different file.
      */
-    private val headAttempts = ConcurrentHashMap<String, Long>()
+    private data class HeadAttempt(val bytes: Long, val modelGeneration: Long)
+    private val headAttempts = ConcurrentHashMap<String, HeadAttempt>()
 
     /**
      * Track-and-rendition pairs that have already reported waiting for a head,
@@ -513,6 +436,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * 22:09:41.
      */
     private val triedRenditions = ConcurrentHashMap.newKeySet<String>()
+    /** Model availability of the last actual attempt, not of an unavailable-model request. */
+    private val renditionModelGenerations = ConcurrentHashMap<String, Long>()
 
     /**
      * How many times each rendition has been thrown off disk for being
@@ -840,6 +765,11 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             restoreOnce(trackId)
             return
         }
+        restoreOnce(trackId) // Good cached analyses remain available even while models are offline.
+        // Do not consume a head/rendition attempt while first-use verification/download
+        // is pending. Completion is observed on the next ordinary request tick.
+        if (!AutomixModels.isReady()) return
+        val modelGeneration = AutomixModels.availabilityGeneration.value
         // Source-backed tracks: while the canonical YouTube match is pending
         // or failed this returns the playback URI as a provisional (see
         // [analysisUriFor]); only an exclusion the user opted into (picked
@@ -860,7 +790,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val usableComplete = local || complete.isNotEmpty()
 
         val recorded = results[trackId]
-        val untried = if (local) {
+        val untried = renditionModelGenerations[trackId] != modelGeneration || if (local) {
             uri.toString() !in triedRenditions
         } else {
             complete.any { it.key !in triedRenditions }
@@ -888,6 +818,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             return
         }
         if (!running.add(trackId)) return
+        renditionModelGenerations[trackId] = modelGeneration
         val seqAtQueue = requestSeq.incrementAndGet()
         lastRequestedTrackId = trackId
         cancelModelReaper()
@@ -904,6 +835,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
             }
             try {
+                if (!AutomixModels.isReady()) {
+                    headRendition?.let { headAttempts.remove(it.key) }
+                    return@execute
+                }
                 playbackFirst()
                 if (elapsedNow() - startedAtElapsed > deadlineOf(usableComplete)) {
                     rememberTerminal(stalled, trackId)
@@ -1058,7 +993,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             // against whichever copy of it happened to rank highest at the time.
             .filter { rendition ->
                 val previous = headAttempts[rendition.key] ?: return@filter true
-                rendition.cachedPrefix >= previous * HEAD_RETRY_GROWTH
+                previous.modelGeneration != AutomixModels.availabilityGeneration.value ||
+                    rendition.cachedPrefix >= previous.bytes * HEAD_RETRY_GROWTH
             }
             // Most *audio*, not most bytes: renditions differ in bitrate, so the
             // largest prefix is not necessarily the longest playable head.
@@ -1099,7 +1035,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             return null
         }
 
-        headAttempts[candidate.key] = prefix
+        headAttempts[candidate.key] = HeadAttempt(prefix, AutomixModels.availabilityGeneration.value)
         return candidate
     }
 
@@ -1661,6 +1597,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         onGridReady: (Double, BeatTracker.Grid?, TrackFeatures.Features?, CurveWindow?) -> Unit = { _, _, _, _ -> },
         shouldAbort: () -> Boolean = { false },
     ): WholeTrack {
+        if (!AutomixModels.isReady()) return WholeTrack(null, aborted = true)
         val copy = copyToRead(trackId, uri, durationSeconds) ?: return WholeTrack(null)
         // Recorded before the outcome is known, because what this gates is
         // whether a *written-off* track is worth reopening, and the answer is
@@ -2352,6 +2289,7 @@ private fun vocalValues(stereo: AudioDecoder.StereoPcm): FloatArray? {
         shortDecodes.clear()
         badRenditions.clear()
         triedRenditions.clear()
+        renditionModelGenerations.clear()
         discarded.clear()
         failed.clear()
         stalled.clear()

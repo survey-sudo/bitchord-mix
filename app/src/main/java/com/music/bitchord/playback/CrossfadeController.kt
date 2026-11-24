@@ -25,6 +25,9 @@ import com.music.bitchord.playback.loopmix.LoopMixPort
 import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
+import com.music.bitchord.playback.djmix.StraightMixGeometry
+import com.music.bitchord.playback.djmix.StraightRateMode
+import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
 import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.CrossfadeMode
 import com.music.bitchord.playback.smart.LoopMix
@@ -43,6 +46,9 @@ import com.music.bitchord.playback.smart.FilterTransitionVariant
 import com.music.bitchord.playback.smart.AutomixStatus
 import com.music.bitchord.playback.smart.DeckBudget
 import com.music.bitchord.playback.smart.MixGain
+import com.music.bitchord.playback.smart.MixInspectorFeed
+import com.music.bitchord.playback.smart.MixInspectorKey
+import com.music.bitchord.playback.smart.MixInspectorRemixAction
 import com.music.bitchord.playback.smart.RetireGuard
 import com.music.bitchord.playback.smart.SeekAction
 import com.music.bitchord.playback.smart.MixWaveform
@@ -1610,6 +1616,12 @@ class CrossfadeController(
         sampleRate: Int,
     ): Boolean {
         if (primedSession != null && primedKey == primeKey(plan, outItem, inItem, sampleRate)) return true
+        // A straight route's PCM is already prepared and coverage-validated, so it is never cold:
+        // asking LoopMix.regionBounds here would invent a decode that must never happen.
+        val straight = straightPreparedPair
+        if (straight != null && straight.plan == plan && straight.sampleRate == sampleRate &&
+            straight.outId == outItem.mediaId && straight.inId == inItem.mediaId
+        ) return true
         val b = LoopMix.regionBounds(plan)
         return loopRegionCached(outItem.mediaId, sampleRate, b.outFrom, b.outTo) &&
             loopRegionCached(inItem.mediaId, sampleRate, b.inFrom, b.inTo)
@@ -1621,6 +1633,138 @@ class CrossfadeController(
         inItem: MediaItem,
         sampleRate: Int,
     ): Double = if (isLoopFastReady(plan, outItem, inItem, sampleRate)) 0.8 else 4.5
+
+    /**
+     * A prepared, coverage-validated straight pair for this exact physical contract, or null.
+     *
+     * Straight geometry is computed once by [PairPreparer] against frozen PCM. This only
+     * certifies that identity (plan, sample rate, level, rate mode, both regions) so the route
+     * can arm it without decoding anything — it never re-derives or loosens the geometry.
+     */
+    private fun straightPreparedFor(
+        outItem: MediaItem,
+        inItem: MediaItem,
+        sampleRate: Int,
+        level: com.music.bitchord.playback.smart.choreo.DjLevel,
+        positionMs: Long,
+        leadMs: Long,
+    ): com.music.bitchord.playback.djmix.PreparedPair? {
+        if (sampleRate <= 0) return null
+        val seen = pairPreparer?.snapshotFor(outItem.mediaId, inItem.mediaId, level) ?: return null
+        val plan = seen.plan ?: return null
+        if (seen.straightRateMode == null) return null
+        if (plan.outLoops || plan.inLoops || plan.handoff != null) return null
+        if ((plan.out.loopStart * 1000).roundToLong() < positionMs + leadMs) return null
+        return preparedStraightFor(plan, outItem, inItem, sampleRate)
+    }
+
+    /**
+     * True only for the explicit straight route [StraightMixGeometry] plans.
+     *
+     * Deliberately keyed on the marker rather than "non-looping + native incoming": the vc91
+     * `Echo`/`Natural handoff` rungs share that geometry but are ordinary decoding builds.
+     */
+    private fun isStraightRoute(plan: LoopMix.Plan): Boolean =
+        plan.alternativeKind == "v2-straight"
+
+    /**
+     * The frozen prepared identity for this exact straight plan, or null.
+     *
+     * The cached [straightPreparedPair] is preferred (it carries the generation the route was
+     * admitted against); otherwise the preparer re-verifies the same contract. Either way the
+     * answer is a coverage-validated PREPARED pair, never a decode request.
+     */
+    private fun preparedStraightFor(
+        plan: LoopMix.Plan,
+        outItem: MediaItem,
+        inItem: MediaItem,
+        sampleRate: Int,
+    ): com.music.bitchord.playback.djmix.PreparedPair? {
+        if (sampleRate <= 0) return null
+        val level = AppSettings.automixDjLevel.value
+        val preparer = pairPreparer ?: return null
+        // A newer preparation generation (re-analysis, seek, queue edit, remix) invalidates the
+        // cached identity even when the geometry happens to match: its PCM belongs to the old run.
+        straightPreparedPair?.takeIf {
+            it.plan == plan && it.sampleRate == sampleRate &&
+                it.outId == outItem.mediaId && it.inId == inItem.mediaId &&
+                preparer.isCurrentGeneration(outItem.mediaId, inItem.mediaId, it.generation)
+        }?.let { return it }
+        val seen = preparer.snapshotFor(outItem.mediaId, inItem.mediaId, level) ?: return null
+        val mode = seen.straightRateMode ?: return null
+        if (seen.plan != plan) return null
+        return preparer.snapshotForBuild(outItem.mediaId, inItem.mediaId, level, plan, sampleRate, mode)
+    }
+
+    /**
+     * Bounded straight rescue for the watchdog: a fresh non-looping plan laid on the PCM that
+     * was already prepared, never a relabelled crown/bridge snapshot plan.
+     *
+     * Returns null (caller then uses classic with the honest reason) when the prepared PCM cannot
+     * cover the rescue geometry or no same-level no-stem recipe fits.
+     */
+    private fun straightRescue(
+        outItem: MediaItem,
+        inItem: MediaItem,
+        durationMs: Long,
+        positionMs: Long,
+        sampleRate: Int,
+        reason: String,
+    ): com.music.bitchord.playback.djmix.PreparedPair? {
+        if (!LoopMixRenderer.available || sampleRate <= 0) return null
+        val level = AppSettings.automixDjLevel.value
+        val pair = pairPreparer?.snapshotFor(outItem.mediaId, inItem.mediaId, level) ?: return null
+        if (pair.sampleRate != sampleRate || pair.outRegion == null || pair.inRegion == null) return null
+        val outAnalysis = pair.outAnalysis ?: return null
+        val inAnalysis = pair.inAnalysis ?: return null
+        val existing = pair.plan
+        val outDurationSec = analysisFor(outItem).duration.takeIf { it.isFinite() && it > 1.0 }
+            ?: durationMs / 1000.0
+        val cue = existing?.inn?.loopStart?.takeIf { it.isFinite() && it >= 0.0 } ?: pair.entryCueSec
+        val outBpm = outAnalysis.tailBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
+            ?: outAnalysis.bpm.takeIf { it.isFinite() && it > 1.0 } ?: 120.0
+        val rescueLeadSec = (positionMs / 1000.0) + 0.45
+        // Only a non-looping prepared plan may be reused verbatim; a crown/bridge snapshot is
+        // never relabelled straight (that was the old watchdog bug).
+        val reusable = existing?.takeIf { !it.outLoops && !it.inLoops && it.handoff == null && it.nativeIncoming }
+        val startSec = reusable?.out?.loopStart?.takeIf { it >= rescueLeadSec } ?: rescueLeadSec
+        val bars = (reusable?.totalBars ?: 4).coerceIn(2, 8)
+        val plan = StraightMixGeometry.rescuePlan(startSec, cue, bars, outBpm)
+        if (plan.out.loopStart + LoopMix.Clock(plan).releaseAt > outDurationSec + 1e-6) return null
+        if (LoopMixSession.preparedCoverageRefusal(
+                plan, sampleRate, pair.outRegion, pair.inRegion,
+                outAnalysis, inAnalysis, StraightRateMode.RATE_ONE, level,
+            ) != null
+        ) return null
+        val prep = ChoreoSessionGlue.prepare(
+            plan = plan, script = null,
+            outAnalysis = outAnalysis, inAnalysis = inAnalysis,
+            outSongMap = pair.outSongMap, inSongMap = pair.inSongMap,
+            level = level, outId = pair.outId, inId = pair.inId,
+            sampleRate = sampleRate, albumOrder = pair.albumOrder,
+            stemsExpected = false,
+            straightRateMode = StraightRateMode.RATE_ONE,
+            capsOverride = pair.v2Prep?.caps,
+        ) ?: return null
+        val script = ChoreoSessionGlue.withoutStems(
+            prep, plan, LoopMix.Clock(plan), sampleRate, outAnalysis, inAnalysis,
+            pair.sungOut, pair.sungIn, prep.forcedRecipe,
+        ) ?: return null
+        AutomixTelemetry.event(
+            "mix.watchdog.straight",
+            mapOf(
+                "reason" to reason,
+                "startSec" to plan.out.loopStart,
+                "bars" to plan.totalBars,
+                "cueSec" to cue,
+                "rateMode" to StraightRateMode.RATE_ONE.name,
+            ),
+        )
+        return pair.copy(
+            plan = plan, v2Prep = prep, script = script, straightRateMode = StraightRateMode.RATE_ONE,
+            outStems = null, inStems = null,
+        )
+    }
 
     private fun dropForQueueEdit(why: String) {
         Log.d(TAG, "playlist changed: $why")
@@ -1748,7 +1892,17 @@ class CrossfadeController(
         }
     }
 
+    // FORK-HOOK(mix-inspector): the controller accepts only the exact preparation currently shown.
+    private fun installMixInspectorFeed() {
+        MixInspectorFeed.setRemixAction(
+            MixInspectorRemixAction { key: MixInspectorKey ->
+                key == MixInspectorFeed.state.value?.key && remixCurrentTransition()
+            },
+        )
+    }
+
     fun start() {
+        installMixInspectorFeed()
         listenTo(active())
         startAnalysisCollector()
         tickerJob?.cancel()
@@ -1825,6 +1979,7 @@ class CrossfadeController(
     }
 
     fun release() {
+        MixInspectorFeed.setRemixAction(null)
         pairPreparer?.release()
         clearAutoMixVisual()
         tickerJob?.cancel()
@@ -2492,11 +2647,42 @@ class CrossfadeController(
                 (committedBeforeLoop.locked || committedBeforeLoop.shown) &&
                 committedBeforeLoop.family != CountdownStabilizer.Family.CLASSIC &&
                 committedBeforeLoop.targetStartMs >= player.currentPosition - CountdownStabilizer.PAST_GRACE_MS
-            loop = nativePlanAfterCrown(planLoop, plan, currentAnalysis, nextAnalysis, committedNative,
-                outLyricCues, inLyricCues) {
-                if (!suppressingBridge && !staleCommittedLoop) nativeBridge(
-                    player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
-                ) else null
+            loop = planLoop
+            if (loop == null && !committedNative) {
+                // Step 4: a pair the loop ladder refused is not finished — the choreographer gets a
+                // straight plan on the same vc91 exit/cue, ahead of the legacy bridge because only
+                // the straight route consumes PCM that was already prepared (no decode at
+                // transition time). Prepared-only: PairPreparer froze the geometry, rate mode,
+                // script and both regions, so nothing is re-derived or re-decoded here.
+                val preparedStraight = if (!suppressingBridge) {
+                    straightPreparedFor(
+                        currentItem, nextItem,
+                        loopPortOf(player)?.sampleRate ?: 0,
+                        AppSettings.automixDjLevel.value,
+                        player.currentPosition,
+                        blendArmLeadMs,
+                    )
+                } else null
+                val straightPlan = preparedStraight?.plan
+                if (preparedStraight != null && straightPlan != null) {
+                    straightPreparedPair = preparedStraight
+                    loop = straightPlan
+                    loopRefusal = null
+                    // Publish it like any other committed native plan so the countdown, the
+                    // watchdog's planned start and the anti-oscillation restore all see the same
+                    // geometry. A straight route has no phrase script to execute.
+                    loopPlanned = straightPlan
+                    loopPlanKey = "$pairKey|${straightPlan.out.loopStart}"
+                    loopScript = null
+                }
+            }
+            if (loop == null) {
+                loop = nativePlanAfterCrown(null, plan, currentAnalysis, nextAnalysis, committedNative,
+                    outLyricCues, inLyricCues) {
+                    if (!suppressingBridge && !staleCommittedLoop) nativeBridge(
+                        player, currentItem, nextItem, currentAnalysis, nextAnalysis, duration, nextDuration,
+                    ) else null
+                }
             }
             if (loop == null && !committedNative && LocalBlendAdmission.isQualified(plan, currentAnalysis, nextAnalysis,
                     outLyricCues, inLyricCues)) {
@@ -4770,6 +4956,9 @@ class CrossfadeController(
             "outGridSource" to session.outGridSource.telemetryValue,
             "inGridSource" to session.inGridSource.telemetryValue,
             "choreo" to session.choreoMove, // AUTOMIX-V2(orch): executed-move attribution
+            // The real execution path, not the planned one: straight routes must be distinguishable.
+            "path" to session.executionPath,
+            "preparationGeneration" to session.preparationGeneration,
         )
 
     private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
@@ -4830,6 +5019,13 @@ class CrossfadeController(
     private var loopSungIn: List<LoopMix.Span>? = null
     private var loopOutDurationMs = 0L
     private var loopInDurationMs = 0L
+
+    /**
+     * The verified prepared pair backing the current straight (non-looping) native route.
+     * Only ever set from a coverage-validated [PairPreparer] snapshot; cleared whenever that
+     * route dies so a later build can never inherit stale PCM or a stale generation.
+     */
+    private var straightPreparedPair: com.music.bitchord.playback.djmix.PreparedPair? = null
 
     /** The pair (and analyses) the cached loop plan belongs to, and that plan; null when none is possible. */
     private var loopPlanKey: String? = null
@@ -5532,7 +5728,14 @@ class CrossfadeController(
         if (primedKey == key && primedSession != null) return
         if (primeJob?.isActive == true && primedKey == key) return
         if (primedKey == key && nowMs() < primeRetryAt) return
+        // A straight route primes from its frozen PCM: hold the identity across the
+        // discardPrime() below and hand it to the build explicitly.
+        val straight = straightPreparedPair?.takeIf {
+            it.plan == plan && it.sampleRate == sampleRate &&
+                it.outId == outItem.mediaId && it.inId == inItem.mediaId
+        }
         discardPrime()
+        straightPreparedPair = straight
         val lead = (plan.out.loopStart * 1000).roundToLong() - player.currentPosition
         deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), player.isPlaying, (plan.out.loopStart * 1000).roundToLong(), player.currentPosition)
         Log.d(
@@ -5540,7 +5743,10 @@ class CrossfadeController(
             "loop prime ${outItem.mediaId}->${inItem.mediaId} at ${sampleRate}Hz, " +
                 "${lead}ms before ${"%.2f".format(Locale.ROOT, plan.out.loopStart)}s",
         )
-        startLoopBuild(key, plan, player, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = false)
+        startLoopBuild(
+            key, plan, player, into, outItem, inItem, durationMs, nextDurationMs, sampleRate,
+            armWhenReady = false, preparedOverride = straight,
+        )
     }
 
     /**
@@ -5627,8 +5833,17 @@ class CrossfadeController(
         // pair before installing this build's wall deadline.
         deckTiming.clear()
         deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), out.isPlaying, loopTargetStartMs, out.currentPosition)
+        // A straight route only ever builds from the frozen prepared pair. If that identity has
+        // gone stale the route is refused here rather than silently re-decoding a different mix.
+        val straight = if (isStraightRoute(plan)) {
+            preparedStraightFor(plan, outItem, inItem, sampleRate)
+                ?: return refuse("straight-prepared-pcm-missing")
+        } else null
         loopBuildStartedAtMs = nowMs()
-        startLoopBuild(key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate, armWhenReady = true)
+        startLoopBuild(
+            key, plan, out, into, outItem, inItem, durationMs, nextDurationMs, sampleRate,
+            armWhenReady = true, preparedOverride = straight,
+        )
         return true
     }
 
@@ -5650,16 +5865,55 @@ class CrossfadeController(
         val generation = ++buildGeneration
         if (armWhenReady && loopBuildStartedAtMs <= 0L) loopBuildStartedAtMs = nowMs()
         val currentDjLevel = AppSettings.automixDjLevel.value
-        val prepared = preparedOverride ?: pairPreparer?.snapshotFor(outItem.mediaId, inItem.mediaId, currentDjLevel)
+        fun straightContract(pair: com.music.bitchord.playback.djmix.PreparedPair?) = pair?.takeIf {
+            it.straightRateMode != null && it.plan == plan && it.sampleRate == sampleRate &&
+                it.djLevel == currentDjLevel && it.outId == outItem.mediaId && it.inId == inItem.mediaId
+        }
+        // A straight route is prepared-only: its PCM, script and rate mode were frozen by
+        // PairPreparer, so the build must consume exactly that pair or refuse — never re-decode.
+        // A rescue override wins (freshly re-fitted against the same prepared PCM); otherwise the
+        // preparer re-verifies the coverage-validated identity behind this exact plan.
+        val straight = when {
+            forceNoStems -> null
+            preparedOverride != null -> straightContract(preparedOverride)
+            isStraightRoute(plan) ->
+                preparedStraightFor(plan, outItem, inItem, sampleRate)?.takeIf { it.djLevel == currentDjLevel }
+            else -> null
+        }
+        val prepared: com.music.bitchord.playback.djmix.PreparedPair? =
+            straight ?: preparedOverride ?: pairPreparer?.snapshotFor(outItem.mediaId, inItem.mediaId, currentDjLevel)
+        // Production straight routing is prepared-only: without the frozen pair there is nothing
+        // legitimate to decode, so refuse instead of inventing a second geometry.
+        if (straight == null && isStraightRoute(plan)) {
+            primedKey = null
+            routeRefusal(
+                "mix.plan.rejected", "straight-prepared-pcm-missing", "prepared",
+                nativeRouteFields(plan)["technique"] as String,
+                context = opportunity, revision = planRevision, generation = generation,
+            )
+            straightPreparedPair = null
+            primeRetryAt = nowMs() + LOOP_PRIME_RETRY_MS
+            loopBuildStartedAtMs = 0L
+            // Arming refuses on the spot so the same tick can fall to classic; a mere prime just
+            // reports and lets the arm path decide.
+            if (armWhenReady && phase == Phase.LOOP_ARMING && outgoing === out) {
+                loopFallBack("straight-prepared-pcm-missing")
+            }
+            return
+        }
         pairPreparer?.markBuilding(outItem.mediaId, inItem.mediaId)
         val inLevel = (loudnessGain(inItem.mediaId) / loudnessGain(outItem.mediaId))
             .takeIf { it.isFinite() && it > 0f } ?: 1f
         val highQuality = AppSettings.automixPerformanceMode.value != AutomixPerformanceMode.EFFICIENT
         val buildPair = "${outItem.mediaId}->${inItem.mediaId}"
-        val script = loopScript?.takeIf {
+        val script = if (straight != null) null else loopScript?.takeIf {
             (loopPlanKey?.startsWith("$buildPair|") == true && loopPlanned == plan) || loopTarget == plan
         } ?: prepared?.phraseScript
-        val effectivePlan = prepared?.plan?.takeIf {
+        // A prepared straight plan is the geometry; only the ordinary (non-straight) route may
+        // substitute a loopStart-tolerant prepared plan for the requested one.
+        val effectivePlan = if (straight != null) {
+            requireNotNull(straight.plan)
+        } else prepared?.plan?.takeIf {
             abs(it.out.loopStart - plan.out.loopStart) < 0.02 &&
                 it.outLoops == plan.outLoops &&
                 it.inLoops == plan.inLoops
@@ -5673,11 +5927,18 @@ class CrossfadeController(
         // Freeze the correct pair BEFORE suspension. CurveWindow owns mutable
         // arrays; a data-class copy alone would still share another pass's mask.
         val rememberedPair = loopOutItem?.mediaId == outItem.mediaId && loopInItem?.mediaId == inItem.mediaId
-        val capturedOutAnalysis = snapshotLoopAnalysis(if (rememberedPair) loopOutAnalysis ?: analysisFor(outItem) else analysisFor(outItem))
-        val capturedInAnalysis = snapshotLoopAnalysis(if (rememberedPair) loopInAnalysis ?: analysisFor(inItem) else analysisFor(inItem))
+        val capturedOutAnalysis = snapshotLoopAnalysis(
+            straight?.outAnalysis
+                ?: if (rememberedPair) loopOutAnalysis ?: analysisFor(outItem) else analysisFor(outItem),
+        )
+        val capturedInAnalysis = snapshotLoopAnalysis(
+            straight?.inAnalysis
+                ?: if (rememberedPair) loopInAnalysis ?: analysisFor(inItem) else analysisFor(inItem),
+        )
         val capturedSungOut = lyricSpans[outItem.mediaId]?.spans?.toList()
         val capturedSungIn = lyricSpans[inItem.mediaId]?.spans?.toList()
         val capturedCoarseDecline = shouldDeclineToMix(capturedOutAnalysis, capturedInAnalysis)
+        val capturedStraight = straight
         val capturedPreparedPrep = prepared?.v2Prep
         val capturedPreparedOutStems = if (forceNoStems) null else prepared?.outStems
         val capturedPreparedInStems = if (forceNoStems) null else prepared?.inStems
@@ -5689,45 +5950,54 @@ class CrossfadeController(
             var buildFailure: String? = null
             val session = withContext(Dispatchers.Default) {
                 runCatching {
-                    val v2OutMap = prepared?.outSongMap
-                        ?: PhraseMaps.get(outItem.mediaId)
-                        ?: runCatching { SongMaps.fromAnalysis(outItem.mediaId, capturedOutAnalysis) }.getOrNull()
-                    val v2InMap = prepared?.inSongMap
-                        ?: PhraseMaps.get(inItem.mediaId)
-                        ?: runCatching { SongMaps.fromAnalysis(inItem.mediaId, capturedInAnalysis) }.getOrNull()
-                    val v2AlbumOrder = prepared?.albumOrder ?: runCatching {
-                        isConsecutiveAlbumTrack(
-                            outItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", outItem.mediaMetadata.trackNumber ?: 0,
-                            inItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", inItem.mediaMetadata.trackNumber ?: 0,
+                    val straightPair = capturedStraight
+                    if (straightPair != null) {
+                        // Prepared-only: consumes the frozen script against the frozen PCM regions.
+                        LoopMixSession.buildStraight(
+                            straightPair, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality,
+                            onRefusal = { reason -> buildFailure = reason },
                         )
-                    }.getOrDefault(false)
-                    LoopMixSession.build(
-                        capturedPlan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script,
-                        separateStem = null, separateVocalStem = null, separateVocalPair = null,
-                        outAnalysis = capturedOutAnalysis, inAnalysis = capturedInAnalysis,
-                        sungOut = capturedSungOut, sungIn = capturedSungIn,
-                        onRefusal = { reason -> buildFailure = reason },
-                        outSongMap = v2OutMap,
-                        inSongMap = v2InMap,
-                        djLevel = currentDjLevel,
-                        albumOrder = v2AlbumOrder,
-                        preparedPrep = capturedPreparedPrep,
-                        preparedOutStems = capturedPreparedOutStems,
-                        preparedInStems = capturedPreparedInStems,
-                        preparedScript = capturedPreparedScript,
-                        preparedOutRegion = capturedPreparedOutRegion,
-                        preparedInRegion = capturedPreparedInRegion,
-                        decode = { side, from, to ->
-                            // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
-                            val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
-                            deckSide = sideName
-                            val item = if (side == LoopMix.Side.OUT) outItem else inItem
-                            val length = if (side == LoopMix.Side.OUT) durationMs else nextDurationMs
-                            loopRegion(item, length, from, to, sampleRate).also { region ->
-                                if (region == null) buildFailure = "$sideName decode-null"
-                            }
-                        },
-                    )
+                    } else {
+                        val v2OutMap = prepared?.outSongMap
+                            ?: PhraseMaps.get(outItem.mediaId)
+                            ?: runCatching { SongMaps.fromAnalysis(outItem.mediaId, capturedOutAnalysis) }.getOrNull()
+                        val v2InMap = prepared?.inSongMap
+                            ?: PhraseMaps.get(inItem.mediaId)
+                            ?: runCatching { SongMaps.fromAnalysis(inItem.mediaId, capturedInAnalysis) }.getOrNull()
+                        val v2AlbumOrder = prepared?.albumOrder ?: runCatching {
+                            isConsecutiveAlbumTrack(
+                                outItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", outItem.mediaMetadata.trackNumber ?: 0,
+                                inItem.mediaMetadata.albumTitle?.toString().orEmpty(), "", inItem.mediaMetadata.trackNumber ?: 0,
+                            )
+                        }.getOrDefault(false)
+                        LoopMixSession.build(
+                            capturedPlan, outItem.mediaId, inItem.mediaId, sampleRate, inLevel, highQuality, script,
+                            separateStem = null, separateVocalStem = null, separateVocalPair = null,
+                            outAnalysis = capturedOutAnalysis, inAnalysis = capturedInAnalysis,
+                            sungOut = capturedSungOut, sungIn = capturedSungIn,
+                            onRefusal = { reason -> buildFailure = reason },
+                            outSongMap = v2OutMap,
+                            inSongMap = v2InMap,
+                            djLevel = currentDjLevel,
+                            albumOrder = v2AlbumOrder,
+                            preparedPrep = capturedPreparedPrep,
+                            preparedOutStems = capturedPreparedOutStems,
+                            preparedInStems = capturedPreparedInStems,
+                            preparedScript = capturedPreparedScript,
+                            preparedOutRegion = capturedPreparedOutRegion,
+                            preparedInRegion = capturedPreparedInRegion,
+                            decode = { side, from, to ->
+                                // vc73: parallel OUT+IN decode — record side per-call, not via shared deckSide race.
+                                val sideName = if (side == LoopMix.Side.OUT) "outgoing" else "incoming"
+                                deckSide = sideName
+                                val item = if (side == LoopMix.Side.OUT) outItem else inItem
+                                val length = if (side == LoopMix.Side.OUT) durationMs else nextDurationMs
+                                loopRegion(item, length, from, to, sampleRate).also { region ->
+                                    if (region == null) buildFailure = "$sideName decode-null"
+                                }
+                            },
+                        )
+                    }
                 }.onFailure {
                     Log.w(TAG, "loop build failed", it)
                     buildFailure = "session error:${it.javaClass.simpleName}"
@@ -5862,6 +6132,8 @@ class CrossfadeController(
         primeRetryAt = 0L
         closeSessionOffThread(primedSession)
         primedSession = null
+        // A straight route's frozen PCM identity dies with the build it belonged to.
+        straightPreparedPair = null
         // djmix15: a stale deckTiming from a prior track/build can never be
         // this build's deadlines — reset on every prime/scrub/discard so
         // lateStepReason cannot subtract a dead wall epoch.
@@ -5876,6 +6148,11 @@ class CrossfadeController(
     private fun shiftLoopOrFallback(out: ExoPlayer) {
         if (phase != Phase.LOOP_ARMING) return
         val plan = loopTarget ?: return loopFallBack(lateDeckReason())
+        // A straight route's PCM was decoded for one exact window. Shifting it to another bar
+        // would play geometry that was never prepared, so it falls back with the real reason.
+        if (isStraightRoute(plan)) {
+            return loopFallBack(if (lateDeckReason() != "") lateDeckReason() else "straight-prepared-plan-missed")
+        }
         val outAnalysis = loopOutAnalysis ?: return loopFallBack(lateDeckReason())
         val inAnalysis = loopInAnalysis ?: return loopFallBack(lateDeckReason())
         val outItem = loopOutItem ?: return loopFallBack(lateDeckReason())
@@ -6178,7 +6455,10 @@ class CrossfadeController(
             AppSettings.smartMixInProgress.value = true
             val binding = nativeBinding
             val snap = pairPreparer?.snapshotFor(session.outId, session.inId)
-            val path = snap?.timings?.path?.takeIf { it.isNotBlank() } ?: "v2-native"
+            // The session knows how it actually executed; a "classic" session path means the
+            // fallback envelopes ran, so the snapshot's planned hint must not override it.
+            val path = session.executionPath.takeIf { it.isNotBlank() && it != "classic" }
+                ?: snap?.timings?.path?.takeIf { it.isNotBlank() } ?: "v2-native"
             val choreoStr = when {
                 session.choreoRecipeId.isNotEmpty() -> "${session.choreoRecipeId}:${session.choreoRecipeName}"
                 session.choreoMove.isNotEmpty() -> session.choreoMove
@@ -6780,18 +7060,58 @@ class CrossfadeController(
         notifyPairPreparer(force = true)
     }
 
-    private fun notifyPairPreparer(force: Boolean = false, fromSeek: Boolean = false) {
-        val preparer = pairPreparer ?: return
+    /**
+     * Remixes the coming transition: same pair, same level, a different allowed recipe.
+     *
+     * Only before anything is armed or sounding (a running renderer is never mutated), and only
+     * with enough lead to re-decode and rebuild. Returns false without touching the existing
+     * preparation when no other recipe fits, so the Inspector never shows a remix that did not
+     * happen.
+     */
+    fun remixCurrentTransition(): Boolean {
+        val preparer = pairPreparer ?: return false
+        if (phase == Phase.ARMING || phase == Phase.FADING || phase == Phase.LOOP_ARMING ||
+            phase == Phase.LOOP_RUNNING || phase == Phase.TAIL || phase == Phase.BAILING
+        ) return false
+        val player = runCatching { active() }.getOrNull() ?: return false
+        val request = prepRequestFor(player) ?: return false
+        val currentSnap = preparer.snapshotFor(
+            request.outTrack.id, request.inTrack.id, request.djLevel,
+        ) ?: return false
+        val startMs = currentSnap.plan?.out?.loopStart?.let { (it * 1000.0).roundToLong() }
+            ?: (currentSnap.plannedWindowStartSec * 1000.0).roundToLong().takeIf { it > 0L }
+            ?: return false
+        val remainingMs = startMs - player.currentPosition
+        if (remainingMs < maxOf(blendArmLeadMs, LOOP_PRIME_RETRY_MS + 2_500L)) return false
+        val excluded = com.music.bitchord.playback.smart.choreo.RecipeId.fromCode(currentSnap.script?.recipeId)
+            ?: currentSnap.v2Prep?.forcedRecipe
+        if (!preparer.onRemixRequested(request, excluded)) return false
+        AutomixTelemetry.event(
+            "mix.remix",
+            mapOf(
+                "outId" to request.outTrack.id,
+                "inId" to request.inTrack.id,
+                "level" to request.djLevel.name,
+                "excludedRecipe" to excluded?.name,
+                "remainingMs" to remainingMs,
+                "phase" to phase.name,
+            ),
+        )
+        discardPrime()
+        return true
+    }
+
+    /** The one request shape both ordinary preparation and a remix use for the shown pair. */
+    private fun prepRequestFor(player: ExoPlayer): com.music.bitchord.playback.djmix.PrepRequest? {
         if (!AppSettings.smartFadeEnabled.value || ListenTogether.state.value.inParty ||
             BitPerfectOutput.status.value.active || versionSwapActive()
-        ) return
-        val player = runCatching { active() }.getOrNull() ?: return
-        if (player.repeatMode == Player.REPEAT_MODE_ONE) return
-        val currentItem = player.currentMediaItem ?: return
+        ) return null
+        if (player.repeatMode == Player.REPEAT_MODE_ONE) return null
+        val currentItem = player.currentMediaItem ?: return null
         val nextIndex = player.nextMediaItemIndex
-        if (nextIndex == C.INDEX_UNSET || nextIndex >= player.mediaItemCount) return
+        if (nextIndex == C.INDEX_UNSET || nextIndex >= player.mediaItemCount) return null
         val nextItem = player.getMediaItemAt(nextIndex)
-        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return
+        if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return null
         val outDurMs = player.duration.takeIf { it != C.TIME_UNSET && it > 0L }
             ?: queuedDurationMs(currentItem).takeIf { it > 0L }
             ?: (analysisFor(currentItem).duration * 1000.0).roundToLong().coerceAtLeast(0L)
@@ -6805,10 +7125,14 @@ class CrossfadeController(
                 nextItem.mediaMetadata.trackNumber ?: 0,
             )
         }.getOrDefault(false)
-        val req = com.music.bitchord.playback.djmix.PrepRequest(
+        val fallbackSeconds = configuredFadeMs().takeIf { it > 0L }?.div(1000.0)
+            ?: DEFAULT_SMART_FALLBACK_SECONDS
+        return com.music.bitchord.playback.djmix.PrepRequest(
             outTrack = com.music.bitchord.playback.djmix.PrepTrack(
                 id = currentItem.mediaId,
                 durationSec = outDurMs / 1000.0,
+                title = currentItem.mediaMetadata.title?.toString().orEmpty(),
+                artist = currentItem.mediaMetadata.artist?.toString().orEmpty(),
                 albumTitle = currentItem.mediaMetadata.albumTitle?.toString().orEmpty(),
                 trackNumber = currentItem.mediaMetadata.trackNumber ?: 0,
                 mediaItem = currentItem,
@@ -6817,6 +7141,8 @@ class CrossfadeController(
             inTrack = com.music.bitchord.playback.djmix.PrepTrack(
                 id = nextItem.mediaId,
                 durationSec = inDurMs / 1000.0,
+                title = nextItem.mediaMetadata.title?.toString().orEmpty(),
+                artist = nextItem.mediaMetadata.artist?.toString().orEmpty(),
                 albumTitle = nextItem.mediaMetadata.albumTitle?.toString().orEmpty(),
                 trackNumber = nextItem.mediaMetadata.trackNumber ?: 0,
                 mediaItem = nextItem,
@@ -6826,7 +7152,21 @@ class CrossfadeController(
             positionSec = player.currentPosition.coerceAtLeast(0L) / 1000.0,
             sampleRate = sampleRate,
             albumOrder = albumOrder,
+            // Straight is the preparer's fallback, not a replacement for real loop recipes: the
+            // selector tries crown/phrase/bridge first and only then freezes a straight plan.
+            // Either way PREPARED means the geometry, rate mode, script and both PCM regions this
+            // execution will consume were already frozen here.
+            preferStraight = false,
+            fallbackSeconds = fallbackSeconds,
+            lyricsOut = lyricSpans[currentItem.mediaId]?.cues.orEmpty().toList(),
+            lyricsIn = lyricSpans[nextItem.mediaId]?.cues.orEmpty().toList(),
         )
+    }
+
+    private fun notifyPairPreparer(force: Boolean = false, fromSeek: Boolean = false) {
+        val preparer = pairPreparer ?: return
+        val player = runCatching { active() }.getOrNull() ?: return
+        val req = prepRequestFor(player) ?: return
         when {
             force -> preparer.onRemixRequested(req)
             fromSeek -> preparer.onSeek(req)
@@ -6987,7 +7327,13 @@ class CrossfadeController(
         hardWatchdogTriggeredPair = pairKey
         hardWatchdogCooldownUntil = nowMs() + 5_000L
         lastFireFallbackReason = reason
-        pairPreparer?.recordWatchdog(outItem.mediaId, inItem.mediaId, reason)
+        // Decide the rescue before emitting so the watchdog line names the route that actually ran.
+        val rescueRate = loopPortOf(player)?.sampleRate ?: 0
+        val straight = if (LoopMixRenderer.available && remainingMs >= 2_500L && rescueRate > 0) {
+            straightRescue(outItem, inItem, durationMs, pos, rescueRate, reason)
+        } else null
+        val attemptedPath = if (straight?.plan != null) "v2-straight" else "classic"
+        pairPreparer?.recordWatchdog(outItem.mediaId, inItem.mediaId, reason, path = attemptedPath)
         val fields = linkedMapOf<String, Any?>(
             "reason" to reason,
             "key" to pairKey,
@@ -6996,13 +7342,13 @@ class CrossfadeController(
             "pos" to pos,
             "remainingMs" to remainingMs,
             "plannedStartMs" to plannedStartMs,
-            "path" to "classic",
+            "path" to attemptedPath,
             "level" to AppSettings.automixDjLevel.value.name,
             "phase" to fromPhase,
         )
         if (elapsedMs != null) fields["elapsedMs"] = elapsedMs
         AutomixTelemetry.event("mix.watchdog", fields)
-        return triggerEmergencyMix(player, outItem, inItem, durationMs, reason)
+        return triggerEmergencyMix(player, outItem, inItem, durationMs, reason, straight)
     }
 
     private fun triggerEmergencyMix(
@@ -7011,12 +7357,58 @@ class CrossfadeController(
         inItem: MediaItem,
         durationMs: Long,
         reason: String,
+        rescue: com.music.bitchord.playback.djmix.PreparedPair? = null,
     ): Boolean {
         val remMs = (durationMs - player.currentPosition).coerceAtLeast(1_200L)
-        val level = AppSettings.automixDjLevel.value
         val outPort = loopPortOf(player)
         val into = standby()
         val inPort = loopPortOf(into)
+        // Bounded straight rescue first: a real same-level native mix on PCM the preparer already
+        // froze. It is the only rescue allowed for a stuck build (8 s of a looping build proved
+        // that geometry cannot land in time), and it never reuses a looping snapshot plan.
+        if (LoopMixRenderer.available && outPort != null && inPort != null && remMs >= 2_500L) {
+            // Reuse the rescue the watchdog already computed (and attributed), else try once here.
+            val usable = rescue ?: straightRescue(
+                outItem, inItem, durationMs, player.currentPosition, outPort.sampleRate, reason,
+            )
+            if (usable?.plan != null) {
+                val plan = requireNotNull(usable.plan)
+                val nextIdx = player.nextMediaItemIndex
+                val inDurationMs = if (nextIdx != C.INDEX_UNSET) nextItemDurationMs(nextIdx, inItem) else 0L
+                val sampleRate = outPort.sampleRate
+                straightPreparedPair = usable
+                loopOutItem = outItem
+                loopInItem = inItem
+                loopOutAnalysis = usable.outAnalysis ?: analysisFor(outItem)
+                loopInAnalysis = usable.inAnalysis ?: analysisFor(inItem)
+                loopOutDurationMs = durationMs
+                loopInDurationMs = inDurationMs
+                endEase(clickless = false)
+                MixDebug.reset()
+                phase = Phase.LOOP_ARMING
+                smartFadeActive = true
+                handedOff = false
+                outgoing = player
+                incoming = into
+                outgoingItemIndex = player.currentMediaItemIndex
+                loopTarget = plan
+                loopTargetStartMs = (plan.out.loopStart * 1000).roundToLong()
+                holdAtEnd(player)
+                deckTiming.clear()
+                deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), player.isPlaying, loopTargetStartMs, player.currentPosition)
+                loopBuildStartedAtMs = nowMs()
+                lastFireFallbackReason = reason
+                pairPreparer?.recordWatchdog(outItem.mediaId, inItem.mediaId, reason, path = "v2-straight")
+                startLoopBuild(
+                    primeKey(plan, outItem, inItem, sampleRate), plan, player, into, outItem, inItem,
+                    durationMs, inDurationMs, sampleRate, armWhenReady = true, preparedOverride = usable,
+                )
+                return true
+            }
+        }
+        // A genuinely prepared looping plan is still a valid emergency only when the build had
+        // time to work; a stuck build has already disproved that.
+        val level = AppSettings.automixDjLevel.value
         val snap = pairPreparer?.snapshotFor(outItem.mediaId, inItem.mediaId, level)
         val snapPlan = snap?.plan
         val canTryNativeEmergency = reason != "stuck-building-8s" &&
@@ -7049,7 +7441,7 @@ class CrossfadeController(
             deckTiming.deadlineMs = DeckBudget.deadlineMs(nowMs(), player.isPlaying, loopTargetStartMs, player.currentPosition)
             loopBuildStartedAtMs = nowMs()
             lastFireFallbackReason = reason
-            pairPreparer.recordWatchdog(outItem.mediaId, inItem.mediaId, reason, path = "v2-native")
+            pairPreparer?.recordWatchdog(outItem.mediaId, inItem.mediaId, reason, path = "v2-native")
             startLoopBuild(
                 key, snapPlan, player, into, outItem, inItem, durationMs, inDurationMs, outPort.sampleRate,
                 armWhenReady = true, preparedOverride = snap, forceNoStems = true,

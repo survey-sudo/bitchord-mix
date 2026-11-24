@@ -27,9 +27,9 @@ kotlin {
         val jvmSharedMain by creating {
             dependsOn(commonMain.get())
             dependencies {
-                // Compile-only: the two applications supply the runtime artifact themselves.
-                // FORK-HOOK(gradle-djmix): compile against ORT 1.29.0 QNN Java API
-                compileOnly("com.microsoft.onnxruntime:onnxruntime:1.29.0")
+                // Official ORT Java API, compile-only: the applications supply the runtime
+                // artifact (Android: onnxruntime-android:1.31.0, CPU EP; no QNN provider).
+                compileOnly("com.microsoft.onnxruntime:onnxruntime:1.31.0")
                 // The network stack the lyrics providers and the YouTube Music
                 // client run on, at the phone's versions — both applications
                 // now call the same code, so they resolve the same libraries.

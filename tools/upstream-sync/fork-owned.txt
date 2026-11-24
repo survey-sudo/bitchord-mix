@@ -11,6 +11,10 @@ app/src/main/java/com/music/bitchord/playback/TransitionFilterProcessor.kt
 app/src/main/java/com/music/bitchord/playback/loopmix
 app/src/main/java/com/music/bitchord/playback/smart
 app/src/main/java/com/music/bitchord/playback/djmix
+app/src/main/res/values/automix_models.xml
+app/src/test/java/com/music/bitchord/playback/smart
+sharedUi/src/commonMain/composeResources/values/mix_inspector.xml
+tools/train
 app/src/main/java/com/music/bitchord/playback/audio/PitchStretch.kt
 app/src/main/java/com/music/bitchord/playback/audio/PrecisionAudioSink.kt
 app/src/main/java/com/music/bitchord/data/stats/PackageRemap.kt

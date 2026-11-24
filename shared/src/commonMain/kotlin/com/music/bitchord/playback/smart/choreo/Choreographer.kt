@@ -376,6 +376,10 @@ object Choreographer {
         val pool = if (forced != null) listOf(Recipes.byId(forced)) else Recipes.forLevel(inputs.level)
         val out = ArrayList<Candidate>()
         for (recipe in pool) {
+            if (recipe.id in inputs.excludedRecipes) {
+                skipped?.add("${recipe.id.code}: excluded by remix")
+                continue
+            }
             val why = MoveCatalog.reject(recipe, c, forcedMode = forced != null)
             if (why != null) {
                 skipped?.add("${recipe.id.code} (${recipe.move.name}): $why")
@@ -428,7 +432,7 @@ object Choreographer {
         if (forced == null && inputs.level == DjLevel.FESTIVAL) {
             // Ensure Festival fallback ladder (F2 / F5) is always present at the end if everything else failed.
             val presentIds = ranked.map { it.recipeId }.toSet()
-            val fallbacks = listOf(RecipeId.F2, RecipeId.F5).filter { it !in presentIds }
+            val fallbacks = listOf(RecipeId.F2, RecipeId.F5).filter { it !in presentIds && it !in inputs.excludedRecipes }
             if (fallbacks.isNotEmpty()) {
                 val extra = ArrayList<Candidate>(ranked)
                 for (fbId in fallbacks) {

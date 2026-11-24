@@ -17,20 +17,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
 /**
- * AUTOMIX-V2(A): bounded one-shot NPU self-test with a numerical verdict. New file beside
- * the legacy [NpuSelfTest] (untouched; it stays dormant behind NpuSupport.QNN_ENABLED=false).
+ * AUTOMIX-V2(A): bounded one-shot NPU self-test with a numerical verdict, kept dormant
+ * in djmix52 beside the legacy [NpuSelfTest] (which stays behind NpuSupport.QNN_ENABLED).
  *
- * Runs the statically quantized Beat This! model (`beat_this_final0_qdq.onnx`, or its
- * precompiled `_qdq_ctx.onnx`) on QNN with `session.disable_cpu_ep_fallback=1` and graph-I/O
- * quantization inside QNN, so a silent CPU fallback makes the open FAIL instead of passing
- * as "NPU". The same deterministic input then runs through the QDQ model on the CPU EP; the
- * logits are compared (max/mean abs diff, beat-peak F-measure) and timed. One summary line:
+ * This probe was written for a statically quantized Beat This! model (`beat_this_final0_qdq.onnx`
+ * or its precompiled `_qdq_ctx.onnx`) running on QNN with `session.disable_cpu_ep_fallback=1`,
+ * so a silent CPU fallback made the open FAIL instead of passing as "NPU". djmix52 ships no
+ * QNN runtime, no QDQ weights and no bundled asset, so [schedule] returns at the first gate:
+ * `NpuRuntime.RUNTIME_AVAILABLE` is `false`, hence `runtimeEnabled()` is `false`. Nothing
+ * below runs in a shipped build.
+ *
+ * The maths and the policy plumbing are retained (and unit-tested in NpuRuntimeTest) because a
+ * future licensed release needs exactly this verdict contract:
  *
  *   BitChordNPU selftest ep=QNN ms=… cpuMs=… openMs=… maxAbsDiff=… meanAbsDiff=… peakF=… verdict=…
  *
- * The verdict feeds [NpuPolicy]: PASS unlocks QNN for production sessions, MISMATCH
- * auto-disables the NPU until the next versionCode, QNN_FAILED counts toward the
- * three-strikes auto-disable, SLOW keeps production on CPU without disabling anything.
+ * PASS would unlock QNN for production sessions, MISMATCH auto-disables the NPU until the next
+ * versionCode, QNN_FAILED counts toward the three-strikes auto-disable, SLOW keeps production on
+ * CPU without disabling anything. In djmix52 none of those outcomes can change behaviour, because
+ * [NpuRuntime.productionQnnAllowed] is gated on the same compile-time constant.
  *
  * Once per versionCode (unless [AutomixV2Npu.selfTestEveryLaunch]); once per process at
  * most; on its own background daemon thread, never on the UI or audio thread; never throws.

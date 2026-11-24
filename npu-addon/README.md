@@ -1,60 +1,64 @@
-# Bundled NPU stack (vc90)
+# Dormant NPU research directory (djmix52)
 
-> **Automix v2 note:** The main APK now carries QNN via Maven (`com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0` + `com.qualcomm.qti:qnn-runtime:2.42.0`); the separate add-on APK / `zero QNN libs` policy below is superseded.
+## Status: not built, not packaged, not reachable
 
-Mirrors Orchard mobile/android/npu-addon: the Maven onnxruntime-android AAR
-carries no QNN execution provider, so BitChord builds ONNX Runtime 1.31.0
-from source with the QNN EP linked in, and the QAIRT HTP libraries ride
-along in the add-on build (see Packaging).
+djmix52 ships exactly one inference runtime: the official CPU execution
+provider from `com.microsoft.onnxruntime:onnxruntime-android:1.31.0`. This
+directory is kept on disk for future work and is deliberately **not** a
+`jniLibs` source set in either `app/build.gradle.kts` or `tv/build.gradle.kts`,
+so nothing here can reach an APK by accident.
 
-Unlike Orchard there is no separate download: the QNN-capable ORT build and
-the QAIRT HTP libraries are produced here (see `build-ort.sh`).
+Three independent gates hold the NPU route closed in this release, and all
+three must change before anything below becomes live:
 
-## Full-ORT QNN build (required)
+| Gate | Location | Value |
+| --- | --- | --- |
+| `NpuRuntime.RUNTIME_AVAILABLE` | shared `NpuRuntime.kt` | `false` |
+| `NpuSupport.QNN_ENABLED` | shared `NpuSupport.kt` | `false` |
+| `AutomixV2Npu.enabled` | shared `NpuRuntime.kt` | `false` |
 
-`build-ort.sh` builds ONNX Runtime 1.31.0 (checkout at the Orchard pin
-`402979ac1bef89dcd55add41eaa7277c407599eb`) with the QNN execution provider
-linked in via `--use_qnn static_lib`, from a **full** ONNX Runtime source tree.
+`NpuRuntime.runtimeEnabled()` returns `false` immediately while
+`RUNTIME_AVAILABLE` is `false`, so no policy, persisted opt-in, SoC detection or
+self-test verdict can activate a QNN session. `NpuQnnSession.qdqResolver` also
+refuses to resolve (unpack) a QDQ file behind the same gate, and
+`NpuNative.nativeInitAdspPath` (see `app/src/main/cpp/jni/npu_jni.cpp`) is a
+no-op returning `JNI_FALSE` — no `dlopen`, no `setenv`, no DSP search path.
 
-`--include_ops_by_config` reduced builds MUST NOT be used unless the ops list
-is regenerated from post-optimization `.ort` artifacts. The vc69 / vc70 reduced
-builds dropped the ops ORT's optimizer introduces at load time
-(`MatMulIntegerToFloat`, `DynamicQuantizeMatMul`), so both bundled models
-failed on both backends; the full build keeps every operator ORT supports.
+The CPU paths are the shipped behaviour: `NpuSession.openCpu` builds an
+`OrtSession.SessionOptions` with the official Java API — intra-op threads
+clamped to 4, one inter-op thread, `ALL_OPT`, CPU arena allocator and memory
+pattern optimisation on, and no NNAPI or vendor delegate.
 
-## QAIRT 2.51 library set
+## What is here
 
-The Qualcomm zip is 2.8 GB; only these files are needed:
+- `build-ort.sh` — builds ONNX Runtime from source with `--use_qnn static_lib`.
+  Not run for djmix52; the app takes the Maven AAR instead.
+- `export_qdq_beat.py` — converts the Beat This! ONNX to static QDQ INT8 at a
+  fixed 6 s and 10 s shape (never 30 s: that variant collapsed downbeat F1 to
+  ~32%) with uint16 activations / uint8 weights, and runs a parity evaluation
+  against the FP32 baseline (fails if the F1 delta exceeds 2 points).
+- `ops.config` — the reduced operator list used by the source build. **Must not**
+  be used unless regenerated from post-optimization `.ort` artifacts: the vc69 /
+  vc70 reduced builds dropped `MatMulIntegerToFloat` and `DynamicQuantizeMatMul`,
+  which ORT's optimizer introduces at load time, so both models failed on both
+  backends. A full build keeps every operator ORT supports.
 
-- lib/aarch64-android/libQnnHtp.so, libQnnSystem.so, libQnnHtpPrepare.so,
-  libQnnHtpV73Stub.so
-- lib/hexagon-v73/unsigned/libQnnHtpV73Skel.so
-- include/QNN/ for the ORT build
+## Requirements for a future NPU release
 
-Download: https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.51.0.260929/v2.51.0.260929.zip
+1. A separately licensed Qualcomm AI Runtime (QAIRT) and its redistributable
+   library set: `libQnnHtp.so`, `libQnnSystem.so`, `libQnnHtpPrepare.so`,
+   `libQnnHtpV73Stub.so`, `lib/hexagon-v73/unsigned/libQnnHtpV73Skel.so`.
+   Qualcomm owns these; review their terms before any redistribution.
+2. A full (not reduced) ORT build with the QNN execution provider, produced
+   from a checkout matching the pinned ORT version.
+3. Verified QDQ weights delivered through the model coordinator with a pinned
+   SHA-256, never as an unrestored APK asset.
+4. A native runner implemented against the official ORT C API
+   (`OrtGetApiBase` / `OrtApi::CreateSession`), not a copied third-party runner.
+5. Flip the three gates above **in the same change** that reinstates the audit
+   expectations in `tools/audit-apk.sh`, which currently requires exactly one
+   `libonnxruntime.so`, zero QNN `.so` files under `lib/`, and zero `.onnx`
+   files anywhere in the APK.
 
-## Packaging
-
-The QNN-capable ORT build must ship as a **separate signed add-on APK** built
-in CI (`useLegacyPackaging = true`). It must NEVER be placed inside the main
-APK: the main APK keeps exactly one `libonnxruntime.so` (34208672 B) and zero
-QNN/HTP `.so` files, which `tools/audit-apk.sh` enforces.
-
-## Runtime
-
-Only Qualcomm devices attempt QNN (`NpuSupport.detectVendor` +
-bundled backend path). Everything else, and any QNN open failure, runs on the
-CPU execution provider: the NPU is an optimization, never a requirement.
-
-Log tag BitChordNPU in logcat: init prints the SoC string, the bundled
-backend path, and which Skel file(s) are present in nativeLibraryDir, so
-the device proves the resolved arch; a QNN session failure prints a
-warning through AnalysisLog.
-
-## Beat QDQ export
-
-`../npu-addon/export_qdq_beat.py` converts the BeatThis ONNX to static QDQ
-INT8 at a fixed 6 s and 10 s shape (never 30 s -- that variant collapsed
-downbeat F1 to ~32%) with uint16 activations / uint8 weights, and runs a
-parity evaluation against the FP32 baseline (fail if the F1 delta exceeds 2
-points).
+Until all five are done, `tools/audit-apk.sh` fails any APK that carries a QNN
+library or an embedded model, which is the intended safety net.

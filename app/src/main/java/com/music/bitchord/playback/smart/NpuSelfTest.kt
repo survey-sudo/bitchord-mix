@@ -12,14 +12,14 @@ import java.nio.FloatBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Bounded one-shot NPU self-test (vc70 NPU dispatch proof).
+ * Bounded one-shot NPU self-test, kept dormant in djmix52.
  *
- * Analysis never runs without playback, so without this the NPU path
- * cannot be verified on a real Snapdragon: session open and the HTP graph
- * initialisation only happen then. This probe opens a minimal QNN session
- * against the bundled beat model shortly after app start, on its own
- * daemon thread, and logs the outcome under BitChordNPU with fixed line
- * shapes. The HTP ARCH line comes from the vendor QAIRT library.
+ * This is the vc70-era probe: it opened a QNN session against a beat model that
+ * used to be packaged as an APK asset. djmix52 ships neither the QNN runtime nor
+ * any asset, and [schedule] returns immediately because [NpuSupport.QNN_ENABLED]
+ * is `false`, so nothing below runs in a shipped build. If it were reached, the
+ * asset unpack would fail and the probe would log "bundled beat model
+ * unavailable" rather than fabricate a result.
  *
  * At most one run per process; off UI and audio threads; never throws; a
  * failure cannot affect playback; aborted when backgrounded.

@@ -7,17 +7,16 @@ import kotlin.math.min
 import kotlin.math.sin
 
 /**
- * AUTOMIX-V2(A) NPU runtime: Snapdragon QNN (Hexagon HTP) through the
- * onnxruntime-android-qnn AAR, with CPU fallback. Lives beside the legacy [NpuSupport]
- * (whose compile-time `QNN_ENABLED` stays `false`, so its dynamic-int8 path stays dormant)
- * and adds a separate, QDQ-only route. Pure and testable: vendor and SoC
+ * Dormant NPU policy/configuration for a future release. djmix52 supplies only
+ * the official CPU onnxruntime-android:1.31.0, no QNN runtime or QDQ weights.
+ * [RUNTIME_AVAILABLE] wins over BOTH the legacy switch and the newer user policy.
+ * Pure and testable: vendor and SoC
  * detection, option maps, model routing (which file may run on the NPU), the
  * context-cache key, and the self-test maths. The ONNX Runtime plumbing lives in
  * [NpuSession] (jvmSharedMain) and the Android wiring in NpuAndroid / NpuNative /
  * NpuSelfTest (app module).
  *
- * AUTOMIX-V2(A): the compile-time `const val QNN_ENABLED = false` gate is replaced by
- * [runtimeEnabled], backed by an injectable [NpuPolicy] (user switch, persisted
+ * A later runtime can also use [runtimeEnabled], backed by an injectable [NpuPolicy] (user switch, persisted
  * auto-disable after repeated QNN failures or a self-test mismatch, reset when the app
  * versionCode changes). With no policy installed (desktop, TV, unit tests that do not
  * install one) the NPU is OFF, which is exactly the vc80 CPU behaviour.
@@ -34,6 +33,9 @@ fun NpuSupport.runtimeEnabled(): Boolean = NpuRuntime.runtimeEnabled()
 
 object NpuRuntime {
 
+    /** Release gate: no addon/runtime/model ships or is offered in djmix52. Not a user toggle. */
+    const val RUNTIME_AVAILABLE = false
+
     // ---- runtime switch -------------------------------------------------------------
 
     @Volatile private var installedPolicy: NpuPolicy? = null
@@ -47,12 +49,13 @@ object NpuRuntime {
     fun policy(): NpuPolicy? = installedPolicy
 
     /**
-     * Runtime replacement for the old compile-time QNN gate: true when the v2 kill
-     * switch is on, a policy is installed, the user switch is on and the policy has not
+     * True only when this release supplies a runtime, the v2 kill switch is on,
+     * a policy is installed, the user switch is on and the policy has not
      * auto-disabled the NPU. Gates every QNN entry point (dlopen preflight, self-test,
      * session open). Cheap: the policy caches its persisted state in memory.
      */
     fun runtimeEnabled(): Boolean {
+        if (!RUNTIME_AVAILABLE) return false
         if (!AutomixV2Npu.enabled) return false
         val policy = installedPolicy ?: return false
         return runCatching { policy.enabled() }.getOrDefault(false)
@@ -77,14 +80,17 @@ object NpuRuntime {
     @Volatile private var backendProvider: (() -> String?)? = null
 
     /**
-     * Installs the resolver of the bundled libQnnHtp.so path; it also runs the one-time
-     * ADSP_LIBRARY_PATH / dlopen preflight (NpuAndroid). Returns null when unavailable.
+     * Retains the backend resolver contract for a future separately delivered runtime.
+     * Resolving it is gated too; the provider is NEVER invoked in djmix52.
      */
     fun installBackendProvider(provider: (() -> String?)?) {
         backendProvider = provider
     }
 
-    fun backendPath(): String? = runCatching { backendProvider?.invoke() }.getOrNull()
+    fun backendPath(): String? {
+        if (!runtimeEnabled()) return null
+        return runCatching { backendProvider?.invoke() }.getOrNull()
+    }
 
     // ---- device -----------------------------------------------------------------------
 
@@ -372,7 +378,7 @@ enum class NpuVerdict { PASS, SLOW, MISMATCH, QNN_FAILED, SKIPPED }
  */
 object AutomixV2Npu {
     /** Master kill switch for every QNN path. false = CPU everywhere, no QNN lib is dlopened. */
-    @Volatile var enabled: Boolean = true
+    @Volatile var enabled: Boolean = false
 
     /** Production sessions use QNN only after the self-test PASSed for this versionCode. */
     @Volatile var requireSelfTestPass: Boolean = true

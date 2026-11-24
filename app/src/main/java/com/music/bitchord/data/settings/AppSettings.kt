@@ -18,6 +18,7 @@ import com.music.bitchord.data.sources.SourceKind
 import com.music.bitchord.playback.AutoMixVisualFeed
 import com.music.bitchord.playback.EqLayout
 import com.music.bitchord.playback.smart.AutomixStatus
+import com.music.bitchord.playback.smart.MixInspectorFeed
 import com.music.bitchord.playback.EqualizerPreset
 import com.music.bitchord.ui.player.AutoMixArtworkPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -944,6 +945,9 @@ object AppSettings {
      * [automixDetail] stays the diagnostic alone, for anything that already reads it.
      */
     val automixStatus = MutableStateFlow<AutomixStatus?>(null)
+
+    // FORK-HOOK(mix-inspector): runtime diagnostics, not a persisted preference or artwork clock.
+    val mixInspector = MixInspectorFeed.state
 
     /**
      * Where on the *playing* track the next transition is planned to happen, as
@@ -2609,6 +2613,5 @@ object AppSettings {
     private const val KEY_DISCORD_INFO_DISMISSED = "discord_info_dismissed"
     private const val KEY_LAST_VERSION_CODE = "last_version_code"
 }
-
 
 

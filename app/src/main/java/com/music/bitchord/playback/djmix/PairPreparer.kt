@@ -7,6 +7,12 @@ import com.music.bitchord.playback.AutomixTelemetry
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.LoopMix
+import com.music.bitchord.playback.smart.LyricCue
+import com.music.bitchord.playback.smart.MixInspectorFeed
+import com.music.bitchord.playback.smart.MixInspectorPhase
+import com.music.bitchord.playback.smart.MixInspectorRecipeScore
+import com.music.bitchord.playback.smart.MixInspectorState
+import com.music.bitchord.playback.smart.MixInspectorTrack
 import com.music.bitchord.playback.smart.PhraseConfig
 import com.music.bitchord.playback.smart.PhraseMaps
 import com.music.bitchord.playback.smart.PhrasePlanner
@@ -117,6 +123,8 @@ data class PairTimings(
 data class PrepTrack(
     val id: String,
     val durationSec: Double,
+    val title: String = "",
+    val artist: String = "",
     val albumTitle: String = "",
     val trackNumber: Int = 0,
     val albumArtist: String = "",
@@ -131,6 +139,11 @@ data class PrepRequest(
     val positionSec: Double,
     val sampleRate: Int = 48_000,
     val albumOrder: Boolean = false,
+    val preferStraight: Boolean = false,
+    val excludedRecipes: Set<RecipeId> = emptySet(),
+    val fallbackSeconds: Double = 8.0,
+    val lyricsOut: List<LyricCue> = emptyList(),
+    val lyricsIn: List<LyricCue> = emptyList(),
 )
 
 data class PlanInput(
@@ -147,6 +160,12 @@ data class PlanInput(
     val positionSec: Double,
     val albumOrder: Boolean,
     val stemsExpected: Boolean,
+    val preferStraight: Boolean = false,
+    val excludedRecipes: Set<RecipeId> = emptySet(),
+    val fallbackSeconds: Double = 8.0,
+    val lyricsOut: List<LyricCue> = emptyList(),
+    val lyricsIn: List<LyricCue> = emptyList(),
+    val caps: Int = 0,
 )
 
 data class SelectedPlan(
@@ -157,6 +176,8 @@ data class SelectedPlan(
     val entryCueSec: Double? = null,
     val pathHint: String = "v2-native",
     val fallbackReason: String = "",
+    val straightRateMode: StraightRateMode? = null,
+    val previewScript: ChoreoScript? = null,
 )
 
 fun interface TransitionPlanSelector {
@@ -164,15 +185,18 @@ fun interface TransitionPlanSelector {
 }
 
 /**
- * Default pass-1 planner combining [LoopMix.plan], [PhrasePlanner], and [LoopMix.bridge], with
- * an optional [straightFallback] slot for Step 4 (`buildStraight`) when `planLoop == null`.
+ * Background-only planner. Loop placement may refuse a pair; straight choreography may not
+ * inherit those musical vetoes. Every accepted result carries v2 geometry, never a NATURAL handoff.
  */
 class DefaultTransitionPlanSelector(
-    private val straightFallback: ((PlanInput) -> SelectedPlan?)? = null,
+    private val straightFallback: (PlanInput) -> SelectedPlan? = { StraightMixGeometry.select(it, it.caps) },
 ) : TransitionPlanSelector {
     override fun select(input: PlanInput): SelectedPlan? {
         val outA = input.outAnalysis
         val inA = input.inAnalysis
+        val classic = StraightMixGeometry.classicPlan(input)
+        if (StraightMixGeometry.policyExcluded(classic, input.albumOrder)) return null
+        if (input.preferStraight || !outA.isUsable || !inA.isUsable) return straightFallback(input)
         val outDur = input.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: outA.duration
         val inDur = input.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: inA.duration
         val loop = LoopMix.plan(
@@ -221,7 +245,10 @@ class DefaultTransitionPlanSelector(
                 sampleRate = input.sampleRate,
                 albumOrder = input.albumOrder,
                 stemsExpected = input.stemsExpected,
+                excludedRecipes = input.excludedRecipes,
+                capsOverride = input.caps,
             )
+            if (prep == null) return straightFallback(input)
             return SelectedPlan(
                 plan = prep?.plan ?: stamped,
                 phraseScript = null,
@@ -267,7 +294,10 @@ class DefaultTransitionPlanSelector(
                 sampleRate = input.sampleRate,
                 albumOrder = input.albumOrder,
                 stemsExpected = input.stemsExpected,
+                excludedRecipes = input.excludedRecipes,
+                capsOverride = input.caps,
             )
+            if (prep == null || prep.plan.handoff != null) return straightFallback(input)
             return SelectedPlan(
                 plan = prep?.plan ?: stamped,
                 phraseScript = script,
@@ -275,9 +305,6 @@ class DefaultTransitionPlanSelector(
                 pathHint = "v2-native",
             )
         }
-
-        // Step 4 slot: when planLoop/phrase are null, straight planning runs before bridge/fallback.
-        straightFallback?.invoke(input)?.let { return it }
 
         val bridge = LoopMix.bridge(
             out = outA,
@@ -288,7 +315,10 @@ class DefaultTransitionPlanSelector(
             sungOut = input.sungOut,
             sungIn = input.sungIn,
             playableOutDurationSec = outDur,
-        ) ?: return null
+        ) ?: return straightFallback(input)
+
+        // Contracted natural/echo handoffs have legacy envelopes, not an installed v2 recipe.
+        if (bridge.handoff != null) return straightFallback(input)
 
         val stamped = stamp(bridge, outA, inA)
         val prep = ChoreoSessionGlue.prepare(
@@ -304,7 +334,10 @@ class DefaultTransitionPlanSelector(
             sampleRate = input.sampleRate,
             albumOrder = input.albumOrder,
             stemsExpected = input.stemsExpected,
+            excludedRecipes = input.excludedRecipes,
+            capsOverride = input.caps,
         )
+        if (prep == null) return straightFallback(input)
         return SelectedPlan(
             plan = prep?.plan ?: stamped,
             phraseScript = null,
@@ -330,6 +363,10 @@ class DefaultTransitionPlanSelector(
 data class PreparedPair(
     val outId: String,
     val inId: String,
+    val outTitle: String = "",
+    val outArtist: String = "",
+    val inTitle: String = "",
+    val inArtist: String = "",
     val djLevel: DjLevel,
     val state: PrepState,
     val plan: LoopMix.Plan? = null,
@@ -356,6 +393,7 @@ data class PreparedPair(
     val entryCueSec: Double = 0.0,
     val generation: Long = 0L,
     val analysisSignature: String = "",
+    val straightRateMode: StraightRateMode? = null,
 )
 
 /**
@@ -412,16 +450,21 @@ class PairPreparer(
     private val waitCondition = waitLock.newCondition()
 
     @Volatile private var collectorJob: Job? = null
+    @Volatile private var inspectorCollectorJob: Job? = null
     @Volatile private var activeRequest: PrepRequest? = null
     @Volatile private var activeGeneration: Long = 0L
     @Volatile private var released = false
 
+    // FORK-HOOK(mix-inspector): PairPreparer is the only process-global producer of this feed.
     init {
         collectorJob = scope.launch {
             analysisUpdates.collect { trackId ->
                 if (trackId.isBlank() || released) return@collect
                 onAnalysisUpdated(trackId)
             }
+        }
+        inspectorCollectorJob = scope.launch {
+            _state.collect { publishInspectorSnapshot(it) }
         }
     }
 
@@ -451,6 +494,10 @@ class PairPreparer(
         _state.value = PreparedPair(
             outId = outId,
             inId = inId,
+            outTitle = request.outTrack.title,
+            outArtist = request.outTrack.artist,
+            inTitle = request.inTrack.title,
+            inArtist = request.inTrack.artist,
             djLevel = request.djLevel,
             state = PrepState.ANALYZING,
             sampleRate = request.sampleRate,
@@ -481,7 +528,29 @@ class PairPreparer(
         trigger(request, force = soughtPastWindow)
     }
 
-    fun onRemixRequested(request: PrepRequest) = trigger(request, force = true)
+    /** Returns false without invalidating the existing preparation if no other allowed recipe fits. */
+    fun onRemixRequested(request: PrepRequest, exclude: RecipeId? = null): Boolean {
+        val current = _state.value ?: return false
+        if (released || current.state in ACTIVE_EXECUTION_STATES || current.outId != request.outTrack.id ||
+            current.inId != request.inTrack.id || current.djLevel != request.djLevel) return false
+        val excluded = exclude ?: RecipeId.fromCode(current.script?.recipeId) ?: return false
+        if (current.topCandidates.none { it.recipeId != excluded }) {
+            // A straight preparation can often fit another same-level no-stem recipe with a different length.
+            val input = planInput(request.copy(excludedRecipes = setOf(excluded)), current)
+            if (StraightMixGeometry.select(input, capabilities()) == null && current.v2Prep?.let { prep ->
+                    Choreographer.rank(buildChoreoInputs(
+                        current.plan ?: return false, prep, current.outAnalysis ?: return false,
+                        current.inAnalysis ?: return false, current.sungOut, current.sungIn,
+                        StemAdapter.view(current.outStems), StemAdapter.view(current.inStems),
+                        current.sampleRate, prep.caps, current.djLevel, current.outId, current.inId,
+                        current.albumOrder, current.outStems != null || current.inStems != null,
+                        setOf(excluded),
+                    )).none { it.recipeId != excluded }
+                } != false) return false
+        }
+        trigger(request.copy(excludedRecipes = setOf(excluded)), force = true)
+        return true
+    }
 
     fun onAnalysisUpdated(trackId: String) {
         if (released) return
@@ -500,8 +569,24 @@ class PairPreparer(
 
     fun snapshotFor(outId: String, inId: String, djLevel: DjLevel? = null): PreparedPair? =
         _state.value?.takeIf {
-            it.outId == outId && it.inId == inId && (djLevel == null || it.djLevel == djLevel)
+            it.generation == generation.get() && it.outId == outId && it.inId == inId &&
+                (djLevel == null || it.djLevel == djLevel)
         }
+
+    /** Inspection may match a pair; applying a script/stems requires this exact execution identity. */
+    fun snapshotForBuild(outId: String, inId: String, djLevel: DjLevel, plan: LoopMix.Plan,
+        sampleRate: Int, straightRateMode: StraightRateMode? = null, expectedGeneration: Long? = null): PreparedPair? =
+        snapshotFor(outId, inId, djLevel)?.takeIf {
+            it.plan == plan && it.sampleRate == sampleRate && it.straightRateMode == straightRateMode &&
+                (expectedGeneration == null || it.generation == expectedGeneration) &&
+                it.state in setOf(PrepState.PREPARED, PrepState.BUILDING, PrepState.ARMED, PrepState.RUNNING) &&
+                it.v2Prep?.plan == plan && it.script != null &&
+                LoopMixSession.preparedCoverageRefusal(plan, sampleRate, it.outRegion, it.inRegion,
+                    it.outAnalysis, it.inAnalysis, straightRateMode, djLevel) == null
+        }
+
+    fun isCurrentGeneration(outId: String, inId: String, expected: Long): Boolean =
+        snapshotFor(outId, inId)?.generation == expected
 
     fun markBuilding(outId: String, inId: String) {
         updateIfPair(outId, inId) { cur ->
@@ -624,6 +709,9 @@ class PairPreparer(
         collectorJob?.cancel()
         collectorJob = null
         _state.value = null
+        publishInspectorSnapshot(null)
+        inspectorCollectorJob?.cancel()
+        inspectorCollectorJob = null
         if (ownsExecutor) {
             runCatching { executor.shutdownNow() }
         }
@@ -638,6 +726,11 @@ class PairPreparer(
         if (current.outId != nextRequest.outTrack.id || current.inId != nextRequest.inTrack.id) return false
         if (current.djLevel != nextRequest.djLevel) return false
         if (current.state in ACTIVE_EXECUTION_STATES) return true
+        if (prevRequest.sampleRate != nextRequest.sampleRate || prevRequest.albumOrder != nextRequest.albumOrder ||
+            prevRequest.preferStraight != nextRequest.preferStraight ||
+            prevRequest.outTrack.durationSec != nextRequest.outTrack.durationSec ||
+            prevRequest.inTrack.durationSec != nextRequest.inTrack.durationSec ||
+            prevRequest.outTrack.uri != nextRequest.outTrack.uri || prevRequest.inTrack.uri != nextRequest.inTrack.uri) return false
         // Seek past the planned exit window must re-plan.
         if (current.plannedWindowStartSec > 0.0 && nextRequest.positionSec > current.plannedWindowStartSec + 0.5) {
             return false
@@ -654,6 +747,34 @@ class PairPreparer(
             PrepState.IDLE, PrepState.DONE -> false
             else -> true
         }
+    }
+
+    /** The selector's view of an already-prepared pair, for a remix feasibility probe. */
+    private fun planInput(request: PrepRequest, current: PreparedPair): PlanInput {
+        val outA = current.outAnalysis ?: analysisFor(request.outTrack.id)
+        val inA = current.inAnalysis ?: analysisFor(request.inTrack.id)
+        return PlanInput(
+            outTrack = request.outTrack,
+            inTrack = request.inTrack,
+            outAnalysis = outA,
+            inAnalysis = inA,
+            outSongMap = current.outSongMap,
+            inSongMap = current.inSongMap,
+            sungOut = current.sungOut ?: sungFor(request.outTrack.id),
+            sungIn = current.sungIn ?: sungFor(request.inTrack.id),
+            djLevel = request.djLevel,
+            sampleRate = request.sampleRate,
+            positionSec = request.positionSec,
+            albumOrder = current.albumOrder,
+            stemsExpected = canUseStems() && AutomixV2Choreo.useStems &&
+                ChoreoCaps.has(capabilities(), ChoreoCaps.STEMS),
+            preferStraight = request.preferStraight,
+            excludedRecipes = request.excludedRecipes,
+            fallbackSeconds = request.fallbackSeconds,
+            lyricsOut = request.lyricsOut,
+            lyricsIn = request.lyricsIn,
+            caps = capabilities(),
+        )
     }
 
     private fun updateIfPair(
@@ -695,8 +816,11 @@ class PairPreparer(
                 }
                 return
             }
-            val (outA, inA, outMap, inMap) = analysisReady
-            val sig = analysisSignature(outA, inA)
+            val (rawOut, rawIn, outMap, inMap) = analysisReady
+            val sig = analysisSignature(rawOut, rawIn)
+            // Physical durations come from what plays. Musical evidence/confidence is left intact.
+            val outA = rawOut.copy(duration = request.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawOut.duration)
+            val inA = rawIn.copy(duration = request.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: rawIn.duration)
             val sungOut = sungFor(request.outTrack.id)
             val sungIn = sungFor(request.inTrack.id)
 
@@ -704,7 +828,7 @@ class PairPreparer(
             val planStartMs = nowMs()
             val stemsAllowed = canUseStems() && AutomixV2Choreo.useStems &&
                 ChoreoCaps.has(capabilities(), ChoreoCaps.STEMS)
-            val selected = planSelector.select(
+            val input =
                 PlanInput(
                     outTrack = request.outTrack,
                     inTrack = request.inTrack,
@@ -719,8 +843,13 @@ class PairPreparer(
                     positionSec = request.positionSec,
                     albumOrder = request.albumOrder,
                     stemsExpected = stemsAllowed,
-                ),
-            )
+                    preferStraight = request.preferStraight,
+                    excludedRecipes = request.excludedRecipes,
+                    fallbackSeconds = request.fallbackSeconds,
+                    lyricsOut = request.lyricsOut, lyricsIn = request.lyricsIn,
+                    caps = capabilities(),
+                )
+            val selected = planSelector.select(input)
             val planMs = (nowMs() - planStartMs).coerceAtLeast(0L)
             if (isAborted()) return
 
@@ -761,6 +890,9 @@ class PairPreparer(
                     sampleRate = request.sampleRate,
                     albumOrder = request.albumOrder,
                     stemsExpected = stemsAllowed,
+                    straightRateMode = selected.straightRateMode,
+                    excludedRecipes = request.excludedRecipes,
+                    capsOverride = input.caps,
                 )
             }
             val effectivePlan = v2Prep?.plan ?: selected.plan
@@ -776,6 +908,10 @@ class PairPreparer(
             val plannedPair = PreparedPair(
                 outId = request.outTrack.id,
                 inId = request.inTrack.id,
+                outTitle = request.outTrack.title,
+                outArtist = request.outTrack.artist,
+                inTitle = request.inTrack.title,
+                inArtist = request.inTrack.artist,
                 djLevel = request.djLevel,
                 state = PrepState.PLANNED,
                 plan = effectivePlan,
@@ -799,6 +935,7 @@ class PairPreparer(
                 entryCueSec = entryCueSec,
                 generation = gen,
                 analysisSignature = sig,
+                straightRateMode = selected.straightRateMode,
             )
             publishIfCurrent(gen) { plannedPair }
 
@@ -811,12 +948,24 @@ class PairPreparer(
                 outAnalysis = outA,
                 inAnalysis = inA,
                 sampleRate = request.sampleRate,
+                straightRateMode = selected.straightRateMode,
+                level = request.djLevel,
             )
 
             val outRegion = decodeRegion(request.outTrack, outBounds.first, outBounds.second, request.sampleRate)
             if (isAborted()) return
+            publishIfCurrent(gen) { it.copy(outRegion = outRegion) }
             val inRegion = decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
             if (isAborted()) return
+            val coverageReason = effectivePlan?.let {
+                LoopMixSession.preparedCoverageRefusal(it, request.sampleRate, outRegion, inRegion,
+                    outA, inA, selected.straightRateMode, request.djLevel)
+            } ?: "prepared_script_geometry_missing"
+            if (coverageReason != null) {
+                publishIfCurrent(gen) { it.copy(state = PrepState.IDLE, outRegion = outRegion, inRegion = inRegion,
+                    timings = it.timings.copy(fallbackReason = coverageReason)) }
+                return
+            }
 
             // --- Stage 3: STEMMING ---
             publishIfCurrent(gen) { cur ->
@@ -901,8 +1050,17 @@ class PairPreparer(
                 outId = request.outTrack.id,
                 inId = request.inTrack.id,
                 albumOrder = request.albumOrder,
+                // A straight selection's script was already validated against this exact geometry,
+                // rate mode and PCM coverage; executing it verbatim keeps PREPARED honest.
+                preferredScript = selected.previewScript,
             )
             if (isAborted()) return
+
+            if (script == null) {
+                publishIfCurrent(gen) { it.copy(state = PrepState.IDLE, outRegion = outRegion, inRegion = inRegion,
+                    timings = it.timings.copy(fallbackReason = "same-level-choreography-unavailable")) }
+                return
+            }
 
             val usedOutStems = if (script?.outUsesStems == true) outStems else null
             val usedInStems = if (script?.inUsesStems == true) inStems else null
@@ -954,6 +1112,102 @@ class PairPreparer(
         }
     }
 
+    private fun publishInspectorSnapshot(pair: PreparedPair?) {
+        if (released) {
+            MixInspectorFeed.publish(null)
+            return
+        }
+        if (pair == null) {
+            MixInspectorFeed.publish(null)
+            return
+        }
+        val script = pair.script
+        val timings = pair.timings
+        val plannedPath = timings.path.takeIf { it.isNotBlank() }
+        val actualPath = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) plannedPath else null
+        val candidates = pair.topCandidates.ifEmpty { script?.topCandidates.orEmpty() }
+            .take(3)
+            .map { candidate ->
+                MixInspectorRecipeScore(
+                    recipeId = candidate.recipeId.code,
+                    recipeName = candidate.recipeName,
+                    score = candidate.total,
+                    reason = candidate.reason,
+                )
+            }
+        val effects = if (script == null) {
+            emptyList()
+        } else {
+            (script.outFx.activeFxNames + script.inFx.activeFxNames).distinct()
+        }
+        val stemsReady = when {
+            pair.state.ordinal >= PrepState.PREPARED.ordinal -> true
+            pair.state == PrepState.STEMMING -> false
+            else -> null
+        }
+        val remixReady = pair.state == PrepState.PREPARED && script != null
+        val remixUnavailableReason = when {
+            remixReady -> null
+            pair.state.ordinal >= PrepState.BUILDING.ordinal -> "This transition is already building or playing."
+            pair.script == null && pair.state == PrepState.PREPARED -> "No prepared recipe is available to remix."
+            pair.state == PrepState.IDLE -> "There is no prepared transition to remix."
+            else -> "Preparation is not ready yet."
+        }
+        MixInspectorFeed.publish(
+            MixInspectorState(
+                generation = pair.generation,
+                current = MixInspectorTrack(
+                    mediaId = pair.outId,
+                    title = pair.outTitle,
+                    artist = pair.outArtist,
+                ),
+                next = MixInspectorTrack(
+                    mediaId = pair.inId,
+                    title = pair.inTitle,
+                    artist = pair.inArtist,
+                ),
+                level = pair.djLevel,
+                phase = when (pair.state) {
+                    PrepState.IDLE -> MixInspectorPhase.IDLE
+                    PrepState.ANALYZING -> MixInspectorPhase.ANALYZING
+                    PrepState.PLANNED -> MixInspectorPhase.PLANNED
+                    PrepState.STEMMING -> MixInspectorPhase.STEMMING
+                    PrepState.PREPARED -> MixInspectorPhase.PREPARED
+                    PrepState.BUILDING -> MixInspectorPhase.BUILDING
+                    PrepState.ARMED -> MixInspectorPhase.ARMED
+                    PrepState.RUNNING -> MixInspectorPhase.RUNNING
+                    PrepState.DONE -> MixInspectorPhase.DONE
+                },
+                plannedPath = plannedPath,
+                path = actualPath,
+                recipeId = script?.recipeId?.takeIf { it.isNotBlank() }
+                    ?: pair.v2Prep?.forcedRecipe?.code
+                    ?: candidates.firstOrNull()?.recipeId,
+                recipeName = script?.recipeName?.takeIf { it.isNotBlank() }
+                    ?: pair.v2Prep?.forcedRecipe?.displayName
+                    ?: candidates.firstOrNull()?.recipeName,
+                reason = script?.reason?.takeIf { it.isNotBlank() },
+                stemsReady = stemsReady,
+                stemCount = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) timings.stems else null,
+                prepStartMs = timings.prepStartMs.takeIf { it > 0L },
+                analysisMs = if (pair.state != PrepState.ANALYZING) timings.analysisMs else null,
+                planMs = if (pair.state.ordinal >= PrepState.PLANNED.ordinal && pair.state != PrepState.ANALYZING) timings.planMs else null,
+                stemMsOut = if (pair.state.ordinal >= PrepState.STEMMING.ordinal) timings.stemMsOut else null,
+                stemMsIn = if (pair.state.ordinal >= PrepState.STEMMING.ordinal) timings.stemMsIn else null,
+                preparedLeadSec = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) timings.preparedLeadSec else null,
+                buildMs = timings.buildMs.takeIf { it > 0L },
+                armLeadMs = timings.armLeadMs.takeIf { it > 0L },
+                watchdog = timings.watchdog,
+                fxCount = script?.fxCount ?: timings.fxCount.takeIf { it > 0 },
+                effects = effects,
+                topCandidates = candidates,
+                fallbackReason = timings.fallbackReason.takeIf { it.isNotBlank() },
+                remixAvailable = remixReady,
+                remixUnavailableReason = remixUnavailableReason,
+            ),
+        )
+    }
+
     private data class ReadyAnalysis(
         val outA: TrackAnalysis,
         val inA: TrackAnalysis,
@@ -975,9 +1229,9 @@ class PairPreparer(
             val outMap = if (outA.isUsable) songMapFor(request.outTrack.id, outA) else null
             val inMap = if (inA.isUsable) songMapFor(request.inTrack.id, inA) else null
 
-            val outMinReady = outA.isUsable && outMap != null &&
+            val outMinReady = outA.isUsable &&
                 (outA.tailBeats != null || outA.quality == TrackAnalysis.QUALITY_FULL || !analysisRunningFor(request.outTrack.id))
-            val inMinReady = inA.isUsable && inMap != null
+            val inMinReady = inA.isUsable
 
             if (outMinReady && inMinReady) {
                 val bothFull = outA.quality == TrackAnalysis.QUALITY_FULL && inA.quality == TrackAnalysis.QUALITY_FULL
@@ -997,14 +1251,12 @@ class PairPreparer(
             val outTerminalFail = outA.status == TrackAnalysis.STATUS_READY && !outA.isUsable && !analysisRunningFor(request.outTrack.id)
             val inTerminalFail = inA.status == TrackAnalysis.STATUS_READY && !inA.isUsable && !analysisRunningFor(request.inTrack.id)
             if (outTerminalFail || inTerminalFail) {
-                return null
+                return ReadyAnalysis(outA, inA, outMap, inMap)
             }
 
             val now = nowMs()
             if (now >= deadlineMs) {
-                return if (outA.isUsable && inA.isUsable && outMap != null && inMap != null) {
-                    ReadyAnalysis(outA, inA, outMap, inMap)
-                } else null
+                return ReadyAnalysis(outA, inA, outMap, inMap)
             }
             val waitSliceMs = (deadlineMs - now).coerceIn(10L, 500L)
             awaitSignal(waitSliceMs)
@@ -1035,11 +1287,13 @@ class PairPreparer(
         outAnalysis: TrackAnalysis,
         inAnalysis: TrackAnalysis,
         sampleRate: Int,
+        straightRateMode: StraightRateMode? = null,
+        level: DjLevel = AutomixV2Choreo.level,
     ): Pair<Pair<Double, Double>, Pair<Double, Double>> {
         val outBarSec = barSeconds(outAnalysis.bpm, effectivePlan?.out?.beatSec ?: 0.5)
         val inBarSec = barSeconds(inAnalysis.bpm, effectivePlan?.inn?.beatSec ?: 0.5)
         if (effectivePlan != null) {
-            val bounds = LoopMix.regionBounds(effectivePlan)
+            val bounds = LoopMixSession.decodeRequirements(effectivePlan, sampleRate, outAnalysis, inAnalysis, straightRateMode, level)
             val clock = LoopMix.Clock(effectivePlan)
             val echoHold = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
             val outStop = clock.releaseAt + 0.05 + echoHold + effectivePlan.exitTailSeconds
@@ -1052,11 +1306,12 @@ class PairPreparer(
             val actualInTo = runCatching {
                 val knots = LoopMixSession.buildDeckKnots(
                     effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
-                    outHasTailKnot, outStop, tailRate,
+                    outHasTailKnot, outStop, tailRate, straightRateMode, level,
                 )
                 val geom = LoopMixSession.incomingGeometry(effectivePlan, clock, knots)
                 val inTail = bounds.inTo - clock.elementTrackTime
-                maxOf(bounds.inTo, geom.handoverTrack + inTail, geom.requiredEnd)
+                // decodeRequirements already includes the actual handover; do not add the offset twice.
+                maxOf(bounds.inTo, geom.requiredEnd)
             }.getOrDefault(bounds.inTo)
 
             val outWin = paddedWindow(bounds.outFrom, bounds.outTo, 2.0 * outBarSec, outDurationSec)
@@ -1160,6 +1415,7 @@ class PairPreparer(
         outId: String,
         inId: String,
         albumOrder: Boolean,
+        preferredScript: ChoreoScript? = null,
     ): Pair<ChoreoScript?, List<Candidate>> {
         if (effectivePlan == null || v2Prep == null) return null to emptyList()
         val inputs = buildChoreoInputs(
@@ -1180,7 +1436,15 @@ class PairPreparer(
             stemsExpected = outStems != null || inStems != null,
         )
         val ranked = Choreographer.rank(inputs).take(3)
-        val script = (if (v2Prep.forcedRecipe != null) Choreographer.chooseRecipe(inputs, v2Prep.forcedRecipe) else null)
+        // Keep PREPARED identical to what will execute: the selector already validated this exact
+        // script against this geometry and rate mode. Re-choosing here could hand the build a
+        // different recipe than the one the preview promised.
+        val planned = preferredScript?.takeIf {
+            it.level == level && RecipeId.fromCode(it.recipeId) !in v2Prep.excludedRecipes &&
+                (!it.outUsesStems || outStems != null) && (!it.inUsesStems || inStems != null)
+        }
+        val script = planned
+            ?: (if (v2Prep.forcedRecipe != null) Choreographer.chooseRecipe(inputs, v2Prep.forcedRecipe) else null)
             ?: Choreographer.choose(inputs, v2Prep.forced)
             ?: Choreographer.chooseRecipe(inputs, null)
             ?: ChoreoSessionGlue.withoutStems(
@@ -1206,6 +1470,7 @@ class PairPreparer(
         inId: String,
         albumOrder: Boolean,
         stemsExpected: Boolean,
+        excludedRecipes: Set<RecipeId> = v2Prep?.excludedRecipes ?: emptySet(),
     ): ChoreoInputs {
         val clock = LoopMix.Clock(effectivePlan)
         val echoHold = if (effectivePlan.echoTail) effectivePlan.out.beatSec * 8 else 0.0
@@ -1222,6 +1487,7 @@ class PairPreparer(
         val (outClock, inClock) = runCatching {
             val knots = LoopMixSession.buildDeckKnots(
                 effectivePlan, clock, sampleRate, outA, inA, outHasTailKnot, outStop, tailRate,
+                v2Prep?.straightRateMode, level,
             )
             val geometry = LoopMixSession.incomingGeometry(effectivePlan, clock, knots)
             val sr = sampleRate.toDouble()
@@ -1261,6 +1527,7 @@ class PairPreparer(
             stemsExpected = stemsExpected,
             outClock = outClock,
             inClock = inClock,
+            excludedRecipes = excludedRecipes,
         )
     }
 

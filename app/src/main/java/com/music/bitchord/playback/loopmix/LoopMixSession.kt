@@ -1,6 +1,9 @@
 package com.music.bitchord.playback.loopmix
 
 import android.util.Log
+import com.music.bitchord.playback.djmix.PreparedPair
+import com.music.bitchord.playback.djmix.StraightRateMode
+import com.music.bitchord.playback.djmix.StraightMixGeometry
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.LoopMixDuck
 import com.music.bitchord.playback.smart.MixGain
@@ -24,6 +27,7 @@ import com.music.bitchord.playback.smart.choreo.RecipeId
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -65,10 +69,13 @@ class LoopMixSession private constructor(
     /** Source of the emitted knots, independent of planner anchor evidence. */
     val outGridSource: GridSource = GridSource.UNKNOWN,
     val inGridSource: GridSource = GridSource.UNKNOWN,
+    /** Actual installed script path; a non-looping bridge is not automatically a straight recipe. */
+    val executionPath: String = "classic",
+    val preparationGeneration: Long = 0L,
 ) {
     /** Bounded attribution; holds/tail/settle retain their existing clock geometry. */
     enum class GridSource(val telemetryValue: String) {
-        UNKNOWN("unknown"), TRACKED("tracked"), CLOCK("clock"), NATIVE_CLOCK("native-clock"),
+        UNKNOWN("unknown"), TRACKED("tracked"), CLOCK("clock"), NATIVE_CLOCK("native-clock"), RATE_ONE("rate-one"),
     }
 
     /** Preserve the prior manual-session constructor; actual geometry is unknown for this path. */
@@ -304,6 +311,11 @@ class LoopMixSession private constructor(
             preparedScript: ChoreoScript? = null,
             preparedOutRegion: LoopRegion? = null,
             preparedInRegion: LoopRegion? = null,
+            /** All production arms opt in. Defaults preserve legacy non-production probes. */
+            preparedOnly: Boolean = false,
+            preparedSampleRate: Int? = null,
+            straightRateMode: StraightRateMode? = null,
+            preparationGeneration: Long = 0L,
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
             fun refuse(reason: String): LoopMixSession? {
@@ -311,6 +323,12 @@ class LoopMixSession private constructor(
                 return null
             }
             if (sampleRate <= 0) return refuse("invalid_sample_rate")
+            if (preparedOnly && (preparedSampleRate != sampleRate || preparedPrep == null ||
+                    preparedPrep.sampleRate != sampleRate || preparedPrep.plan != plan ||
+                    preparedPrep.level != djLevel || preparedPrep.pairKey != "$outId->$inId" ||
+                    preparedPrep.albumOrder != albumOrder || preparedPrep.straightRateMode != straightRateMode)) {
+                return refuse("prepared_geometry_or_rate_mismatch")
+            }
             val crown = plan.outLoops && plan.inLoops
             // Preserve the early capability gate for non-crown routes. Crowns
             // qualify first, even without JNI, so a geometry refusal is not
@@ -323,14 +341,13 @@ class LoopMixSession private constructor(
             val handoff = plan.handoff.takeIf { contractEcho }
             // AUTOMIX-V2(E) pass 1: caps, structure, and (CLUB+) a verified drop re-time of a
             // straight native incoming cue. Zero synchronous stem separation at build time.
-            val v2Prep = if (AutomixV2Choreo.enabled && LoopMixRenderer.available && handoff == null) {
+            val v2Prep = if (preparedOnly) preparedPrep else if (AutomixV2Choreo.enabled && LoopMixRenderer.available && handoff == null) {
                 preparedPrep?.takeIf {
                     it.pairKey == "$outId->$inId" &&
                         it.level == djLevel &&
                         it.albumOrder == albumOrder &&
-                        abs(it.plan.out.loopStart - plan.out.loopStart) < 0.02 &&
-                        it.plan.outLoops == plan.outLoops &&
-                        it.plan.inLoops == plan.inLoops
+                        it.plan == plan && (it.sampleRate == 0 || it.sampleRate == sampleRate) &&
+                        it.straightRateMode == straightRateMode
                 }
                     ?: ChoreoSessionGlue.prepare(
                         plan, script, outAnalysis, inAnalysis, outSongMap, inSongMap, djLevel, outId, inId,
@@ -341,7 +358,39 @@ class LoopMixSession private constructor(
                 v2Prep?.plan ?: plan, outId, inId, sampleRate, inLevel, highQuality, script,
                 separateStem, separateVocalStem, separateVocalPair, outAnalysis, inAnalysis, sungOut, sungIn,
                 onRefusal, onEnvelopeInstalled,
-                v2Prep, preparedOutStems, preparedInStems, preparedScript, preparedOutRegion, preparedInRegion, decode,
+                v2Prep, preparedOutStems, preparedInStems, preparedScript, preparedOutRegion, preparedInRegion,
+                preparedOnly, straightRateMode, djLevel, preparationGeneration, decode,
+            )
+        }
+
+        /** Prepared-input-only entry: two ordinary decks, the existing renderer and handover lifecycle. */
+        fun buildStraight(
+            prepared: PreparedPair,
+            outId: String,
+            inId: String,
+            sampleRate: Int,
+            inLevel: Float,
+            highQuality: Boolean = true,
+            onRefusal: ((String) -> Unit)? = null,
+        ): LoopMixSession? {
+            val plan = prepared.plan
+            if (plan == null || plan.outLoops || plan.inLoops || plan.handoff != null ||
+                prepared.straightRateMode == null || prepared.outId != outId || prepared.inId != inId ||
+                prepared.sampleRate != sampleRate || prepared.script == null) {
+                onRefusal?.invoke("straight_prepared_contract_missing")
+                return null
+            }
+            return build(
+                plan, outId, inId, sampleRate, inLevel, highQuality,
+                outAnalysis = prepared.outAnalysis, inAnalysis = prepared.inAnalysis,
+                sungOut = prepared.sungOut, sungIn = prepared.sungIn,
+                onRefusal = onRefusal, djLevel = prepared.djLevel, albumOrder = prepared.albumOrder,
+                preparedPrep = prepared.v2Prep, preparedScript = prepared.script,
+                preparedOutStems = prepared.outStems, preparedInStems = prepared.inStems,
+                preparedOutRegion = prepared.outRegion, preparedInRegion = prepared.inRegion,
+                preparedOnly = true, preparedSampleRate = prepared.sampleRate,
+                straightRateMode = prepared.straightRateMode, preparationGeneration = prepared.generation,
+                decode = { _, _, _ -> error("prepared-only straight build must never decode") },
             )
         }
 
@@ -368,6 +417,10 @@ class LoopMixSession private constructor(
             preparedScript: ChoreoScript?,
             preparedOutRegion: LoopRegion?,
             preparedInRegion: LoopRegion?,
+            preparedOnly: Boolean,
+            straightRateMode: StraightRateMode?,
+            djLevel: DjLevel,
+            preparationGeneration: Long,
             decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
         ): LoopMixSession? {
 
@@ -452,7 +505,7 @@ class LoopMixSession private constructor(
             // once, then reject an incomplete decoder result below.
             val outHasTailKnot = !effectivePlan.outLoops && outStopMixSec > clock.releaseAt + 1e-6
             val knots = buildDeckKnots(effectivePlan, clock, sampleRate, outAnalysis, inAnalysis,
-                outHasTailKnot, outStopMixSec, tailRateEarly)
+                outHasTailKnot, outStopMixSec, tailRateEarly, straightRateMode, djLevel)
             if (handoff != null) {
                 qualifyHandoffKnots(effectivePlan, clock, sampleRate, knots)?.let { return refuse(it) }
             }
@@ -467,18 +520,23 @@ class LoopMixSession private constructor(
             // Preserve straight OUT's existing real-EOF/effect-drain contract.
             // Only repeated OUT audio needs a complete loop body and seam.
             val requiredOutEnd = if (effectivePlan.outLoops) effectivePlan.out.loopEnd + 0.008 else null
-            val actualOutTo = outTo
+            val actualOutTo = if (straightRateMode != null) knots.outPositionsSec.maxOrNull()!! + 0.5 else outTo
             val reusableOut = preparedOutRegion?.takeIf { region ->
                 val regionEnd = region.start + region.left.size.toDouble() / sampleRate
                 val outDur = outAnalysis?.duration?.takeIf { it.isFinite() && it > 1.0 }
-                region.start <= bounds.outFrom + 0.02 &&
+                region.start <= maxOf(0.0, bounds.outFrom) + 0.02 &&
                     coversOutgoingStartAndLoop(region, sampleRate, effectivePlan) &&
                     (regionEnd >= actualOutTo - 0.05 || (outDur != null && regionEnd >= outDur - 0.15))
             }
             val reusableIn = preparedInRegion?.takeIf { region ->
-                region.start <= bounds.inFrom + 0.02 &&
+                region.start <= maxOf(0.0, bounds.inFrom) + 0.02 &&
                     region.start <= effectivePlan.inn.loopStart &&
                     coversPhysical(region, sampleRate, effectivePlan.inn.loopStart, maxOf(incomingGeometry.requiredEnd, actualInTo - 0.05))
+            }
+            if (preparedOnly) {
+                preparedCoverageRefusal(effectivePlan, sampleRate, preparedOutRegion, preparedInRegion,
+                    outAnalysis, inAnalysis, straightRateMode, djLevel)?.let { return refuse(it) }
+                if (reusableOut == null || reusableIn == null) return refuse("prepared_pcm_coverage_mismatch")
             }
             val (outDecoded, inDecoded) = when {
                 reusableOut != null && reusableIn != null -> reusableOut to reusableIn
@@ -526,12 +584,13 @@ class LoopMixSession private constructor(
                 )
             } else null
             var v2Script: ChoreoScript? = v2?.script
+            if (preparedOnly && v2Script == null) return refuse("choreography_unavailable")
             // vc67: on-device umxhq Wiener stem separation for the acapella rung.
             // OUT carries the vocal stem (0.88 vocal + 0.12 dry air); IN carries the
             // instrumental when windowed stems are enabled. Worker thread only; null
             // falls back to the dry region so the build never fails on separation.
             // AUTOMIX-V2(E): a choreographed script owns separation; the vc80 2-stem paths run only without one.
-            if (handoff == null && v2Script == null && effectivePlan.acapella && separateStem != null) {
+            if (!preparedOnly && handoff == null && v2Script == null && effectivePlan.acapella && separateStem != null) {
                 if (outRegion.left.size / sampleRate.toDouble() <= 21.5) {
                     val split = runCatching {
                         separateStem(LoopMix.Side.OUT, outRegion.left, outRegion.right, sampleRate, true)
@@ -564,7 +623,7 @@ class LoopMixSession private constructor(
             // vocal intervals. Its valid pickups (including disjoint bursts)
             // must not be re-ducked using the legacy whole-window projection.
             // AUTOMIX-V2(E): a choreographed script owns separation; the vc80 2-stem paths run only without one.
-            if (handoff == null && v2Script == null && !effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
+            if (!preparedOnly && handoff == null && v2Script == null && !effectivePlan.acapella && (separateVocalPair != null || separateVocalStem != null)) {
                 val inWinFrom = plan.inn.loopStart
                 val inWinTo = maxOf(inWinFrom + 1.0, clock.elementTrackTime)
                 val inMask = if (!inAnalysis?.vocalWindows.isNullOrEmpty()) {
@@ -826,6 +885,10 @@ class LoopMixSession private constructor(
                         plannedRecipe = RecipeId.fromCode(v2Chosen.recipeId),
                     )
                 }
+            }
+            if (preparedOnly && v2Script == null) {
+                renderer.close()
+                return refuse("no_stem_recipe_unavailable")
             }
             val nativeEchoOut = contractEcho || (effectivePlan.echoTail && effectivePlan.rung == "Echo" && script == null)
             val contractM6 = handoff != null && script?.choice?.template == MixTemplate.M6
@@ -1130,7 +1193,6 @@ class LoopMixSession private constructor(
             val v2Final = v2Script
             if (v2Final != null && v2Prep != null) {
                 ChoreoRendererBridge.apply(renderer, v2Final, v2Prep.caps, v2OutStems, v2InStems)
-                AutomixV2Choreo.history.record(v2Prep.pairKey, v2Final.move, RecipeId.fromCode(v2Final.recipeId))
             }
             renderer.setHighQuality(highQuality)
             renderer.prepare()
@@ -1138,6 +1200,8 @@ class LoopMixSession private constructor(
             return LoopMixSession(effectivePlan, clock, outId, inId, renderer, sampleRate, handoverTrackSec,
                 configuredOutLoops = effectivePlan.outLoops, configuredInLoops = incomingGeometry.loops,
                 outGridSource = knots.outGridSource, inGridSource = knots.inGridSource,
+                executionPath = if (v2Final == null) "classic" else if (straightRateMode != null) "v2-straight" else "v2-native",
+                preparationGeneration = preparationGeneration,
             ).also {
                 it.planIncomingStart()
                 // AUTOMIX-V2(E): what the choreographer did, for the status line / Mix Inspector / telemetry.
@@ -1253,6 +1317,7 @@ class LoopMixSession private constructor(
             val inPositionsSec: DoubleArray,
             val outGridSource: GridSource = GridSource.UNKNOWN,
             val inGridSource: GridSource = GridSource.UNKNOWN,
+            val sampleRate: Int = 0,
         )
 
         /** Interpolate the exact arrays supplied to native, in source seconds. */
@@ -1459,7 +1524,9 @@ class LoopMixSession private constructor(
             val handoff = plan.handoff
             val release = handoff?.let {
                 it.inCueSourceSec + max(0.0, clock.releaseAt - it.inHoldMixSec)
-            } ?: knots.inPositionsSec[clock.beats]
+            } ?: if (knots.sampleRate > 0) {
+                requireNotNull(knotSourceAt(knots.inFrames, knots.inPositionsSec, clock.releaseAt, knots.sampleRate))
+            } else knots.inPositionsSec[clock.beats]
             val loops = plan.inLoops && !plan.nativeIncoming && release >= plan.inn.loopEnd
             fun physical(position: Double) = if (loops) LoopMix.physicalTrackTime(
                 position, plan.inn.loopStart, plan.inn.loopEnd, release,
@@ -1483,6 +1550,45 @@ class LoopMixSession private constructor(
                 if (plan.outLoops) plan.out.loopEnd + 0.008 else plan.out.loopStart) &&
                 region.start + region.left.size.toDouble() / sampleRate > plan.out.loopStart
 
+        /** Exact build request, including actual tracked/straight knots and handover tail. */
+        internal fun decodeRequirements(
+            plan: LoopMix.Plan, sampleRate: Int, outAnalysis: TrackAnalysis?, inAnalysis: TrackAnalysis?,
+            straightRateMode: StraightRateMode? = null, level: DjLevel = AutomixV2Choreo.level,
+        ): LoopMix.RegionBounds {
+            val clock = LoopMix.Clock(plan)
+            val nominal = LoopMix.regionBounds(plan)
+            val stop = clock.releaseAt + 0.05 + (if (plan.echoTail) plan.out.beatSec * 8 else 0.0) + plan.exitTailSeconds
+            val tailRate = if (clock.beats >= 1) plan.out.beatSec /
+                (clock.beatTimes[clock.beats] - clock.beatTimes[clock.beats - 1]).coerceAtLeast(1e-6) else 1.0
+            val knots = buildDeckKnots(plan, clock, sampleRate, outAnalysis, inAnalysis,
+                !plan.outLoops && stop > clock.releaseAt + 1e-6, stop, tailRate, straightRateMode, level)
+            val geometry = incomingGeometry(plan, clock, knots)
+            return LoopMix.RegionBounds(
+                maxOf(0.0, nominal.outFrom),
+                if (straightRateMode != null) knots.outPositionsSec.maxOrNull()!! + 0.5 else nominal.outTo,
+                maxOf(0.0, nominal.inFrom),
+                maxOf(nominal.inTo, geometry.handoverTrack + nominal.inTo - clock.elementTrackTime, geometry.requiredEnd),
+            )
+        }
+
+        /** PREPARED means complete, usable PCM on the same geometry/rate contract as build. */
+        internal fun preparedCoverageRefusal(
+            plan: LoopMix.Plan, sampleRate: Int, out: LoopRegion?, inn: LoopRegion?,
+            outAnalysis: TrackAnalysis?, inAnalysis: TrackAnalysis?, straightRateMode: StraightRateMode? = null,
+            level: DjLevel = AutomixV2Choreo.level,
+        ): String? {
+            if (sampleRate <= 0) return "prepared_invalid_sample_rate"
+            if (out == null || inn == null) return "prepared_pcm_missing"
+            val bounds = runCatching { decodeRequirements(plan, sampleRate, outAnalysis, inAnalysis, straightRateMode, level) }
+                .getOrNull() ?: return "prepared_invalid_geometry"
+            val eof = outAnalysis?.duration?.takeIf { it.isFinite() && it > plan.out.loopStart }
+            val outEnd = if (!plan.outLoops && eof != null) minOf(bounds.outTo, eof) else bounds.outTo
+            if (!coversPhysical(out, sampleRate, bounds.outFrom, outEnd) ||
+                !coversOutgoingStartAndLoop(out, sampleRate, plan)) return "prepared_out_pcm_incomplete"
+            if (!coversPhysical(inn, sampleRate, bounds.inFrom, bounds.inTo)) return "prepared_in_pcm_incomplete"
+            return null
+        }
+
         internal fun buildDeckKnots(
             plan: LoopMix.Plan,
             clock: LoopMix.Clock,
@@ -1492,10 +1598,99 @@ class LoopMixSession private constructor(
             outHasTailKnot: Boolean,
             outStopAtSec: Double,
             tailRateEarly: Double,
+            straightRateMode: StraightRateMode? = null,
+            level: DjLevel = AutomixV2Choreo.level,
         ): DeckKnots {
             val sr = sampleRate.toDouble()
             val beats = clock.beats
             val totalInBeats = beats + clock.settleBeats
+
+            if (straightRateMode != null) {
+                require(!plan.outLoops && !plan.inLoops && plan.handoff == null)
+                require(sampleRate > 0 && beats > 0 && clock.incomingHoldSec.isFinite() && clock.incomingHoldSec >= 0.0)
+                if (straightRateMode == StraightRateMode.BEAT_MATCH) {
+                    require(StraightMixGeometry.rateMode(outAnalysis, inAnalysis, level) == StraightRateMode.BEAT_MATCH)
+                }
+                val outTimes = (clock.beatTimes.take(beats + 1) +
+                    if (outHasTailKnot) listOf(outStopAtSec) else emptyList()).distinct().sorted()
+                // Insert the actual hold boundary, even when it is between beats.
+                val inTimes = (clock.beatTimes.toList() + listOf(clock.incomingHoldSec))
+                    .filter { it <= clock.elementAt }.distinct().sorted()
+                if (straightRateMode == StraightRateMode.RATE_ONE) {
+                    return DeckKnots(
+                        DoubleArray(outTimes.size) { outTimes[it] * sr },
+                        DoubleArray(outTimes.size) { plan.out.loopStart + outTimes[it] },
+                        DoubleArray(inTimes.size) { inTimes[it] * sr },
+                        DoubleArray(inTimes.size) { plan.inn.loopStart + max(0.0, inTimes[it] - clock.incomingHoldSec) },
+                        GridSource.RATE_ONE, GridSource.RATE_ONE, sampleRate,
+                    )
+                }
+                fun progress(t: Double): Double {
+                    val (k, f) = clock.beatAt(t.coerceIn(0.0, clock.releaseAt))
+                    return minOf(beats.toDouble(), k + f)
+                }
+                fun trackedAt(grid: DoubleArray?, beat: Double, start: Double, step: Double): Double {
+                    if (grid == null) return start + beat * step
+                    val k = kotlin.math.floor(beat).toInt().coerceIn(0, grid.lastIndex)
+                    return if (k == grid.lastIndex) grid[k] else grid[k] + (grid[k + 1] - grid[k]) * (beat - k)
+                }
+                val outSide = outAnalysis?.tailBeats?.beats ?: outAnalysis?.headBeats?.beats
+                val inSide = inAnalysis?.headBeats?.beats ?: inAnalysis?.tailBeats?.beats
+                val trackedOut = trackedBeatsInWindow(outSide, plan.out.loopStart, beats, plan.out.beatSec)
+                val inCount = ceil((beats - progress(clock.incomingHoldSec)) * plan.fold).toInt().coerceAtLeast(1)
+                val trackedIn = trackedBeatsInWindow(inSide, plan.inn.loopStart, inCount, plan.inn.beatSec)
+                fun outPositions(grid: DoubleArray?) = DoubleArray(outTimes.size) { i ->
+                    val t = outTimes[i]
+                    if (t <= clock.releaseAt) trackedAt(grid, progress(t), plan.out.loopStart, plan.out.beatSec)
+                    else {
+                        val last = trackedAt(grid, beats.toDouble(), plan.out.loopStart, plan.out.beatSec)
+                        val previous = trackedAt(grid, beats - 1.0, plan.out.loopStart, plan.out.beatSec)
+                        last + (t - clock.releaseAt) * (last - previous) /
+                            (clock.beatTimes[beats] - clock.beatTimes[beats - 1])
+                    }
+                }
+                fun inPositions(grid: DoubleArray?): DoubleArray {
+                    val result = DoubleArray(inTimes.size)
+                    val holdProgress = progress(clock.incomingHoldSec)
+                    val rel = trackedAt(grid, max(0.0, beats - holdProgress) * plan.fold, plan.inn.loopStart, plan.inn.beatSec)
+                    val prev = trackedAt(grid, max(0.0, beats - 1.0 - holdProgress) * plan.fold, plan.inn.loopStart, plan.inn.beatSec)
+                    val endRate = (rel - prev) / (clock.beatTimes[beats] - clock.beatTimes[beats - 1])
+                    var post = rel
+                    var lastT = clock.releaseAt
+                    for (i in inTimes.indices) {
+                        val t = inTimes[i]
+                        result[i] = if (t <= clock.releaseAt) {
+                            trackedAt(grid, max(0.0, progress(t) - holdProgress) * plan.fold, plan.inn.loopStart, plan.inn.beatSec)
+                        } else {
+                            val u = ((t - clock.releaseAt) / (clock.elementAt - clock.releaseAt)).coerceIn(0.0, 1.0)
+                            val rate = endRate + (1.0 - endRate) * (0.5 - 0.5 * cos(PI * u))
+                            post += (t - lastT) * rate
+                            lastT = t
+                            post
+                        }
+                    }
+                    return result
+                }
+                fun ratesFit(times: List<Double>, positions: DoubleArray, hold: Double): Boolean =
+                    (1 until positions.size).all { i ->
+                        val advance = positions[i] - positions[i - 1]
+                        if (advance == 0.0 && times[i] <= hold) true else {
+                            val rate = advance / (times[i] - times[i - 1])
+                            rate.isFinite() && rate >= 1.0 - level.maxStretch - 1e-9 && rate <= 1.0 + level.maxStretch + 1e-9
+                        }
+                    }
+                var op = outPositions(trackedOut)
+                var ip = inPositions(trackedIn)
+                val useOut = trackedOut != null && ratesFit(outTimes, op, 0.0)
+                val useIn = trackedIn != null && ratesFit(inTimes, ip, clock.incomingHoldSec)
+                if (!useOut) op = outPositions(null)
+                if (!useIn) ip = inPositions(null)
+                require(ratesFit(outTimes, op, 0.0) && ratesFit(inTimes, ip, clock.incomingHoldSec))
+                return DeckKnots(DoubleArray(outTimes.size) { outTimes[it] * sr }, op,
+                    DoubleArray(inTimes.size) { inTimes[it] * sr }, ip,
+                    if (useOut) GridSource.TRACKED else GridSource.CLOCK,
+                    if (useIn) GridSource.TRACKED else GridSource.CLOCK, sampleRate)
+            }
 
             if (plan.handoff != null) {
                 val h = requireNotNull(plan.handoff)

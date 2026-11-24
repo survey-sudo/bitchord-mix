@@ -27,6 +27,8 @@ import com.music.bitchord.playback.MusicOnlyPlayback
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.AudioRouting
 import com.music.bitchord.playback.AutoMixVisualFeed
+import com.music.bitchord.playback.smart.MixInspectorFeed
+import com.music.bitchord.playback.smart.MixInspectorKey
 import com.music.bitchord.playback.audio.bitperfect.BitPerfectOutput
 import com.music.bitchord.playback.audio.bitperfect.DacVolume
 import com.music.bitchord.playback.cast.CastController
@@ -61,6 +63,9 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
     private val main = Handler(Looper.getMainLooper())
 
     override val autoMixVisualState get() = AutoMixVisualFeed.state
+
+    // FORK-HOOK(mix-inspector): only the playback engine can accept a re-pick for this preparation.
+    override fun remixCurrentTransition(key: MixInspectorKey): Boolean = MixInspectorFeed.remixCurrentTransition(key)
 
     override fun onAutoMixScrubIntent() = AutoMixVisualFeed.cancel()
 
@@ -107,6 +112,8 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         override val automixDetail get() = AppSettings.automixDetail
         // FORK-HOOK(player-status): expose AppSettings.automixStatus to sharedUi
         override val automixStatus get() = AppSettings.automixStatus
+        // FORK-HOOK(mix-inspector): AppSettings exposes the shared feed read-only.
+        override val mixInspector get() = AppSettings.mixInspector
         override val smartFadeEnabled get() = AppSettings.smartFadeEnabled
         override val autoMixArtwork get() = AppSettings.autoMixArtwork
         override val smartMixInProgress get() = AppSettings.smartMixInProgress

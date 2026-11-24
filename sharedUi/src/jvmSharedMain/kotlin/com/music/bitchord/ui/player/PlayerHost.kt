@@ -18,9 +18,12 @@ import com.music.bitchord.data.settings.MixBlend
 import com.music.bitchord.data.settings.MixTransitionView
 import com.music.bitchord.data.settings.TransitionWindow
 import com.music.bitchord.playback.AutoMixVisualState
+import com.music.bitchord.playback.smart.MixInspectorKey
+import com.music.bitchord.playback.smart.MixInspectorState
 import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Everything the player takes from the application it is drawn in.
@@ -37,6 +40,9 @@ interface PlayerHost {
 
     /** Optional in-process feed; platforms without AutoMix leave it absent. */
     val autoMixVisualState: StateFlow<AutoMixVisualState?>? get() = null
+
+    // FORK-HOOK(mix-inspector): platforms without an engine never offer a remix action.
+    fun remixCurrentTransition(key: MixInspectorKey): Boolean = false
 
     /** Visual-only seek intent, before the scrubber dispatches its transport command. */
     fun onAutoMixScrubIntent() = Unit
@@ -310,6 +316,8 @@ interface PlayerSettingsSource {
      */
     // FORK-HOOK(player-status): AutomixStatus flow read by PlayerControls & MixViewPopup
     val automixStatus: StateFlow<com.music.bitchord.playback.smart.AutomixStatus?>
+    // FORK-HOOK(mix-inspector): default absent for desktop hosts that do not publish this feed.
+    val mixInspector: StateFlow<MixInspectorState?> get() = noMixInspector
     val smartFadeEnabled: StateFlow<Boolean>
     val autoMixArtwork: StateFlow<AutoMixArtworkPreferences> get() = defaultAutoMixArtwork
     /** True only while an analysed Automix transition is audibly mixing two tracks. */
@@ -339,6 +347,7 @@ internal val PlayerSettings: PlayerSettingsSource
     get() = PlayerPlatform.host.settings
 
 private val defaultAutoMixArtwork: StateFlow<AutoMixArtworkPreferences> = MutableStateFlow(AutoMixArtworkPreferences())
+private val noMixInspector: StateFlow<MixInspectorState?> = MutableStateFlow<MixInspectorState?>(null).asStateFlow()
 
 /** The lyric offset sheet's range, in milliseconds either way. */
 const val MIN_LYRICS_OFFSET_MS = -5_000

@@ -72,7 +72,7 @@ val betaSuffix = rootProject.extra["bitchordBetaSuffix"] as String
 android {
     namespace = "com.music.bitchord"
     // InnerTubeX's AAR requires compiling against 37; targetSdk (runtime behaviour) stays 36.
-    // FORK-HOOK(gradle-djmix): keep compileSdk=36 for dvb SDK compat & bundled .onnx assets in Step 2
+    // FORK-HOOK(gradle-djmix): keep compileSdk=36 for dvb SDK compat
     compileSdk = 36
 
     defaultConfig {
@@ -129,19 +129,10 @@ android {
     sourceSets {
         getByName("main") {
             java.srcDir("../wearos/protocol")
-            // AUTOMIX-V2(A): QNN now comes from Maven (onnxruntime-android-qnn +
-            // qnn-runtime, see dependencies); npu-addon/ stays OFF the jniLibs source
-            // sets (it would add a second libonnxruntime.so). Historical note follows.
-            // QNN disabled in vc70 (see NpuSupport.QNN_ENABLED): the
-            // reduced-ORT build in npu-addon/prebuilt cannot see the ops
-            // ORT's optimizer introduces at load time, so both models fail
-            // on both backends since vc69, and QAIRT fails before
-            // partitioning. The Maven full libonnxruntime.so ships instead,
-            // so this dir is NOT a jniLibs source set and the ~100 MB of
-            // QAIRT libs no longer enter the APK. npu-addon/ is kept on
-            // disk for future QNN work; do not re-add it without fixing
-            // ops.config generation and the QAIRT device config. See
-            // npu-addon/README.md.
+            // npu-addon/ is deliberately NOT a jniLibs source set: it carries a second,
+            // reduced libonnxruntime.so built for QNN. djmix52 ships only the official
+            // CPU onnxruntime-android:1.31.0 from Maven, so that directory stays off the
+            // build entirely. See npu-addon/README.md for why the QNN route is dormant.
         }
     }
 
@@ -241,41 +232,15 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     packaging {
-        // AUTOMIX-V2(A): onnxruntime-android-qnn (one libonnxruntime.so, from that AAR
-        // only) + Qualcomm qnn-runtime (libQnnHtp, libQnnSystem, libQnnHtpPrepare,
-        // libQnnHtpV73Stub/Skel ...). Legacy (compressed, extracted-on-install) packaging is
-        // REQUIRED again: the HTP backend is dlopened by path from nativeLibraryDir and the
-        // DSP loads libQnnHtpV73Skel.so through ADSP_LIBRARY_PATH, which needs a real file on
-        // disk, not a page inside base.apk. 16 KB page-size support is unaffected: extracted
-        // libs need 16 KB-aligned ELF LOAD segments (our libs link with
-        // -Wl,-z,max-page-size=16384, see CMakeLists.txt), not 16 KB zip alignment.
-        // The manifest's extractNativeLibs="true" already matches this.
-        // FORK-HOOK(gradle-djmix): legacy packaging + non-v73 QNN HTP excludes
+        // djmix52 ships the official CPU ORT only: no QNN/HTP libraries, no vendor
+        // properties, no graph compiler. Legacy extraction is kept solely because the
+        // parent-owned manifest declares extractNativeLibs="true" (vc93 upgrade path);
+        // 16 KiB page support is verified by the ELF PT_LOAD alignment in
+        // tools/audit-apk.sh, not by zip alignment. To switch to uncompressed,
+        // 16 KiB-aligned libs, the manifest attribute and this flag must change together
+        // (manifest is another lane's scope).
         jniLibs {
             useLegacyPackaging = true
-            // Hexagon stubs/skels for other HTP generations are dead weight on the target
-            // (SM8635 = v73). Keep them all with -Pbitchord.qnnAllArchs=true (other phones
-            // then use the NPU too); without them a non-v73 phone fails the QNN open and
-            // stays on CPU, which is the designed fallback.
-            if (project.findProperty("bitchord.qnnAllArchs")?.toString() != "true") {
-                for (arch in listOf("V68", "V69", "V75", "V79", "V81")) {
-                    excludes += "**/libQnnHtp${arch}Stub.so"
-                    excludes += "**/libQnnHtp${arch}Skel.so"
-                    excludes += "**/libQnnHtp${arch}CalculatorStub.so"
-                }
-                // Other QNN backends (GPU, DSP, CPU reference, saver) are never used.
-                excludes += "**/libQnnGpu.so"
-                excludes += "**/libQnnDsp.so"
-                excludes += "**/libQnnDspV66Stub.so"
-                excludes += "**/libQnnDspV66Skel.so"
-                excludes += "**/libQnnCpu.so"
-                excludes += "**/libQnnSaver.so"
-            }
-            // When a precompiled beat_this_final0_qdq_ctx.onnx ships (tools/npu), the on-device
-            // graph compiler is not needed: -Pbitchord.qnnNoPrepare=true drops it (tens of MB).
-            if (project.findProperty("bitchord.qnnNoPrepare")?.toString() == "true") {
-                excludes += "**/libQnnHtpPrepare.so"
-            }
         }
         resources {
             // SMBJ's BouncyCastle and jspecify both ship this descriptor.
@@ -491,10 +456,11 @@ dependencies {
     // ---- SMB file shares: pure-Java SMB2/3 client (listing + streaming) ----
     implementation("com.hierynomus:smbj:0.15.0")
 
-    // ---- Automix: on-device beat/downbeat model (Beat This!, MIT-licensed) ----
-    // FORK-HOOK(gradle-djmix): keep ORT QNN 1.29.0 + qnn-runtime 2.42.0 for Step 2
-    implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.29.0")
-    implementation("com.qualcomm.qti:qnn-runtime:2.42.0")
+    // ---- Automix: beat/downbeat, vocal and stem models on the CPU ----
+    // Official CPU-only ORT. No QNN execution provider, no vendor runtime, and the
+    // three weights are delivered at first use (see AutomixModels), not packaged.
+    // Pinned: onnxruntime-android 1.31.0, arm64 core 34,208,680 B.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.31.0")
 
     // ---- Casting: Google Cast sender + the route discovery it sits on ----
     // The framework and the router only. media3-cast is left out on purpose:

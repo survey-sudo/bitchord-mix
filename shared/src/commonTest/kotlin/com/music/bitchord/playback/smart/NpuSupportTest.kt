@@ -6,9 +6,10 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * vc69 NPU: Snapdragon detection, QNN option maps, and CPU fallback flags.
- * Mirrors the OrchID qnn_runner.cpp option set (burst HTP, context
- * caching) with BitChord CPU fallback kept (0), not Orchard disabled (1).
+ * Device classification, dormant provider option maps and the CPU fallback flags.
+ * The option keys are the public ORT QNN provider interface; djmix52 never opens
+ * such a session (see [NpuRuntime.RUNTIME_AVAILABLE]), so this pins the shape of a
+ * future route rather than the shipped one.
  */
 class NpuSupportTest {
 
@@ -37,12 +38,16 @@ class NpuSupportTest {
 
     @Test
     fun qnnIsAttemptedOnlyWhenEnabledAndQualcomm() {
-        // vc70 ORT restore: master QNN_ENABLED=false forces all false;
-        // flipping it restores the enabled+Qualcomm expectation below.
-        assertEquals(NpuSupport.QNN_ENABLED, NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = true), NpuSupport.Vendor.QUALCOMM))
+        // djmix52 ships no QNN runtime, so every combination is false. The vendor and
+        // user-switch shape is still asserted so a future release cannot silently
+        // widen it.
+        assertFalse(NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = true), NpuSupport.Vendor.QUALCOMM))
         assertFalse(NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = false), NpuSupport.Vendor.QUALCOMM))
         assertFalse(NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = true), NpuSupport.Vendor.MEDIATEK))
         assertFalse(NpuSupport.shouldAttemptQnn(NpuSupport.NpuConfig(enabled = true), NpuSupport.Vendor.NONE))
+        // The production provider stays CPU, and the compile-time gate stays closed.
+        assertFalse(NpuSupport.QNN_ENABLED)
+        assertEquals(NpuSupport.InferenceProvider.CPU_DEFAULT, NpuSupport.defaultProvider())
     }
 
     @Test

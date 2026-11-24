@@ -51,6 +51,8 @@ class ChoreoInputs(
     /** Actual deck positions (from the renderer knots) when the caller has them. */
     val outClock: TrackClock? = null,
     val inClock: TrackClock? = null,
+    /** Preparation-only remix constraint; never changes the user's level or a running script. */
+    val excludedRecipes: Set<RecipeId> = emptySet(),
 )
 
 /** Coarse genre class for blend-length, recipe weighting, and move preferences. */

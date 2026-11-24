@@ -1,0 +1,16 @@
+<resources>
+    <string name="automix_models_title">Automix models</string>
+    <string name="automix_models_preparing_download">Preparing models · %1$d%%\nDownloading missing files. The 3 models total about %2$d MB.</string>
+    <string name="automix_models_preparing_verification">Preparing models · checking files</string>
+    <string name="automix_models_missing">Beat, vocal and stem models are not all ready. About %1$d MB in total; existing verified files are reused. Metered data needs your permission.</string>
+    <string name="automix_models_ready">All 3 models are downloaded and verified · %1$d MB.</string>
+    <string name="automix_models_preparation_failed">Couldn’t finish preparing the models. Check your connection and retry.</string>
+    <string name="automix_models_waiting_network">No connection. The 3 models total about %1$d MB; only missing files need downloading. Metered data needs your permission.</string>
+    <string name="automix_models_waiting_wifi">Waiting for Wi-Fi or another unmetered connection. The 3 models total about %1$d MB.</string>
+    <string name="automix_models_use_metered">Use metered data</string>
+    <string name="automix_models_wait_for_wifi">Wait for Wi-Fi</string>
+    <string name="automix_models_metered_title">Download using metered data?</string>
+    <string name="automix_models_metered_message">The beat, vocal and stem models total about %1$d MB. Existing verified files are reused. This download may use your data allowance.\n\nPermission applies to this download only. Future downloads will still wait for Wi-Fi or another unmetered connection.</string>
+    <string name="automix_models_delete_title">Delete Automix models?</string>
+    <string name="automix_models_delete_warning">This frees about %1$d MB and turns Automix off. You will need to download the models again to use Automix.</string>
+</resources>
