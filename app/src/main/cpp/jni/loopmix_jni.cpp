@@ -240,6 +240,12 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoudnessMatch(
 }
 
 JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetLoudnessDropWindow(
+    JNIEnv*, jclass, jlong handle, jdouble exemptStartSec, jdouble exemptEndSec, jfloat dropBumpLu) {
+  if (handle != 0) From(handle)->setLoudnessDropWindow(exemptStartSec, exemptEndSec, dropBumpLu);
+}
+
+JNIEXPORT void JNICALL
 Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetTruePeak(JNIEnv*, jclass, jlong handle,
                                                                          jboolean on) {
   if (handle != 0) From(handle)->setTruePeak(on == JNI_TRUE);

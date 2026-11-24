@@ -20,6 +20,7 @@ import com.music.bitchord.playback.smart.choreo.ChoreoRendererBridge
 import com.music.bitchord.playback.smart.choreo.ChoreoScript
 import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
 import com.music.bitchord.playback.smart.choreo.DjLevel
+import com.music.bitchord.playback.smart.choreo.RecipeId
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
@@ -101,10 +102,16 @@ class LoopMixSession private constructor(
     var inPort: LoopMixPort? = null
         private set
 
-    /** AUTOMIX-V2(E): the choreographed move (enum name) and its display label; empty = vc80 envelopes. */
+    /** AUTOMIX-V2(E): the choreographed move (enum name), display label, recipe ID, FX count, and top-3 candidates. */
     var choreoMove: String = ""
         internal set
     var choreoLabel: String = ""
+        internal set
+    var choreoRecipeId: String = ""
+        internal set
+    var choreoFxCount: Int = 0
+        internal set
+    var choreoTopCandidates: List<String> = emptyList()
         internal set
 
     private val closed = AtomicBoolean(false)
@@ -774,6 +781,7 @@ class LoopMixSession private constructor(
                     v2InStems = false
                     v2Script = ChoreoSessionGlue.withoutStems(
                         v2Prep, effectivePlan, clock, sampleRate, outAnalysis, inAnalysis, sungOut, sungIn,
+                        plannedRecipe = RecipeId.fromCode(v2Chosen.recipeId),
                     )
                 }
             }
@@ -1080,7 +1088,7 @@ class LoopMixSession private constructor(
             val v2Final = v2Script
             if (v2Final != null && v2Prep != null) {
                 ChoreoRendererBridge.apply(renderer, v2Final, v2Prep.caps, v2OutStems, v2InStems)
-                AutomixV2Choreo.history.record(v2Prep.pairKey, v2Final.move)
+                AutomixV2Choreo.history.record(v2Prep.pairKey, v2Final.move, RecipeId.fromCode(v2Final.recipeId))
             }
             renderer.setHighQuality(highQuality)
             renderer.prepare()
@@ -1090,10 +1098,15 @@ class LoopMixSession private constructor(
                 outGridSource = knots.outGridSource, inGridSource = knots.inGridSource,
             ).also {
                 it.planIncomingStart()
-                // AUTOMIX-V2(E): what the choreographer did, for the status line / telemetry.
+                // AUTOMIX-V2(E): what the choreographer did, for the status line / Mix Inspector / telemetry.
                 if (v2Final != null) {
                     it.choreoMove = v2Final.move.name
                     it.choreoLabel = v2Final.label
+                    it.choreoRecipeId = v2Final.recipeId
+                    it.choreoFxCount = v2Final.fxCount
+                    it.choreoTopCandidates = v2Final.topCandidates.map { cand ->
+                        "${cand.recipeId.code} (${cand.recipeName}): ${((cand.total * 100.0).toLong() / 100.0)}"
+                    }
                 }
             }
         }

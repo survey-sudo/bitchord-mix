@@ -7,8 +7,7 @@ import com.music.bitchord.playback.smart.StemSet
 /**
  * AUTOMIX-V2(E) -> C adapter: the ONLY place the choreographer touches stream
  * C's renderer additions (V2_CAPABILITIES, KIND_STEM_*, KIND_FILTER_RES ..
- * KIND_BRAKE, setDeckStems, setPhaser/Gate/Riser/Pump/Brake). A late rename
- * or renumbering in C is a fix in this file only.
+ * KIND_BRAKE, setDeckStems, setPhaser/Gate/Riser/Pump/Brake, setLoudnessDropWindow).
  *
  * Worker thread only (called from LoopMixSession.build before prepare()).
  */
@@ -16,29 +15,37 @@ internal object ChoreoRendererBridge {
     private const val TAG = "BitChordChoreo"
 
     // Stream C's native capability bits (native/loopmix/dj_fx.h `Capability`),
-    // which LoopMixRenderer.V2_CAPABILITIES mirrors. Translated to ChoreoCaps.
+    // which LoopMixRenderer.V2_CAPABILITIES mirrors 1:1 with ChoreoCaps.
     private const val C_STEMS = 1 shl 0
     private const val C_FILTER_RES = 1 shl 1
+    private const val C_FILTER_KNOB = 1 shl 2
     private const val C_PHASER = 1 shl 3
     private const val C_GATE = 1 shl 4
+    private const val C_STUTTER = 1 shl 5
     private const val C_RISER = 1 shl 6
     private const val C_PUMP = 1 shl 7
     private const val C_BRAKE = 1 shl 8
+    private const val C_SPINBACK = 1 shl 9
     private const val C_LOUDNESS = 1 shl 10
+    private const val C_TRUE_PEAK = 1 shl 11
 
     /** The renderer's v2 abilities in [ChoreoCaps] bits; 0 when the library or the constant is missing. */
     fun capabilities(): Int {
         if (!LoopMixRenderer.available) return 0
-        val native = runCatching { LoopMixRenderer.v2Capabilities() }.getOrDefault(0) // AUTOMIX-V2(orch): runtime caps, not the compile-time const
+        val native = runCatching { LoopMixRenderer.v2Capabilities() }.getOrDefault(0)
         var caps = 0
         if ((native and C_STEMS) != 0) caps = caps or ChoreoCaps.STEMS
         if ((native and C_FILTER_RES) != 0) caps = caps or ChoreoCaps.FILTER_RES
+        if ((native and C_FILTER_KNOB) != 0) caps = caps or ChoreoCaps.FILTER_KNOB
         if ((native and C_PHASER) != 0) caps = caps or ChoreoCaps.PHASER
         if ((native and C_GATE) != 0) caps = caps or ChoreoCaps.GATE
+        if ((native and C_STUTTER) != 0) caps = caps or ChoreoCaps.STUTTER
         if ((native and C_RISER) != 0) caps = caps or ChoreoCaps.RISER
         if ((native and C_PUMP) != 0) caps = caps or ChoreoCaps.PUMP
         if ((native and C_BRAKE) != 0) caps = caps or ChoreoCaps.BRAKE
+        if ((native and C_SPINBACK) != 0) caps = caps or ChoreoCaps.SPINBACK
         if ((native and C_LOUDNESS) != 0) caps = caps or ChoreoCaps.LOUDNESS
+        if ((native and C_TRUE_PEAK) != 0) caps = caps or ChoreoCaps.TRUE_PEAK
         return caps
     }
 
@@ -97,11 +104,11 @@ internal object ChoreoRendererBridge {
             renderer.setIsolate(LoopMixRenderer.OUT, true)
             renderer.setIsolate(LoopMixRenderer.IN, true)
         }
-        // AUTOMIX-V2(orch): the loudness guard (no dip / no bump across the overlap) and the -1 dBTP
-        // true-peak limiter were built in C but never switched on. Choreographed transitions only, so
-        // vc91 paths stay bit-identical; setLoudnessMatch also enables the true-peak limiter.
         if (ChoreoCaps.has(caps, ChoreoCaps.LOUDNESS)) {
             renderer.setLoudnessMatch(true, LOUDNESS_TARGET_LUFS)
+            if (script.dropExemptEndSec > script.dropExemptStartSec && script.dropBumpLu > 0f) {
+                renderer.setLoudnessDropWindow(script.dropExemptStartSec, script.dropExemptEndSec, script.dropBumpLu)
+            }
         }
     }
 
@@ -110,7 +117,12 @@ internal object ChoreoRendererBridge {
 
     private fun writeDeck(renderer: LoopMixRenderer, index: Int, lanes: Map<EnvKind, Env>, caps: Int, stems: Boolean) {
         for ((kind, env) in lanes) {
-            if (kind.v2 && !ChoreoCaps.has(caps, kind.cap)) continue
+            val capOk = when (kind) {
+                EnvKind.GATE_DEPTH -> ChoreoCaps.has(caps, ChoreoCaps.GATE) || ChoreoCaps.has(caps, ChoreoCaps.STUTTER)
+                EnvKind.BRAKE -> ChoreoCaps.has(caps, ChoreoCaps.BRAKE) || ChoreoCaps.has(caps, ChoreoCaps.SPINBACK)
+                else -> ChoreoCaps.has(caps, kind.cap)
+            }
+            if (kind.v2 && !capOk) continue
             if (kind.isStem && !stems) continue
             renderer.setEnvelope(index, rendererKind(kind), env.times, env.values, env.exponential)
         }
@@ -121,7 +133,6 @@ internal object ChoreoRendererBridge {
         if (fx.reverb) renderer.setReverb(index, fx.reverbRoom, fx.reverbDamping, fx.reverbWet)
         if (fx.flanger) renderer.setFlanger(index, fx.flangerLfoHz, fx.flangerDepthSec, fx.flangerFeedback, fx.flangerWet)
         if (index == LoopMixRenderer.OUT) {
-            // vc80 may have armed a roll / a buildup Q on the outgoing deck; the script decides now.
             if (fx.loopRoll) {
                 renderer.setLoopRoll(index, true, fx.rollStartSec, fx.rollBeatSec, fx.rollReleaseSec, fx.rollTotalBeats)
             } else {
@@ -131,21 +142,22 @@ internal object ChoreoRendererBridge {
         } else {
             fx.svfQ?.let { renderer.setSvfQ(index, it) }
         }
-        // v2 setters: only when the native side says it has them.
         if (fx.phaser && ChoreoCaps.has(caps, ChoreoCaps.PHASER)) {
             renderer.setPhaser(index, fx.phaserRateBeats, fx.phaserDepth, fx.phaserFeedback)
         }
-        if (fx.gate && ChoreoCaps.has(caps, ChoreoCaps.GATE)) {
+        val gateCap = if (fx.gateDivision < 0f) ChoreoCaps.STUTTER else ChoreoCaps.GATE
+        if (fx.gate && ChoreoCaps.has(caps, gateCap)) {
             renderer.setGate(index, fx.gateBeatSec, fx.gateDivision, fx.gateSwing)
         }
         if (fx.riser && ChoreoCaps.has(caps, ChoreoCaps.RISER)) {
             renderer.setRiser(index, fx.riserBeatSec, fx.riserLengthBeats)
         }
         if (fx.pump && ChoreoCaps.has(caps, ChoreoCaps.PUMP)) {
-            renderer.setPump(index, fx.pumpBeatSec)
+            renderer.setPump(index, fx.pumpBeatSec, fx.pumpFullBand)
         }
-        if (fx.brake && ChoreoCaps.has(caps, ChoreoCaps.BRAKE)) {
-            renderer.setBrake(index, fx.brakeStartSec, fx.brakeLengthSec)
+        val brakeCap = if (fx.brakeSpinback) ChoreoCaps.SPINBACK else ChoreoCaps.BRAKE
+        if (fx.brake && ChoreoCaps.has(caps, brakeCap)) {
+            renderer.setBrake(index, fx.brakeStartSec, fx.brakeLengthSec, fx.brakeSpinback)
         }
     }
 }

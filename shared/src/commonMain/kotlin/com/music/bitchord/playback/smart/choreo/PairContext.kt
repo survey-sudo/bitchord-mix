@@ -35,6 +35,8 @@ class ChoreoInputs(
     val pairKey: String = "",
     /** Recent moves, most recent last (from [AutomixV2Choreo.history]). */
     val history: List<Move> = emptyList(),
+    /** Recent recipe IDs, most recent last (from [AutomixV2Choreo.history]). */
+    val recipeHistory: List<RecipeId> = emptyList(),
     val seed: Long = AutomixV2Choreo.seed,
     val sungOut: List<LoopMix.Span>? = null,
     val sungIn: List<LoopMix.Span>? = null,
@@ -51,8 +53,8 @@ class ChoreoInputs(
     val inClock: TrackClock? = null,
 )
 
-/** Coarse genre class for blend-length and move preferences. */
-enum class GenreClass { DANCE, HIPHOP, POP, BALLAD, UNKNOWN }
+/** Coarse genre class for blend-length, recipe weighting, and move preferences. */
+enum class GenreClass { DANCE, HIPHOP, POP, ROCK, BALLAD, UNKNOWN }
 
 /** Camelot relation between the outgoing exit key and the incoming entry key. */
 enum class Harmony(val score: Double) {
@@ -240,6 +242,9 @@ class PairContext(val inputs: ChoreoInputs) {
         val hipBpm = { x: Double -> x in 78.0..102.0 || x in 150.0..180.0 }
         if (hipBpm(outBpm) && hipBpm(inBpm) && a.vocalProbability >= 0.5 && b.vocalProbability >= 0.5) return GenreClass.HIPHOP
         if (dance) return GenreClass.DANCE
+        if (!bothSteady && beatConf >= 0.35 && !soft(a) && !soft(b) && (a.vocalProbability < 0.7 || b.vocalProbability < 0.7)) {
+            return GenreClass.ROCK
+        }
         return GenreClass.POP
     }
 

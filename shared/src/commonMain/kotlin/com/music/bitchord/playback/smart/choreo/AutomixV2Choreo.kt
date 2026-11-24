@@ -14,12 +14,9 @@ package com.music.bitchord.playback.smart.choreo
 /**
  * How much DJ the user wants. Plain enum so settings/UI can store it by name.
  *
- * SUBTLE is the default: research on Apple AutoMix says the main complaint is
- * that it "draws attention to itself". SUBTLE keeps the clean moves (fade,
- * smooth blend, bass swap, drums-first, instrumental bed, muffle, echo-out,
- * loop extend, in-window drops) with light FX. CLUB adds acapella, drum swap,
- * phaser/flanger dissolves, pump and drop re-timing. FESTIVAL adds brake cuts
- * and full-depth risers/gates.
+ * SUBTLE is the default: S1..S5, max 1 FX, 3% stretch cap, restrained blends.
+ * CLUB: C1..C7, 1-2 FX, 6% stretch cap, up to 32 s drop re-time.
+ * FESTIVAL: F1..F8, 2-3 layered FX, 8% stretch cap, up to 64 s drop re-time.
  */
 enum class DjLevel(
     /** Multiplier on wet/send/resonance/riser/gate depths. */
@@ -30,10 +27,12 @@ enum class DjLevel(
     val maxEntrySkipSec: Double,
     /** Small score bias toward "showier" moves; negative at SUBTLE keeps it quiet. */
     val showBias: Double,
+    /** Tempo-stretch cap for beat-matched recipes at this level (0.03 = 3%, 0.06 = 6%, 0.08 = 8%). */
+    val maxStretch: Double,
 ) {
-    SUBTLE(0.6f, 1, 0.0, -0.10),
-    CLUB(0.85f, 1, 32.0, 0.0),
-    FESTIVAL(1.0f, 2, 64.0, 0.10),
+    SUBTLE(0.6f, 1, 0.0, -0.10, 0.03),
+    CLUB(0.85f, 2, 32.0, 0.0, 0.06),
+    FESTIVAL(1.0f, 3, 64.0, 0.10, 0.08),
     ;
 
     fun atLeast(other: DjLevel): Boolean = ordinal >= other.ordinal
@@ -67,7 +66,7 @@ object AutomixV2Choreo {
     /** Seed for the variety jitter; deterministic for a given seed + pair. */
     @Volatile var seed: Long = 0L
 
-    /** A best candidate scoring below this is not used (vc80 envelopes stay). */
+    /** A best candidate scoring below this is not used at SUBTLE (vc80 envelopes stay). */
     @Volatile var minScore: Double = 0.15
 
     /** Regions longer than this are not sent to the stem separator (worker-time budget). */
@@ -76,24 +75,27 @@ object AutomixV2Choreo {
     /** Minimum separator confidence before a StemSet is trusted. */
     const val MIN_STEM_CONFIDENCE = 0.35f
 
-    /** Recent moves, for the variety rule. Process-wide, survives across transitions. */
+    /** Recent moves and recipes, for the variety rule. Process-wide, survives across transitions. */
     val history: MoveHistory = MoveHistory()
 }
 
 /**
- * The last few chosen moves, one entry per pair (a rebuild of the same pair
- * replaces its entry instead of counting twice). Lock-free: the list is
- * immutable and swapped whole.
+ * The last few chosen moves and recipes, one entry per pair (a rebuild of the
+ * same pair replaces its entry instead of counting twice). Lock-free: the list
+ * is immutable and swapped whole.
  */
 class MoveHistory(private val capacity: Int = 8) {
-    @Volatile private var entries: List<Pair<String, Move>> = emptyList()
+    private data class Entry(val pairKey: String, val move: Move, val recipeId: RecipeId?)
 
-    fun record(pairKey: String, move: Move) {
+    @Volatile private var entries: List<Entry> = emptyList()
+
+    fun record(pairKey: String, move: Move, recipeId: RecipeId? = null) {
         val current = entries
-        val next = if (current.isNotEmpty() && current.last().first == pairKey) {
-            current.dropLast(1) + (pairKey to move)
+        val entry = Entry(pairKey, move, recipeId)
+        val next = if (current.isNotEmpty() && current.last().pairKey == pairKey) {
+            current.dropLast(1) + entry
         } else {
-            current + (pairKey to move)
+            current + entry
         }
         entries = if (next.size > capacity) next.takeLast(capacity) else next
     }
@@ -101,8 +103,15 @@ class MoveHistory(private val capacity: Int = 8) {
     /** Most recent last, excluding an entry for [pairKey] itself (a rebuild must not penalise its own move). */
     fun recent(pairKey: String? = null): List<Move> {
         val list = entries
-        val trimmed = if (pairKey != null && list.isNotEmpty() && list.last().first == pairKey) list.dropLast(1) else list
-        return trimmed.map { it.second }
+        val trimmed = if (pairKey != null && list.isNotEmpty() && list.last().pairKey == pairKey) list.dropLast(1) else list
+        return trimmed.map { it.move }
+    }
+
+    /** Most recent recipes last, excluding an entry for [pairKey] itself. */
+    fun recentRecipes(pairKey: String? = null): List<RecipeId> {
+        val list = entries
+        val trimmed = if (pairKey != null && list.isNotEmpty() && list.last().pairKey == pairKey) list.dropLast(1) else list
+        return trimmed.mapNotNull { it.recipeId }
     }
 
     fun clear() {

@@ -1,7 +1,7 @@
 package com.music.bitchord.playback.smart.choreo
 
-import kotlin.math.ln
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.pow
 
 /**
@@ -77,20 +77,23 @@ enum class EnvKind(val neutral: Float, val exponential: Boolean, val v2: Boolean
 }
 
 /**
- * Renderer capability bits as the choreographer reads them. The app bridge
- * translates `LoopMixRenderer.V2_CAPABILITIES` into this layout (one table,
- * see ChoreoRendererBridge) so a late renumbering in stream C is a one-line fix.
+ * Renderer capability bits as the choreographer reads them, matching
+ * `LoopMixRenderer.CAP_*` / native `v2::Capability` 1:1.
  */
 object ChoreoCaps {
     const val STEMS = 1 shl 0
     const val FILTER_RES = 1 shl 1
-    const val PHASER = 1 shl 2
-    const val GATE = 1 shl 3
-    const val RISER = 1 shl 4
-    const val PUMP = 1 shl 5
-    const val BRAKE = 1 shl 6
-    const val LOUDNESS = 1 shl 7
-    const val ALL = STEMS or FILTER_RES or PHASER or GATE or RISER or PUMP or BRAKE or LOUDNESS
+    const val FILTER_KNOB = 1 shl 2
+    const val PHASER = 1 shl 3
+    const val GATE = 1 shl 4
+    const val STUTTER = 1 shl 5
+    const val RISER = 1 shl 6
+    const val PUMP = 1 shl 7
+    const val BRAKE = 1 shl 8
+    const val SPINBACK = 1 shl 9
+    const val LOUDNESS = 1 shl 10
+    const val TRUE_PEAK = 1 shl 11
+    const val ALL = STEMS or FILTER_RES or FILTER_KNOB or PHASER or GATE or STUTTER or RISER or PUMP or BRAKE or SPINBACK or LOUDNESS or TRUE_PEAK
 
     fun has(caps: Int, bit: Int): Boolean = bit == 0 || (caps and bit) == bit
 }
@@ -205,6 +208,8 @@ data class DeckFx(
     val brake: Boolean = false,
     val brakeStartSec: Double = 0.0,
     val brakeLengthSec: Double = 0.0,
+    val brakeSpinback: Boolean = false,
+    val pumpFullBand: Boolean = false,
     val loopRoll: Boolean = false,
     val rollStartSec: Double = 0.0,
     val rollBeatSec: Double = 0.5,
@@ -213,11 +218,24 @@ data class DeckFx(
     /** Cytomic SVF Q for the deck's filters; null leaves the renderer default. */
     val svfQ: Float? = null,
 ) {
-    /** How many audible effects this deck uses (the "1 FX per transition" budget). */
+    /** How many audible effects this deck uses (the level FX budget). */
     val fxCount: Int
         get() = (if (echoDelaySec > 0.0) 1 else 0) + (if (reverb) 1 else 0) + (if (flanger) 1 else 0) +
             (if (phaser) 1 else 0) + (if (gate) 1 else 0) + (if (riser) 1 else 0) + (if (pump) 1 else 0) +
             (if (brake) 1 else 0)
+
+    /** Human-readable active effect names matching [fxCount] (for Mix Inspector / telemetry). */
+    val activeFxNames: List<String>
+        get() = buildList {
+            if (echoDelaySec > 0.0) add("Echo")
+            if (reverb) add("Reverb")
+            if (flanger) add("Flanger")
+            if (phaser) add("Phaser")
+            if (gate) add(if (gateDivision < 0f) "Stutter" else "Gate")
+            if (riser) add("Riser")
+            if (pump) add(if (pumpFullBand) "Pump (full)" else "Pump")
+            if (brake) add(if (brakeSpinback) "Spinback" else "Brake")
+        }
 
     companion object {
         val NONE = DeckFx()
@@ -251,7 +269,8 @@ data class ScoreBreakdown(
 
 /**
  * One chosen transition on the plan's clock: per-deck lanes in mix seconds,
- * per-deck effects, and whether stems were relied on.
+ * per-deck effects, whether stems were relied on, recipe metadata, and any
+ * Festival drop loudness exemption window.
  */
 class ChoreoScript(
     val move: Move,
@@ -271,8 +290,16 @@ class ChoreoScript(
     val isolate: Boolean,
     val score: ScoreBreakdown,
     val reason: String,
+    val recipeId: String = "",
+    val recipeName: String = move.label,
+    val topCandidates: List<Candidate> = emptyList(),
+    val dropExemptStartSec: Double = 1e18,
+    val dropExemptEndSec: Double = -1e18,
+    val dropBumpLu: Float = 0f,
 ) {
-    val label: String get() = move.label
+    val label: String get() = recipeName.ifEmpty { move.label }
+
+    val fxCount: Int get() = outFx.fxCount + inFx.fxCount
 
     /** Value of [kind] on the given deck at [t], neutral when the script does not write it. */
     fun value(outDeck: Boolean, kind: EnvKind, t: Double): Float {

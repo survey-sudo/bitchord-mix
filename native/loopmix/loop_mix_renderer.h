@@ -399,6 +399,13 @@ class Renderer {
    * true-peak limiter on.
    */
   void setLoudnessMatch(bool enabled, float targetLufs);
+  /**
+   * Festival loudness drop exemption: during [exemptStartSec, exemptEndSec]
+   * (pre-drop build tension), exempts from the "no dip" upward boost; during
+   * the following drop impact bar [exemptEndSec, exemptEndSec + bar], allows
+   * +[dropBumpLu] LU above the ceiling and A->B line. Inactive by default.
+   */
+  void setLoudnessDropWindow(double exemptStartSec, double exemptEndSec, float dropBumpLu);
   /** 4x oversampled true-peak detection in the limiter (-1 dBTP). */
   void setTruePeak(bool on) { truePeakExplicit_ = on; }
   /** EBU R128 short-term (3 s) loudness: 0/1 = deck programme, 2 = output bus. -120 when unknown. */
@@ -445,6 +452,9 @@ class Renderer {
   // AUTOMIX-V2(C) state. Pre-allocated in prepare(); render thread only after that.
   bool loudnessOn_ = false;
   float targetLufs_ = 0.f;
+  double dropExemptStartSec_ = 1e18;
+  double dropExemptEndSec_ = -1e18;
+  float dropBumpLu_ = 0.f;
   bool truePeakExplicit_ = false;
   v2::LoudnessMeter busMeter_, outMeter_;
   float guardDb_ = 0.f;

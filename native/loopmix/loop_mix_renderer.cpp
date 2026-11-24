@@ -1475,6 +1475,18 @@ void Renderer::setLoudnessMatch(bool enabled, float targetLufs) {
   targetLufs_ = (targetLufs < -3.f && targetLufs > -60.f) ? targetLufs : 0.f;  // NaN fails both
 }
 
+void Renderer::setLoudnessDropWindow(double exemptStartSec, double exemptEndSec, float dropBumpLu) {
+  if (!std::isfinite(exemptStartSec) || !std::isfinite(exemptEndSec) || exemptEndSec <= exemptStartSec) {
+    dropExemptStartSec_ = 1e18;
+    dropExemptEndSec_ = -1e18;
+    dropBumpLu_ = 0.f;
+    return;
+  }
+  dropExemptStartSec_ = exemptStartSec;
+  dropExemptEndSec_ = exemptEndSec;
+  dropBumpLu_ = std::isfinite(dropBumpLu) ? std::clamp(dropBumpLu, 0.f, 6.f) : 0.f;
+}
+
 double Renderer::beatPosAt(double t) const {
   const size_t n = gridTimes_.size();
   if (n >= 2) {
@@ -1692,18 +1704,33 @@ void Renderer::loudnessPreBlock(int64_t frame, int frames) {
 }
 
 void Renderer::loudnessGuard(int64_t frame, int frames) {
-  (void)frame;
+  const double sr = double(sampleRate_);
+  const double tMid = (double(frame) + 0.5 * double(frames)) / sr;
   for (int i = 0; i < frames; ++i) busMeter_.push(mixLeft_[i], mixRight_[i]);
   float desired = 0.f;
   const double pb = busMeter_.meanPower(kLoudCtrlSlots);
   if (overlap_ > 0.f && busMeter_.filled >= 5 && pb > kLoudGatePower) {
     const double lb = v2::LoudnessMeter::lufs(pb);
     double delta = lineLufs_ - lb;  // > 0: dip below the A->B line; < 0: bump above it
+    const bool dropWindowActive = dropExemptEndSec_ > dropExemptStartSec_;
+    const bool inPreDrop = dropWindowActive && tMid >= dropExemptStartSec_ && tMid < dropExemptEndSec_;
+    const double barSec = 4.0 * beatDurAt(tMid);
+    const bool inDropImpact = dropWindowActive && dropBumpLu_ > 0.f &&
+        tMid >= dropExemptEndSec_ && tMid < dropExemptEndSec_ + barSec;
+    if (inPreDrop && delta > 0.0) {
+      // Pre-drop build tension: preserve deliberate dips (no upward boost).
+      delta = 0.0;
+    }
     // A dip of 8 LU or more is a deliberate move (breakdown, brake, kill): don't chase it.
     const double dipWeight = std::clamp((8.0 - delta) / 2.0, 0.0, 1.0);
+    if (inDropImpact && delta < 0.0) {
+      // Drop impact bar: allow +dropBumpLu above the A->B line without attenuation.
+      delta = std::min(0.0, delta + double(dropBumpLu_));
+    }
     delta = std::clamp(delta, -4.0, 3.0);
     if (targetLufs_ < 0.f) {
-      const double ceiling = std::max(std::max(deckLufs_[0], deckLufs_[1]), double(targetLufs_)) + 1.0;
+      double ceiling = std::max(std::max(deckLufs_[0], deckLufs_[1]), double(targetLufs_)) + 1.0;
+      if (inDropImpact) ceiling += double(dropBumpLu_);
       if (lb + delta > ceiling) delta = ceiling - lb;
     }
     desired = float(delta * dipWeight * double(overlap_));

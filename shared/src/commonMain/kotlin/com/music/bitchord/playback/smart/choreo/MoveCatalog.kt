@@ -2,26 +2,21 @@ package com.music.bitchord.playback.smart.choreo
 
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.SectionKind
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * What a move needs before it may be scored. Checked against a
- * [PairContext]; the first failing requirement is the reason it was skipped.
+ * Legacy [Move] requirement summary (kept for diagnostic / test inspection).
  */
 data class Requirements(
-    /** 0 = none, 2 = vocal/instrumental split, 4 = full stems. Per deck. */
     val outStems: Int = 0,
     val inStems: Int = 0,
-    /** [ChoreoCaps] bits that must be present. */
     val caps: Int = 0,
     val beatMatched: Boolean = false,
     val minBeatConf: Double = 0.0,
-    /** Bars from incoming audible to release the move needs. */
     val minOverlapBars: Double = 0.0,
-    /** Highest folded tempo gap the move tolerates (0.08 = 8%). */
     val maxTempoGap: Double = Double.POSITIVE_INFINITY,
-    /** The move only makes sense with a compatible key (and confident keys). */
     val harmonicCompatible: Boolean = false,
     val outLoops: Boolean = false,
 )
@@ -36,13 +31,12 @@ class Built(
     val inUsesStems: Boolean,
     val isolate: Boolean,
     val note: String,
+    val resolvedMove: Move? = null,
 )
 
 /**
- * The catalogue: requirements, swap-beat windows and envelope builders for
- * each [Move]. All builders write every vc80 kind on both decks (so a script
- * fully owns the transition) and start the outgoing deck neutral at t0 and
- * leave the incoming deck neutral by the release.
+ * The catalogue: gates, swap-beat windows, and step-list interpreter for every
+ * [Recipe] in [Recipes] (and legacy [Move] wrappers).
  */
 object MoveCatalog {
     const val KILL_DB = -24f
@@ -67,45 +61,92 @@ object MoveCatalog {
         Move.PUMP_BLEND -> Requirements(caps = ChoreoCaps.PUMP, beatMatched = true, minBeatConf = 0.55, minOverlapBars = 4.0, maxTempoGap = 0.06)
     }
 
-    /** Null when [move] may be scored here; otherwise why not. */
-    fun reject(move: Move, c: PairContext): String? {
+    // ---- Recipe gating -----------------------------------------------------------------------
+
+    /**
+     * Null when [recipe] may be scored for [c]; otherwise the rejection reason.
+     * When [forcedMode] is true (forced recipe / no-stem same-recipe fallback),
+     * stem and non-essential cap gates are relaxed so [Recipe.noStemSteps] can run.
+     */
+    fun reject(recipe: Recipe, c: PairContext, forcedMode: Boolean = false): String? {
         val inputs = c.inputs
-        if (!inputs.level.atLeast(move.minLevel)) return "level ${inputs.level} < ${move.minLevel}"
-        if (inputs.albumOrder && move != Move.SIMPLE_FADE && move != Move.APPLE_STYLE_SMOOTH) return "album order"
-        val r = requirementsOf(move)
-        if (!ChoreoCaps.has(inputs.caps, r.caps)) return "renderer lacks caps ${r.caps}"
-        if (r.outStems > 0 && !stemsOk(inputs.outStems, r.outStems, inputs)) return "outgoing stems < ${r.outStems}"
-        if (r.inStems > 0 && !stemsOk(inputs.inStems, r.inStems, inputs)) return "incoming stems < ${r.inStems}"
-        if (r.beatMatched && !c.beatMatched) return "not beat-matched"
-        if (c.beatConf < r.minBeatConf && !(move == Move.FILTER_WASH_ECHO_OUT && c.outBeatConf >= r.minBeatConf) &&
-            !(move == Move.BRAKE_CUT && c.outBeatConf >= r.minBeatConf)
-        ) return "beat confidence ${c.beatConf}"
-        if (c.overlapBars + 1e-9 < r.minOverlapBars) return "overlap ${c.overlapBars} bars"
-        if (c.tempoGap > r.maxTempoGap && r.beatMatched) return "tempo gap ${c.tempoGap}"
-        if (r.harmonicCompatible && !c.harmony.compatible) return "keys ${c.harmony}"
-        if (r.outLoops && !c.plan.outLoops) return "outgoing does not loop"
-        return when (move) {
-            Move.ACAPELLA_OVER_INSTRUMENTAL -> {
-                val outV = c.mean(c.inAudibleAt, c.release) { c.outVocalAt(it) } ?: 0.0
-                val inV = c.mean(c.inAudibleAt, c.release) { c.inVocalAt(it) } ?: 1.0
+        if (inputs.level != recipe.minLevel) {
+            return "level ${inputs.level} != ${recipe.minLevel}"
+        }
+        if (inputs.albumOrder) {
+            val allowedOnAlbum = when (inputs.level) {
+                DjLevel.SUBTLE -> recipe.id == RecipeId.S5 || recipe.id == RecipeId.S1
+                DjLevel.CLUB -> recipe.id == RecipeId.C2
+                DjLevel.FESTIVAL -> recipe.id == RecipeId.F2 || recipe.id == RecipeId.F5
+            }
+            if (!allowedOnAlbum) return "album order"
+        }
+        if (recipe.requiresOutLoop && !c.plan.outLoops) return "outgoing does not loop"
+        if (recipe.requiresHarmony && !c.harmony.compatible) return "keys ${c.harmony}"
+        if (recipe.requiresDrops) {
+            if (recipe.requiresOutDrop) {
+                if (c.inputs.outStructure.drops.isEmpty() || c.inputs.inStructure.drops.isEmpty()) {
+                    return "both tracks need drops"
+                }
+            } else if (dropBeat(c) == null) {
+                return "no incoming drop in the window"
+            }
+        }
+        if (recipe.requiresBeatMatch && !c.beatMatched) return "not beat-matched"
+        if (recipe.needsGridConfidence && c.beatConf < recipe.minBeatConf) {
+            return "beat confidence ${c.beatConf}"
+        }
+        if (c.overlapBars + 1e-9 < recipe.minOverlapBars) return "overlap ${c.overlapBars} bars"
+        if (recipe.requiresBeatMatch) {
+            val cap = min(recipe.stretchCap, inputs.level.maxStretch)
+            if (c.tempoGap > cap) return "tempo gap ${c.tempoGap} > $cap"
+        }
+        if (!forcedMode) {
+            if (!ChoreoCaps.has(inputs.caps, recipe.requiredCaps)) {
+                return "renderer lacks caps ${recipe.requiredCaps}"
+            }
+            if (recipe.requiresStems > 0) {
+                val needIn = if (recipe.id == RecipeId.C3 || recipe.id == RecipeId.F4) 0 else recipe.requiresStems
+                if (!stemsOk(inputs.outStems, recipe.requiresStems, inputs)) return "outgoing stems < ${recipe.requiresStems}"
+                if (needIn > 0 && !stemsOk(inputs.inStems, needIn, inputs)) return "incoming stems < $needIn"
+            }
+            if (recipe.id == RecipeId.S5) {
+                val compatible = !PairScorer.incompatible(c) && c.genre != GenreClass.BALLAD && !inputs.albumOrder
+                if (compatible) return "simple fade reserved for ballads/incompatible pairs"
+            }
+            if (recipe.id == RecipeId.F6 && c.genre != GenreClass.DANCE) {
+                return "pump is for house/EDM"
+            }
+            if (recipe.id == RecipeId.F7 && c.genre != GenreClass.HIPHOP && c.tempoGap <= 0.06) {
+                return "spinback is for hip-hop/R&B or tempo jump"
+            }
+        }
+        return when (recipe.id) {
+            RecipeId.C3, RecipeId.F4 -> if (forcedMode) null else {
+                val outV = c.mean(c.inAudibleAt, c.release) { c.outVocalAt(it) } ?: c.outVocalProb
+                val inV = c.mean(c.inAudibleAt, c.release) { c.inVocalAt(it) } ?: c.inVocalProb
                 when {
                     outV < 0.25 -> "outgoing not singing ($outV)"
-                    inV > 0.2 && inputs.inStems?.vocalSplit != true -> "incoming intro sings ($inV)"
+                    inV > 0.25 && inputs.inStems?.vocalSplit != true && !(inputs.stemsExpected && inputs.stemsExpectedCount >= 2) ->
+                        "incoming intro sings ($inV)"
                     else -> null
                 }
             }
-            Move.INSTRUMENTAL_BED -> {
-                if (inputs.outStems == null && !inputs.stemsExpected && c.inVocalEntry(c.inAudibleAt, c.release) == null) "no incoming vocal entry" else null
+            RecipeId.C4 -> if (forcedMode) null else {
+                if (inputs.outStems == null && !inputs.stemsExpected &&
+                    c.inVocalEntry(c.inAudibleAt, c.release) == null && c.inVocalProb < 0.35
+                ) "no incoming vocal entry" else null
             }
-            Move.EDM_BUILD_DROP -> {
-                if (c.genre != GenreClass.DANCE) "not a dance pair"
-                else if (dropBeat(c) == null) "no incoming drop in the window"
-                else null
-            }
-            Move.BRAKE_CUT -> if (c.tempoGap <= 0.08 && c.genre != GenreClass.HIPHOP) "no genre/tempo jump" else null
-            Move.PUMP_BLEND -> if (c.genre != GenreClass.DANCE) "pump is for house/EDM" else null
             else -> null
         }
+    }
+
+    /** Legacy [Move] wrapper for diagnostics. */
+    fun reject(move: Move, c: PairContext): String? {
+        val matches = Recipes.forMove(c.inputs.level, move)
+        if (matches.isEmpty()) return "level ${c.inputs.level} < ${move.minLevel}"
+        val reasons = matches.mapNotNull { reject(it, c) }
+        return if (reasons.size < matches.size) null else reasons.firstOrNull()
     }
 
     private fun stemsOk(view: StemView?, need: Int, inputs: ChoreoInputs): Boolean {
@@ -116,37 +157,86 @@ object MoveCatalog {
 
     // ---- swap-beat windows -------------------------------------------------------------------
 
-    /** Candidate swap beats (bar lines on the mix clock) for [move]. */
-    fun swapBeats(move: Move, c: PairContext): List<Int> {
+    fun swapBeats(recipe: Recipe, c: PairContext): List<Int> {
         val kIn = c.kIn
         val kRel = c.kRel
+        if (kRel <= 0) return emptyList()
         val out = ArrayList<Int>()
-        if (move == Move.EDM_BUILD_DROP) {
-            dropBeat(c)?.let { out += it }
-            return out
+        when (recipe.swapRule) {
+            SwapWindowRule.DROP_BEAT -> {
+                dropBeat(c)?.let { out += it }
+                return out
+            }
+            SwapWindowRule.DROP_OR_LATE -> {
+                dropBeat(c)?.let { out += it }
+                if (out.isNotEmpty()) return out
+                val preferred = (kRel - 4).coerceAtLeast(kIn + 1).coerceAtMost(kRel - 1)
+                out += preferred
+                return out
+            }
+            SwapWindowRule.DROP_OR_MID -> {
+                dropBeat(c)?.let { out += it }
+                if (out.isNotEmpty()) return out
+            }
+            SwapWindowRule.FULL_FADE -> {
+                return barLinesIn(kIn, kRel, kIn).ifEmpty { listOf(kIn) }
+            }
+            else -> Unit
         }
-        val (lo, hi) = if (move.cut) {
-            val first = max(kIn, if (move == Move.FILTER_WASH_ECHO_OUT || move == Move.BRAKE_CUT) 4 else 8)
-            val last = kRel - 1
-            first to last
-        } else if (move == Move.SIMPLE_FADE) {
-            kIn to kRel
-        } else {
-            val first = kIn + 4
-            val last = kRel - 4
-            val mid = kIn + ((kRel - kIn) / 8) * 4
-            if (first <= last) first to last else mid to mid
+        if (recipe.cut) {
+            val first = when (recipe.swapRule) {
+                SwapWindowRule.CUT_BAR_5_OR_LATE -> max(kIn, min(kRel - 1, kIn + 16))
+                else -> max(kIn + 1, min(kRel - 1, 4))
+            }
+            val last = max(first, kRel - 1)
+            val lines = barLinesIn(first, last, kIn)
+            if (lines.isNotEmpty()) return lines
+            return listOf((kRel - 1).coerceAtLeast(0))
         }
-        if (lo > hi) {
-            if (move.cut && kIn <= kRel - 1) out += kIn.coerceAtLeast(0)
-            return out
+        val span = kRel - kIn
+        val mid = kIn + (span / 8) * 4
+        val (lo, hi) = when (recipe.swapRule) {
+            SwapWindowRule.BAR_9_OR_MID -> {
+                val bar9 = kIn + 32
+                if (bar9 <= kRel - 4) bar9 to bar9 else (kIn + 4) to (kRel - 4)
+            }
+            SwapWindowRule.BAR_9_OR_LATE -> {
+                val bar9 = kIn + 32
+                if (bar9 <= kRel - 4) bar9 to bar9 else (kIn + 4) to (kRel - 4)
+            }
+            SwapWindowRule.BAR_9_OR_FIRST_THIRD -> {
+                val t3 = kIn + ((span / 3) / 4) * 4
+                val target = max(kIn + 4, t3).coerceAtMost(max(kIn + 4, kRel - 4))
+                target to target
+            }
+            SwapWindowRule.EARLY_PHRASE -> (kIn + 4) to max(kIn + 4, min(kRel - 4, kIn + 16))
+            SwapWindowRule.LAST_PHRASE, SwapWindowRule.LATE_PHRASE -> {
+                val late = max(kIn + 4, kRel - 4)
+                late to late
+            }
+            else -> (kIn + 4) to (kRel - 4)
         }
-        var k = lo + ((4 - ((lo - kIn) % 4)) % 4)
+        val lines = if (lo <= hi) barLinesIn(lo, hi, kIn) else emptyList()
+        if (lines.isNotEmpty()) return lines
+        val fallback = mid.coerceIn(kIn, max(kIn, kRel - 1))
+        return listOf(fallback)
+    }
+
+    fun swapBeats(move: Move, c: PairContext): List<Int> {
+        val recipe = Recipes.forMove(c.inputs.level, move).firstOrNull()
+            ?: Recipes.ALL.firstOrNull { it.move == move }
+            ?: return emptyList()
+        return swapBeats(recipe, c)
+    }
+
+    private fun barLinesIn(lo: Int, hi: Int, kIn: Int): List<Int> {
+        if (lo > hi) return emptyList()
+        val out = ArrayList<Int>()
+        var k = lo + ((4 - (((lo - kIn) % 4 + 4) % 4)) % 4)
         while (k <= hi) {
             out += k
             k += 4
         }
-        if (out.isEmpty()) out += lo
         return out
     }
 
@@ -161,56 +251,51 @@ object MoveCatalog {
             val p = c.inPos(t)
             if (p != null) {
                 val tol = max(0.06, c.beatSecAt(k) * 0.25)
-                if (drops.any { kotlin.math.abs(it - p) <= tol }) return k
+                if (drops.any { abs(it - p) <= tol }) return k
             }
             k++
         }
         return null
     }
 
-    // ---- envelope builders -------------------------------------------------------------------
+    // ---- Step-list interpreter ---------------------------------------------------------------
 
-    fun build(move: Move, c: PairContext, swapBeat: Int): Built {
-        val L = Lanes(c, swapBeat)
-        return when (move) {
-            Move.SIMPLE_FADE -> L.simpleFade()
-            Move.APPLE_STYLE_SMOOTH -> L.appleSmooth()
-            Move.STEM_BASS_SWAP -> L.bassSwap(fx = null)
-            Move.DRUMS_FIRST -> L.drumsFirst()
-            Move.DRUM_SWAP -> L.drumSwap()
-            Move.ACAPELLA_OVER_INSTRUMENTAL -> L.acapella()
-            Move.INSTRUMENTAL_BED -> L.instrumentalBed()
-            Move.MUFFLE_IN -> L.muffleIn()
-            Move.FILTER_WASH_ECHO_OUT -> L.echoOut()
-            Move.LOOP_EXTEND -> L.loopExtend()
-            Move.EDM_BUILD_DROP -> L.buildDrop()
-            Move.BRAKE_CUT -> L.brakeCut()
-            Move.PHASER_DISSOLVE -> L.bassSwap(fx = Move.PHASER_DISSOLVE)
-            Move.FLANGER_DISSOLVE -> L.bassSwap(fx = Move.FLANGER_DISSOLVE)
-            Move.PUMP_BLEND -> L.bassSwap(fx = Move.PUMP_BLEND)
-        }
+    fun build(
+        recipe: Recipe,
+        c: PairContext,
+        swapBeat: Int,
+        forcedMove: Move? = null,
+    ): Built {
+        val compiler = StepCompiler(recipe, c, swapBeat, forcedMove)
+        return compiler.compile()
     }
 
-    /**
-     * Lane writer for one (context, swap beat). S = swap second, A = incoming
-     * audible, R = release, b = beat seconds at S.
-     */
-    private class Lanes(val c: PairContext, val k: Int) {
+    fun build(move: Move, c: PairContext, swapBeat: Int): Built {
+        val recipe = Recipes.forMove(c.inputs.level, move).firstOrNull()
+            ?: Recipes.ALL.firstOrNull { it.move == move }
+            ?: Recipes.S1
+        return build(recipe, c, swapBeat, forcedMove = move)
+    }
+
+    private class StepCompiler(
+        val recipe: Recipe,
+        val c: PairContext,
+        val k: Int,
+        val forcedMove: Move?,
+    ) {
         val S: Double = c.t(k)
         val A: Double = c.inAudibleAt
         val R: Double = c.release
         val b: Double = c.beatSecAt(k)
-        val bar: Double = b * 4
+        val bar: Double = b * 4.0
         val depth: Float = c.inputs.level.fxDepth
         val h: Double = LoopMix.HANDOVER_SEC
-        /** Bass swap ramp: 1/8 beat, inside the 1/16..1/4 beat DJ range. */
-        val w: Double = (b / 8).coerceIn(0.02, 0.12)
         val outStems: StemView? = c.inputs.outStems
         val inStems: StemView? = c.inputs.inStems
-        val outFull: Boolean = outStems?.full == true
-        val inFull: Boolean = inStems?.full == true
-        val outSplit: Boolean = outStems?.vocalSplit == true
-        val inSplit: Boolean = inStems?.vocalSplit == true
+        val outFull: Boolean = AutomixV2Choreo.useStems && outStems?.full == true
+        val inFull: Boolean = AutomixV2Choreo.useStems && inStems?.full == true
+        val outSplit: Boolean = AutomixV2Choreo.useStems && outStems?.vocalSplit == true
+        val inSplit: Boolean = AutomixV2Choreo.useStems && inStems?.vocalSplit == true
         val o = HashMap<EnvKind, Env>()
         val i = HashMap<EnvKind, Env>()
         var outFx = DeckFx.NONE
@@ -218,290 +303,339 @@ object MoveCatalog {
         var isolate = false
         var outStemsUsed = false
         var inStemsUsed = false
+        var resolvedMove: Move = forcedMove ?: recipe.move
 
-        /** A time at or before the release, so the incoming is neutral by then. */
-        fun byR(t: Double): Double = min(t, R - 0.005)
+        fun byR(t: Double): Double = min(t, (R - 0.005).coerceAtLeast(0.0))
 
-        fun outGainHoldThenFall(fallFrom: Double, fallTo: Double) {
-            val from = fallFrom.coerceIn(0.0, R)
-            val to = max(from + 0.01, min(fallTo, R))
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(from, 1f).fall(from, to).build()
+        private fun resolveAnchor(anchor: Anchor, param: Double): Double = when (anchor) {
+            Anchor.ZERO -> 0.0
+            Anchor.IN_AUDIBLE -> A
+            Anchor.SWAP -> S
+            Anchor.RELEASE -> R
+            Anchor.OUT_STOP -> c.outStop
+            Anchor.PRE_FRAC -> A + (S - A).coerceAtLeast(0.0) * param
+            Anchor.POST_FRAC -> S + (R - S).coerceAtLeast(0.0) * param
+            Anchor.OVERLAP_FRAC -> A + (R - A).coerceAtLeast(0.0) * param
+            Anchor.A_PLUS_CAPPED_S -> min(S, A + param * bar)
+            Anchor.S_PLUS_CAPPED_R -> min(R, S + param * bar)
+            Anchor.SWAP_BACK_A -> max(A, S - param * bar)
+            Anchor.SWAP_BACK_ZERO -> max(0.0, S - param * bar)
+            Anchor.RELEASE_BACK_S -> max(S, R - param * bar)
+            Anchor.VOCAL_ENTRY -> (c.inVocalEntry(A, R) ?: (A + min(bar, (S - A).coerceAtLeast(0.05) * 0.6))).coerceIn(
+                min(A + 0.02, R - 0.05).coerceAtLeast(0.0),
+                (R - 0.05).coerceAtLeast(0.0),
+            )
+            Anchor.FADE_START -> max(A, R - min(10.0, max(4.0, (R - A) * 0.8)))
         }
 
-        fun inGainRise(from: Double, to: Double, peak: Float = 1f, holdUntil: Double? = null) {
-            val a = max(from, A)
-            val z = byR(max(to, a + 0.01))
-            val eb = EnvBuilder().at(0.0, 0f)
-            if (a > 0.0) eb.at(a, 0f)
-            eb.rise(a, z, 0f, peak)
-            if (holdUntil != null && peak < 1f) {
-                val hu = byR(max(holdUntil, z + 0.01))
-                eb.at(hu, peak).at(byR(hu + b), 1f)
-            } else if (peak < 1f) {
-                eb.at(byR(z + b), 1f)
-            }
-            i[EnvKind.GAIN] = eb.build()
+        private fun resolveTime(st: StepTime): Double {
+            var t = resolveAnchor(st.anchor, st.param) + st.offsetBars * bar + st.offsetBeats * b + st.offsetSec
+            st.minAt?.let { t = max(t, resolveAnchor(it, 0.0)) }
+            st.maxAt?.let { t = min(t, resolveAnchor(it, 0.0)) }
+            return t.coerceAtLeast(0.0)
         }
 
-        /** Swap the lows at S on both decks: EQ shelf always (belt and braces), bass stems when present. */
-        fun swapLows(inLowBefore: Float = KILL_DB) {
-            val a = S - w / 2
-            val z = S + w / 2
-            o[EnvKind.LOW_DB] = EnvBuilder().at(0.0, 0f).at(a, 0f).at(z, KILL_DB).build()
-            i[EnvKind.LOW_DB] = EnvBuilder().at(0.0, inLowBefore).at(a, inLowBefore).at(byR(z), 0f).build()
-            if (outFull) {
-                o[EnvKind.STEM_BASS] = EnvBuilder().at(0.0, 1f).at(a, 1f).at(z, 0f).build()
-                outStemsUsed = true
-            }
-            if (inFull) {
-                i[EnvKind.STEM_BASS] = EnvBuilder().at(0.0, 0f).at(a, 0f).at(byR(z), 1f).build()
-                inStemsUsed = true
+        private fun useStemMode(): Boolean {
+            if (!AutomixV2Choreo.useStems) return false
+            if (recipe.stemModeMinStems == 0) return outFull || inFull || outSplit || inSplit
+            return when (recipe.id) {
+                RecipeId.C1, RecipeId.F3, RecipeId.F8 -> outFull && inFull
+                RecipeId.F1 -> inFull
+                RecipeId.C3, RecipeId.F4 -> outSplit
+                RecipeId.C4 -> outSplit || inFull
+                else -> outFull || inFull
             }
         }
 
-        fun finish(note: String): Built {
+        fun compile(): Built {
+            val useStems = useStemMode()
+            val stepList = if (useStems) recipe.steps else recipe.noStemSteps
+            for (step in stepList) {
+                when (step) {
+                    is RecipeStep.EnableIsolator -> isolate = true
+                    is RecipeStep.SwapLows -> applySwapLows(step, useStems)
+                    is RecipeStep.LaneCurve -> applyCurve(step.deck, step.kind, step.shape, step.points, step.steps, step.holdNeutralAtStart, step.ensureNeutralAtReleaseForIn)
+                    is RecipeStep.ConfigureFx -> applyFx(step)
+                }
+            }
             for (kind in EnvKind.LEGACY) {
                 if (!o.containsKey(kind)) o[kind] = Env.constant(kind.neutral, kind.exponential)
                 if (!i.containsKey(kind)) i[kind] = Env.constant(kind.neutral, kind.exponential)
             }
             if (outStemsUsed) for (kind in STEM_KINDS) if (!o.containsKey(kind)) o[kind] = Env.constant(1f)
             if (inStemsUsed) for (kind in STEM_KINDS) if (!i.containsKey(kind)) i[kind] = Env.constant(1f)
-            return Built(o, i, outFx, inFx, outStemsUsed, inStemsUsed, isolate, note)
+            val stemTag = if (outStemsUsed || inStemsUsed) "stems" else "no-stem"
+            val fxNames = (outFx.activeFxNames + inFx.activeFxNames).distinct()
+            val fxTag = if (fxNames.isEmpty()) "dry" else fxNames.joinToString("+")
+            return Built(o, i, outFx, inFx, outStemsUsed, inStemsUsed, isolate, "${recipe.id.code} ${recipe.displayName} ($stemTag, $fxTag) @${r1(S)}", resolvedMove)
         }
 
-        // -- moves ------------------------------------------------------------------------------
-
-        fun simpleFade(): Built {
-            // Ballad-length equal-power fade (4..10 s) ending at the release; no EQ, no FX.
-            val len = min(10.0, max(4.0, (R - A) * 0.8))
-            val fs = max(A, R - len)
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(max(0.0, fs), 1f).fall(max(0.0, fs) + 1e-3, R, steps = 16).build()
-            val eb = EnvBuilder().at(0.0, 0f)
-            if (fs > 0.0) eb.at(fs, 0f)
-            eb.rise(fs + 1e-3, byR(R), steps = 16)
-            i[EnvKind.GAIN] = eb.build()
-            return finish("fade ${r1(R - fs)} s")
+        private fun evalWaypoint(wp: Waypoint): Float {
+            return if (wp.scaleByFxDepth) {
+                if (wp.depthBase > 0f) wp.depthBase + wp.value * depth else wp.value * depth
+            } else {
+                wp.value
+            }
         }
 
-        fun appleSmooth(): Built {
-            val bs = max(A, c.t(c.kIn))
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(bs, 1f).fall(bs + 1e-3, R, steps = 16).build()
-            val eb = EnvBuilder().at(0.0, 0f)
-            if (bs > 0.0) eb.at(bs, 0f)
-            eb.rise(bs + 1e-3, byR(R), steps = 16)
-            i[EnvKind.GAIN] = eb.build()
-            swapLows()
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(S, 20f).at(R, 150f).build()
-            return finish("equal-power ${r1(R - bs)} s, EQ swap @${r1(S)}")
-        }
-
-        fun bassSwap(fx: Move?): Built {
-            inGainRise(A, min(A + 2 * bar, S), peak = 0.85f, holdUntil = S)
-            outGainHoldThenFall(S, R)
-            swapLows()
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(S, 20f).at(R, 200f + 200f * depth).build()
-            val fxFrom = max(A, S - 2 * bar)
-            when (fx) {
-                Move.PHASER_DISSOLVE -> {
-                    outFx = DeckFx(phaser = true, phaserRateBeats = 8.0, phaserDepth = 0.7f * depth, phaserFeedback = 0.45f)
-                    o[EnvKind.PHASER_WET] = EnvBuilder().at(0.0, 0f).at(fxFrom, 0f).at(S, 0.5f * depth).at(R, 0.5f * depth).build()
+        private fun applyCurve(
+            deck: DeckTarget,
+            kind: EnvKind,
+            shape: CurveShape,
+            points: List<Waypoint>,
+            steps: Int,
+            holdNeutralAtStart: Boolean,
+            ensureNeutralAtReleaseForIn: Boolean,
+        ) {
+            if (kind.isStem) {
+                if (deck == DeckTarget.OUT) {
+                    if ((kind == EnvKind.STEM_DRUMS || kind == EnvKind.STEM_BASS) && !outFull) return
+                    if (!outSplit) return
+                    outStemsUsed = true
+                } else {
+                    if ((kind == EnvKind.STEM_DRUMS || kind == EnvKind.STEM_BASS) && !inFull) return
+                    if (!inSplit) return
+                    inStemsUsed = true
                 }
-                Move.FLANGER_DISSOLVE -> {
-                    outFx = DeckFx(
-                        flanger = true, flangerLfoHz = LoopMix.lfoHzForBeatSec(b),
-                        flangerDepthSec = LoopMix.FLANGER_DEPTH_COLOUR_SEC, flangerFeedback = 0.55f,
-                        flangerWet = min(0.5f, LoopMix.FLANGER_WET * depth),
+            }
+            val map = if (deck == DeckTarget.OUT) o else i
+            val eb = EnvBuilder(kind.exponential || shape == CurveShape.EXPONENTIAL)
+            val n = points.size
+            if (n == 0) return
+
+            val resolvedTimes = DoubleArray(n) { idx ->
+                val raw = resolveTime(points[idx].time)
+                if (deck == DeckTarget.IN) {
+                    val maxAllowed = (R - 0.005 - 0.001 * (n - 1 - idx)).coerceAtLeast(0.0)
+                    raw.coerceIn(0.0, maxAllowed)
+                } else {
+                    val limit = if (kind == EnvKind.REVERB_SEND || kind == EnvKind.ECHO_SEND) c.outStop else R
+                    raw.coerceIn(0.0, limit)
+                }
+            }
+            // Enforce non-decreasing waypoint times before curve generation.
+            for (idx in 1 until n) {
+                if (resolvedTimes[idx] <= resolvedTimes[idx - 1]) {
+                    val cap = if (deck == DeckTarget.IN) (R - 0.005 - 0.001 * (n - 1 - idx)).coerceAtLeast(0.0) else c.outStop
+                    resolvedTimes[idx] = min(cap, resolvedTimes[idx - 1] + 0.001)
+                }
+            }
+
+            if (deck == DeckTarget.OUT) {
+                if (kind == EnvKind.GAIN) {
+                    eb.at(-h, 0f).at(0.0, 1f)
+                    val firstT = resolvedTimes[0]
+                    if (firstT > 0.002) eb.at(firstT, 1f)
+                } else if (holdNeutralAtStart && resolvedTimes[0] > 1e-4) {
+                    eb.at(0.0, kind.neutral)
+                    if (resolvedTimes[0] > 0.002) eb.at(resolvedTimes[0], kind.neutral)
+                }
+            } else {
+                // Incoming deck: keep held silent prior to A for GAIN.
+                if (kind == EnvKind.GAIN && resolvedTimes[0] > 0.0) {
+                    eb.at(0.0, 0f)
+                } else if (holdNeutralAtStart && resolvedTimes[0] > 1e-4 && kind != EnvKind.GAIN) {
+                    eb.at(0.0, evalWaypoint(points[0]))
+                }
+            }
+
+            if (shape == CurveShape.EQUAL_POWER_FALL && n >= 2) {
+                for (idx in 0 until n) {
+                    val tv = resolvedTimes[idx]
+                    val vv = evalWaypoint(points[idx])
+                    if (idx == 0) {
+                        if (deck != DeckTarget.OUT || kind != EnvKind.GAIN || tv > 0.002) eb.at(tv, vv)
+                    } else if (vv < evalWaypoint(points[idx - 1]) && tv > resolvedTimes[idx - 1] + 0.002) {
+                        eb.fall(resolvedTimes[idx - 1], tv, gain0 = evalWaypoint(points[idx - 1]), steps = steps)
+                    } else {
+                        eb.at(tv, vv)
+                    }
+                }
+            } else if (shape == CurveShape.EQUAL_POWER_RISE && n >= 2) {
+                for (idx in 0 until n) {
+                    val tv = resolvedTimes[idx]
+                    val vv = evalWaypoint(points[idx])
+                    if (idx == 0) {
+                        eb.at(tv, vv)
+                    } else {
+                        val prevV = evalWaypoint(points[idx - 1])
+                        if (vv > prevV && tv > resolvedTimes[idx - 1] + 0.002) {
+                            eb.rise(resolvedTimes[idx - 1], tv, g0 = prevV, g1 = vv, steps = steps)
+                        } else {
+                            eb.at(tv, vv)
+                        }
+                    }
+                }
+            } else {
+                for (idx in 0 until n) {
+                    val tv = resolvedTimes[idx]
+                    val vv = evalWaypoint(points[idx])
+                    if (deck == DeckTarget.OUT && kind == EnvKind.GAIN && idx == 0 && tv <= 0.002 && abs(vv - 1f) <= 0.02f) {
+                        continue
+                    }
+                    eb.at(tv, vv)
+                }
+            }
+
+            if (deck == DeckTarget.IN && ensureNeutralAtReleaseForIn) {
+                val built = eb.build()
+                if (!ChoreoGuard.neutral(kind, built.lastValue) || !ChoreoGuard.neutral(kind, built.at(R))) {
+                    eb.at(byR(R), kind.neutral)
+                }
+            }
+            map[kind] = eb.build()
+        }
+
+        private fun applySwapLows(step: RecipeStep.SwapLows, useStems: Boolean) {
+            val swapAt = resolveTime(step.at)
+            val halfW = (b * step.widthBeats * 0.5).coerceIn(0.01, 0.12)
+            val a = max(0.002, swapAt - halfW)
+            val zOut = max(a + 0.002, swapAt + halfW)
+            val zIn = byR(zOut).coerceAtLeast(min(a + 0.002, byR(R)))
+            val aIn = min(a, (zIn - 0.002).coerceAtLeast(0.0))
+            o[EnvKind.LOW_DB] = EnvBuilder().at(0.0, 0f).at(a, 0f).at(zOut, step.outLowAfterDb).build()
+            i[EnvKind.LOW_DB] = EnvBuilder().at(0.0, step.inLowBeforeDb).at(aIn, step.inLowBeforeDb).at(zIn, 0f).build()
+            if (step.useBassStems && useStems) {
+                if (outFull) {
+                    o[EnvKind.STEM_BASS] = EnvBuilder().at(0.0, 1f).at(a, 1f).at(zOut, 0f).build()
+                    outStemsUsed = true
+                }
+                if (inFull) {
+                    i[EnvKind.STEM_BASS] = EnvBuilder().at(0.0, 0f).at(aIn, 0f).at(zIn, 1f).build()
+                    inStemsUsed = true
+                }
+            }
+        }
+
+        private fun applyFx(step: RecipeStep.ConfigureFx) {
+            val caps = c.inputs.caps
+            val useFallback = step.requiredCap != 0 && !ChoreoCaps.has(caps, step.requiredCap)
+            val forceFlangerInC6 = recipe.id == RecipeId.C6 && step.fx == FxType.PHASER &&
+                (forcedMove == Move.FLANGER_DISSOLVE ||
+                    (forcedMove != Move.PHASER_DISSOLVE && ((c.inputs.pairKey.hashCode() xor c.inputs.seed.toInt()) and 1) != 0))
+            val activeFx = when {
+                forceFlangerInC6 -> FxType.FLANGER
+                useFallback -> step.fallbackFx ?: return
+                else -> step.fx
+            }
+            if (recipe.id == RecipeId.C6) {
+                resolvedMove = if (activeFx == FxType.FLANGER) Move.FLANGER_DISSOLVE else Move.PHASER_DISSOLVE
+            }
+            val current = if (step.deck == DeckTarget.OUT) outFx else inFx
+            val rockOrBallad = step.heavyReverbOnRockBallad && (c.genre == GenreClass.ROCK || c.genre == GenreClass.BALLAD)
+            val updated = when (activeFx) {
+                FxType.ECHO -> {
+                    val delay = if (step.flag && c.outBpm <= 120.0) b else b * step.param1.coerceAtLeast(0.25)
+                    val fb = step.param2.coerceIn(0.1f, 0.75f)
+                    val wet = (step.param3 * depth).coerceIn(0.1f, 0.75f)
+                    current.copy(echoDelaySec = delay, echoFeedback = fb, echoWet = wet)
+                }
+                FxType.REVERB -> {
+                    val room = if (rockOrBallad) (step.param1.toFloat() * 1.25f).coerceAtMost(4.0f) else step.param1.toFloat()
+                    val damp = if (rockOrBallad) (step.param2 * 0.85f).coerceAtLeast(0.25f) else step.param2
+                    val wet = ((if (rockOrBallad) step.param3 * 1.25f else step.param3) * depth).coerceIn(0.1f, 0.8f)
+                    current.copy(reverb = true, reverbRoom = room, reverbDamping = damp, reverbWet = wet)
+                }
+                FxType.FLANGER -> {
+                    val lfo = LoopMix.lfoHzForBeatSec(b)
+                    val fb = step.param2.takeIf { it > 0f } ?: LoopMix.FLANGER_FEEDBACK
+                    val wet = min(0.5f, (step.param3.takeIf { it > 0f } ?: LoopMix.FLANGER_WET) * depth)
+                    current.copy(
+                        flanger = true,
+                        flangerLfoHz = lfo,
+                        flangerDepthSec = LoopMix.FLANGER_DEPTH_COLOUR_SEC,
+                        flangerFeedback = fb,
+                        flangerWet = wet,
                     )
-                    o[EnvKind.FLANGER_WET] = EnvBuilder().at(0.0, 0f).at(fxFrom, 0f).at(S, 1f).at(R, 1f).build()
                 }
-                Move.PUMP_BLEND -> {
-                    outFx = DeckFx(pump = true, pumpBeatSec = b)
-                    o[EnvKind.PUMP_DEPTH] = EnvBuilder().at(0.0, 0f).at(A, 0f).at(S, 0.65f * depth).at(R, 0.65f * depth).build()
+                FxType.PHASER -> {
+                    current.copy(
+                        phaser = true,
+                        phaserRateBeats = step.param1.takeIf { it > 0.0 } ?: 8.0,
+                        phaserDepth = (step.param2 * depth).coerceIn(0.1f, 1.0f),
+                        phaserFeedback = step.param3,
+                    )
                 }
-                else -> Unit
+                FxType.GATE -> {
+                    current.copy(
+                        gate = true,
+                        gateBeatSec = b,
+                        gateDivision = step.param1.toFloat(),
+                        gateSwing = step.param2,
+                    )
+                }
+                FxType.RISER -> {
+                    current.copy(
+                        riser = true,
+                        riserBeatSec = b,
+                        riserLengthBeats = step.param1.takeIf { it > 0.0 } ?: 16.0,
+                    )
+                }
+                FxType.PUMP -> {
+                    current.copy(
+                        pump = true,
+                        pumpBeatSec = b,
+                        pumpFullBand = step.flag,
+                    )
+                }
+                FxType.BRAKE -> {
+                    val sT = step.startTime?.let { resolveTime(it) } ?: max(0.0, S - b)
+                    val eT = step.endTime?.let { resolveTime(it) } ?: S
+                    val len = (eT - sT).coerceIn(0.15, if (step.flag) 1.5 else 2.5)
+                    current.copy(
+                        brake = true,
+                        brakeStartSec = max(0.0, eT - len),
+                        brakeLengthSec = len,
+                        brakeSpinback = step.flag,
+                    )
+                }
+                FxType.LOOP_ROLL -> {
+                    val sT = step.startTime?.let { resolveTime(it) } ?: max(0.0, S - 2.0 * bar)
+                    val eT = step.endTime?.let { resolveTime(it) } ?: S
+                    val beats = ((eT - sT) / b).coerceIn(2.0, step.param1.takeIf { it > 0.0 } ?: 8.0)
+                    current.copy(
+                        loopRoll = true,
+                        rollStartSec = sT,
+                        rollBeatSec = b,
+                        rollReleaseSec = eT,
+                        rollTotalBeats = beats,
+                    )
+                }
+                FxType.SVF_Q -> current.copy(svfQ = step.param3)
             }
-            val tag = when (fx) {
-                Move.PHASER_DISSOLVE -> "phaser"
-                Move.FLANGER_DISSOLVE -> "flanger"
-                Move.PUMP_BLEND -> "pump"
-                else -> if (outFull || inFull) "stems" else "eq"
-            }
-            return finish("bass swap @${r1(S)} ($tag)")
-        }
+            if (step.deck == DeckTarget.OUT) outFx = updated else inFx = updated
 
-        fun drumsFirst(): Built {
-            // Incoming drums ride in under the outgoing; the rest follows on the swap downbeat.
-            inGainRise(A, min(A + bar, S), peak = 0.9f, holdUntil = S)
-            outGainHoldThenFall(S, R)
-            swapLows()
-            outStemsUsed = true
-            inStemsUsed = true
-            o[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 1f).at(A, 1f).at(min(A + bar, S), 0.4f).at(S - w / 2, 0.4f).at(S + w / 2, 0f).build()
-            i[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 1f).build()
-            i[EnvKind.STEM_OTHER] = EnvBuilder().at(0.0, 0f).at(S, 0f).at(byR(S + b), 1f).build()
-            i[EnvKind.STEM_VOCALS] = EnvBuilder().at(0.0, 0f).at(S, 0f).at(byR(S + bar), 1f).build()
-            return finish("drums first from ${r1(A)}, swap @${r1(S)}")
-        }
-
-        fun drumSwap(): Built {
-            val kD = max(c.kIn, k - 8)
-            val d = c.t(kD)
-            inGainRise(A, min(A + bar, S), peak = 0.75f, holdUntil = S)
-            outGainHoldThenFall(S, R)
-            swapLows()
-            outStemsUsed = true
-            inStemsUsed = true
-            o[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 1f).at(d - w / 2, 1f).at(d + w / 2, 0f).build()
-            i[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 0f).at(d - w / 2, 0f).at(byR(d + w / 2), 1f).build()
-            i[EnvKind.STEM_VOCALS] = EnvBuilder().at(0.0, 0f).at(S, 0f).at(byR(S + 2 * b), 1f).build()
-            return finish("drums swap @${r1(d)}, bass @${r1(S)}")
-        }
-
-        fun acapella(): Built {
-            // Outgoing vocal rides over the incoming instrumental; its own band leaves under it.
-            val vocalOut = max(S + b, R - bar)
-            i[EnvKind.GAIN] = EnvBuilder().at(0.0, 0f).at(A, 0f).rise(A + 1e-3, byR(A + bar)).build()
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(vocalOut, 1f).fall(vocalOut + 1e-3, R).build()
-            swapLows()
-            outStemsUsed = true
-            o[EnvKind.STEM_OTHER] = EnvBuilder().at(0.0, 1f).at(A, 1f).fall(A + 1e-3, S).build()
-            if (outFull) {
-                o[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 1f).at(A, 1f).at(A + b, 0f).build()
+            val envKind = when (activeFx) {
+                FxType.ECHO -> EnvKind.ECHO_SEND
+                FxType.REVERB -> EnvKind.REVERB_SEND
+                FxType.FLANGER -> EnvKind.FLANGER_WET
+                FxType.PHASER -> EnvKind.PHASER_WET
+                FxType.GATE -> EnvKind.GATE_DEPTH
+                FxType.RISER -> EnvKind.RISER_LEVEL
+                FxType.PUMP -> EnvKind.PUMP_DEPTH
+                FxType.BRAKE -> EnvKind.BRAKE
+                FxType.LOOP_ROLL, FxType.SVF_Q -> null
             }
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(S, 20f).at(byR(S + b), 120f).build()
-            if (inSplit) {
-                inStemsUsed = true
-                i[EnvKind.STEM_VOCALS] = EnvBuilder().at(0.0, 0f).at(vocalOut, 0f).at(byR(R - 0.01), 1f).build()
+            val curvePts = when {
+                activeFx != step.fx && step.fallbackWetCurve != null -> step.fallbackWetCurve
+                else -> step.wetCurve
             }
-            // One FX: the acapella echoes out on its last beat (the deck carries only the vocal by then).
-            val delay = if (c.outBpm > 120.0) b * 0.5 else b
-            outFx = DeckFx(echoDelaySec = delay, echoFeedback = 0.5f + 0.1f * depth, echoWet = 0.5f)
-            o[EnvKind.ECHO_SEND] = EnvBuilder().at(0.0, 0f).at(max(0.0, R - 1.5 * b), 0f).at(R - 0.3 * b, 0.8f * depth).at(R, 0f).build()
-            return finish("acapella over instrumental, swap @${r1(S)}")
-        }
-
-        fun instrumentalBed(): Built {
-            val entry = c.inVocalEntry(A, R) ?: (A + bar)
-            val vFrom = max(A, entry - bar)
-            val vTo = max(vFrom + 0.05, entry - 0.05)
-            inGainRise(A, min(A + b * 2, S), peak = 1f)
-            outGainHoldThenFall(S, R)
-            swapLows(inLowBefore = KILL_DB)
-            if (outSplit) {
-                outStemsUsed = true
-                o[EnvKind.STEM_VOCALS] = EnvBuilder().at(0.0, 1f).at(vFrom, 1f).fall(vFrom + 1e-3, vTo).build()
-            } else {
-                // Stemless fallback: carve the outgoing mids away before the incoming line.
-                isolate = true
-                o[EnvKind.MID_DB] = EnvBuilder().at(0.0, 0f).at(vFrom, 0f).at(vTo, -9f).build()
-            }
-            if (inFull) {
-                inStemsUsed = true
-                i[EnvKind.STEM_DRUMS] = EnvBuilder().at(0.0, 0f).at(S, 0f).at(byR(S + b * 0.25), 1f).build()
-                i[EnvKind.STEM_OTHER] = EnvBuilder().at(0.0, 0.3f).at(S, 0.3f).at(byR(S + b), 1f).build()
-            } else {
-                i[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 280f).at(S, 280f).at(byR(S + b), 20f).build()
-            }
-            return finish("instrumental bed under vocal @${r1(entry)}, swap @${r1(S)}")
-        }
-
-        fun muffleIn(): Built {
-            val len = min(S - A, 8 * bar).coerceAtLeast(min(S - A, 2 * bar))
-            val ms = S - len
-            i[EnvKind.GAIN] = EnvBuilder().at(0.0, 0f).at(A, 0f).rise(A + 1e-3, byR(min(ms + bar, S)), 0f, 0.9f).at(byR(S), 1f).build()
-            i[EnvKind.LOW_PASS_HZ] = EnvBuilder(true).at(0.0, 300f).at(ms, 300f).at(ms + len * 0.7, 2500f).at(byR(S), 20000f).build()
-            i[EnvKind.FILTER_RES] = EnvBuilder().at(0.0, 1f).at(ms, 1f).at(ms + len * 0.6, 1f + 1.4f * depth).at(byR(S), 1f).build()
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(max(ms, 0.0), 20f).at(S, 300f + 500f * depth).build()
-            o[EnvKind.FILTER_RES] = EnvBuilder().at(0.0, 1f).at(max(ms, 0.0), 1f).at(S, 1f + 0.8f * depth).at(R, 1f).build()
-            outGainHoldThenFall(S, min(R, S + 2 * bar))
-            swapLows(inLowBefore = MUFFLE_LOW_DB)
-            outFx = DeckFx(svfQ = 0.8f + 0.3f * depth)
-            return finish("demuffle ${r1(len)} s into @${r1(S)}")
-        }
-
-        fun echoOut(): Built {
-            // Wash: HP 20 Hz -> ~1.2 kHz over up to 8 bars, echo on the last beat, dry cut on the 1.
-            val len = min(S, 8 * bar).coerceAtLeast(min(S, bar))
-            val ws = max(0.0, S - len)
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(ws, 20f).at(S, 700f + 600f * depth).build()
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(S - 0.1, 1f).at(S, 0f).build()
-            o[EnvKind.LOW_DB] = EnvBuilder().at(0.0, 0f).at(S - 0.1, 0f).at(S, KILL_DB).build()
-            val delay = if (c.outBpm > 125.0) b * 0.5 else b
-            val fb = (0.5f + 0.12f * depth).coerceAtMost(0.62f)
-            var fx = DeckFx(echoDelaySec = delay, echoFeedback = fb, echoWet = 0.5f)
-            o[EnvKind.ECHO_SEND] = EnvBuilder().at(0.0, 0f).at(max(0.0, S - 1.5 * b), 0f).at(S - 0.02, 0.85f).at(S + 0.12, 0f).build()
-            if (c.inputs.level.maxFx >= 2) {
-                fx = fx.copy(reverb = true, reverbWet = 0.35f * depth)
-                o[EnvKind.REVERB_SEND] = EnvBuilder().at(0.0, 0f).at(ws, 0f).at(S - 0.02, 0.5f).at(S + 0.12, 0f).build()
-            }
-            outFx = fx
-            i[EnvKind.GAIN] = EnvBuilder().at(0.0, 0f).at(max(A, S - 0.02), 0f).rise(max(A, S - 0.02) + 1e-3, byR(S + 0.5 * b), steps = 8).build()
-            i[EnvKind.LOW_PASS_HZ] = EnvBuilder(true).at(0.0, 900f).at(S, 900f).at(byR(S + b), 20000f).build()
-            return finish("echo out on @${r1(S)} (${if (delay < b) "1/2" else "1"} beat)")
-        }
-
-        fun loopExtend(): Built {
-            // The outgoing loop holds; the incoming rides in thin under it, bass on a late phrase downbeat.
-            val eb = EnvBuilder().at(0.0, 0f)
-            if (A > 0.0) eb.at(A, 0f)
-            eb.rise(A + 1e-3, byR(S), 0f, 0.85f, steps = 16).at(byR(S + b), 1f)
-            i[EnvKind.GAIN] = eb.build()
-            i[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 160f).at(max(A, S - bar), 160f).at(byR(S), 20f).build()
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(max(A, 0.0), 20f).at(S, 90f).at(R, 400f).build()
-            outGainHoldThenFall(S, R)
-            swapLows()
-            return finish("loop extend ${c.plan.out.bars}-bar outro, swap @${r1(S)}")
-        }
-
-        fun buildDrop(): Built {
-            // Outgoing rolls and rises into the incoming DROP; the drop lands dry on the 1.
-            val buildBars = if (c.inputs.level == DjLevel.SUBTLE) 4 else 8
-            val bs = max(0.0, S - buildBars * bar)
-            val rollBeats = if (c.inputs.level == DjLevel.FESTIVAL && S >= 16 * b) 16.0 else 8.0
-            var fx = DeckFx(
-                loopRoll = true,
-                rollStartSec = max(0.0, S - rollBeats * b),
-                rollBeatSec = b,
-                rollReleaseSec = S,
-                rollTotalBeats = rollBeats,
-                svfQ = (0.95f + 0.4f * depth).coerceAtMost(1.4f),
-            )
-            var budget = c.inputs.level.maxFx
-            if (budget > 0 && ChoreoCaps.has(c.inputs.caps, ChoreoCaps.RISER)) {
-                fx = fx.copy(riser = true, riserBeatSec = b, riserLengthBeats = (S - bs) / b)
-                o[EnvKind.RISER_LEVEL] = EnvBuilder().at(0.0, 0f).at(bs, 0f).at(S - 0.02, 0.7f * depth).at(S, 0f).build()
-                budget--
-            }
-            if (budget > 0 && ChoreoCaps.has(c.inputs.caps, ChoreoCaps.GATE)) {
-                fx = fx.copy(gate = true, gateBeatSec = b, gateDivision = 4f, gateSwing = 0f)
-                o[EnvKind.GATE_DEPTH] = EnvBuilder().at(0.0, 0f).at(max(0.0, S - 2 * bar), 0f).at(S - 0.05, 0.8f * depth).at(S, 0f).build()
-                budget--
-            }
-            if (budget > 0) {
-                fx = fx.copy(
-                    flanger = true, flangerLfoHz = LoopMix.lfoHzForBeatSec(b),
-                    flangerDepthSec = LoopMix.FLANGER_DEPTH_BUILDUP_SEC, flangerFeedback = LoopMix.FLANGER_FEEDBACK,
-                    flangerWet = min(0.5f, LoopMix.FLANGER_WET),
+            if (envKind != null && curvePts != null && curvePts.isNotEmpty()) {
+                val adjusted = if (rockOrBallad && activeFx == FxType.REVERB) {
+                    curvePts.map { pt -> if (pt.value > 0f) pt.copy(value = (pt.value * 1.25f).coerceAtMost(0.75f)) else pt }
+                } else {
+                    curvePts
+                }
+                applyCurve(
+                    deck = step.deck,
+                    kind = envKind,
+                    shape = CurveShape.LINEAR,
+                    points = adjusted,
+                    steps = 8,
+                    holdNeutralAtStart = true,
+                    ensureNeutralAtReleaseForIn = true,
                 )
-                o[EnvKind.FLANGER_WET] = EnvBuilder().at(0.0, 0f).at(bs, 0f).at(S - 0.02, depth).at(S, 0f).build()
             }
-            outFx = fx
-            o[EnvKind.HIGH_PASS_HZ] = EnvBuilder(true).at(0.0, 20f).at(bs, 30f).at(S - 0.01, 400f + 500f * depth).build()
-            o[EnvKind.FILTER_RES] = EnvBuilder().at(0.0, 1f).at(bs, 1f).at(S - 0.01, 1f + 1.2f * depth).at(S, 1f).build()
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(S - 0.03, 1f).at(S, 0f).build()
-            o[EnvKind.LOW_DB] = EnvBuilder().at(0.0, 0f).at(S - 0.03, 0f).at(S, KILL_DB).build()
-            i[EnvKind.GAIN] = EnvBuilder().at(0.0, 0f).at(max(A, S - 0.012), 0f).at(byR(S + 0.004), 1f).build()
-            return finish("build ${buildBars} bars + roll ${rollBeats.toInt()} beats into drop @${r1(S)}")
-        }
-
-        fun brakeCut(): Built {
-            val len = (b * 1.5).coerceIn(0.3, 1.2)
-            val bs = max(0.0, S - len)
-            outFx = DeckFx(brake = true, brakeStartSec = bs, brakeLengthSec = S - bs)
-            o[EnvKind.BRAKE] = EnvBuilder().at(0.0, 0f).at(bs, 0f).at(S, 1f).build()
-            o[EnvKind.GAIN] = EnvBuilder().at(-h, 0f).at(0.0, 1f).at(S - 0.02, 1f).at(S, 0f).build()
-            i[EnvKind.GAIN] = EnvBuilder().at(0.0, 0f).at(max(A, S - 0.015), 0f).at(byR(S + 0.005), 1f).build()
-            return finish("brake ${r1(S - bs)} s, cut on @${r1(S)}")
         }
 
         private fun r1(v: Double): String = ((v * 10.0).toLong() / 10.0).toString()

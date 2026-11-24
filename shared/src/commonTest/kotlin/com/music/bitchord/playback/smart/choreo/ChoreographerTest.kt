@@ -127,23 +127,33 @@ class ChoreographerTest {
     fun movesNeedingStemsOrCapsAreGatedAndFallBack() {
         val out = track("a", 124.0)
         val inn = track("b", 124.0)
-        val skipped = ArrayList<String>()
-        val ranked = Choreographer.rank(inputs(blendPlan(124.0), out, inn, level = DjLevel.FESTIVAL), skipped)
-        val moves = ranked.map { it.move }.toSet()
-        // No stems, no v2 caps: every stem/cap move is skipped, with its reason logged.
-        for (m in listOf(Move.DRUMS_FIRST, Move.DRUM_SWAP, Move.ACAPELLA_OVER_INSTRUMENTAL, Move.BRAKE_CUT, Move.PHASER_DISSOLVE, Move.PUMP_BLEND)) {
-            assertFalse(m in moves, "$m must be gated without stems/caps")
-            assertTrue(skipped.any { it.startsWith(m.name) }, "$m skip reason missing")
+        // At CLUB without stems or v2 caps: stem/cap recipes (C1 Drum swap, C3 Acapella) are skipped with reasons logged.
+        val clubSkipped = ArrayList<String>()
+        val clubNoStems = Choreographer.rankRecipes(inputs(blendPlan(124.0), out, inn, level = DjLevel.CLUB), clubSkipped)
+        val clubMoves = clubNoStems.map { it.move }.toSet()
+        for (id in listOf(RecipeId.C1, RecipeId.C3)) {
+            assertFalse(clubNoStems.any { it.recipeId == id }, "$id must be gated without stems")
+            assertTrue(clubSkipped.any { it.startsWith(id.code) }, "$id skip reason missing")
         }
-        // The bass swap falls back to the EQ kill instead of disappearing.
-        assertTrue(Move.STEM_BASS_SWAP in moves)
+        assertFalse(Move.DRUM_SWAP in clubMoves)
+        // At FESTIVAL without stems or v2 caps: F3/F4/F6/F7 are skipped with reasons, while Festival never downgrades to Subtle/Club.
+        val festSkipped = ArrayList<String>()
+        val festNoStems = Choreographer.rankRecipes(inputs(blendPlan(124.0), out, inn, level = DjLevel.FESTIVAL), festSkipped)
+        for (id in listOf(RecipeId.F3, RecipeId.F4, RecipeId.F6, RecipeId.F7)) {
+            assertFalse(festNoStems.any { it.recipeId == id }, "$id must be gated without stems/caps")
+            assertTrue(festSkipped.any { it.startsWith(id.code) }, "$id skip reason missing")
+        }
+        assertTrue(festNoStems.all { it.recipeId.minLevel == DjLevel.FESTIVAL })
+        // At SUBTLE, the bass swap (S2) falls back to the EQ kill instead of disappearing.
+        val subtleMoves = Choreographer.rank(inputs(blendPlan(124.0), out, inn, level = DjLevel.SUBTLE)).map { it.move }.toSet()
+        assertTrue(Move.STEM_BASS_SWAP in subtleMoves)
         val script = assertNotNull(Choreographer.choose(inputs(blendPlan(124.0), out, inn), forced = Move.STEM_BASS_SWAP))
         assertFalse(script.outUsesStems || script.inUsesStems)
         val swap = script.swapAt
         assertEquals(MoveCatalog.KILL_DB, script.value(true, EnvKind.LOW_DB, swap + 0.2), 0.01f)
         assertEquals(0f, script.value(false, EnvKind.LOW_DB, swap + 0.2), 0.01f)
         assertEquals(MoveCatalog.KILL_DB, script.value(false, EnvKind.LOW_DB, swap - 0.2), 0.01f)
-        // CLUB-only moves are not offered at SUBTLE even with stems and every cap.
+        // CLUB-only and FESTIVAL-only moves are not offered at SUBTLE even with stems and every cap.
         val subtle = Choreographer.rank(inputs(blendPlan(124.0), out, inn, caps = ChoreoCaps.ALL, withStems = true)).map { it.move }
         assertFalse(Move.DRUM_SWAP in subtle)
         assertFalse(Move.BRAKE_CUT in subtle)

@@ -1982,6 +1982,74 @@ bool loudnessProbe() {
   return ok;
 }
 
+bool loudnessDropWindowProbe() {
+  bool ok = true;
+  constexpr double kLen = 18.0;
+  constexpr double kDipStart = 8.0, kDropAt = 12.0, kBarSec = 2.0;  // 120 BPM (kBeat = 0.5 s)
+  const size_t n = size_t((kLen + 1.0) * kSampleRate);
+  std::vector<float> aL(n), aR(n), bL(n), bR(n);
+  probe::Lcg s1(101u), s2(202u), s3(303u), s4(404u);
+  for (size_t i = 0; i < n; ++i) {
+    aL[i] = 0.19f * s1.next();
+    aR[i] = 0.19f * s2.next();
+    bL[i] = 0.19f * s3.next();
+    bR[i] = 0.19f * s4.next();
+  }
+  auto runCase = [&](bool callSetter, double s0, double s1t, float bump,
+                     double& preDropGuardDb, double& impactGuardDb) -> Out {
+    Renderer r(kSampleRate);
+    r.setHighQuality(false);
+    straightDeck(r.deck(0), aL, aR, kLen, 1e18);
+    straightDeck(r.deck(1), bL, bR, kLen, 1e18);
+    // Pre-drop build dip at [8.5, 11.9] (0.35+0.35 uncorrelated = -6 dB below programme line),
+    // followed by drop impact bar [12.0, 14.0] (0.85+0.85 uncorrelated = +1.6 dB above line/ceiling).
+    setEnv(r.deck(0).gain,
+           {0.0, 2.0, 7.9, 8.5, 11.9, kDropAt, kDropAt + kBarSec, kLen - 1.0},
+           {1.f, 1.f, 0.7f, 0.35f, 0.35f, 0.85f, 0.85f, 0.f});
+    setEnv(r.deck(1).gain,
+           {0.0, 2.0, 7.9, 8.5, 11.9, kDropAt, kDropAt + kBarSec, kLen - 1.0},
+           {0.f, 0.f, 0.7f, 0.35f, 0.35f, 0.85f, 0.85f, 1.f});
+    r.setLoudnessMatch(true, -14.f);
+    if (callSetter) r.setLoudnessDropWindow(s0, s1t, bump);
+    r.prepare();
+    Out o;
+    o.first = r.firstFrame();
+    const int64_t end = int64_t(std::llround(kLen * kSampleRate));
+    o.pcm.assign(size_t(end - o.first) * 2, 0.0f);
+    preDropGuardDb = 0.0;
+    impactGuardDb = 0.0;
+    bool gotPre = false, gotImpact = false;
+    for (int64_t f = o.first; f < end;) {
+      const int chunk = int(std::min<int64_t>(1024, end - f));
+      r.render(f, o.pcm.data() + size_t(f - o.first) * 2, chunk);
+      const double tMid = (double(f) + 0.5 * double(chunk)) / kSampleRate;
+      const double gDb = double(r.loudnessGuardDb());
+      if (tMid >= kDropAt - 0.8 && tMid < kDropAt) {
+        if (!gotPre || gDb > preDropGuardDb) { preDropGuardDb = gDb; gotPre = true; }
+      }
+      if (tMid >= kDropAt + 1.0 && tMid < kDropAt + kBarSec) {
+        if (!gotImpact || gDb < impactGuardDb) { impactGuardDb = gDb; gotImpact = true; }
+      }
+      f += chunk;
+    }
+    o.violations = r.exitGateViolations();
+    return o;
+  };
+  double preOff = 0, impOff = 0, preInact = 0, impInact = 0, preOn = 0, impOn = 0;
+  const Out oOff = runCase(false, 0.0, 0.0, 0.f, preOff, impOff);
+  const Out oInact = runCase(true, 1e18, -1e18, 0.f, preInact, impInact);
+  const Out oOn = runCase(true, kDipStart, kDropAt, 1.5f, preOn, impOn);
+  double inactRms = 0, inactPeak = 0;
+  diff(oOff, oInact, inactRms, inactPeak);
+  std::printf("v2 drop-window: inactive-vs-uncalled peak=%.3g  preDropGuard off=%+.2f dB on=%+.2f dB  impactGuard off=%+.2f dB on=%+.2f dB\n",
+              inactPeak, preOff, preOn, impOff, impOn);
+  if (inactPeak != 0.0) { std::printf("FAIL v2 drop-window inactive is not bit-identical to uncalled\n"); ok = false; }
+  if (!(preOff > 0.4)) { std::printf("FAIL v2 drop-window pre-drop probe insensitive (off=%.2f dB)\n", preOff); ok = false; }
+  if (!(preOn <= 0.05)) { std::printf("FAIL v2 drop-window boosted pre-drop dip (on=%.2f dB)\n", preOn); ok = false; }
+  if (!(impOn > impOff + 0.25)) { std::printf("FAIL v2 drop-window did not allow +1.5 LU drop impact (off=%.2f on=%.2f)\n", impOff, impOn); ok = false; }
+  return ok;
+}
+
 }  // namespace v2probe
 
 int runV2Probe() {
@@ -1990,6 +2058,7 @@ int runV2Probe() {
   ok = v2probe::fxProbe() && ok;
   ok = v2probe::brakeProbe() && ok;
   ok = v2probe::loudnessProbe() && ok;
+  ok = v2probe::loudnessDropWindowProbe() && ok;
   std::printf("%s v2-probe (capabilities 0x%x)\n", ok ? "ok" : "FAIL", Renderer::capabilities());
   return ok ? 0 : 1;
 }

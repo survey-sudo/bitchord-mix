@@ -31,6 +31,7 @@ internal object ChoreoSessionGlue {
     class Prep(
         val plan: LoopMix.Plan,
         val forced: Move?,
+        val forcedRecipe: RecipeId? = null,
         val caps: Int,
         val level: DjLevel,
         val outStructure: StructureView,
@@ -68,13 +69,16 @@ internal object ChoreoSessionGlue {
         val pairKey = "$outId->$inId"
         var chosen = plan
         var forced: Move? = null
+        var forcedRecipe: RecipeId? = null
         var note = ""
         val hold = script?.incomingHoldSec ?: plan.incomingHoldSec
         val held = if (hold != plan.incomingHoldSec) plan.copy(incomingHoldSec = hold) else plan
+        val recentRecipes = AutomixV2Choreo.history.recentRecipes(pairKey)
         val inputs = ChoreoInputs(
             plan = held, clock = LoopMix.Clock(held), out = outAnalysis, inn = inAnalysis,
             outStructure = outStructure, inStructure = inStructure, caps = caps, level = level,
-            pairKey = pairKey, history = AutomixV2Choreo.history.recent(pairKey), albumOrder = albumOrder,
+            pairKey = pairKey, history = AutomixV2Choreo.history.recent(pairKey),
+            recipeHistory = recentRecipes, albumOrder = albumOrder,
             stemsExpected = stemsExpected,
         )
         val start = Choreographer.dropRetimeStart(inputs)
@@ -83,10 +87,22 @@ internal object ChoreoSessionGlue {
             if (verified != null) {
                 chosen = verified
                 forced = Move.EDM_BUILD_DROP
+                forcedRecipe = when (level) {
+                    DjLevel.CLUB -> RecipeId.C7
+                    DjLevel.FESTIVAL -> {
+                        val c = PairContext(inputs)
+                        if (outStructure.drops.isNotEmpty() && c.tempoGap <= 0.04 && recentRecipes.lastOrNull() != RecipeId.F8) {
+                            RecipeId.F8
+                        } else {
+                            RecipeId.F1
+                        }
+                    }
+                    DjLevel.SUBTLE -> null
+                }
                 note = "retimed incoming ${plan.inn.loopStart} -> ${verified.inn.loopStart} for a drop"
             }
         }
-        Prep(chosen, forced, caps, level, outStructure, inStructure, pairKey, albumOrder, note)
+        Prep(chosen, forced, forcedRecipe, caps, level, outStructure, inStructure, pairKey, albumOrder, note)
     }.onFailure { Log.w(TAG, "prepare failed", it) }.getOrNull()
 
     /**
@@ -156,19 +172,22 @@ internal object ChoreoSessionGlue {
             outStems = if (withStems) StemAdapter.view(outStems) else null,
             inStems = if (withStems) StemAdapter.view(inStems) else null,
             caps = prep.caps, level = prep.level, pairKey = prep.pairKey,
-            history = AutomixV2Choreo.history.recent(prep.pairKey), seed = AutomixV2Choreo.seed,
+            history = AutomixV2Choreo.history.recent(prep.pairKey),
+            recipeHistory = AutomixV2Choreo.history.recentRecipes(prep.pairKey),
+            seed = AutomixV2Choreo.seed,
             sungOut = sungOut, sungIn = sungIn, albumOrder = prep.albumOrder,
             outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots),
         )
         val log = ArrayList<String>()
-        val script = Choreographer.choose(inputs(true), prep.forced, log)
-            ?: Choreographer.choose(inputs(true), null, log)
+        val script = (if (prep.forcedRecipe != null) Choreographer.chooseRecipe(inputs(true), prep.forcedRecipe, log) else null)
+            ?: Choreographer.choose(inputs(true), prep.forced, log)
+            ?: Choreographer.chooseRecipe(inputs(true), null, log)
             ?: return null.also { Log.i(TAG, "no choreography: ${log.joinToString("; ")}") }
         Log.i(TAG, Choreographer.describe(script) + (if (prep.note.isNotEmpty()) " · ${prep.note}" else ""))
         Result(script, if (script.outUsesStems) outStems else null, if (script.inUsesStems) inStems else null)
     }.onFailure { Log.w(TAG, "choreograph failed", it) }.getOrNull()
 
-    /** Same as [choreograph]'s choice but with stems off: used when the renderer refused a StemSet. */
+    /** Same as [choreograph]'s choice (preferring [plannedRecipe] without stems), used when the renderer refused a StemSet. */
     fun withoutStems(
         prep: Prep,
         plan: LoopMix.Plan,
@@ -178,17 +197,22 @@ internal object ChoreoSessionGlue {
         inAnalysis: TrackAnalysis?,
         sungOut: List<LoopMix.Span>?,
         sungIn: List<LoopMix.Span>?,
+        plannedRecipe: RecipeId? = prep.forcedRecipe,
     ): ChoreoScript? = runCatching {
         val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis)
         val inputs = ChoreoInputs(
             plan = plan, clock = clock, out = outAnalysis, inn = inAnalysis,
             outStructure = prep.outStructure, inStructure = prep.inStructure,
             caps = prep.caps and ChoreoCaps.STEMS.inv(), level = prep.level, pairKey = prep.pairKey,
-            history = AutomixV2Choreo.history.recent(prep.pairKey), sungOut = sungOut, sungIn = sungIn,
+            history = AutomixV2Choreo.history.recent(prep.pairKey),
+            recipeHistory = AutomixV2Choreo.history.recentRecipes(prep.pairKey),
+            sungOut = sungOut, sungIn = sungIn,
             albumOrder = prep.albumOrder,
             outClock = outClock(plan, knots, sampleRate), inClock = inClock(plan, clock, knots),
         )
-        Choreographer.choose(inputs, prep.forced) ?: Choreographer.choose(inputs, null)
+        (if (plannedRecipe != null) Choreographer.chooseRecipe(inputs, plannedRecipe) else null)
+            ?: Choreographer.choose(inputs, prep.forced)
+            ?: Choreographer.chooseRecipe(inputs, null)
     }.getOrNull()
 
     private fun separate(provider: StemProvider, region: LoopRegion, sampleRate: Int): StemSet? {

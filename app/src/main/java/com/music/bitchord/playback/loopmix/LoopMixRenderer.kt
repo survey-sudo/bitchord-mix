@@ -220,6 +220,17 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         if (handle != 0L) nativeSetLoudnessMatch(handle, enabled && AutomixV2Render.loudness, targetLufs)
     }
 
+    /**
+     * Festival drop exemption: [exemptStartSec]..[exemptEndSec] is exempt from the
+     * "no dip" upward boost (build tension), and the drop impact bar immediately
+     * following allows +[dropBumpLu] LU above the ceiling.
+     */
+    fun setLoudnessDropWindow(exemptStartSec: Double, exemptEndSec: Double, dropBumpLu: Float) {
+        if (handle != 0L && AutomixV2Render.loudness) {
+            nativeSetLoudnessDropWindow(handle, exemptStartSec, exemptEndSec, dropBumpLu)
+        }
+    }
+
     /** 4x oversampled true-peak detection in the -1 dBTP limiter. Off = vc80 sample-peak limiter. */
     fun setTruePeakLimiter(enabled: Boolean) {
         if (handle != 0L) nativeSetTruePeak(handle, enabled)
@@ -330,6 +341,9 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         @JvmStatic private external fun nativeSetPump(handle: Long, index: Int, beatSec: Double, fullBand: Boolean)
         @JvmStatic private external fun nativeSetBrake(handle: Long, index: Int, startSec: Double, lengthSec: Double, spinback: Boolean)
         @JvmStatic private external fun nativeSetLoudnessMatch(handle: Long, enabled: Boolean, targetLufs: Float)
+        @JvmStatic private external fun nativeSetLoudnessDropWindow(
+            handle: Long, exemptStartSec: Double, exemptEndSec: Double, dropBumpLu: Float,
+        )
         @JvmStatic private external fun nativeSetTruePeak(handle: Long, on: Boolean)
         @JvmStatic private external fun nativeShortTermLufs(handle: Long, which: Int): Double
         @JvmStatic private external fun nativeLoudnessGuardDb(handle: Long): Float
