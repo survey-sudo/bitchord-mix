@@ -1,15 +1,23 @@
 name: Release
 
-# One release pipeline (Part B11.1): CI gates -> signed APK -> changelog
-# from conventional commits -> GitHub Release with the APK, models.json and
-# the quality HTML (when present under docs/quality/).
+# One release pipeline (Part B11.1 / checklist C3): CI gates -> signed APK ->
+# changelog from conventional commits -> GitHub Release with the APK,
+# models.json and the release's quality HTML.
 #
 # Triggered manually (workflow_dispatch, optional `tag` and `draft` inputs)
 # or by pushing a release tag `ae3-*` (e.g. `ae3-1.10-djmix53`).
-# Signing is optional: with the four signing secrets configured
-# (KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD) the
-# release is signed; without them the release carries the unsigned APK and
-# the full audit is skipped with a warning.
+#
+# The job is fail-closed. Signing is NOT optional: every publish-capable run,
+# draft included, needs all four secrets (KEYSTORE_BASE64 /
+# KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD), and it fails before any heavy
+# work when one is missing or the key material is unusable. There is no
+# unsigned release path. The full tools/audit-apk.sh release audit is mandatory
+# before publishing, and the quality HTML for this build
+# (docs/quality/AE3-<build>.html) must exist and be non-empty before upload.
+#
+# The quality report is transported, not re-judged: mixq/audition/perf/soak
+# gates stay on the devbox (docs/QUALITY.md), and a missing report blocks the
+# release instead of being skipped or synthesized.
 #
 # Heavy work (soak, real-corpus mixq, audition) stays on the devbox; its
 # results are linked from the release notes, not rebuilt here.
@@ -56,11 +64,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The tag becomes a git ref, a `gh release` argument and a regex. It is
+      # passed through env (never interpolated into the script) so an input
+      # cannot inject shell; tools/release/release-gates.sh then restricts it to
+      # the `ae3-*` shape. workflow_dispatch inputs are trusted only as far as
+      # the validation makes them.
       - name: Resolve release tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag }}"
+          TAG="${INPUT_TAG:-}"
           if [ -z "$TAG" ]; then
             if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
               TAG="${GITHUB_REF_NAME}"
@@ -68,8 +83,32 @@ jobs:
               TAG="ae3-manual-${GITHUB_RUN_NUMBER}"
             fi
           fi
+          TAG="$TAG" bash tools/release/release-gates.sh validate-tag
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
+
+      # Everything below publishes or feeds a publish, so the signing gate runs
+      # first: a missing/empty secret or unusable key material stops the run
+      # here, before the probes and the Gradle build spend 100+ minutes.
+      #
+      # The emptiness check lives in the shell on purpose: GitHub does not
+      # allow the `secrets` context inside a step-level `if:`, so an `if` here
+      # would evaluate to false and the check would silently never run.
+      - name: Require release signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: bash tools/release/release-gates.sh require-signing
+
+      # The quality report for this exact build must already be in the tree.
+      # Checking it now fails fast; the publish step re-checks and uploads the
+      # very file selected here. Presence is not a metrics verdict — the mixq /
+      # audition gates that produced the report ran upstream (docs/QUALITY.md).
+      - name: Require release quality report
+        id: quality
+        run: bash tools/release/release-gates.sh require-quality
 
       # --- CI gates (B11.1): core tests, native probes, synthetic render ---
 
@@ -179,35 +218,22 @@ jobs:
       - name: djmix-core jvmTest
         run: ./gradlew :djmix-core:jvmTest --max-workers=2 --no-daemon --stacktrace
 
-      # Optional signing. Absent secrets leave the release unsigned rather
-      # than failing, because signingConfig is null when the keystore is
-      # missing.
-      #
-      # The emptiness check lives in the shell on purpose: GitHub does not
-      # allow the `secrets` context inside a step-level `if:`, so an `if`
-      # here would evaluate to false and the signing step would silently
-      # never run.
-      - name: Configure signing (optional)
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      # Signing material was validated and written 0600 by "Require release
+      # signing secrets" above; nothing optional happens here. The build signs
+      # through keystore.properties, and a build that ends up unsigned fails in
+      # the audit step rather than shipping.
+      - name: Configure signing
         run: |
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "No signing secrets configured — the release will be unsigned."
-            echo "Add KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD"
-            echo "as repository secrets to produce a signed, installable APK."
-            exit 0
-          fi
-          echo "$KEYSTORE_BASE64" | base64 -d > bitchord-loopfix.jks
-          {
-            echo "storeFile=bitchord-loopfix.jks"
-            echo "storePassword=$KEYSTORE_PASSWORD"
-            echo "keyAlias=$KEY_ALIAS"
-            echo "keyPassword=$KEY_PASSWORD"
-          } > keystore.properties
-          chmod 600 bitchord-loopfix.jks keystore.properties
+          set -euo pipefail
+          ks=keystore.properties
+          [ -f "$ks" ] || { echo "ERROR: $ks missing; the signing gate did not run" >&2; exit 1; }
+          mode=$(stat -c '%a' "$ks")
+          [ "$mode" = "600" ] || { echo "ERROR: $ks is mode $mode, expected 600" >&2; exit 1; }
+          store=$(sed -n 's/^storeFile=//p' "$ks")
+          [ -n "$store" ] && [ -f "$store" ] || { echo "ERROR: keystore named by $ks is not on disk" >&2; exit 1; }
+          mode=$(stat -c '%a' "$store")
+          [ "$mode" = "600" ] || { echo "ERROR: keystore $store is mode $mode, expected 600" >&2; exit 1; }
+          echo "signing configured from $store"
 
       - name: Pre-build disk check
         run: df -h
@@ -215,35 +241,48 @@ jobs:
       - name: assembleProdRelease
         run: ./gradlew :app:assembleProdRelease -Pbitchord.bundleWear=false --max-workers=2 --no-daemon --stacktrace
 
+      # Mandatory full release audit: identity, ORT/model assets, signature
+      # scheme/certs, 16 KiB alignment. No structural-only mode and no accepted
+      # exit codes here — any failure is a failed release. select-artifacts
+      # requires the quality report too, and refuses 0 or >1 APKs plus an
+      # unsigned file name, instead of picking "the first" match.
       - name: Audit APK
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        id: artifacts
         run: |
           set -euo pipefail
-          APK=$(ls app/build/outputs/apk/prod/release/*.apk | head -1)
-          echo "apk=$APK"
-          stat -c '%s bytes' "$APK"
-          sha256sum "$APK"
-          if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            # Signed release: full audit (identity, ORT/model assets,
-            # signature scheme/certs, 16 KiB alignment).
-            export AUDIT_EXPECTED_VERSION_NAME="1.10-djmix53"
-            export AUDIT_EXPECTED_VERSION_CODE="95"
-            bash tools/audit-apk.sh "$APK"
-          else
-            echo "::warning::unsigned build — running structural checks only"
-            bash tools/audit-apk.sh --structural-only "$APK" || test "$?" = "3"
-          fi
+          : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
+          release_env=$(mktemp)
+          trap 'rm -f "$release_env"' EXIT
+          env GITHUB_OUTPUT="$release_env" bash tools/release/release-gates.sh select-artifacts
+          cat "$release_env" >> "$GITHUB_OUTPUT"
+          # Values are simple paths/hashes; split on the first '=' only.
+          while IFS='=' read -r key value; do
+            [ -n "$key" ] || continue
+            printf -v "$key" '%s' "$value"
+          done < "$release_env"
+          export AUDIT_EXPECTED_VERSION_NAME="$version_name"
+          export AUDIT_EXPECTED_VERSION_CODE="$version_code"
+          bash tools/audit-apk.sh "$apk"
+          {
+            echo "### APK audit"
+            echo ""
+            echo "- apk: \`$(basename "$apk")\`"
+            echo "- size: $(stat -c %s "$apk") bytes"
+            echo "- sha256: \`$(sha256sum "$apk" | cut -d' ' -f1)\`"
+            echo "- versionName: \`$version_name\` / versionCode $version_code"
+            echo "- quality report: \`$(basename "$quality_html")\` (sha256 \`$quality_sha256\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # --- Changelog from conventional commits since previous tag (B11.1) ---
 
       - name: Generate release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          QUALITY_NAME: ${{ steps.quality.outputs.quality_html }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.tag.outputs.tag }}"
-          PREV=$(git tag --list 'ae3-*' --sort=-v:refname | grep -v "^${TAG}$" | head -1 || true)
+          PREV=$(git tag --list 'ae3-*' --sort=-v:refname | grep -vxF -- "$TAG" | head -1 || true)
           if [ -n "$PREV" ] && git rev-parse "$PREV" >/dev/null 2>&1; then
             RANGE="${PREV}..HEAD"
           else
@@ -260,32 +299,41 @@ jobs:
             echo ""
             echo "### Downloads"
             echo ""
-            echo "- The release APK below (install with \`adb install -r\`; never uninstall)."
+            echo "- The signed release APK below (install with \`adb install -r\`; never uninstall)."
             echo "- \`models.json\` — the bundled model registry (B4.1)."
-            echo "- Quality HTML under \`docs/quality/\` (when present in this tree)."
+            echo "- \`$(basename "$QUALITY_NAME")\` — the quality report for this build (from \`${QUALITY_NAME}\`)."
+            echo ""
+            echo "The report records the devbox mixq/audition gates; attaching it is not a claim that they passed."
           } > release-notes.md
           cat release-notes.md
 
-      # --- Publish the GitHub Release with APK + models.json + quality ---
+      # --- Publish the GitHub Release with the audited APK + models.json + report ---
 
+      # Uploads exactly the files audited above. The SHA-256 check re-verifies
+      # that nothing replaced the APK or the report between the audit and the
+      # upload, so the release cannot carry a different artifact than the one
+      # that passed. There is no fallback file selection and no skip path.
       - name: Create GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
           DRAFT: ${{ inputs.draft }}
+          APK: ${{ steps.artifacts.outputs.apk }}
+          APK_SHA256: ${{ steps.artifacts.outputs.apk_sha256 }}
+          QUALITY_HTML: ${{ steps.artifacts.outputs.quality_html }}
+          QUALITY_SHA256: ${{ steps.artifacts.outputs.quality_sha256 }}
+          MODELS_JSON: app/src/main/assets/models.json
         run: |
           set -euo pipefail
-          APK=$(ls app/build/outputs/apk/prod/release/*.apk | head -1)
-          FILES=("$APK" "app/src/main/assets/models.json")
-          shopt -s nullglob
-          QUALITY=(docs/quality/*.html)
-          shopt -u nullglob
-          if [ "${#QUALITY[@]}" -gt 0 ]; then
-            FILES+=("${QUALITY[@]}")
-          else
-            echo "No docs/quality/*.html present — skipping quality HTML."
-          fi
+          [ -n "$APK" ] || { echo "ERROR: no audited APK path from the audit step" >&2; exit 1; }
+          [ -n "$QUALITY_HTML" ] || { echo "ERROR: no audited quality report from the audit step" >&2; exit 1; }
+          [ -f "$MODELS_JSON" ] || { echo "ERROR: $MODELS_JSON missing" >&2; exit 1; }
+          bash tools/release/release-gates.sh verify-sha "$APK" "$APK_SHA256" "audited APK"
+          bash tools/release/release-gates.sh verify-sha "$QUALITY_HTML" "$QUALITY_SHA256" "quality report"
+          FILES=("$APK" "$MODELS_JSON" "$QUALITY_HTML")
           echo "Uploading: ${FILES[*]}"
+          # Tag is validated (^ae3-[A-Za-z0-9][A-Za-z0-9._-]*$) before it reaches
+          # here and is passed through env, so it is a plain ref argument.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${FILES[@]}" --clobber
           else
@@ -303,8 +351,11 @@ jobs:
             echo "| field | value |"
             echo "|---|---|"
             echo "| apk | \`$(basename "$APK")\` |"
-            echo "| size | $(stat -c %s "$APK") bytes |"
-            echo "| sha256 | \`$(sha256sum "$APK" | cut -d' ' -f1)\` |"
+            echo "| apk sha256 | \`$(sha256sum "$APK" | cut -d' ' -f1)\` |"
+            echo "| apk size | $(stat -c %s "$APK") bytes |"
+            echo "| quality report | \`$(basename "$QUALITY_HTML")\` |"
+            echo "| quality report sha256 | \`$(sha256sum "$QUALITY_HTML" | cut -d' ' -f1)\` |"
+            echo "| models.json | \`$(sha256sum "$MODELS_JSON" | cut -d' ' -f1)\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build diagnostics (on failure)
