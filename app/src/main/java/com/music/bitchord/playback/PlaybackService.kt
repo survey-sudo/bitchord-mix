@@ -2230,6 +2230,35 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
+    private fun createPairPreparer(): com.music.bitchord.playback.djmix.PairPreparer =
+        com.music.bitchord.playback.djmix.PairPreparer(
+            scope = scope,
+            analysisFor = { id -> trackAnalyzer.analysisFor(id) },
+            analysisUpdates = trackAnalyzer.analysisUpdates,
+            analysisRunningFor = { id -> trackAnalyzer.isAnalysing(id) },
+            sungFor = { id -> crossfade?.lyricSpansFor(id) },
+            canUseStems = { trackAnalyzer.canUseStems() },
+            planSelector = com.music.bitchord.playback.djmix.DefaultTransitionPlanSelector(),
+            decodeRegion = { track, from, to, rate ->
+                val uri = (track.uri as? Uri) ?: track.mediaItem?.localConfiguration?.uri
+                uri?.let { trackAnalyzer.loopRegion(track.id, it, track.durationSec, from, to, rate) }
+            },
+            separateStems = { trackId, left, right, rate, start, shouldAbort ->
+                if (trackAnalyzer.canUseStems()) {
+                    trackAnalyzer.stemSeparator.separateFor(trackId, left, right, rate, start, shouldAbort)
+                } else null
+            },
+            stemLock = trackAnalyzer.stemLock,
+            requestAnalysis = { track ->
+                val uri = (track.uri as? Uri) ?: track.mediaItem?.let(::analysisUriForItem)
+                if (uri != null) {
+                    trackAnalyzer.request(track.id, uri, track.durationSec)
+                }
+            },
+            onArtworkPrefetch = ::prefetchAutoMixIncoming,
+            positionSecProvider = { (player?.currentPosition ?: 0L).coerceAtLeast(0L) / 1000.0 },
+        )
+
     private fun createCrossfadeController() = CrossfadeController(
             scope,
             active = { requireNotNull(player) },
@@ -2371,13 +2400,7 @@ class PlaybackService : MediaLibraryService() {
             separateTransitionPair = { left, right, rate ->
                 trackAnalyzer.separateTransitionBothWindows(left, right, rate)
             },
-            // AUTOMIX-V2(orch): 4-stem provider per track + background prefetch of planned regions.
-            stemProviderFor = { trackId, cachedOnly -> trackAnalyzer.stemProviderFor(trackId, cachedOnly) },
-            prefetchStems = { item, durationMs, from, to, rate ->
-                item.localConfiguration?.uri?.let { uri ->
-                    trackAnalyzer.prefetchStems(item.mediaId, uri, durationMs / 1000.0, from, to, rate)
-                }
-            },
+            pairPreparer = createPairPreparer(),
             syncedLines = ::loopMixLyrics,
             loudnessGain = ::loudnessGainFor,
             onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },
@@ -4764,6 +4787,7 @@ class PlaybackService : MediaLibraryService() {
         publishWidgetState()
         loadLyricsForCurrentTrack()
         if (exoPlayer.isPlaying) startLyricsTicker()
+        crossfade?.onTrackChanged()
     }
 
     /** The background hunt for a better copy of whatever is playing. */

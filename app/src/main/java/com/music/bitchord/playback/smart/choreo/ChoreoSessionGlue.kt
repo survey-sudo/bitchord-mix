@@ -6,7 +6,6 @@ import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.SongMap
-import com.music.bitchord.playback.smart.StemProvider
 import com.music.bitchord.playback.smart.StemSet
 import com.music.bitchord.playback.smart.TrackAnalysis
 import kotlin.math.abs
@@ -19,13 +18,15 @@ import kotlin.math.abs
  *     outgoing geometry is never touched. The re-time is verified against the
  *     real deck knots ([LoopMixSession.buildDeckKnots]) so the drop lands on
  *     the beat the renderer will actually play.
- *  2. [choreograph] (after decode): stems through [StemProvider] when the
- *     renderer can play them, then [Choreographer.choose] on the real knots.
+ *  2. [choreograph] (after decode): pure CPU choreography on pre-separated
+ *     stems ([preparedOutStems]/[preparedInStems]) or [preparedScript] with
+ *     zero ONNX inference at build time, falling back cleanly when stems are
+ *     not ready.
  *
  * Every step is runCatching'd; any failure returns null and the vc80
  * envelopes stand.
  */
-internal object ChoreoSessionGlue {
+object ChoreoSessionGlue {
     private const val TAG = "BitChordChoreo"
 
     class Prep(
@@ -156,16 +157,30 @@ internal object ChoreoSessionGlue {
         inAnalysis: TrackAnalysis?,
         sungOut: List<LoopMix.Span>?,
         sungIn: List<LoopMix.Span>?,
-        stemProvider: StemProvider?,
-        // AUTOMIX-V2(orch): B caches stems per track, so each deck gets its own provider.
-        inStemProvider: StemProvider? = null,
+        preparedOutStems: StemSet? = null,
+        preparedInStems: StemSet? = null,
+        preparedScript: ChoreoScript? = null,
     ): Result? = runCatching {
+        val wantStems = AutomixV2Choreo.useStems && ChoreoCaps.has(prep.caps, ChoreoCaps.STEMS)
+        val outStems = if (wantStems && StemAdapter.matchesRegion(preparedOutStems, outRegion.left.size, sampleRate)) {
+            preparedOutStems
+        } else null
+        val inStems = if (wantStems && StemAdapter.matchesRegion(preparedInStems, inRegion.left.size, sampleRate)) {
+            preparedInStems
+        } else null
+        if (preparedScript != null &&
+            preparedScript.level == prep.level &&
+            (!preparedScript.outUsesStems || outStems != null) &&
+            (!preparedScript.inUsesStems || inStems != null)
+        ) {
+            Log.i(TAG, Choreographer.describe(preparedScript) + (if (prep.note.isNotEmpty()) " · ${prep.note}" else ""))
+            return@runCatching Result(
+                preparedScript,
+                if (preparedScript.outUsesStems) outStems else null,
+                if (preparedScript.inUsesStems) inStems else null,
+            )
+        }
         val knots = knotsFor(plan, clock, sampleRate, outAnalysis, inAnalysis)
-        val inProvider = inStemProvider ?: stemProvider
-        val wantStems = AutomixV2Choreo.useStems && ChoreoCaps.has(prep.caps, ChoreoCaps.STEMS) &&
-            (stemProvider != null || inProvider != null)
-        val outStems = if (wantStems && stemProvider != null) separate(stemProvider, outRegion, sampleRate) else null
-        val inStems = if (wantStems && inProvider != null) separate(inProvider, inRegion, sampleRate) else null
         fun inputs(withStems: Boolean) = ChoreoInputs(
             plan = plan, clock = clock, out = outAnalysis, inn = inAnalysis,
             outStructure = prep.outStructure, inStructure = prep.inStructure,
@@ -214,15 +229,6 @@ internal object ChoreoSessionGlue {
             ?: Choreographer.choose(inputs, prep.forced)
             ?: Choreographer.chooseRecipe(inputs, null)
     }.getOrNull()
-
-    private fun separate(provider: StemProvider, region: LoopRegion, sampleRate: Int): StemSet? {
-        val seconds = region.left.size / sampleRate.toDouble()
-        if (seconds > AutomixV2Choreo.MAX_STEM_REGION_SEC) return null
-        val stems = runCatching { provider.separate(region.left, region.right, sampleRate, region.start) }
-            .onFailure { Log.w(TAG, "stem separation failed", it) }
-            .getOrNull() ?: return null
-        return if (StemAdapter.matchesRegion(stems, region.left.size, sampleRate)) stems else null
-    }
 
     /** The knots LoopMixSession.build lays for [plan] (same formulas as build). */
     private fun knotsFor(

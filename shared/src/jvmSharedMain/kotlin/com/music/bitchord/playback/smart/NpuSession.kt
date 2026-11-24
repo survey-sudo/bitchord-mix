@@ -48,14 +48,13 @@ object NpuSession {
     /**
      * Opens the plain CPU execution provider session. Immediate CPU ORT wins:
      * the arena allocator and the memory pattern optimisation are on, and the
-     * thread pool is pinned to two intra-op / one inter-op threads so a
-     * backgrounded music player never starves playback on the same silicon
-     * (the SM8635 underruns when ORT would otherwise take every core).
+     * intra-op thread pool respects [threads] (clamped to 1..4) with one
+     * inter-op thread.
      */
     fun openCpu(modelPath: String, threads: Int): OrtSession {
         val options = OrtSession.SessionOptions().apply {
             // CPU execution provider. NNAPI is not used.
-            setIntraOpNumThreads(2)
+            setIntraOpNumThreads(threads.coerceIn(1, 4))
             setInterOpNumThreads(1)
             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             // Immediate CPU ORT wins: arena allocator retained blocks are tens of

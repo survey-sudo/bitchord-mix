@@ -84,6 +84,8 @@ class StemSeparator(
     private val shouldStop: () -> Boolean = { false },
     /** Longest window the legacy path is handed at once (umxhq graph is 960 frames ~ 22.3 s). */
     private val legacyWindowSeconds: Double = 21.5,
+    /** Dedicated lock for legacy 2-stem fallback (VocalTracker), independent of 4-stem [modelLock]. */
+    private val legacyLock: Any = modelLock,
 ) : StemProvider {
 
     private val runLock = Any()
@@ -93,8 +95,8 @@ class StemSeparator(
         separateFor(null, left, right, sampleRate, regionStartSec)
 
     /** A provider bound to [trackId]: hand this to the loop mix for that deck. */
-    fun forTrack(trackId: String): StemProvider = StemProvider { left, right, rate, start ->
-        separateFor(trackId, left, right, rate, start)
+    fun forTrack(trackId: String, shouldAbort: () -> Boolean = { false }): StemProvider = StemProvider { left, right, rate, start ->
+        separateFor(trackId, left, right, rate, start, shouldAbort)
     }
 
     /** Cache-only provider for [trackId]: never computes, never blocks on inference. */
@@ -121,6 +123,7 @@ class StemSeparator(
         right: FloatArray,
         sampleRate: Int,
         regionStartSec: Double,
+        shouldAbort: () -> Boolean = { false },
     ): StemSet? {
         if (!AutomixV2Stems.enabled) return null
         if (left.isEmpty() || left.size != right.size || sampleRate <= 0) return null
@@ -131,7 +134,9 @@ class StemSeparator(
         val id = trackId ?: ("fp:" + java.lang.Long.toHexString(StemMath.fingerprint(left, right)))
         lookup(id, left, right, sampleRate, regionStartSec)?.let { return it }
         if (onPlaybackThread()) return null
-        return runCatching { compute(id, left, right, sampleRate, regionStartSec) }
+        val stopCheck = { shouldStop() || shouldAbort() }
+        if (stopCheck()) return null
+        return runCatching { compute(id, left, right, sampleRate, regionStartSec, stopCheck) }
             .onFailure { AnalysisLog.warn("stem separation failed", it) }
             .getOrNull()
     }
@@ -152,24 +157,32 @@ class StemSeparator(
         return cache.lookup(id, LEGACY_TAG, left, right, rate, start)
     }
 
-    private fun compute(id: String, left: FloatArray, right: FloatArray, rate: Int, start: Double): StemSet? {
+    private fun compute(
+        id: String,
+        left: FloatArray,
+        right: FloatArray,
+        rate: Int,
+        start: Double,
+        stopCheck: () -> Boolean,
+    ): StemSet? {
         synchronized(runLock) {
             // Another worker may have produced it while this one waited.
             lookup(id, left, right, rate, start)?.let { return it }
+            if (stopCheck()) return null
             val active = if (fourStemAllowed()) engine() else null
             if (active != null) {
-                val four = fourStem(active, left, right, rate, start)
+                val four = fourStem(active, left, right, rate, start, stopCheck)
                 if (four != null) {
                     fourStemFailures = 0
                     cache.put(id, active.tag, four, left, right)
                     return four
                 }
-                if (shouldStop()) return null
+                if (stopCheck()) return null
                 fourStemFailures++
                 AnalysisLog.warn("4-stem separation failed ($fourStemFailures); trying the 2-stem fallback")
             }
-            if (!AutomixV2Stems.legacyFallbackEnabled) return null
-            val two = twoStem(left, right, rate, start) ?: return null
+            if (!AutomixV2Stems.legacyFallbackEnabled || stopCheck()) return null
+            val two = twoStem(left, right, rate, start, stopCheck) ?: return null
             cache.put(id, LEGACY_TAG, two, left, right)
             return two
         }
@@ -177,14 +190,21 @@ class StemSeparator(
 
     // --- 4 stems ----------------------------------------------------------------------------
 
-    private fun fourStem(active: StemEngine, left: FloatArray, right: FloatArray, rate: Int, start: Double): StemSet? {
+    private fun fourStem(
+        active: StemEngine,
+        left: FloatArray,
+        right: FloatArray,
+        rate: Int,
+        start: Double,
+        stopCheck: () -> Boolean,
+    ): StemSet? {
         val modelRate = active.modelRate.toDouble()
         val sameRate = abs(rate - modelRate) < 0.5
         val modelLeft = if (sameRate) left else resample(left, rate.toDouble(), modelRate) ?: return null
         val modelRight = if (sameRate) right else resample(right, rate.toDouble(), modelRate) ?: return null
         if (modelLeft.isEmpty() || modelLeft.size != modelRight.size) return null
         val raw = synchronized(modelLock) {
-            if (shouldStop()) null else active.separate(modelLeft, modelRight, shouldStop)
+            if (stopCheck()) null else active.separate(modelLeft, modelRight, stopCheck)
         } ?: return null
 
         val n = left.size
@@ -230,7 +250,13 @@ class StemSeparator(
 
     // --- 2 stems (legacy) -------------------------------------------------------------------
 
-    private fun twoStem(left: FloatArray, right: FloatArray, rate: Int, start: Double): StemSet? {
+    private fun twoStem(
+        left: FloatArray,
+        right: FloatArray,
+        rate: Int,
+        start: Double,
+        stopCheck: () -> Boolean,
+    ): StemSet? {
         val split = legacy ?: return null
         val n = left.size
         val window = floor(legacyWindowSeconds * rate).toInt().coerceAtLeast(1)
@@ -240,12 +266,12 @@ class StemSeparator(
         val vocalLeft = FloatArray(n)
         val vocalRight = FloatArray(n)
         for ((index, from) in starts.withIndex()) {
-            if (shouldStop()) return null
+            if (stopCheck()) return null
             val length = min(window, n - from)
             val pieceLeft = left.copyOfRange(from, from + length)
             val pieceRight = right.copyOfRange(from, from + length)
-            val pair = synchronized(modelLock) {
-                if (shouldStop()) null else split.separate(pieceLeft, pieceRight, rate.toDouble())
+            val pair = synchronized(legacyLock) {
+                if (stopCheck()) null else split.separate(pieceLeft, pieceRight, rate.toDouble())
             } ?: return null
             val vocals = pair.first
             if (vocals.first.size != length || vocals.second.size != length) return null

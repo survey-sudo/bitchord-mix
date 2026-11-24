@@ -27,6 +27,7 @@ app/src/test/java/com/music/bitchord/data/stats/PackageRemapTest.kt
 app/src/test/java/com/music/bitchord/playback/audio/LoopGeneratedTimestampTest.kt
 app/src/test/java/com/music/bitchord/playback/audio/LoopSinkClockTest.kt
 app/src/test/java/com/music/bitchord/playback/loopmix
+app/src/test/java/com/music/bitchord/playback/djmix
 app/src/test/java/com/music/bitchord/playback/AutomixReplanLifecycleTest.kt
 app/src/test/java/com/music/bitchord/playback/AutomixTickerRecoveryTest.kt
 app/src/test/java/com/music/bitchord/playback/DeclineOverlapRenderTest.kt
@@ -46,6 +47,7 @@ app/src/test/java/com/music/bitchord/playback/LocalBlendControllerRegressionTest
 app/src/test/java/com/music/bitchord/playback/LoopCrownControllerRecoveryTest.kt
 app/src/test/java/com/music/bitchord/playback/LoopHandoverCleanupTest.kt
 app/src/test/java/com/music/bitchord/playback/MeasuredEchoTestEvidence.kt
+app/src/test/java/com/music/bitchord/playback/StuckStateRecoveryTest.kt
 app/src/test/java/com/music/bitchord/playback/Vc70DeclineRideAppTest.kt
 app/src/test/java/com/music/bitchord/playback/Vc70ExitLegAppTest.kt
 native/analyzer

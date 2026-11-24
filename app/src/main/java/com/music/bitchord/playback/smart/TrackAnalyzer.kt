@@ -197,7 +197,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         StemEngines(
             store = stemModels,
             dsp = { StemNative },
-            inferenceThreads = { AppSettings.automixPerformanceMode.value.inferenceThreads },
+            inferenceThreads = { 4 },
             npuVendor = { npuVendor },
             npuBackendPath = { npuBackendPath },
             npuCacheDir = { npuCacheDir },
@@ -208,8 +208,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             engine = { stemEngines.current() },
             legacy = LegacyTwoStem { l, r, rate -> vocals.separateBothWindows(l, r, rate) },
             cache = StemCache({ java.io.File(context.cacheDir, "stems") }),
-            modelLock = modelLock,
+            modelLock = stemLock,
             shouldStop = { stopped || overheated },
+            legacyLock = vocalLock,
         )
     }
 
@@ -232,23 +233,13 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
     }
 
+    /** Whether v2 stems are enabled and allowed on this device and analyzer isn't stopped/thermal-throttled. */
+    fun canUseStems(): Boolean = AutomixV2Stems.enabled && canUseV2Stems() && !stopped && !overheated
+
     /** AUTOMIX-V2(orch): per-deck provider; null when stems are not allowed on this device. */
     fun stemProviderFor(trackId: String, cachedOnly: Boolean): StemProvider? {
         if (!AutomixV2Stems.enabled || !canUseV2Stems()) return null
         return if (cachedOnly) stemSeparator.cachedOnly(trackId) else stemSeparator.forTrack(trackId)
-    }
-
-    /** AUTOMIX-V2(orch): separate a planned transition region ahead of the loop build (analysis worker). */
-    fun prefetchStems(trackId: String, uri: Uri, durationSeconds: Double, from: Double, to: Double, sampleRate: Int) {
-        if (!AutomixV2Stems.enabled || !canUseV2Stems() || stopped || overheated) return
-        runCatching {
-            executor.execute {
-                runCatching {
-                    val region = loopRegion(trackId, uri, durationSeconds, from, to, sampleRate) ?: return@runCatching
-                    stemSeparator.prefetch(trackId, region.left, region.right, sampleRate, region.start)
-                }
-            }
-        }
     }
 
     /** AUTOMIX-V2(orch): install the 4-stem model (worker thread). Bundled asset first, download second. */
@@ -579,7 +570,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     /** The cache itself (tests + budget gate). */
     fun loopRegionCache(): LoopRegionCache = loopCache
 
-    private val modelLock = Any()
+    private val beatLock = Any()
+    private val vocalLock = Any()
+    val stemLock = Any()
 
     /**
      * What is known about [trackId] right now: never a computation, never a
@@ -1951,11 +1944,16 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         val inputs = regionInputs(stereo, seconds, deriveFeatures)
 
         playbackFirst()
-        val (rawGrid, vocalValues) = synchronized(modelLock) {
-            val grid = inputs.forModel?.let { tracker.track(it, offsetSeconds = actualStart) }
-            val vocals = if (features != null) vocalValues(stereo) else null
-            grid to vocals
+        val rawGrid = inputs.forModel?.let { modelInput ->
+            synchronized(beatLock) {
+                if (yieldOrStopped()) null else tracker.track(modelInput, offsetSeconds = actualStart)
+            }
         }
+        val vocalValues = if (features != null) {
+            synchronized(vocalLock) {
+                if (yieldOrStopped()) null else vocalValues(stereo)
+            }
+        } else null
         return Region(
             grid = rawGrid?.let { snapGrid(it, stereo, actualStart) },
             vocalMask = if (features != null && vocalValues != null) vocalMask(vocalValues, features, actualStart) else null,
@@ -2152,7 +2150,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         keepVocals: Boolean,
     ): Pair<FloatArray, FloatArray>? {
         if (yieldOrStopped()) return null
-        return synchronized(modelLock) {
+        return synchronized(vocalLock) {
             if (yieldOrStopped()) null else vocals.separateWindow(left, right, sampleRate.toDouble(), keepVocals)
         }
     }
@@ -2162,7 +2160,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         right: FloatArray,
         sampleRate: Int,
     ): Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>? {
-        return synchronized(modelLock) {
+        return synchronized(vocalLock) {
             if (yieldOrStopped()) null else vocals.separateBothWindows(left, right, sampleRate.toDouble())
         }
     }
