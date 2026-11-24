@@ -210,10 +210,10 @@ class RecipesTest {
             ),
         )
         assertEquals(DjLevel.FESTIVAL, festFallback1.level)
-        assertTrue(festFallback1.recipeId in listOf("F2", "F5"), "Expected F2 or F5 fallback, got ${festFallback1.recipeId}")
+        assertTrue(festFallback1.recipeId in listOf("F2", "F5", "C2"), "Expected F2, F5, or C2 fallback, got ${festFallback1.recipeId}")
         assertTrue(festFallback1.fxCount >= 2, "Festival fallback should preserve >= 2 vc80 FX, got ${festFallback1.fxCount}")
 
-        // Second consecutive fallback transition alternates F2 <-> F5 without repeating back-to-back.
+        // Second consecutive fallback transition alternates without repeating back-to-back (ADR 0010 musical fallback F5/C2).
         val prevId = RecipeId.fromCode(festFallback1.recipeId)!!
         val festFallback2 = assertNotNull(
             Choreographer.chooseRecipe(
@@ -226,7 +226,7 @@ class RecipesTest {
             ),
         )
         assertEquals(DjLevel.FESTIVAL, festFallback2.level)
-        assertTrue(festFallback2.recipeId in listOf("F2", "F5"))
+        assertTrue(festFallback2.recipeId in listOf("F2", "F5", "C2"), "Expected F2, F5, or C2 fallback, got ${festFallback2.recipeId}")
         assertNotEquals(festFallback1.recipeId, festFallback2.recipeId)
     }
 
