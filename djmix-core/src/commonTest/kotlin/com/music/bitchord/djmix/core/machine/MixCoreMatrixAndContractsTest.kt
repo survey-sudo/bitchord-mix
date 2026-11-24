@@ -34,6 +34,7 @@ import com.music.bitchord.djmix.core.contracts.TransitionScriptV1
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
 import com.music.bitchord.djmix.core.contracts.WaypointV2
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.serializer
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -163,11 +164,11 @@ class MixCoreMatrixAndContractsTest {
         assertEquals(tele, json.decodeFromString(MixTelemetryV3.serializer(), json.encodeToString(MixTelemetryV3.serializer(), tele)))
         val ui = MixUiState(phase = MixUiPhase.READY, chipText = "Blend in 0:12", countdownSec = 12, countdownVisible = true)
         assertEquals(ui, json.decodeFromString(MixUiState.serializer(), json.encodeToString(MixUiState.serializer(), ui)))
-        assertEquals(MixOutcome.Ok("hello"), json.decodeFromString<MixOutcome.Ok<String>>(json.encodeToString<MixOutcome.Ok<String>>(MixOutcome.Ok("hello"))))
+        assertEquals(MixOutcome.Ok("hello"), json.decodeFromString(serializer<MixOutcome.Ok<String>>(), json.encodeToString(serializer<MixOutcome.Ok<String>>(), MixOutcome.Ok("hello"))))
         val refused = MixOutcome.Refused(com.music.bitchord.djmix.core.contracts.RefusalReason.WAITING_ON_ANALYSIS, "wait")
-        assertEquals(refused, json.decodeFromString<MixOutcome.Refused>(json.encodeToString<MixOutcome.Refused>(refused)))
+        assertEquals(refused, json.decodeFromString(serializer<MixOutcome.Refused>(), json.encodeToString(serializer<MixOutcome.Refused>(), refused)))
         val failed = MixOutcome.Failed(FailureKind.DECODE_ERROR, "bad", true)
-        assertEquals(failed, json.decodeFromString<MixOutcome.Failed>(json.encodeToString<MixOutcome.Failed>(failed)))
+        assertEquals(failed, json.decodeFromString(serializer<MixOutcome.Failed>(), json.encodeToString(serializer<MixOutcome.Failed>(), failed)))
         assertEquals(20, EnvelopeKind.entries.size)
         assertEquals((0..19).toSet(), EnvelopeKind.entries.map { it.nativeId }.toSet())
         assertEquals(EnvelopeKind.BRAKE, EnvelopeKind.fromNativeId(18))
