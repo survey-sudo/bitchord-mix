@@ -37,12 +37,21 @@ import com.music.bitchord.playback.loopmix.LoopMixPort
 import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
+import com.music.bitchord.playback.djmix.DeckWave
 import com.music.bitchord.playback.djmix.EaseTempoEngine
 import com.music.bitchord.playback.djmix.EaseTempoHost
 import com.music.bitchord.playback.djmix.FadeRideCurves
 import com.music.bitchord.playback.djmix.MixDeckAdapter
+import com.music.bitchord.playback.djmix.MixEventHost
+import com.music.bitchord.playback.djmix.MixEventRouter
 import com.music.bitchord.playback.djmix.MixExecutor
+import com.music.bitchord.playback.djmix.MixGeometry
+import com.music.bitchord.playback.djmix.MixViewHost
+import com.music.bitchord.playback.djmix.MixViewPublisher
+import com.music.bitchord.playback.djmix.NativeBinding
+import com.music.bitchord.playback.djmix.Opportunity
 import com.music.bitchord.playback.djmix.PreparedPair
+import com.music.bitchord.playback.djmix.RideSpec
 import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
 import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.LoopMix
@@ -788,8 +797,6 @@ class CrossfadeController(
     /** The last reason logged for the seek bar's Automix marker showing or not, so it logs on change. */
     private var lastMarkerVerdict = ""
 
-    /** Decoding the mix popup's waveforms for the blend in flight. */
-    private var mixViewJob: Job? = null
 
     /**
      * The style fields of a [com.music.bitchord.playback.smart.TransitionPlan],
@@ -1333,25 +1340,6 @@ class CrossfadeController(
         }
     }
 
-    /** Length of the fade-out driven by [Phase.SLEEP_FADE], in ms. Fixed when it begins. */
-    private var sleepFadeMs = 0L
-
-    /**
-     * Where the outgoing track was when [beginSleepFadeOut] started, in its
-     * own position ms. Progress is measured from here rather than off a
-     * clock, for the same reason [driveFade] measures off the incoming
-     * track's position: a pause should park the fade-out where it stands,
-     * not keep counting down underneath a silent, stopped player.
-     */
-    private var sleepFadeStartPositionMs = 0L
-
-    /**
-     * The outgoing track's own volume when [beginSleepFadeOut] started, so a
-     * fade-out that begins mid-ramp (rare, but a plan can be replanned right up
-     * to the moment it arms) scales from where the volume actually is rather
-     * than assuming it started at full.
-     */
-    private var sleepFadeStartGain = 1f
 
     /**
      * When the last transition finished, from [SystemClock.elapsedRealtime], or
@@ -3935,104 +3923,11 @@ class CrossfadeController(
      * grid moving to the other song — or playback starts or stops.
      */
     private fun publishBlend(out: ExoPlayer, into: ExoPlayer, force: Boolean = false) {
-        if (!smartFadeActive) return
-        val session = if (handedOff) into else out
-        val playing = session.isPlaying
-        val last = AppSettings.smartMixBlend.value
-        // A paused blend's grid is frozen along with its players; re-deriving
-        // it against a clock that keeps running would only slide the anchor.
-        if (!force && last != null && !playing && !last.playing) return
-
-        // Placed with [beatAt], the grid the phase lock itself steers by: beats
-        // counted within the analyzer's downbeat bars, not off one interval from
-        // the first beat. That constant grid drifts — a 0.1% tempo error is
-        // 180ms three minutes in, a third of a beat, right where a blend runs —
-        // so the pulse sat visibly off audio the lock had put exactly on it.
-        // The rate is each player's real speed, which includes any phase-lock
-        // nudge in flight rather than the stretch it was armed with.
-        val sides = if (handedOff) {
-            listOf(incomingAnalysis to into, outgoingAnalysis to out)
-        } else {
-            listOf(outgoingAnalysis to out, incomingAnalysis to into)
-        }
-        var beatMs = 0f
-        var anchor = 0L
-        for ((analysis, player) in sides) {
-            if (!tempoEngine.beatAt(analysis, positionMs(player) / 1000.0)) continue
-            val rate = player.playbackParameters.speed.toDouble().takeIf { it > 0.0 } ?: 1.0
-            val sinceBeat = tempoEngine.beatSinceSec
-            beatMs = (tempoEngine.beatIntervalSec * 1000.0 / rate).toFloat()
-            anchor = System.nanoTime() - (sinceBeat / rate * 1e9).toLong()
-            break
-        }
-        if (!force && last != null && last.playing == playing && sameGrid(last, beatMs, anchor)) return
-        AppSettings.smartMixBlend.value = MixBlend(
-            beatMs = beatMs,
-            beatAnchorNanos = anchor,
-            playing = playing,
-        )
+        mixViewPublisher.publishBlend(out, into, force)
     }
 
-    /**
-     * The overlap on each track's own timeline, as the mix popup draws it,
-     * and the context shown either side of it. Fixed by the plan, so arming
-     * and the blend agree on it.
-     */
-    private class MixGeometry(val outStart: Double, val outEnd: Double, val inStart: Double, val inEnd: Double, val ratio: Double) {
-        val outSpan get() = outEnd - outStart
-        val context get() = outSpan * MIX_VIEW_CONTEXT
-        val outFrom get() = outStart - context
-        val outTo get() = outEnd + context
-        val inFrom get() = inStart - context * ratio
-        val inTo get() = inEnd + context * ratio
-    }
+    private fun mixGeometry(): MixGeometry = mixViewPublisher.mixGeometry()
 
-    private fun mixGeometry(): MixGeometry {
-        val outEnd = fadeEndMs / 1000.0
-        val outStart = outEnd - (fadeMs / 1000.0).coerceAtLeast(0.5)
-        val ratio = if (render.advanced) mediaRatio else 1.0
-        val inStart = incomingCueTimeMs / 1000.0
-        return MixGeometry(outStart, outEnd, inStart, inStart + (outEnd - outStart) * ratio, ratio)
-    }
-
-    /** A decoded waveform and the stretch of its track, in seconds, it covers. */
-    private class DeckWave(val mediaId: String, val from: Double, val to: Double, val bands: MixWaveform.Bands) {
-        fun covers(id: String, start: Double, end: Double) = id == mediaId && from <= start + 0.05 && to >= end - 0.05
-    }
-
-    /**
-     * The waveforms for the next transition. Decoded ahead of it — see
-     * [prefetchMixWaves] — so the popup has them the moment the blend starts.
-     */
-    private var outgoingWave: DeckWave? = null
-    private var incomingWave: DeckWave? = null
-
-    /** Which pair [mixViewJob] is decoding, so a tick does not start it twice. */
-    private var mixWavePair: String? = null
-
-    /** The media ids [mixViewJob] has still to decode, which the popup shows as skeletons. */
-    private val pendingWaveIds = mutableSetOf<String>()
-
-    /**
-     * When a media id's waveform last failed to decode. Held off for
-     * [MIX_WAVE_RETRY_MS] rather than retried on the next tick, which with the
-     * popup open would be four failing decodes a second.
-     */
-    private val failedWaveAt = mutableMapOf<String, Long>()
-
-    private fun waveFailedRecently(id: String) =
-        failedWaveAt[id]?.let { nowMs() - it < MIX_WAVE_RETRY_MS } == true
-
-    /**
-     * Decodes both waveforms the mix popup will draw, once the next
-     * transition is [MIX_PREFETCH_MS] away. Padded beyond the popup's own
-     * context, since the plan can still shift a little before it arms; the
-     * popup places each waveform by its time, so the extra is simply offscreen.
-     *
-     * Only the windows themselves are decoded, never the whole file, and on a
-     * background thread long before they are needed: a blend can be over in
-     * a few seconds, which is less than a decode deep into a file can take.
-     */
     private fun prefetchMixWaves(
         outItem: MediaItem,
         inItem: MediaItem,
@@ -4042,106 +3937,15 @@ class CrossfadeController(
         outEnd: Double,
         inStart: Double,
         ratio: Double,
-        /** Each side on its own: the popup's preview decodes a track as soon as that one is measured. */
         wantOut: Boolean = true,
         wantIn: Boolean = true,
     ) {
-        val span = (outEnd - outStart).coerceAtLeast(0.5)
-        val pad = span * MIX_VIEW_CONTEXT + MIX_PREFETCH_PAD_SECONDS
-        val outFrom = (outStart - pad).coerceAtLeast(0.0)
-        val outTo = outEnd + pad
-        val inFrom = (inStart - pad * ratio).coerceAtLeast(0.0)
-        val inTo = inStart + (span + pad) * ratio
-        val pair = "${outItem.mediaId}->${inItem.mediaId}"
-        if (mixWavePair != null && mixWavePair != pair) failedWaveAt.clear()
-        val outReady = !wantOut || waveFailedRecently(outItem.mediaId) ||
-            outgoingWave?.covers(outItem.mediaId, outFrom + MIX_PREFETCH_PAD_SECONDS, outTo - MIX_PREFETCH_PAD_SECONDS) == true
-        val inReady = !wantIn || waveFailedRecently(inItem.mediaId) ||
-            incomingWave?.covers(inItem.mediaId, inFrom + MIX_PREFETCH_PAD_SECONDS, inTo - MIX_PREFETCH_PAD_SECONDS) == true
-        if (outReady && inReady) return
-        if (mixViewJob?.isActive == true && mixWavePair == pair) return
-        mixViewJob?.cancel()
-        mixWavePair = pair
-        pendingWaveIds.clear()
-        if (!outReady) pendingWaveIds += outItem.mediaId
-        if (!inReady) pendingWaveIds += inItem.mediaId
-        republishWaves()
-        mixViewJob = scope.launch {
-            suspend fun wave(item: MediaItem, durationMs: Long, from: Double, to: Double): DeckWave? =
-                withContext(Dispatchers.IO) {
-                    val began = nowMs()
-                    val bins = ((to - from) * MIX_WAVE_BINS_PER_SECOND).toInt().coerceIn(64, MIX_WAVE_MAX_BINS)
-                    val bands = runCatching { mixWaveform(item, durationMs, from, to, bins) }
-                        .onFailure { Log.w(TAG, "mix waveform failed for ${item.mediaId}", it) }
-                        .getOrNull()
-                    Log.d(
-                        TAG,
-                        "mix waveform ${item.mediaId} " +
-                            String.format(Locale.ROOT, "%.1f-%.1fs", from, to) +
-                            ": ${if (bands == null) "none" else "ok"} in ${nowMs() - began}ms",
-                    )
-                    bands?.let { DeckWave(item.mediaId, from, to, it) }
-                }
-            if (!outReady) {
-                outgoingWave = wave(outItem, outDurationMs, outFrom, outTo)
-                if (outgoingWave == null) failedWaveAt[outItem.mediaId] = nowMs()
-                pendingWaveIds -= outItem.mediaId
-                republishWaves()
-            }
-            if (!inReady) {
-                incomingWave = wave(inItem, inDurationMs, inFrom, inTo)
-                if (incomingWave == null) failedWaveAt[inItem.mediaId] = nowMs()
-                pendingWaveIds -= inItem.mediaId
-                republishWaves()
-            }
-        }
-    }
-
-    /** Puts whatever waveforms have arrived into the views the popup can be showing. */
-    private fun republishWaves() {
-        AppSettings.smartMixView.value?.let { AppSettings.smartMixView.value = withWaves(it, mixViewIds) }
-        AppSettings.smartMixPreview.value?.let { AppSettings.smartMixPreview.value = withWaves(it, mixPreviewIds) }
-    }
-
-    /** [view] with the decoded waveforms of [ids] in, and each deck marked while its own is still coming. */
-    private fun withWaves(view: MixTransitionView, ids: Pair<String, String>?): MixTransitionView {
-        fun MixDeck.with(wave: DeckWave?, id: String?): MixDeck {
-            val decoded = if (wave != null && wave.mediaId == id) {
-                withWave(wave.bands.low, wave.bands.mid, wave.bands.high, wave.from, wave.to)
-            } else {
-                this
-            }
-            return decoded.withDecoding(id != null && id in pendingWaveIds)
-        }
-        return view.withDecks(
-            view.outgoing.with(outgoingWave, ids?.first),
-            view.incoming.with(incomingWave, ids?.second),
+        mixViewPublisher.prefetchMixWaves(
+            outItem, inItem, outDurationMs, inDurationMs,
+            outStart, outEnd, inStart, ratio, wantOut, wantIn,
         )
     }
 
-    /** The media ids of the blend [AppSettings.smartMixView] is showing. */
-    private var mixViewIds: Pair<String, String>? = null
-
-    /** The media ids of the pair [AppSettings.smartMixPreview] lays out. */
-    private var mixPreviewIds: Pair<String, String>? = null
-
-    /** When [AppSettings.smartMixPreview] was last planned, so one nothing is planning any more is let go. */
-    private var mixPreviewAt = 0L
-
-    /** What the last preview showed, so a tick that changes nothing does not republish it. */
-    private var mixPreviewKey = ""
-
-    /**
-     * Lays the next transition out for a mix popup opened by hand between
-     * blends: the same decks, frame and faders the blend will show, from the
-     * plan as it stands. Only while the popup is up — nobody else reads it —
-     * and its waveforms are decoded now rather than [MIX_PREFETCH_MS] out,
-     * because someone is looking.
-     *
-     * A side still being measured goes out flagged and without numbers, and
-     * the popup draws a skeleton for it; the frame it sits in may still move
-     * as that measurement lands.
-     */
     private fun publishMixPreview(
         currentItem: MediaItem,
         nextItem: MediaItem,
@@ -4153,279 +3957,41 @@ class CrossfadeController(
         plan: TransitionPlan,
         advanced: Boolean,
     ) {
-        if (!AppSettings.mixViewOpen.value || AppSettings.smartMixView.value != null) return
-        mixPreviewAt = nowMs()
-        val outStart = plan.transitionStart
-        val outEnd = maxOf(plan.transitionEnd, outStart + 0.5)
-        val inStart = plan.incomingCueTime
-        val ratio = plan.incomingPlaybackRate / plan.outgoingPlaybackRate.coerceAtLeast(0.01)
-        val geometry = MixGeometry(outStart, outEnd, inStart, inStart + (outEnd - outStart) * ratio, ratio)
-        val currentAnalysing = state.current == TrackAnalysisState.WAITING || state.current == TrackAnalysisState.ANALYSING
-        val nextAnalysing = state.next == TrackAnalysisState.WAITING || state.next == TrackAnalysisState.ANALYSING
-        val beatSeconds = if (currentAnalysis.isUsable) plan.beatSeconds else 0.0
-        val beats = if (beatSeconds > 0) (geometry.outSpan / beatSeconds).roundToInt() else 0
-
-        // Before the waveforms, so a decode that starts now is marked on the decks below.
-        prefetchMixWaves(
-            currentItem, nextItem, duration, nextDuration, outStart, outEnd, inStart, ratio,
-            wantOut = currentAnalysis.isUsable,
-            wantIn = nextAnalysis.isUsable,
-        )
-
-        val ids = currentItem.mediaId to nextItem.mediaId
-        val key = "${ids.first}|${ids.second}|${round(outStart * 20)}|${round(outEnd * 20)}|${round(inStart * 20)}|" +
-            "$beats|$currentAnalysing|$nextAnalysing|${currentAnalysis.bpm}|${nextAnalysis.bpm}|" +
-            "${currentAnalysis.key}|${nextAnalysis.key}|${plan.transitionStyle}|${plan.bassSwap}"
-        if (key == mixPreviewKey && mixPreviewIds == ids && AppSettings.smartMixPreview.value != null) return
-        mixPreviewKey = key
-
-        // The plan's own fader curves, through the same code the blend will
-        // ride them with. Swapped in and straight back out on this thread:
-        // [render] is only read by the blend, and no blend is running while
-        // there is a plan to preview.
-        val planned = renderFor(plan, advanced)
-        val running = render
-        render = planned
-        val samples = MIX_VIEW_FADER_POINTS
-        val wallSpan = (plan.fadeMs * if (planned.advanced) ratio else 1.0).toFloat()
-        val fadeOut: FloatArray
-        val fadeIn: FloatArray
-        try {
-            fadeOut = FloatArray(samples) {
-                fadeCurves.outgoingLevel(render.rideSpec, it / (samples - 1f), wallSpan).coerceIn(0f, 1f)
-            }
-            fadeIn = FloatArray(samples) {
-                fadeCurves.mixRise(render.rideSpec, it / (samples - 1f)).coerceIn(0f, 1f)
-            }
-        } finally {
-            render = running
-        }
-
-        fun deck(item: MediaItem, analysis: TrackAnalysis, durationMs: Long, analysing: Boolean, from: Double, to: Double) = MixDeck(
-            title = item.mediaMetadata.title?.toString().orEmpty(),
-            artist = item.mediaMetadata.artist?.toString().orEmpty(),
-            artworkUrl = item.mediaMetadata.artworkUri?.toString(),
-            bpm = if (analysis.isUsable) analysis.bpm else 0.0,
-            key = if (analysis.isUsable) analysis.key else "",
-            durationMs = durationMs.takeIf { it > 0L } ?: (analysis.duration * 1000).roundToLong(),
-            waveStart = from,
-            waveEnd = to,
-            analysing = analysing,
-        )
-
-        mixPreviewIds = ids
-        AppSettings.smartMixPreview.value = withWaves(
-            MixTransitionView(
-                outgoing = deck(currentItem, currentAnalysis, duration, currentAnalysing, geometry.outFrom, geometry.outTo),
-                incoming = deck(nextItem, nextAnalysis, nextDuration, nextAnalysing, geometry.inFrom, geometry.inTo),
-                outStart = outStart,
-                outEnd = outEnd,
-                inStart = geometry.inStart,
-                inEnd = geometry.inEnd,
-                beats = beats,
-                beatMarks = beatMarks(currentAnalysis, outStart, outEnd, beatSeconds),
-                fadeOut = fadeOut,
-                fadeIn = fadeIn,
-                bassSwapAt = when {
-                    plan.transitionStyle == TransitionStyle.DJ_FILTER &&
-                        (plan.filterVariant == FilterTransitionVariant.BASS_HANDOFF || plan.filterVariant == FilterTransitionVariant.DECLINE) -> planned.filterSwapAtF
-                    planned.bassSwap -> planned.swapAtF
-                    else -> -1f
-                },
-            ),
-            ids,
+        mixViewPublisher.publishMixPreview(
+            currentItem, nextItem, duration, nextDuration,
+            currentAnalysis, nextAnalysis, state, plan, advanced,
         )
     }
 
-    /**
-     * Lets the preview go once the popup is closed, a blend has taken over, or
-     * nothing has planned the pair for a while — the queue ran out, a party
-     * started, Automix was switched off. Only between blends: arming plans
-     * nothing, and the preview is still the right picture until the blend
-     * replaces it.
-     */
     private fun expireMixPreview() {
-        if (AppSettings.smartMixPreview.value == null) return
-        val stale = phase == Phase.IDLE && nowMs() - mixPreviewAt > MIX_PREVIEW_STALE_MS
-        if (AppSettings.mixViewOpen.value && AppSettings.smartMixView.value == null && !stale) return
-        AppSettings.smartMixPreview.value = null
-        mixPreviewIds = null
-        mixPreviewKey = ""
+        mixViewPublisher.expireMixPreview()
     }
 
-    /** Beats inside [outStart]..[outEnd] on [analysis]'s grid, as fractions of it, for the popup's grid lines. */
-    private fun beatMarks(analysis: TrackAnalysis, outStart: Double, outEnd: Double, beatSeconds: Double): FloatArray {
-        if (beatSeconds <= 0) return FloatArray(0)
-        val span = outEnd - outStart
-        val anchor = analysis.downbeats.lastOrNull { it <= outStart } ?: outStart
-        val first = anchor + ceil((outStart - anchor) / beatSeconds) * beatSeconds
-        return generateSequence(first) { it + beatSeconds }
-            .takeWhile { it <= outEnd + 1e-6 }
-            .map { ((it - outStart) / span).toFloat() }
-            .toList().toFloatArray()
-    }
-
-    /**
-     * Lays the blend just started out for the mix popup: both tracks' cards,
-     * where the overlap sits on each timeline, its beats and the faders it
-     * will ride, with whichever waveforms have already been decoded.
-     */
     private fun publishMixView(out: ExoPlayer, into: ExoPlayer) {
-        val plan = planInFlight ?: return
-        val outItem = out.currentMediaItem ?: return
-        val inItem = into.currentMediaItem ?: return
-        val geometry = mixGeometry()
-        val outStart = geometry.outStart
-        val outEnd = geometry.outEnd
-        val outSpan = geometry.outSpan
-        val beatSeconds = plan.beatSeconds
-        val beats = if (beatSeconds > 0) (outSpan / beatSeconds).roundToInt() else 0
-        val marks = beatMarks(outgoingAnalysis, outStart, outEnd, beatSeconds)
-        val wallSpan = (fadeMs * if (render.advanced) mediaRatio else 1.0).toFloat()
-        val samples = MIX_VIEW_FADER_POINTS
-        val fadeOut = FloatArray(samples) {
-            fadeCurves.outgoingLevel(render.rideSpec, it / (samples - 1f), wallSpan).coerceIn(0f, 1f)
-        }
-        val fadeIn = FloatArray(samples) {
-            fadeCurves.mixRise(render.rideSpec, it / (samples - 1f)).coerceIn(0f, 1f)
-        }
-
-        fun deck(item: MediaItem, player: ExoPlayer, analysis: TrackAnalysis, from: Double, to: Double) = MixDeck(
-            title = item.mediaMetadata.title?.toString().orEmpty(),
-            artist = item.mediaMetadata.artist?.toString().orEmpty(),
-            artworkUrl = item.mediaMetadata.artworkUri?.toString(),
-            bpm = analysis.bpm,
-            key = analysis.key,
-            durationMs = player.duration.takeIf { it != C.TIME_UNSET && it > 0L }
-                ?: (analysis.duration * 1000).roundToLong(),
-            waveStart = from,
-            waveEnd = to,
-        )
-
-        AppSettings.smartMixProgress.value = 0f
-        mixViewIds = outItem.mediaId to inItem.mediaId
-        // The blend is the picture from here; a popup opened on the plan moves onto it.
-        AppSettings.smartMixPreview.value = null
-        mixPreviewIds = null
-        mixPreviewKey = ""
-        AppSettings.smartMixView.value = MixTransitionView(
-            outgoing = deck(outItem, out, outgoingAnalysis, geometry.outFrom, geometry.outTo),
-            incoming = deck(inItem, into, incomingAnalysis, geometry.inFrom, geometry.inTo),
-            outStart = outStart,
-            outEnd = outEnd,
-            inStart = geometry.inStart,
-            inEnd = geometry.inEnd,
-            beats = beats,
-            beatMarks = marks,
-            fadeOut = fadeOut,
-            fadeIn = fadeIn,
-            bassSwapAt = when {
-                render.style == TransitionStyle.DJ_FILTER && (render.filterVariant == FilterTransitionVariant.BASS_HANDOFF || render.filterVariant == FilterTransitionVariant.DECLINE) ->
-                    render.filterSwapAtF
-                render.bassSwap -> render.swapAtF
-                else -> -1f
-            },
-        )
-        republishWaves()
+        mixViewPublisher.publishMixView(out, into)
     }
 
     private fun clearMixView() {
-        mixViewJob?.cancel()
-        mixViewJob = null
-        mixWavePair = null
-        mixViewIds = null
-        outgoingWave = null
-        incomingWave = null
-        pendingWaveIds.clear()
-        failedWaveAt.clear()
-        AppSettings.smartMixView.value = null
+        mixViewPublisher.clearMixView()
     }
 
-    /** Whether [beatMs] and [anchor] describe the grid [last] already published, to within a tick's jitter. */
-    private fun sameGrid(last: MixBlend, beatMs: Float, anchor: Long): Boolean {
-        if (beatMs <= 0f || last.beatMs <= 0f) return beatMs <= 0f && last.beatMs <= 0f
-        if (abs(beatMs - last.beatMs) > beatMs * TEMPO_TOLERANCE) return false
-        val beatNanos = (beatMs * 1_000_000.0).toLong().coerceAtLeast(1L)
-        // Distance between the two anchors, the short way round one beat.
-        val offset = Math.floorMod(anchor - last.beatAnchorNanos, beatNanos)
-        return minOf(offset, beatNanos - offset) <= ANCHOR_TOLERANCE_NANOS
-    }
+    private fun sameGrid(last: MixBlend, beatMs: Float, anchor: Long): Boolean =
+        mixViewPublisher.sameGrid(last, beatMs, anchor)
 
-    /**
-     * Starts [Phase.SLEEP_FADE]: the track playing right now is faded to
-     * silence on its own, over `fade` ms — the same span a real transition
-     * into the next track would have spent on this side of the blend — and
-     * then paused.
-     *
-     * Deliberately not [begin] with a no-op standby. [begin] loads the queue
-     * onto the idle player and starts it silently so it is ready to take over
-     * at the handoff; none of that should happen here; there is no handoff
-     * coming, and preparing a second decoder just to throw it away the moment
-     * the fade ends wastes exactly the work this exists to skip.
-     */
     private fun beginSleepFadeOut(fade: Long) {
-        val out = active()
-        sleepFadeMs = fade.coerceAtLeast(1L)
-        sleepFadeStartPositionMs = out.currentPosition
-        sleepFadeStartGain = out.volume
-        outgoing = out
-        incoming = null
-        handedOff = false
-        Log.d(TAG, "sleep timer due: fading out over ${fade}ms instead of transitioning")
-        phase = Phase.SLEEP_FADE
+        mixEventRouter.beginSleepFadeOut(fade)
     }
 
-    /**
-     * The fade-out proper. Mirrors [driveFade]'s curve on the outgoing side —
-     * same [fallGain], same position-driven progress — but there is no
-     * incoming track to weigh it against, so the span is simply [sleepFadeMs].
-     */
     private fun driveSleepFade() {
-        val out = outgoing ?: return finishSleepFade()
-        // The listener turned the timer off mid-fade — nothing left to do but
-        // hand the track back at full volume and let ordinary transition
-        // logic resume next tick.
-        if (!SleepTimer.afterTrack.value) {
-            out.volume = 1f
-            outgoing = null
-            phase = Phase.IDLE
-            return
-        }
-        val elapsed = (out.currentPosition - sleepFadeStartPositionMs).coerceAtLeast(0L)
-        val progress = (elapsed.toFloat() / sleepFadeMs).coerceIn(0f, 1f)
-        out.volume = sleepFadeStartGain * FadeRideCurves.fallGain(progress)
-        val done = progress >= 1f ||
-            out.playbackState == Player.STATE_ENDED ||
-            out.playbackState == Player.STATE_IDLE
-        if (done) finishSleepFade()
+        mixEventRouter.driveSleepFade()
     }
 
-    /** Pauses the track the fade-out was run on and retires the timer that asked for it. */
     private fun finishSleepFade() {
-        outgoing?.pause()
-        outgoing?.volume = 1f
-        SleepTimer.cancel()
-        outgoing = null
-        phase = Phase.IDLE
+        mixEventRouter.finishSleepFade()
     }
 
-    /** Ramps the outgoing track away rather than cutting it, so an interruption has no click in it. */
     private fun driveBail() {
-        val leaving = leavingOnBail()
-        if (leaving == null) {
-            finish()
-            return
-        }
-        // djmix11: even bail (emergency) takes the shortened dissolve.
-        val progress = (nowMs() - bailStartedAt).toFloat() /
-            maxOf(BAIL_MS, PhraseConfig.EXIT_TAIL_EMERGENCY_MS.toLong())
-        if (progress < 1f) {
-            val fall = if (leaving === outgoing && ranOn(leaving)) 0f else bailFromGain * FadeRideCurves.fallGain(progress)
-            leaving.volume = fall
-            onBlendHeadroom(FadeRideCurves.headroomFor(1f, fall))
-            return
-        }
-        finish()
+        mixEventRouter.driveBail()
     }
 
 
@@ -4449,85 +4015,49 @@ class CrossfadeController(
     private var primeJob: Job? = null
     private var primeRetryAt = 0L
     private var buildGeneration = 0
-    /** One opportunity survives revisions, retries and native -> classic cleanup. */
-    private data class Opportunity(val attemptId: String, val outId: String, val inId: String, val scrubEpoch: Long)
-    private val opportunityRunId = java.util.UUID.randomUUID().toString()
-    private var opportunitySequence = 0L
-    private var opportunity: Opportunity? = null
-    private var planRevision = 0
-    private var revisionRoute: Any? = null
-    private var executedRoute: Map<String, Any?>? = null
-    private var terminalRecorded = false
-    private var routingFallback = false
-    private data class NativeBinding(
-        val context: Opportunity,
-        val revision: Int,
-        val generation: Int,
-        val coarseDecline: Boolean?,
-    )
-    private var nativeBinding: NativeBinding? = null
-    private val routingEvidenceKeys = mutableSetOf<String>()
+    private var opportunity: Opportunity?
+        get() = mixEventRouter.opportunity
+        set(value) { mixEventRouter.opportunity = value }
 
-    private fun ensureOpportunity(outId: String, inId: String): Opportunity {
-        opportunity?.let { current ->
-            if (current.outId == outId && current.inId == inId && current.scrubEpoch == scrubEpoch && !terminalRecorded) return current
-        }
-        // A pair changed without a measured terminal event: do not invent success.
-        countdownStabilizer.clearFailedNativeRecovery()
-        opportunity = Opportunity("$opportunityRunId:${++opportunitySequence}", outId, inId, scrubEpoch)
-        planGeneration++
-        planResultGeneration = -1L
-        fallbackNaturalGeneration = -1L
-        naturalProvisionalUntilPosMs = -1L
-        planRevision = 0
-        revisionRoute = null
-        executedRoute = null
-        initiatingExitReason = null
-        capturedTakeoverSpliceBufferStatus = null
-        capturedLoopTookOver = null
-        nativeBinding = null
-        terminalRecorded = false
-        routingEvidenceKeys.clear()
-        resetOpportunityEventKeys()
-        return opportunity!!
-    }
+    private var planRevision: Int
+        get() = mixEventRouter.planRevision
+        set(value) { mixEventRouter.planRevision = value }
 
-    /** Natural queue occurrences can share IDs; expire telemetry only, never audio/planning state. */
+    private var executedRoute: Map<String, Any?>?
+        get() = mixEventRouter.executedRoute
+        set(value) { mixEventRouter.executedRoute = value }
+
+    private var terminalRecorded: Boolean
+        get() = mixEventRouter.terminalRecorded
+        set(value) { mixEventRouter.terminalRecorded = value }
+
+    private var routingFallback: Boolean
+        get() = mixEventRouter.routingFallback
+        set(value) { mixEventRouter.routingFallback = value }
+
+    private var nativeBinding: NativeBinding?
+        get() = mixEventRouter.nativeBinding
+        set(value) { mixEventRouter.nativeBinding = value }
+
+    private val routingEvidenceKeys: MutableSet<String>
+        get() = mixEventRouter.routingEvidenceKeys
+
+    private fun ensureOpportunity(outId: String, inId: String): Opportunity =
+        mixEventRouter.ensureOpportunity(outId, inId)
+
     private fun expireIdleOpportunity(reason: String) {
-        if (phase != Phase.IDLE) return
-        val context = opportunity ?: return
-        if (!terminalRecorded) {
-            mixEvent("mix.plan.rejected", mapOf("stage" to "terminal", "outcome" to "unknown",
-                "terminal" to true, "refusalCode" to "media-occurrence-ended", "reason" to reason), context)
-        }
-        terminalRecorded = true
-        opportunity = null
-        planRevision = 0
-        revisionRoute = null
-        executedRoute = null
-        nativeBinding = null
-        routingEvidenceKeys.clear()
-        resetOpportunityEventKeys()
+        mixEventRouter.expireIdleOpportunity(reason)
     }
 
-    /** Outer event guards must not hide the same verdict on a later opportunity. */
     private fun resetOpportunityEventKeys() {
-        lastRejectedLogKey = null
-        lastEmittedPlanVerdict = null
-        lastArmDeathKey = null
-        lastFallbackLogKey = null
+        mixEventRouter.resetOpportunityEventKeys()
     }
 
-    private fun opportunityFields(context: Opportunity?): Map<String, Any?> = mapOf(
-        "attemptId" to context?.attemptId,
-        "outId" to context?.outId, "inId" to context?.inId,
-        "scrubEpoch" to context?.scrubEpoch,
-        "outRenditionRevision" to "unknown", "inRenditionRevision" to "unknown",
-        "outAnalysisRevision" to "unknown", "inAnalysisRevision" to "unknown",
-    )
+    private fun opportunityFields(context: Opportunity?): Map<String, Any?> =
+        mixEventRouter.opportunityFields(context)
 
     private fun mixEvent(name: String, fields: Map<String, Any?>, context: Opportunity? = opportunity) {
-        AutomixTelemetry.event(name, opportunityFields(context) + mapOf("planRevision" to planRevision) + fields)
+        mixEventRouter.mixEvent(name, fields, context)
     }
 
     private fun nativeRouteFields(
@@ -4536,99 +4066,46 @@ class CrossfadeController(
         inLoops: Boolean? = null,
         actualConfiguration: Boolean = false,
         coarseDecline: Boolean? = null,
-    ): Map<String, Any?> {
-        val configurationKnown = actualConfiguration || outLoops != null || inLoops != null
-        // Telemetry may be assembled on the playback ticker. Keep its planned
-        // endpoint summaries scalar-only; the full shared qualifier allocates
-        // a clock and is run at admission, not again for every route event.
-        val targetRate = plan.targetBpm / plan.out.bpm
-        val reciprocalRate = 1.0 / targetRate
-        val ratesFinite = plan.outLoops && plan.inLoops && targetRate.isFinite() && targetRate > 0.0 &&
-            reciprocalRate.isFinite() && reciprocalRate > 0.0
-        val isConfiguredCrown = if (configurationKnown) outLoops == true && inLoops == true
-            else plan.outLoops && plan.inLoops
-        val technique = when {
-            configurationKnown && (outLoops == null || inLoops == null) -> "unknown-native"
-            configurationKnown && outLoops == true && inLoops == true -> "crown-loop"
-            configurationKnown -> "native-bridge"
-            plan.outLoops && plan.inLoops -> "crown-loop" // requested candidate only
-            else -> "native-bridge"
-        }
-        return mapOf(
-            "technique" to technique,
-            "rung" to plan.rung,
-            "requestedOutLoops" to plan.outLoops, "requestedInLoops" to plan.inLoops,
-            "configuredOutLoops" to outLoops, "configuredInLoops" to inLoops,
-            "outLoopStart" to plan.out.loopStart, "outLoopEnd" to plan.out.loopEnd,
-            "inLoopStart" to plan.inn.loopStart, "inLoopEnd" to plan.inn.loopEnd,
-            "fold" to plan.fold, "rampBars" to plan.rampBars,
-            "echoTail" to plan.echoTail, "carve" to plan.carve, "clash" to plan.clash,
-            "coarseDecline" to coarseDecline,
-            "coarseOverride" to (coarseDecline == true && isConfiguredCrown),
-            "plannedOutGridSource" to if (plan.out.anchorBeats != null) "tracked" else "constant-grid",
-            "plannedInGridSource" to if (plan.inn.anchorBeats != null) "tracked" else "constant-grid",
-            "outGridSource" to "unknown", "inGridSource" to "unknown",
-            "plannedOutMinRate" to if (ratesFinite) minOf(1.0, targetRate) else null,
-            "plannedOutMaxRate" to if (ratesFinite) maxOf(1.0, targetRate) else null,
-            "plannedInMinRate" to if (ratesFinite) minOf(1.0, reciprocalRate) else null,
-            "plannedInMaxRate" to if (ratesFinite) maxOf(1.0, reciprocalRate) else null,
-        )
-    }
+    ): Map<String, Any?> =
+        mixEventRouter.nativeRouteFields(plan, outLoops, inLoops, actualConfiguration, coarseDecline)
 
     private fun nativeSessionRouteFields(session: LoopMixSession, coarseDecline: Boolean? = null): Map<String, Any?> =
-        nativeRouteFields(session.plan, session.configuredOutLoops, session.configuredInLoops,
-            actualConfiguration = true, coarseDecline = coarseDecline) + mapOf(
-            "outGridSource" to session.outGridSource.telemetryValue,
-            "inGridSource" to session.inGridSource.telemetryValue,
-            "choreo" to session.choreoMove, // AUTOMIX-V2(orch): executed-move attribution
-            // The real execution path, not the planned one: straight routes must be distinguishable.
-            "path" to session.executionPath,
-            "preparationGeneration" to session.preparationGeneration,
-        )
+        mixEventRouter.nativeSessionRouteFields(session, coarseDecline)
 
-    private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(
-        "technique" to "classic", "transitionStyle" to plan?.transitionStyle?.name,
-        "filterVariant" to plan?.filterVariant?.name, "djEffect" to plan?.djEffect?.name,
-        "localBlendAdmission" to (plan?.policyReasons?.contains(LocalBlendAdmission.MARKER) == true),
-        "plannedIncomingRate" to plan?.incomingPlaybackRate,
-    )
+    private fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> =
+        mixEventRouter.classicRouteFields(plan)
 
     private fun acceptRoute(plan: Any, fields: Map<String, Any?>) {
-        reviseRoute(plan)
-        val key = "accepted|${fields["technique"]}|$planRevision"
-        if (routingEvidenceKeys.add(key)) mixEvent("mix.plan", fields + mapOf("stage" to "accepted"))
+        mixEventRouter.acceptRoute(plan, fields)
     }
 
-    private fun reviseRoute(plan: Any): Int {
-        if (revisionRoute != plan) {
-            revisionRoute = plan
-            planRevision++
-        }
-        return planRevision
+    private fun reviseRoute(plan: Any): Int =
+        mixEventRouter.reviseRoute(plan)
+
+    private fun preparedRoute(
+        fields: Map<String, Any?>,
+        context: Opportunity? = opportunity,
+        revision: Int = planRevision,
+        generation: Int? = null,
+    ) {
+        mixEventRouter.preparedRoute(fields, context, revision, generation)
     }
 
-    private fun preparedRoute(fields: Map<String, Any?>, context: Opportunity? = opportunity, revision: Int = planRevision, generation: Int? = null) {
-        if (context != opportunity || terminalRecorded) return
-        val key = "prepared|${fields["technique"]}|$revision|$generation"
-        if (routingEvidenceKeys.add(key)) mixEvent("mix.plan", fields + mapOf(
-            "stage" to "prepared", "planRevision" to revision, "buildGeneration" to generation,
-        ), context)
-    }
+    private fun refusalCode(reason: String): String =
+        mixEventRouter.refusalCode(reason)
 
-    private fun refusalCode(reason: String): String = reason
-        .replace(Regex("\\s+\\d+ ms over$"), " deadline-over")
-        .replace(Regex(" early-abort \\(\\d+ ms left\\)$"), " early-abort")
-
-    private fun routeRefusal(name: String, reason: String, stage: String, technique: String, destination: String? = null,
-        context: Opportunity? = opportunity, revision: Int = planRevision, generation: Int? = null,
-        coarseDecline: Boolean? = null) {
-        if (context != opportunity || terminalRecorded) return
-        val code = refusalCode(reason)
-        if (!routingEvidenceKeys.add("refusal|$stage|$technique|$code")) return
-        mixEvent(name, mapOf("stage" to stage, "technique" to technique, "reason" to reason,
-            "refusalCode" to code, "fallbackTo" to destination, "phase" to phase.name,
-            "planRevision" to revision, "buildGeneration" to generation,
-            "coarseDecline" to coarseDecline), context)
+    private fun routeRefusal(
+        name: String,
+        reason: String,
+        stage: String,
+        technique: String,
+        destination: String? = null,
+        context: Opportunity? = opportunity,
+        revision: Int = planRevision,
+        generation: Int? = null,
+        coarseDecline: Boolean? = null,
+    ) {
+        mixEventRouter.routeRefusal(name, reason, stage, technique, destination, context, revision, generation, coarseDecline)
     }
     private val deckTiming = DeckTiming(nowMs)
     @Volatile private var deckSide: String = "outgoing"
@@ -7501,6 +6978,92 @@ class CrossfadeController(
         override fun userPlaybackSpeed(): Float = AppSettings.playbackSpeed.value
         override fun inParty(): Boolean = ListenTogether.state.value.inParty
     })
+
+    private val mixViewHost: MixViewHost = object : MixViewHost {
+        override val scope: CoroutineScope get() = this@CrossfadeController.scope
+        override val fadeCurves: FadeRideCurves get() = this@CrossfadeController.fadeCurves
+        override val tempoEngine: EaseTempoEngine get() = this@CrossfadeController.tempoEngine
+        override val mixWaveform: (MediaItem, Long, Double, Double, Int) -> MixWaveform.Bands?
+            get() = this@CrossfadeController.mixWaveform
+        override fun nowMs(): Long = this@CrossfadeController.nowMs()
+        override fun positionMs(player: ExoPlayer): Double = this@CrossfadeController.positionMs(player)
+        override fun isSmartFadeActive(): Boolean = smartFadeActive
+        override fun isHandedOff(): Boolean = handedOff
+        override fun isIdle(): Boolean = phase == Phase.IDLE
+        override val outgoingAnalysis: TrackAnalysis get() = this@CrossfadeController.outgoingAnalysis
+        override val incomingAnalysis: TrackAnalysis get() = this@CrossfadeController.incomingAnalysis
+        override val planInFlight: TransitionPlan? get() = this@CrossfadeController.planInFlight
+        override val fadeMs: Long get() = this@CrossfadeController.fadeMs
+        override val fadeEndMs: Long get() = this@CrossfadeController.fadeEndMs
+        override val incomingCueTimeMs: Long get() = this@CrossfadeController.incomingCueTimeMs
+        override val mediaRatio: Double get() = this@CrossfadeController.mediaRatio
+        override fun currentRideSpec(): RideSpec = render.rideSpec
+        override fun rideSpecFor(plan: TransitionPlan, advanced: Boolean): RideSpec =
+            renderFor(plan, advanced).rideSpec
+    }
+
+    private val mixViewPublisher = MixViewPublisher(mixViewHost)
+
+    private val mixEventHost: MixEventHost = object : MixEventHost {
+        override val phaseName: String get() = phase.name
+        override val scrubEpoch: Long get() = this@CrossfadeController.scrubEpoch
+        override fun isIdle(): Boolean = phase == Phase.IDLE
+        override fun active(): ExoPlayer = this@CrossfadeController.active()
+        override val outgoingPlayer: ExoPlayer? get() = outgoing
+        override fun setOutgoingPlayer(player: ExoPlayer?) {
+            outgoing = player
+        }
+        override fun setIncomingPlayer(player: ExoPlayer?) {
+            incoming = player
+        }
+        override fun setHandedOff(handedOff: Boolean) {
+            this@CrossfadeController.handedOff = handedOff
+        }
+        override fun onSleepFadeStarted() {
+            phase = Phase.SLEEP_FADE
+        }
+        override fun onSleepFadeFinished() {
+            outgoing = null
+            phase = Phase.IDLE
+        }
+        override fun onSleepFadeAborted() {
+            outgoing = null
+            phase = Phase.IDLE
+        }
+        override fun isSleepTimerAfterTrack(): Boolean = SleepTimer.afterTrack.value
+        override fun cancelSleepTimer() {
+            SleepTimer.cancel()
+        }
+        override fun leavingOnBail(): ExoPlayer? = this@CrossfadeController.leavingOnBail()
+        override fun finish() {
+            this@CrossfadeController.finish()
+        }
+        override fun nowMs(): Long = this@CrossfadeController.nowMs()
+        override val bailStartedAt: Long get() = this@CrossfadeController.bailStartedAt
+        override val bailFromGain: Float get() = this@CrossfadeController.bailFromGain
+        override fun isRanOn(player: ExoPlayer): Boolean = ranOn(player)
+        override fun onBlendHeadroom(headroom: Float) {
+            this@CrossfadeController.onBlendHeadroom(headroom)
+        }
+        override fun onNewOpportunity() {
+            countdownStabilizer.clearFailedNativeRecovery()
+            planGeneration++
+            planResultGeneration = -1L
+            fallbackNaturalGeneration = -1L
+            naturalProvisionalUntilPosMs = -1L
+            initiatingExitReason = null
+            capturedTakeoverSpliceBufferStatus = null
+            capturedLoopTookOver = null
+        }
+        override fun onResetOpportunityEventKeys() {
+            lastRejectedLogKey = null
+            lastEmittedPlanVerdict = null
+            lastArmDeathKey = null
+            lastFallbackLogKey = null
+        }
+    }
+
+    private val mixEventRouter = MixEventRouter(mixEventHost)
 
     // Reflection shims retained solely for existing unit tests (Djmix31AppTest,
     // Vc70DeclineRideAppTest, Vc70ExitLegAppTest) until M9 D1 test cleanup.
