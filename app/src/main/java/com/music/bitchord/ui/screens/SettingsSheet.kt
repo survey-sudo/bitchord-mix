@@ -2597,7 +2597,7 @@ fun SettingsScreen(
     if (showMixHistory) {
         ModalBottomSheet(
             onDismissRequest = { showMixHistory = false },
-            contentWindowInsets = androidx.compose.foundation.layout.WindowInsets(),
+            contentWindowInsets = { androidx.compose.foundation.layout.WindowInsets() },
         ) {
             val records = remember(mixHistoryTick) { djmixStore.recentTransitions(100) }
             MixHistoryScreen(
