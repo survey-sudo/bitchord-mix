@@ -2,9 +2,7 @@
 // fallback. A null-write bug shipped in vc73/vc74 because nothing ever called
 // this with a valid magnitude tensor and checked the outputs came back sized.
 //
-//   g++ -O2 -std=c++17 -I native/analyzer native/analyzer/vocal_spectrogram_test.cpp \
-//       native/analyzer/vocal_spectrogram.cpp -o /tmp/vocal_spectrogram_test \
-//       && /tmp/vocal_spectrogram_test
+//   g++ -O2 -std=c++17 -I native/analyzer native/analyzer/vocal_spectrogram_test.cpp native/analyzer/vocal_spectrogram.cpp -o /tmp/vocal_spectrogram_test && /tmp/vocal_spectrogram_test
 //
 // Exit 0 means every check passed. A segmentation fault is the failure the
 // vc74 crash presented as, so a crash here is a legible result: the test does

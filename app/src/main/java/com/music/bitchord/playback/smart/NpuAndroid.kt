@@ -33,6 +33,7 @@ object NpuAndroid {
     private const val KEY_VERDICT = "selftest_verdict"
 
     private val installed = AtomicBoolean(false)
+    private val installLock = Any()
     private val preflightLock = Any()
     @Volatile private var preflightDone = false
     @Volatile private var preflightOk = false
@@ -63,12 +64,20 @@ object NpuAndroid {
     }
 
     fun install(context: Context, userEnabled: () -> Boolean) {
-        if (!installed.compareAndSet(false, true)) return
-        runCatching {
-            NpuRuntime.installSocModel(socModel())
-            NpuRuntime.install(NpuPolicy(PrefsStore(context, userEnabled), BuildConfig.VERSION_CODE.toLong()))
-            NpuRuntime.installBackendProvider { preflightBackend(context) }
-        }.onFailure { Log.w(TAG, "BitChordNPU install failed; NPU stays off", it) }
+        synchronized(installLock) {
+            if (installed.get()) return
+            try {
+                NpuRuntime.installSocModel(socModel())
+                NpuRuntime.install(NpuPolicy(PrefsStore(context, userEnabled), BuildConfig.VERSION_CODE.toLong()))
+                NpuRuntime.installBackendProvider { preflightBackend(context) }
+                installed.set(true)
+            } catch (error: Throwable) {
+                NpuRuntime.installBackendProvider(null)
+                NpuRuntime.install(null)
+                installed.set(false)
+                Log.w(TAG, "BitChordNPU install failed; NPU stays off", error)
+            }
+        }
     }
 
     /**

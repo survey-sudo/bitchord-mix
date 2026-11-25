@@ -44,19 +44,19 @@ jobs:
       - name: Native analyzer tests
         run: |
           set -euo pipefail
-          g++ -std=c++17 -O2 -I native/analyzer \
+          g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/analyzer \
               native/analyzer/vocal_spectrogram_test.cpp \
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test
           /tmp/vocal_spectrogram_test
           echo "--- window path calibration ---"
-          g++ -std=c++17 -O2 -I native/analyzer \
+          g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/analyzer \
               native/analyzer/window_calibration.cpp \
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/window_calibration
           /tmp/window_calibration
           echo "--- same test under ASan/UBSan ---"
-          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -I native/analyzer \
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/analyzer \
               native/analyzer/vocal_spectrogram_test.cpp \
               native/analyzer/vocal_spectrogram.cpp \
               -o /tmp/vocal_spectrogram_test_asan
@@ -93,19 +93,31 @@ jobs:
                 -o /tmp/loopmix_startup_probe
             /tmp/loopmix_startup_probe
           fi
+          echo "--- loopmix dj_fx tests (A sec 5) ---"
+          if [ -f native/loopmix/dj_fx_test.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/dj_fx_test.cpp \
+                -o /tmp/dj_fx_test
+            /tmp/dj_fx_test
+          fi
 
       # >>> AUTOMIX-V2(B): stem separation DSP self-test (Stream B owns this block)
       - name: Native stem DSP tests
         run: |
           set -euo pipefail
-          g++ -std=c++17 -O2 -I native \
+          g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native \
               native/analyzer/stem_dsp_test.cpp native/analyzer/stem_dsp.cpp \
               -o /tmp/stem_dsp_test
           /tmp/stem_dsp_test
-          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -I native \
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-fast-math -ffp-contract=off -Wall -Wextra -I native \
               native/analyzer/stem_dsp_test.cpp native/analyzer/stem_dsp.cpp \
               -o /tmp/stem_dsp_test_asan
           /tmp/stem_dsp_test_asan
+          g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-fast-math -ffp-contract=off -Wall -Wextra -I native/analyzer \
+              native/analyzer/window_calibration.cpp native/analyzer/vocal_spectrogram.cpp \
+              -o /tmp/window_calibration_asan
+          /tmp/window_calibration_asan
       # <<< AUTOMIX-V2(B)
 
       # B13/ADR 0008: ASan+UBSan on the loopmix host probes (the analyzer
@@ -139,6 +151,14 @@ jobs:
                 -o /tmp/loopmix_startup_probe_asan
             /tmp/loopmix_startup_probe_asan
           fi
+           echo "--- loopmix dj_fx tests (A sec 5) ASan/UBSan ---"
+           if [ -f native/loopmix/dj_fx_test.cpp ]; then
+             g++ $CXXFLAGS -I native -I native/third_party \
+                 native/loopmix/loop_mix_renderer.cpp \
+                 native/loopmix/dj_fx_test.cpp \
+                 -o /tmp/dj_fx_test_asan
+             /tmp/dj_fx_test_asan
+           fi
 
       # B6.6: 10-pair synthetic host render + mixq gate. Generated in-repo
       # (no copyrighted audio); a representative S1/C2/F1 subset per pair
@@ -273,6 +293,14 @@ jobs:
                 native/loopmix/loop_mix_renderer_startup_probe.cpp \
                 -o /tmp/loopmix_startup_probe
             /tmp/loopmix_startup_probe
+          fi
+          echo "--- loopmix dj_fx tests (A sec 5) ---"
+          if [ -f native/loopmix/dj_fx_test.cpp ]; then
+            g++ -std=c++17 -O2 -fno-fast-math -ffp-contract=off -Wall -Wextra -I native -I native/third_party \
+                native/loopmix/loop_mix_renderer.cpp \
+                native/loopmix/dj_fx_test.cpp \
+                -o /tmp/dj_fx_test
+            /tmp/dj_fx_test
           fi
 
       - name: Free disk space

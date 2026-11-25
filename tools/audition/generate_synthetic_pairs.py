@@ -53,20 +53,13 @@ from mixq import write_wav_pcm16  # noqa: E402
 SR = 48000
 VOCAL_FPS = 50.0
 
-# Recipe catalog mirror (BuiltInRecipeCatalog S1..S6, C1..C9, F1..F11) — only
-# the subset used by default renders; every entry names its catalog recipe.
-RECIPES = {
-    "S1": {"name": "Smooth blend", "desc": "Beat-matched equal-power blend with gentle low-end handoff", "level": "SUBTLE", "abruptness": "SMOOTH"},
-    "S2": {"name": "Bass swap", "desc": "Equal-power blend trading bass stems cleanly on the downbeat", "level": "SUBTLE", "abruptness": "SMOOTH"},
-    "S5": {"name": "Simple fade", "desc": "Restrained equal-power fade for ballads and drifting tempi", "level": "SUBTLE", "abruptness": "SMOOTH"},
-    "C2": {"name": "Filter wash + echo", "desc": "Resonant high-pass filter wash and tempo echo bridging any tempo gap", "level": "CLUB", "abruptness": "PUNCHY"},
-    "C5": {"name": "Loop extend", "desc": "Beat-locked outgoing outro loop holds under the incoming intro", "level": "CLUB", "abruptness": "PUNCHY"},
-    "C6": {"name": "Phaser dissolve", "desc": "Tempo-synced phaser and stereo flanger dissolve into the mix", "level": "CLUB", "abruptness": "PUNCHY"},
-    "F1": {"name": "Riser drop", "desc": "Multi-layer riser, beat gate, and loop roll launching into the drop", "level": "FESTIVAL", "abruptness": "PUNCHY"},
-    "F11": {"name": "Riser + impact cut", "desc": "Tempo-synced riser build cutting cleanly into an impact hit on the drop", "level": "FESTIVAL", "abruptness": "PUNCHY"},
-}
+# Load every descriptor from the same 26 RecipeV2 JSONs as the app.
+from recipe_catalog import CATALOG, RECIPE_IDS, requested_recipes, resolve_recipe  # noqa: E402
+
+RECIPES = {rid: dict(recipe, desc=recipe["description"]) for rid, recipe in CATALOG.items()}
+# Deterministic fixture controls only. Real AUTO selections come from the JVM planner.
 AUTO_PICKS = {"SUBTLE": "S1", "CLUB": "C2", "FESTIVAL": "F1"}
-DEFAULT_RECIPES = ["S1", "S2", "C2", "C5", "C6", "F1", "F11", "AUTO-CLUB"]
+DEFAULT_RECIPES = list(RECIPE_IDS)
 
 # ---------------------------------------------------------------------------
 # Pair specs: (genre_out, bpm_out, genre_in, bpm_in, root_out, root_in, note)
@@ -125,8 +118,6 @@ class TrackSynth:
         dur_bars = duration_sec / self.bar_sec
         # Structure: intro 0-25% instrumental, main 25-75% full (+vocal),
         # outro 75-100% vocal-free, bass-thinned (exit zone).
-        for i in range(n):
-            pass  # per-sample loop avoided; all synthesis is vectorised below.
         t = np.arange(n, dtype=np.float64) / SR
         bar_pos = t / self.bar_sec
 
@@ -356,125 +347,28 @@ def effective_in_tempo(bpm_out: float, bpm_in: float, genre_jump: bool) -> tuple
 
 
 def build_script(pair: dict, recipe_id: str) -> dict:
-    """TransitionScriptV1-compatible (schema=1) script for one pair x recipe."""
-    out_pcm = pair["outF32"]
-    in_pcm = pair["inF32"]
-    dur_out = pair["outDurationSec"]
-    dur_in = pair["inDurationSec"]
-    bpm_out = pair["bpmOut"]
-    bpm_in = pair["bpmIn"]
-    pa = 60.0 / bpm_in
-    exit_sec = pair["exitSec"]
-    entry_sec = pair["entrySec"]
-    fade_sec = pair.get("fadeSec", 4.0)
-    recipe = RECIPES.get(recipe_id, RECIPES["S1"])
-    plan_id = f"{pair['pairId']}-{recipe_id}"
-    fade_start = max(exit_sec - fade_sec / 2.0, 0.0)
-    fade_end = fade_start + fade_sec
-
-    rate_in, bpm_in_eff, stretched = effective_in_tempo(
-        bpm_out, bpm_in, bool(pair.get("genreJump", False))
-    )
-    if stretched:
-        hold_until = fade_start
-    else:
-        k_beats = max(1, int(round((exit_sec - fade_start) / pa)))
-        hold_until = max(0.0, exit_sec - k_beats * pa)
-    in_end_mix = hold_until + dur_in / rate_in
-
-    # GAIN envelopes: equal-power crossfade over [fade_start, fade_end].
-    steps = 9
-    ts = [round(fade_start + (fade_end - fade_start) * (k / (steps - 1)), 4) for k in range(steps)]
-    out_vals = [round(math.cos((k / (steps - 1)) * math.pi / 2.0), 5) for k in range(steps)]
-    in_vals = [round(math.sin((k / (steps - 1)) * math.pi / 2.0), 5) for k in range(steps)]
-    if hold_until < fade_start - 1e-4:
-        ts = [round(hold_until, 4)] + ts
-        out_vals = [1.0] + out_vals
-        in_vals = [0.0] + in_vals
-    envelopes = [
-        {"deck": "OUT", "kind": "GAIN", "timesSec": ts, "values": out_vals, "exponential": False},
-        {"deck": "IN", "kind": "GAIN", "timesSec": ts, "values": in_vals, "exponential": False},
-    ]
-    # Recipe-specific lanes (renderer reads these as FX + envelope parameters).
-    fx = {"isolate": bool(recipe_id in ("S2", "C2"))}
-    if recipe_id == "C2":
-        envelopes.append({"deck": "OUT", "kind": "HIGH_PASS_HZ", "timesSec": ts,
-                          "values": [round(20.0 * ((1500.0 / 20.0) ** (k / (steps - 1))), 1) for k in range(steps)],
-                          "exponential": True})
-    if recipe_id in ("C6", "F1"):
-        envelopes.append({"deck": "OUT", "kind": "PHASER_WET", "timesSec": ts,
-                          "values": [round(k / (steps - 1) * 0.6, 4) for k in range(steps)], "exponential": False})
-    if recipe_id == "F1":
-        envelopes.append({"deck": "OUT", "kind": "RISER_LEVEL", "timesSec": ts,
-                          "values": [round(k / (steps - 1) * 0.7, 4) for k in range(steps)], "exponential": False})
-        fx["riser"] = {"enabled": True, "deck": "OUT", "beatSec": round(60.0 / bpm_out, 6),
-                       "lengthBeats": 8.0, "noiseSweepStartHz": 300.0, "noiseSweepEndHz": 8000.0,
-                       "noiseLevelPeak": 0.7, "uplifterOctaves": 1.0, "includeSnareRoll": True,
-                       "reverseReverbTailBeats": 1.0}
-        fx["impact"] = {"enabled": True, "deck": "IN", "triggerMixSec": round(fade_end, 3),
-                        "peakDbfs": -6.0, "lowThumpHz": 55.0, "noiseBurstMs": 180.0}
-    if recipe_id == "C5":
-        fx["loop"] = {"enabled": True, "bars": 2, "seamCrossfadeMs": 8.0, "holdPhrases": 1}
-    if recipe_id == "S2":
-        envelopes.append({"deck": "OUT", "kind": "LOW_DB", "timesSec": ts,
-                          "values": [round(-(k / (steps - 1)) * 12.0, 3) for k in range(steps)],
-                          "exponential": False})
-
-    def region(deck, pcm, duration_sec, start_sec, track_id):
-        return {
-            "deck": deck,
-            "trackId": track_id,
-            "startMs": int(round(start_sec * 1000)),
-            "endMs": int(round((start_sec + duration_sec) * 1000)),
-            "sampleRateHz": SR,
-            "pcmPath": str(pcm) if isinstance(pcm, str) else None,
-            "prerollMs": 400,
-            "stopAtMixMs": None,
-            "fadeOutTrackMs": None,
-            "levelGain": 1.0,
-            "runOn": deck == "IN",
-        }
-
-    script = {
-        "schema": 1,
-        "planId": plan_id,
-        "generation": 1,
-        "sampleRateHz": SR,
-        "outRegion": region("OUT", pair.get("outF32"), dur_out, 0, pair["outTrackId"]),
-        "inRegion": region("IN", pair.get("inF32"), dur_in, 0, pair["inTrackId"]),
-        "knots": [
-            {"mixTimeMs": 0, "trackPosMs": 0, "bpm": bpm_out},
-            {"mixTimeMs": int(round(dur_out * 1000)), "trackPosMs": int(round(dur_out * 1000)), "bpm": bpm_out},
-        ],
-        "inKnots": [
-            {"mixTimeMs": int(round(hold_until * 1000)), "trackPosMs": 0, "bpm": round(bpm_in_eff, 3)},
-            {"mixTimeMs": int(round(in_end_mix * 1000)), "trackPosMs": int(round(dur_in * 1000)), "bpm": round(bpm_in_eff, 3)},
-        ],
-        "loopBounds": None,
-        "envelopes": envelopes,
-        "fxParams": fx,
-        "stems": [],
-        "loudness": {"enabled": True, "targetLufs": -14.0, "truePeakLimiter": True,
-                     "truePeakCeilingDbtp": -1.0, "dropBumpLu": 0.0},
-        "dropWindowMs": {"startMs": int(round(pair["dropWindowSec"][0] * 1000)), "endMs": int(round(pair["dropWindowSec"][1] * 1000))} if pair.get("dropWindowSec") else None,
-        # Provenance lives outside the TransitionScriptV1 contract so strict
-        # kotlinx.serialization decoding of the script stays schema-clean.
-        "audition": {"recipeId": recipe_id, "recipeName": recipe["name"], "reason": recipe["desc"]},
-    }
-    return script
+    """Build a synthetic fixture; real audio uses canonical JVM exports."""
+    from synthetic_script import build_fixture_script
+    rate, _, _ = effective_in_tempo(pair["bpmOut"], pair["bpmIn"], bool(pair.get("genreJump", False)))
+    return build_fixture_script(pair, recipe_id, pair.get("autoPicks", AUTO_PICKS), rate)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", required=True, help="Output directory")
     ap.add_argument("--bars", type=int, default=16, help="Bars per track")
-    ap.add_argument("--no-f32", action="store_true", help="Skip raw f32 PCM files (script pcmPath then points at WAV)")
-    ap.add_argument("--recipes", default=",".join(DEFAULT_RECIPES), help="Comma-separated recipe IDs")
+    ap.add_argument("--no-f32", action="store_true", help="Write source WAVs/metadata only; audition decodes raw PCM before script export")
+    ap.add_argument("--recipes", default=",".join(DEFAULT_RECIPES), help="ALL or comma-separated canonical IDs / AUTO-SUBTLE, AUTO-CLUB, AUTO-FESTIVAL")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
+    try:
+        recipes = requested_recipes(args.recipes)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.bars < 4:
+        ap.error("--bars must be at least 4")
+    out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    recipes = [r.strip() for r in args.recipes.split(",") if r.strip()]
     manifest_pairs = []
 
     for idx, spec in enumerate(PAIR_SPECS, start=1):
@@ -503,7 +397,7 @@ def main() -> int:
             wav_path = out_dir / wav_name
             write_wav_pcm16(str(wav_path), left, right, SR)
             if args.no_f32:
-                f32_path = wav_path  # script points at WAV when f32 skipped
+                f32_path = None
             else:
                 f32_path = out_dir / f32_name
                 inter = np.empty((len(left), 2), dtype=np.float32)
@@ -512,14 +406,17 @@ def main() -> int:
                 inter.tofile(str(f32_path))
             tracks["out" if is_out else "in"] = {
                 "wav": str(wav_path),
-                "f32": str(f32_path),
-                "durationSec": round(dur, 3),
+                "f32": str(f32_path) if f32_path is not None else None,
+                "durationSec": len(left) / SR,
+                "frameCount": len(left),
                 "voice": voice.tolist(),
                 "voiceTimes": None,  # implicit 50 fps
             }
 
         pair = {
             "pairId": pair_id,
+            "synthetic": True,
+            "autoPicks": AUTO_PICKS,
             "name": spec["name"],
             "genreOut": spec["genreOut"], "genreIn": spec["genreIn"],
             "bpmOut": bpm_out, "bpmIn": bpm_in,
@@ -529,6 +426,7 @@ def main() -> int:
             "inTrackId": f"{pair_id}-in",
             "outDurationSec": tracks["out"]["durationSec"],
             "inDurationSec": tracks["in"]["durationSec"],
+            "outFrameCount": tracks["out"]["frameCount"], "inFrameCount": tracks["in"]["frameCount"],
             "outWav": tracks["out"]["wav"], "inWav": tracks["in"]["wav"],
             "outF32": tracks["out"]["f32"], "inF32": tracks["in"]["f32"],
             "exitSec": round(exit_sec, 3), "entrySec": entry_sec,
@@ -543,11 +441,12 @@ def main() -> int:
         # Per-recipe scripts + meta (TransitionScriptV1 + mixq metadata).
         _, bpm_in_eff, _ = effective_in_tempo(bpm_out, bpm_in, pair["genreJump"])
         for rid in recipes:
-            script = build_script(pair, rid)
-            script_path = out_dir / f"{pair_id}_{rid}.script.json"
-            with open(script_path, "w", encoding="utf-8") as f:
-                json.dump(script, f, indent=2)
-            recipe_meta = RECIPES.get(rid) if rid != "AUTO-CLUB" else RECIPES["C2"]
+            if not args.no_f32:
+                script = build_script(pair, rid)
+                script_path = out_dir / f"{pair_id}_{rid}.script.json"
+                with open(script_path, "w", encoding="utf-8") as f:
+                    json.dump(script, f, indent=2, allow_nan=False)
+            resolved_id, recipe_meta = resolve_recipe(rid, AUTO_PICKS)
             meta = {
                 "file": f"{pair_id}_{rid}.wav",
                 "transitionStartSec": round(max(exit_sec - fade_sec / 2.0, 0.0), 3),
@@ -556,7 +455,10 @@ def main() -> int:
                 "bpmOut": bpm_out, "bpmIn": round(bpm_in_eff, 3), "bpmInNative": bpm_in,
                 "level": recipe_meta["level"],
                 "abruptness": recipe_meta["abruptness"],
-                "recipeId": rid.replace("AUTO-", ""),
+                "recipeId": resolved_id,
+                "requestedRecipeId": rid,
+                "recipeName": recipe_meta["name"], "description": recipe_meta["description"],
+                "provenance": "synthetic-fixture; no production analysis, scoring or separated stems",
                 "genreJump": pair["genreJump"],
                 "tempoJumpPct": pair["tempoJumpPct"],
                 "exitSec": round(exit_sec, 3), "entrySec": entry_sec,

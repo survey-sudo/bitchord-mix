@@ -7,9 +7,12 @@ import com.music.bitchord.djmix.core.contracts.AnalysisLevel
 import com.music.bitchord.djmix.core.contracts.DjLevel as CoreDjLevel
 import com.music.bitchord.djmix.core.contracts.MixOutcome
 import com.music.bitchord.djmix.core.contracts.RefusalReason
+import com.music.bitchord.djmix.core.contracts.RecipeV2
+import com.music.bitchord.djmix.core.contracts.RenderGeometryV1
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
 import com.music.bitchord.djmix.core.contracts.TransitionGeometry
 import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
+import com.music.bitchord.djmix.core.contracts.TransitionScriptV1
 import com.music.bitchord.djmix.core.machine.MixEvent
 import com.music.bitchord.djmix.core.machine.MixState
 import com.music.bitchord.djmix.core.planner.BuiltInRecipeCatalog
@@ -17,6 +20,11 @@ import com.music.bitchord.djmix.core.planner.PairPlanner
 import com.music.bitchord.djmix.core.planner.PlannerRequest
 import com.music.bitchord.playback.AutomixTelemetry
 import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
+import com.music.bitchord.playback.djmix.diagnostics.FlagsSnapshot
+import com.music.bitchord.djmix.core.learning.TasteSnapshot
+import java.security.MessageDigest
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.loopmix.LoopRegion
 import com.music.bitchord.playback.smart.LoopMix
@@ -45,9 +53,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -141,6 +151,8 @@ data class PrepRequest(
     val minExitMs: Long? = null,
     val preferNoStemVariant: Boolean = false,
     val machineGeneration: Long? = null,
+    /** Exact registry IDs, including canonical recipes that have no legacy enum entry. */
+    val excludedRecipeIds: Set<String> = emptySet(),
 )
 
 data class PreparedPair(
@@ -178,6 +190,14 @@ data class PreparedPair(
     val analysisSignature: String = "",
     val straightRateMode: StraightRateMode? = null,
     val transitionPlanV1: TransitionPlanV1? = null,
+    /** Detached registry recipe retained with the frozen generation. */
+    val frozenRecipe: RecipeV2? = null,
+    /** Complete canonical script after host geometry compilation, when available. */
+    val canonicalScript: TransitionScriptV1? = null,
+    /** Same frozen recipe/geometry compiled with its declared no-stem steps. */
+    val canonicalNoStemScript: TransitionScriptV1? = null,
+    /** Exact geometry used by [canonicalScript], retained for diagnostics/replay. */
+    val renderGeometry: RenderGeometryV1? = null,
     val useNoStemVariant: Boolean = false,
     val preparedSession: LoopMixSession? = null,
     val preparedSessionNoStem: Boolean = false,
@@ -186,7 +206,71 @@ data class PreparedPair(
     internal val outStemWindowEndSec: Double? = null,
     internal val inStemWindowStartSec: Double? = null,
     internal val inStemWindowEndSec: Double? = null,
+    /** Planner V3 inputs frozen with transitionPlanV1, independent of later refinement fields. */
+    val frozenOutAnalysisV3: TrackAnalysisV3? = null,
+    val frozenInAnalysisV3: TrackAnalysisV3? = null,
 )
+
+internal fun inspectorTasteAdjustment(value: Double?): Double = when {
+    value == null || !value.isFinite() -> 0.0
+    else -> value.coerceIn(-0.3, 0.3)
+}
+
+internal fun learningGatedPlannerWeights(
+    learningEnabled: Boolean,
+    genreClass: String,
+    provider: (String) -> Map<String, Double>,
+): Map<String, Double> = if (learningEnabled) provider(genreClass).toMap() else emptyMap()
+
+internal fun <T> combineInspectorPolicy(
+    pair: StateFlow<T>,
+    learningEnabled: StateFlow<Boolean>,
+): Flow<Pair<T, Boolean>> = combine(pair, learningEnabled) { snapshot, enabled -> snapshot to enabled }
+
+/** Worker-only archival projection of the actual frozen inputs; absent provenance stays absent. */
+internal fun retainedContextFor(
+    pair: PreparedPair,
+    flags: FlagsSnapshot,
+    taste: TasteSnapshot,
+    hashPcm: (FloatArray) -> String = ::preparedPcmSha256,
+): RetainedMixContext? {
+    val plan = pair.transitionPlanV1 ?: return null
+    if (plan.generation != pair.generation || plan.outTrackId != pair.outId || plan.inTrackId != pair.inId) return null
+    val script = if (pair.preparedSessionNoStem || pair.useNoStemVariant) pair.canonicalNoStemScript else pair.canonicalScript
+    val assets = linkedMapOf<String, String>()
+    fun add(name: String, left: FloatArray, right: FloatArray) {
+        assets["${name}_left_f32le"] = hashPcm(left)
+        assets["${name}_right_f32le"] = hashPcm(right)
+    }
+    pair.outRegion?.let { add("prepared_out_region", it.left, it.right) }
+    pair.inRegion?.let { add("prepared_in_region", it.left, it.right) }
+    for ((name, stems) in listOf("prepared_out" to pair.outStems, "prepared_in" to pair.inStems)) {
+        stems ?: continue
+        for ((kind, left) in stems.left) stems.right[kind]?.let { add("${name}_${kind.name.lowercase()}", left, it) }
+    }
+    val mode = pair.frozenOutAnalysisV3?.structure?.mode
+        ?.takeIf { it.isNotBlank() && it == pair.frozenInAnalysisV3?.structure?.mode }
+    return RetainedMixContext(
+        planId = plan.planId, generation = plan.generation, outTrackId = pair.outId, inTrackId = pair.inId,
+        transitionPlanV1 = plan, frozenRecipe = pair.frozenRecipe,
+        renderGeometry = script?.renderGeometry ?: pair.renderGeometry, transitionScript = script,
+        analysisA = pair.frozenOutAnalysisV3,
+        analysisB = pair.frozenInAnalysisV3,
+        genreClass = mode, flagsSnapshot = flags, tasteSnapshot = taste, assetSha256 = assets,
+    )
+}
+
+/** Digest exact prepared planar Float32 samples in declared little-endian order, in bounded chunks. */
+internal fun preparedPcmSha256(samples: FloatArray): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteBuffer.allocate(16_384).order(ByteOrder.LITTLE_ENDIAN)
+    for (sample in samples) {
+        if (buffer.remaining() < 4) { digest.update(buffer.array(), 0, buffer.position()); buffer.clear() }
+        buffer.putInt(sample.toRawBits())
+    }
+    digest.update(buffer.array(), 0, buffer.position())
+    return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
 
 /**
  * Background pipeline that prepares `(outId, inId)` well before the splice:
@@ -231,6 +315,9 @@ class PairPreparer(
     private val ownsExecutor: Boolean = true,
     private val store: DjmixAnalysisStore? = null,
     private val stemExecutor: ExecutorService = newStemExecutor(),
+    private val inspectorLearningEnabled: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow(),
+    private val plannerWeightsProvider: (genreClass: String) -> Map<String, Double> = { emptyMap() },
+    private val thermalStatus: () -> Int? = { null },
 ) {
     private val _state = MutableStateFlow<PreparedPair?>(null)
     val state: StateFlow<PreparedPair?> = _state.asStateFlow()
@@ -250,6 +337,24 @@ class PairPreparer(
     @Volatile private var activeRequest: PrepRequest? = null
     @Volatile private var activeGeneration: Long = 0L
     @Volatile private var released = false
+    @Volatile private var retainedMixOwner: DjmixServices? = null
+    private var retainedPlayerEpoch = 0L
+
+    /** The controller binds its process owner before any execution/preparation callbacks start. */
+    fun attachRetainedMixOwner(owner: DjmixServices, playerEpoch: Long) {
+        check(retainedMixOwner == null || retainedMixOwner === owner)
+        retainedPlayerEpoch = playerEpoch
+        retainedMixOwner = owner
+        _state.value?.let(::retainAcceptedPair)
+    }
+
+    private fun retainAcceptedPair(pair: PreparedPair) {
+        if (released) return
+        val plan = pair.transitionPlanV1 ?: return
+        val current = mixExecutor?.currentState() ?: return
+        if (current.generation != pair.generation || current.plan?.planId != plan.planId) return
+        retainedMixOwner?.retainPreparedPairAsync(pair, retainedPlayerEpoch)
+    }
 
     private val sessionManager = PreparedSessionManager(
         object : PreparedSessionHost {
@@ -258,6 +363,7 @@ class PairPreparer(
             override val executor: ExecutorService get() = this@PairPreparer.executor
             override fun isReleased(): Boolean = released
             override fun currentGeneration(): Long = generation.get()
+            override fun awaitPrepThermalBudget(gen: Long): Boolean = this@PairPreparer.awaitThermalBudget(gen)
             override fun nowMs(): Long = this@PairPreparer.nowMs()
             override fun mixExecutor(): MixExecutor? = mixExecutor
             override fun inLevel(outId: String, inId: String): Float = inLevelProvider(outId, inId)
@@ -275,6 +381,7 @@ class PairPreparer(
             override val stemExecutor: ExecutorService get() = this@PairPreparer.stemExecutor
             override val stemLock: Any get() = this@PairPreparer.stemLock
             override fun isAborted(gen: Long): Boolean = released || generation.get() != gen
+            override fun awaitPrepThermalBudget(gen: Long): Boolean = this@PairPreparer.awaitThermalBudget(gen)
             override fun nowMs(): Long = this@PairPreparer.nowMs()
             override fun positionSec(): Double = positionSecProvider()
             override fun songMapFor(trackId: String, analysis: TrackAnalysis): SongMap? =
@@ -284,7 +391,12 @@ class PairPreparer(
             override fun capabilities(): Int = this@PairPreparer.capabilities()
             override fun recentRecipeIdsSnapshot(): List<String> = this@PairPreparer.recentRecipeIdsSnapshot()
             override fun currentTransitionsSinceLastAbrupt(): Int = this@PairPreparer.currentTransitionsSinceLastAbrupt()
-            override fun tasteWeights(): Map<String, Double> = store?.getPreferenceWeights().orEmpty()
+            override fun tasteWeights(
+                outTrackId: String,
+                outAnalysis: TrackAnalysis,
+                inTrackId: String,
+                inAnalysis: TrackAnalysis,
+            ): Map<String, Double> = this@PairPreparer.plannerWeightsFor(outTrackId, outAnalysis, inTrackId, inAnalysis)
             override fun selectPlan(input: PlanInput): SelectedPlan? = planSelector.select(input)
             override fun resolveTransitionPlanV1(
                 selected: SelectedPlan,
@@ -310,6 +422,7 @@ class PairPreparer(
             override fun mixExecutor(): MixExecutor? = mixExecutor
             override fun onArtworkPrefetch(item: MediaItem) = this@PairPreparer.onArtworkPrefetch(item)
             override fun prepareRendererIfCurrent(gen: Long, useNoStemVariant: Boolean) {
+                if (!awaitThermalBudget(gen)) return
                 _state.value?.takeIf { it.generation == gen }?.let { frozenPair ->
                     sessionManager.prepareRenderer(frozenPair, useNoStemVariant = useNoStemVariant)
                 }
@@ -353,7 +466,8 @@ class PairPreparer(
             }
         }
         inspectorCollectorJob = scope.launch {
-            _state.collect { publishInspectorSnapshot(it) }
+            combineInspectorPolicy(_state, inspectorLearningEnabled)
+                .collect { (pair, learningEnabled) -> publishInspectorSnapshot(pair, learningEnabled) }
         }
     }
 
@@ -426,7 +540,7 @@ class PairPreparer(
             current.inId != request.inTrack.id || current.djLevel != request.djLevel) return false
         val currentCode = current.transitionPlanV1?.recipeId ?: current.script?.recipeId
         val excluded = exclude ?: RecipeId.fromCode(currentCode)
-        val excludedCodes = (request.excludedRecipes.map { it.code } + listOfNotNull(currentCode, excluded?.code)).toSet()
+        val excludedCodes = (request.excludedRecipeIds + request.excludedRecipes.map { it.code } + listOfNotNull(currentCode, excluded?.code)).toSet()
         val outA = current.outAnalysis ?: analysisFor(request.outTrack.id)
         val inA = current.inAnalysis ?: analysisFor(request.inTrack.id)
         if (outA.isUsable && inA.isUsable) {
@@ -446,7 +560,7 @@ class PairPreparer(
                     transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
                     excludedRecipeIds = excludedCodes,
                     preferNoStemVariant = request.preferNoStemVariant,
-                    tasteWeights = store?.getPreferenceWeights().orEmpty(),
+                    tasteWeights = plannerWeightsFor(request.outTrack.id, outA, request.inTrack.id, inA),
                 ),
             )
             if (probe !is MixOutcome.Ok) return false
@@ -454,7 +568,7 @@ class PairPreparer(
             return false
         }
         val nextExcluded = if (excluded != null) request.excludedRecipes + excluded else request.excludedRecipes
-        trigger(request.copy(excludedRecipes = nextExcluded), force = true)
+        trigger(request.copy(excludedRecipes = nextExcluded, excludedRecipeIds = excludedCodes), force = true)
         return true
     }
 
@@ -632,6 +746,7 @@ class PairPreparer(
 
     fun release() {
         released = true
+        retainedMixOwner = null
         generation.incrementAndGet()
         activeRequest = null
         collectorJob?.cancel()
@@ -718,6 +833,7 @@ class PairPreparer(
                 ChoreoCaps.has(capabilities(), ChoreoCaps.STEMS),
             preferStraight = request.preferStraight,
             excludedRecipes = request.excludedRecipes,
+            excludedRecipeIds = request.excludedRecipeIds,
             fallbackSeconds = request.fallbackSeconds,
             lyricsOut = request.lyricsOut,
             lyricsIn = request.lyricsIn,
@@ -726,7 +842,7 @@ class PairPreparer(
             transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
             minExitMs = request.minExitMs,
             preferNoStemVariant = request.preferNoStemVariant,
-            tasteWeights = store?.getPreferenceWeights().orEmpty(),
+            tasteWeights = plannerWeightsFor(request.outTrack.id, outA, request.inTrack.id, inA),
             machineGeneration = current.generation,
         )
     }
@@ -750,13 +866,12 @@ class PairPreparer(
         initialTimings: PairTimings,
         reuseFrom: PreparedPair? = null,
     ) {
-        fun isAborted(): Boolean = released || generation.get() != gen
-
         runCatching {
-            if (isAborted()) return
+            if (!awaitThermalBudget(gen)) return
 
             // --- Stage 1: Non-blocking HEAD_TAIL/FULL check (never stall 15 s in awaitAnalysis) ---
             requestAnalysis(request.outTrack)
+            if (!awaitThermalBudget(gen)) return
             requestAnalysis(request.inTrack)
 
             val rawOut = analysisFor(request.outTrack.id)
@@ -817,7 +932,7 @@ class PairPreparer(
     }
 
     private fun refineOnAnalysisUpdate(targetGen: Long, request: PrepRequest) {
-        if (released || generation.get() != targetGen) return
+        if (!awaitThermalBudget(targetGen)) return
         val cur = _state.value ?: return
         if (cur.generation != targetGen || cur.state in ACTIVE_EXECUTION_STATES) return
         if (cur.outId != request.outTrack.id || cur.inId != request.inTrack.id) return
@@ -884,9 +999,9 @@ class PairPreparer(
                 minExitMs = liveReq.minExitMs,
                 recentRecipeIds = recentRecipeIdsSnapshot(),
                 transitionsSinceLastAbrupt = currentTransitionsSinceLastAbrupt(),
-                excludedRecipeIds = liveReq.excludedRecipes.map { it.code }.toSet(),
+                excludedRecipeIds = liveReq.excludedRecipeIds + liveReq.excludedRecipes.map { it.code },
                 preferNoStemVariant = liveReq.preferNoStemVariant,
-                tasteWeights = store?.getPreferenceWeights().orEmpty(),
+                tasteWeights = plannerWeightsFor(liveReq.outTrack.id, outA, liveReq.inTrack.id, inA),
             ),
         )
         val oldV1 = cur.transitionPlanV1
@@ -940,6 +1055,12 @@ class PairPreparer(
             reuseFrom = cur,
         )
     }
+
+    /** Wait only before new background work; thermal pressure never invalidates/closes a session. */
+    private fun awaitThermalBudget(gen: Long): Boolean = PrepThermalGate.awaitReadyBlocking(
+        status = thermalStatus,
+        isAborted = { released || generation.get() != gen },
+    )
 
     private fun resolveTransitionPlanV1(
         selected: SelectedPlan,
@@ -1003,21 +1124,36 @@ class PairPreparer(
             val cur = _state.value ?: return
             if (cur.generation != gen) return
             val next = transform(cur)
-            if (_state.compareAndSet(cur, next)) return
+            if (_state.compareAndSet(cur, next)) {
+                retainAcceptedPair(next)
+                return
+            }
         }
     }
 
-    private fun publishInspectorSnapshot(pair: PreparedPair?) {
-        if (released) {
-            MixInspectorFeed.publish(null)
-            return
+    private fun publishInspectorSnapshot(pair: PreparedPair?, effectiveLearningEnabled: Boolean = inspectorLearningEnabled.value) {
+        MixInspectorFeed.publish(if (released || pair == null) null else InspectorProjection.inspectorSnapshotFor(pair, effectiveLearningEnabled))
+    }
+
+    /** Pure Inspector projection, shared with the focused canonical-only regression tests. */
+    internal object InspectorProjection {
+    internal fun inspectorSnapshotFor(pair: PreparedPair, effectiveLearningEnabled: Boolean): MixInspectorState {
+        val planV1 = pair.transitionPlanV1?.takeIf {
+            it.generation == pair.generation && it.outTrackId == pair.outId && it.inTrackId == pair.inId
         }
-        if (pair == null) {
-            MixInspectorFeed.publish(null)
-            return
+        val hasCanonical = pair.frozenRecipe != null || pair.canonicalScript != null || pair.canonicalNoStemScript != null
+        val recipe = pair.frozenRecipe?.takeIf { it.id == planV1?.recipeId }
+        val selectedCanonical = if (pair.preparedSessionNoStem || pair.useNoStemVariant) pair.canonicalNoStemScript else pair.canonicalScript
+        val canonical = selectedCanonical?.takeIf {
+            recipe != null && it.planId == planV1?.planId && it.generation == pair.generation &&
+                it.outRegion.trackId == pair.outId && it.inRegion.trackId == pair.inId && it.renderGeometry != null
         }
-        val script = pair.script
-        val planV1 = pair.transitionPlanV1
+        // A frozen recipe can be remixed before its renderer script finishes compiling. A supplied
+        // script must match the exact frozen identity; stale canonical data never falls back to preview FX.
+        val canonicalIdentityValid = planV1 != null && recipe != null && (selectedCanonical == null || canonical != null)
+        val script = pair.script?.takeUnless { hasCanonical }?.takeIf {
+            it.recipeId.isNotBlank() && (pair.transitionPlanV1 == null || it.recipeId == planV1?.recipeId)
+        }
         val timings = pair.timings
         val plannedPath = timings.path.takeIf { it.isNotBlank() }
         val actualPath = if (pair.state.ordinal >= PrepState.PREPARED.ordinal) plannedPath else null
@@ -1041,26 +1177,26 @@ class PairPreparer(
                     )
                 }
             }
-        val effects = if (script == null) {
-            emptyList()
-        } else {
-            (script.outFx.activeFxNames + script.inFx.activeFxNames).distinct()
+        val effects = when {
+            hasCanonical -> canonical?.let(ChoreoScriptBuilder::canonicalFxNames).orEmpty()
+            script != null -> (script.outFx.activeFxNames + script.inFx.activeFxNames).distinct()
+            else -> emptyList()
         }
         val stemsReady = when {
             pair.state.ordinal >= PrepState.PREPARED.ordinal -> true
             pair.state == PrepState.STEMMING -> false
             else -> null
         }
-        val remixReady = pair.state == PrepState.PREPARED && script != null
+        val hasPreparedRecipe = if (hasCanonical) canonicalIdentityValid else script != null
+        val remixReady = pair.state == PrepState.PREPARED && hasPreparedRecipe
         val remixUnavailableReason = when {
             remixReady -> null
             pair.state.ordinal >= PrepState.BUILDING.ordinal -> "This transition is already building or playing."
-            pair.script == null && pair.state == PrepState.PREPARED -> "No prepared recipe is available to remix."
+            !hasPreparedRecipe && pair.state == PrepState.PREPARED -> "No matching prepared recipe is available to remix."
             pair.state == PrepState.IDLE -> "There is no prepared transition to remix."
             else -> "Preparation is not ready yet."
         }
-        MixInspectorFeed.publish(
-            MixInspectorState(
+        return MixInspectorState(
                 generation = pair.generation,
                 current = MixInspectorTrack(
                     mediaId = pair.outId,
@@ -1086,11 +1222,11 @@ class PairPreparer(
                 },
                 plannedPath = plannedPath,
                 path = actualPath,
-                recipeId = planV1?.recipeId?.takeIf { it.isNotBlank() }
+                recipeId = recipe?.id ?: planV1?.recipeId?.takeIf { it.isNotBlank() }
                     ?: script?.recipeId?.takeIf { it.isNotBlank() }
                     ?: pair.v2Prep?.forcedRecipe?.code
                     ?: candidates.firstOrNull()?.recipeId,
-                recipeName = planV1?.recipeName?.takeIf { it.isNotBlank() }
+                recipeName = recipe?.name ?: planV1?.recipeName?.takeIf { it.isNotBlank() }
                     ?: script?.recipeName?.takeIf { it.isNotBlank() }
                     ?: pair.v2Prep?.forcedRecipe?.displayName
                     ?: candidates.firstOrNull()?.recipeName,
@@ -1107,14 +1243,33 @@ class PairPreparer(
                 buildMs = timings.buildMs.takeIf { it > 0L },
                 armLeadMs = timings.armLeadMs.takeIf { it > 0L },
                 watchdog = timings.watchdog,
-                fxCount = script?.fxCount ?: timings.fxCount.takeIf { it > 0 },
+                fxCount = if (hasCanonical) canonical?.let { effects.size } else script?.fxCount,
                 effects = effects,
                 topCandidates = candidates,
                 fallbackReason = timings.fallbackReason.takeIf { it.isNotBlank() },
                 remixAvailable = remixReady,
                 remixUnavailableReason = remixUnavailableReason,
-            ),
-        )
+                tasteAdjustment = inspectorTasteAdjustment(planV1?.tasteAdjustment),
+                learningEnabled = effectiveLearningEnabled,
+            )
+    }
+
+    }
+
+    /** Never consults SQLite from selection; disabled or unavailable learning is a deterministic baseline. */
+    private fun plannerWeightsFor(
+        outTrackId: String,
+        outAnalysis: TrackAnalysis,
+        inTrackId: String,
+        inAnalysis: TrackAnalysis,
+    ): Map<String, Double> {
+        if (released) return emptyMap()
+        val outMap = songMapFor(outTrackId, outAnalysis)
+        val inMap = songMapFor(inTrackId, inAnalysis)
+        val outMode = outMap?.structure?.mode
+        val inMode = inMap?.structure?.mode
+        val genreClass = outMode?.takeIf { it == inMode }?.name.orEmpty()
+        return learningGatedPlannerWeights(inspectorLearningEnabled.value, genreClass, plannerWeightsProvider)
     }
 
     companion object {

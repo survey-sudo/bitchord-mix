@@ -4,9 +4,13 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import java.io.File
+import java.lang.ref.ReferenceQueue
+import java.lang.ref.WeakReference
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 
 /**
  * CPU session factory using the official ONNX Runtime Java interfaces:
@@ -21,6 +25,14 @@ object NpuSession {
     private val sessionEp: MutableMap<OrtSession, String> =
         Collections.synchronizedMap(WeakHashMap())
     private val lastByModel = ConcurrentHashMap<String, String>()
+    private class SessionOptionsRef(session: OrtSession, queue: ReferenceQueue<OrtSession>) :
+        WeakReference<OrtSession>(session, queue) {
+        @Volatile var options: OrtSession.SessionOptions? = null
+    }
+
+    private val sessionQueue = ReferenceQueue<OrtSession>()
+    private val retainedOptions = ConcurrentHashMap<SessionOptionsRef, Boolean>()
+    private val reaperStarted = AtomicBoolean(false)
 
     @Suppress("UNUSED_PARAMETER")
     fun open(
@@ -36,7 +48,7 @@ object NpuSession {
         val session = try {
             openCpu(modelPath, threads)
         } catch (failure: Throwable) {
-            AnalysisLog.warn("ORT CPU open failed; model unavailable", failure)
+            warnSafely("ORT CPU open failed; model unavailable", failure)
             throw failure
         }
         val description = "CPU (djmix52; NPU runtime unavailable)"
@@ -48,25 +60,65 @@ object NpuSession {
         // VocalTracker/OrtStemEngine would catch it, discard the session and never close it.
         // Deliberately contained at this one call site; the global sink policy is not changed
         // here and remains D4's accounting item.
-        try {
-            AnalysisLog.warn("BitChordNPU session ${File(modelPath).name} ep=$description")
-        } catch (_: Exception) {
-            // Nonfatal diagnostic callback failure: the session stays valid and owned.
-            // Exception (not Throwable): fatal JVM errors still propagate.
-        }
+        warnSafely("BitChordNPU session ${File(modelPath).name} ep=$description")
         return session
     }
 
     /** One CPU EP, up to four intra-op workers, one inter-op worker, no NNAPI/delegate. */
     fun openCpu(modelPath: String, threads: Int): OrtSession {
         val options = OrtSession.SessionOptions()
-        options.setIntraOpNumThreads(threads.coerceIn(1, 4))
-        options.setInterOpNumThreads(1)
-        options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        options.setCPUArenaAllocator(true)
-        options.setMemoryPatternOptimization(true)
-        // SessionOptions must outlive sessions created from them (official Java API contract).
-        return OrtEnvironment.getEnvironment().createSession(modelPath, options)
+        try {
+            options.setIntraOpNumThreads(threads.coerceIn(1, 4))
+            options.setInterOpNumThreads(1)
+            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            options.setCPUArenaAllocator(true)
+            options.setMemoryPatternOptimization(true)
+            val session = OrtEnvironment.getEnvironment().createSession(modelPath, options)
+            retainOptions(session, options)
+            return session
+        } catch (failure: Throwable) {
+            runCatching { options.close() }
+            throw failure
+        }
+    }
+
+    /** Closes a session opened here, then releases the options retained for its lifetime. */
+    fun close(session: OrtSession) {
+        try {
+            session.close()
+        } finally {
+            val ref = retainedOptions.keys.firstOrNull { it.get() === session }
+            if (ref != null && retainedOptions.remove(ref) != null) closeOptions(ref.options)
+            sessionEp.remove(session)
+        }
+    }
+
+    private fun retainOptions(session: OrtSession, options: OrtSession.SessionOptions) {
+        val ref = SessionOptionsRef(session, sessionQueue)
+        ref.options = options
+        retainedOptions[ref] = true
+        if (reaperStarted.compareAndSet(false, true)) {
+            Thread({
+                while (true) {
+                    try {
+                        val collected = sessionQueue.remove() as SessionOptionsRef
+                        if (retainedOptions.remove(collected) != null) closeOptions(collected.options)
+                    } catch (interrupted: InterruptedException) {
+                        // The reaper is process-lived; an interrupt only restarts the wait.
+                    }
+                }
+            }, "BitChord-ORT-options").apply { isDaemon = true }.start()
+        }
+    }
+
+    private fun closeOptions(options: OrtSession.SessionOptions?) {
+        if (options == null) return
+        try {
+            options.close()
+        } catch (failure: Throwable) {
+            if (failure is CancellationException) throw failure
+            warnSafely("ORT SessionOptions close failed", failure)
+        }
     }
 
     @Suppress("UNUSED_PARAMETER")
@@ -106,4 +158,13 @@ object NpuSession {
         val shape = info.shape
         if (shape.size < 2) null else shape[1].takeIf { it in 1..Int.MAX_VALUE.toLong() }?.toInt()
     }.getOrNull()
+
+    private fun warnSafely(message: String, failure: Throwable? = null) {
+        try {
+            if (failure == null) AnalysisLog.warn(message) else AnalysisLog.warn(message, failure)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            // Optional diagnostics must not discard a session or block CPU fallback.
+        }
+    }
 }

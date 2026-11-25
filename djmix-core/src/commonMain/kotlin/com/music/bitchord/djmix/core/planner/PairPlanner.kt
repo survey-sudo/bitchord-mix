@@ -247,6 +247,10 @@ object PairPlanner {
         }
 
         val recipe = selectLastResortRecipe(request)
+            ?: return MixOutcome.Refused(
+                RefusalReason.CHOREOGRAPHY_UNAVAILABLE,
+                "No allowed last-resort recipe for ${request.djLevel} (excluded=${request.excludedRecipeIds.sorted().joinToString(",")})",
+            )
         val candidate = TransitionCandidate(
             exitMs = lastDownbeatMs,
             entryMs = entryMs,
@@ -478,7 +482,7 @@ object PairPlanner {
         }
     }
 
-    private fun selectLastResortRecipe(request: PlannerRequest): RecipeCatalogEntry {
+    private fun selectLastResortRecipe(request: PlannerRequest): RecipeCatalogEntry? {
         val preferredIds = when (request.djLevel) {
             DjLevel.SUBTLE -> listOf("S4", "S5")
             DjLevel.CLUB, DjLevel.FESTIVAL -> listOf("C2", "S4", "S5")
@@ -488,7 +492,7 @@ object PairPlanner {
                 BuiltInRecipeCatalog.byId(id)?.let { return it }
             }
         }
-        return BuiltInRecipeCatalog.S4
+        return null
     }
 
     private fun buildPlan(

@@ -50,16 +50,23 @@ object AndroidStreamHooks {
         InnerTubeXResolver.debugLogging = BuildConfig.DEBUG
     }
 
-    /** What `InnerTubeXResolver.init(context)` did when it lived in the app. */
-    fun initInnerTubeX(context: Context) {
+    /** A missing runtime API key leaves BotGuard PoTokens unavailable. */
+    fun initInnerTubeX(context: Context, apiKey: String? = null) {
         val app = context.applicationContext
         val prefs = app.getSharedPreferences("innertubex_player_config", Context.MODE_PRIVATE)
         // BotGuard PoTokens minted in a hidden WebView; what WEB_REMIX needs for age-restricted tracks.
         val webViewSupported by lazy { runCatching { CookieManager.getInstance() }.isSuccess }
-        val poTokens = PoTokenGenerator(
-            createMinter = { PoTokenWebView.getNewPoTokenGenerator(app) },
-            available = { webViewSupported },
-        )
+        // The existing player-config store has no BotGuard key source; never use a fallback.
+        val resolvedApiKey = apiKey?.trim()?.takeIf { it.isNotEmpty() }
+        val poTokens = resolvedApiKey?.let { key ->
+            PoTokenGenerator(
+                createMinter = { PoTokenWebView.getNewPoTokenGenerator(app, key) },
+                available = { webViewSupported },
+            )
+        }
+        if (poTokens == null) {
+            TrackLog.w("AndroidStreamHooks", "BotGuard PoToken unavailable: no API key configured")
+        }
         InnerTubeXResolver.init(
             filesDir = app.filesDir,
             store = object : InnerTubeXResolver.ConfigStore {
@@ -68,7 +75,7 @@ object AndroidStreamHooks {
                 override fun putString(key: String, value: String) = prefs.edit().putString(key, value).apply()
                 override fun putLong(key: String, value: Long) = prefs.edit().putLong(key, value).apply()
             },
-            poTokenProvider = poTokens.asTokenProvider(),
+            poTokenProvider = poTokens?.asTokenProvider(),
         )
     }
 }

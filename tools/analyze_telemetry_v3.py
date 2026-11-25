@@ -9,6 +9,17 @@ Accepts two JSONL dialects and normalises both into one record shape:
 * legacy (`automix-telemetry.jsonl`): `{"ts":..., "ev":"mix.timing"|"mix.fire"|
   "mix.countdown.*"|...}` records as written by vc91..vc94.
 
+A file that mixes both dialects is supported: each transition is described
+twice (MixMachine writes v3, CrossfadeController/PairPreparer legacy), so
+fires and attempts are de-duplicated per pair before counting, and v3 fires
+absorb the legacy `fx` / `exitVocal` fields the v3 schema cannot carry.
+
+Fire records that carry a recipe id but no FX list (every v3 fire) get their
+FX types derived from the bundled RecipeV2 catalog (`--recipes`, default the
+repo's `app/src/main/assets/recipes`), mirroring `direct_fx()` in
+tools/recipes/lint_recipes.py — that is what makes the Festival distinct-FX
+§10 row measurable from v3-only telemetry.
+
 `--before` accepts either a baseline JSON summary (for example
 `evidence/ae3-m0/m0-metrics.json`) or a telemetry JSONL file; `--after` is the
 v3 (or legacy) JSONL to score. `--out` writes the Markdown results table and a
@@ -28,12 +39,23 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 LEVELS = ("SUBTLE", "CLUB", "FESTIVAL")
 FROZEN_PATHS = {"PREPARER_FROZEN", "PREPARER_NO_STEM_FALLBACK", "v2-native", "v2-straight"}
 LEGACY_FROZEN_HINT = {"v2-native", "v2-straight"}
 FESTIVAL_WINDOW = 12
+
+# A merged v3+legacy stream describes one transition twice: MixMachine writes
+# the v3 records, CrossfadeController/PairPreparer the legacy ones. These
+# windows bound what counts as "the same transition" when deduping.
+FIRE_MATCH_WINDOW_MS = 15_000        # both records are written at execution time
+ATTEMPT_MATCH_WINDOW_MS = 300_000    # legacy mix.timing lands at fire, v3 prep at start
+INCIDENT_MATCH_WINDOW_MS = 2_000     # boolean incidents (moved / last resort / broken)
+
+# `TelemetryEventType.wireName` values that keep an underscore; every other
+# enum name maps mechanically to its dotted wire name.
+WIRE_NAME_OVERRIDES = {"MIX_LAST_RESORT": "mix.last_resort"}
 
 # Part A §10 targets (Festival/Club/Subtle rows use the same numbers).
 GATES = {
@@ -93,7 +115,15 @@ def text(v: Any) -> str:
 
 
 def wire_kind(raw: str) -> str:
-    """`MIX_FIRE` -> `mix.fire`; already-dotted names pass through."""
+    """`MIX_FIRE` -> `mix.fire`; already-dotted names pass through.
+
+    [WIRE_NAME_OVERRIDES] holds the enum values whose wire name keeps an
+    underscore (`TelemetryEventType.wireName` in djmix-core); everything else
+    dotted-lowercases mechanically.
+    """
+    override = WIRE_NAME_OVERRIDES.get(raw)
+    if override:
+        return override
     if raw.startswith("MIX_"):
         return "mix." + raw[4:].lower().replace("_", ".")
     return raw
@@ -104,8 +134,9 @@ def normalise_v3(o: Dict[str, Any]) -> Rec:
     if isinstance(fx, str):
         fx = [s for s in fx.replace(";", ",").split(",") if s.strip()]
     gen = o.get("generation")
+    kind = wire_kind(text(o.get("eventType")))
     return Rec(
-        kind=wire_kind(text(o.get("eventType"))),
+        kind=kind,
         ts=int(num(o.get("timestampMs")) or 0),
         schema="v3",
         plan_id=text(o.get("planId")) or None,
@@ -122,7 +153,9 @@ def normalise_v3(o: Dict[str, Any]) -> Rec:
         stem_out_ms=num(o.get("stemMsOut")),
         stem_in_ms=num(o.get("stemMsIn")),
         build_ms=num(o.get("buildMs")),
-        countdown_broken=o.get("countdownBroken") is True,
+        # The v3 MIX_COUNTDOWN_BROKEN event may carry countdownBroken=null; the
+        # event type itself is the incident, exactly like the legacy ev name.
+        countdown_broken=o.get("countdownBroken") is True or kind == "mix.countdown.broken",
         reason=text(o.get("reason")) or None,
         detail=text(o.get("detail")),
         stress=o.get("stress") is True or "stress" in text(o.get("detail")).lower(),
@@ -209,15 +242,81 @@ def pct(vals: List[float], q: float) -> Optional[float]:
 
 
 def transitions(recs: List[Rec]) -> List[Rec]:
-    """Attempts: one per prepared transition (v3 prep start, else legacy mix.timing)."""
+    """Attempts: one per prepared transition (v3 prep start, else legacy mix.timing).
+
+    On a merged v3+legacy stream both dialects describe the same preparation,
+    so a legacy timing that duplicates a v3 prep for the same pair (within
+    [ATTEMPT_MATCH_WINDOW_MS], generous because the legacy record lands at
+    fire time while the v3 one lands at prep start) is dropped.
+    """
     v3 = [r for r in recs if r.schema == "v3" and r.kind == "mix.prep.started"]
-    if v3:
-        return v3
-    return [r for r in recs if r.schema == "legacy" and r.kind == "mix.timing"]
+    legacy = [r for r in recs if r.schema == "legacy" and r.kind == "mix.timing"]
+    if not v3 or not legacy:
+        return v3 + legacy
+    used: Set[int] = set()
+    for r in v3:
+        best, best_dt = None, None
+        for i, l in enumerate(legacy):
+            if i in used or l.out_id != r.out_id or l.in_id != r.in_id:
+                continue
+            dt = abs(l.ts - r.ts)
+            if dt > ATTEMPT_MATCH_WINDOW_MS:
+                continue
+            if best is None or dt < best_dt:
+                best, best_dt = i, dt
+        if best is not None:
+            used.add(best)
+    return v3 + [l for i, l in enumerate(legacy) if i not in used]
 
 
 def fires(recs: List[Rec]) -> List[Rec]:
-    return [r for r in recs if r.kind == "mix.fire"]
+    """Fired transitions: one entry per fire, across dialects.
+
+    On a merged stream each v3 fire absorbs the nearest same-pair legacy fire
+    within [FIRE_MATCH_WINDOW_MS] — inheriting `fx` and `exitVocal`, which the
+    v3 schema cannot carry — and the absorbed legacy record is dropped.
+    Unmatched legacy fires stay, so legacy-only input is unchanged.
+    """
+    v3 = [r for r in recs if r.schema == "v3" and r.kind == "mix.fire"]
+    legacy = [r for r in recs if r.schema == "legacy" and r.kind == "mix.fire"]
+    if not v3 or not legacy:
+        return v3 + legacy
+    used: Set[int] = set()
+    for r in v3:
+        best, best_dt = None, None
+        for i, l in enumerate(legacy):
+            if i in used or l.out_id != r.out_id or l.in_id != r.in_id:
+                continue
+            dt = abs(l.ts - r.ts)
+            if dt > FIRE_MATCH_WINDOW_MS:
+                continue
+            if best is None or dt < best_dt:
+                best, best_dt = i, dt
+        if best is not None:
+            used.add(best)
+            l = legacy[best]
+            if not r.fx and l.fx:
+                r.fx = list(l.fx)
+            if r.exit_vocal is None and l.exit_vocal is not None:
+                r.exit_vocal = l.exit_vocal
+    return v3 + [l for i, l in enumerate(legacy) if i not in used]
+
+
+def cross_dialect_count(recs: List[Rec], window_ms: int = INCIDENT_MATCH_WINDOW_MS) -> int:
+    """Count records of one incident across dialects without double counting.
+
+    A merged stream writes the same incident (a `mix.moved`, a broken
+    countdown, ...) once per dialect within milliseconds; a legacy record
+    within [window_ms] of any v3 one is treated as its duplicate.
+    """
+    if not recs:
+        return 0
+    v3 = [r for r in recs if r.schema == "v3"]
+    legacy = [r for r in recs if r.schema == "legacy"]
+    if not v3 or not legacy:
+        return len(recs)
+    kept = [l for l in legacy if not any(abs(l.ts - r.ts) <= window_ms for r in v3)]
+    return len(v3) + len(kept)
 
 
 def frozen(r: Rec) -> Optional[bool]:
@@ -240,18 +339,83 @@ def ready_latencies(recs: List[Rec]) -> List[float]:
     return out
 
 
-def summarise(recs: List[Rec], bad_lines: int, source: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Recipe catalog (FX derivation for records without an fx list)
+# ---------------------------------------------------------------------------
+
+def default_recipe_catalog() -> Path:
+    """Bundled RecipeV2 JSONs in the repo the analyzer ships in."""
+    return Path(__file__).resolve().parent.parent / "app" / "src" / "main" / "assets" / "recipes"
+
+
+def load_recipe_fx(catalog_dir: Path) -> Dict[str, Set[str]]:
+    """recipeId -> FX types the recipe uses, over `steps` + `noStemSteps`.
+
+    Mirrors `direct_fx()` in tools/recipes/lint_recipes.py: a `configure_fx`
+    step contributes its `fx`; a `lane_curve` of kind `HIGH_PASS_HZ`,
+    `LOW_PASS_HZ` or `FILTER_KNOB` contributes `SWEEP`. Malformed files are
+    skipped, never fatal.
+    """
+    out: Dict[str, Set[str]] = {}
+    if not catalog_dir.is_dir():
+        return out
+    for path in sorted(catalog_dir.glob("*.json")):
+        try:
+            recipe = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            continue
+        if not isinstance(recipe, dict):
+            continue
+        rid = text(recipe.get("id"))
+        if not rid:
+            continue
+        fx: Set[str] = set()
+        for variant in ("steps", "noStemSteps"):
+            steps = recipe.get(variant)
+            if not isinstance(steps, list):
+                continue
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if step.get("type") == "configure_fx" and isinstance(step.get("fx"), str):
+                    fx.add(text(step["fx"]))
+                elif step.get("type") == "lane_curve" and step.get("kind") in (
+                    "HIGH_PASS_HZ", "LOW_PASS_HZ", "FILTER_KNOB",
+                ):
+                    fx.add("SWEEP")
+        out[rid] = fx
+    return out
+
+
+def summarise(
+    recs: List[Rec],
+    bad_lines: int,
+    source: str,
+    recipe_fx: Optional[Dict[str, Set[str]]] = None,
+) -> Dict[str, Any]:
     att = transitions(recs)
     fi = fires(recs)
+    # Fires that carry a recipe id but no FX list (the v3 schema has no fx
+    # field) get their FX derived from the recipe catalog, so the Festival
+    # distinct-FX §10 row is measurable from v3-only telemetry.
+    fx_derived = 0
+    if recipe_fx:
+        for r in fi:
+            if not r.fx and r.recipe:
+                rid = r.recipe.split(":", 1)[0].strip()
+                catalog_fx = recipe_fx.get(rid)
+                if catalog_fx:
+                    r.fx = sorted(catalog_fx)
+                    fx_derived += 1
     n_att = len(att) or len(fi)
     overlap = len(fi)
     # Transitions that reached a fire are audible overlaps; attempts that never
     # fired (failed / suspended without a fire for the same plan) count against it.
     overlap_pct = 100.0 * min(overlap, n_att) / n_att if n_att else None
 
-    broken = sum(1 for r in recs if r.countdown_broken)
-    moved = sum(1 for r in recs if r.kind == "mix.moved")
-    last_resort = sum(1 for r in recs if r.kind == "mix.last_resort")
+    broken = cross_dialect_count([r for r in recs if r.countdown_broken])
+    moved = cross_dialect_count([r for r in recs if r.kind == "mix.moved"])
+    last_resort = cross_dialect_count([r for r in recs if r.kind == "mix.last_resort"])
 
     analysis_cpu, analysis_npu = [], []
     for r in recs:
@@ -270,30 +434,38 @@ def summarise(recs: List[Rec], bad_lines: int, source: str) -> Dict[str, Any]:
 
     ready = ready_latencies(recs)
 
-    def level_block(level: Optional[str], subset: List[Rec]) -> Dict[str, Any]:
-        f = [r for r in subset if r.kind == "mix.fire"]
-        a = [r for r in subset if r.kind in ("mix.prep.started", "mix.timing")]
-        n = len(a) or len(f)
-        kn = [frozen(r) for r in a + f if frozen(r) is not None]
-        window = [r for r in f][:FESTIVAL_WINDOW]
+    def level_block(
+        level: Optional[str],
+        subset: List[Rec],
+        attempts: List[Rec],
+        fired: List[Rec],
+    ) -> Dict[str, Any]:
+        n = len(attempts) or len(fired)
+        kn = [frozen(r) for r in attempts + fired if frozen(r) is not None]
+        window = fired[:FESTIVAL_WINDOW]
         return {
             "level": level,
             "attempts": n,
-            "fires": len(f),
-            "overlap_pct": 100.0 * min(len(f), n) / n if n else None,
+            "fires": len(fired),
+            "overlap_pct": 100.0 * min(len(fired), n) / n if n else None,
             "frozen_pct": 100.0 * sum(kn) / len(kn) if kn else None,
             "countdown_broken": sum(1 for r in subset if r.countdown_broken),
-            "distinct_recipes": len({r.recipe for r in f if r.recipe}),
-            "distinct_fx": len({x for r in f for x in r.fx}),
+            "distinct_recipes": len({r.recipe for r in fired if r.recipe}),
+            "distinct_fx": len({x for r in fired for x in r.fx}),
             "first12_distinct_recipes": len({r.recipe for r in window if r.recipe}),
             "first12_distinct_fx": len({x for r in window for x in r.fx}),
         }
 
     by_level = {}
     for lvl in LEVELS:
-        by_level[lvl] = level_block(lvl, [r for r in recs if r.level == lvl])
-    natural = [r for r in recs if not r.stress]
+        by_level[lvl] = level_block(
+            lvl,
+            [r for r in recs if r.level == lvl],
+            [r for r in att if r.level == lvl],
+            [r for r in fi if r.level == lvl],
+        )
     stress = [r for r in recs if r.stress]
+    natural = [r for r in recs if not r.stress]
     fest = [r for r in fi if r.level == "FESTIVAL"]
     fest12 = fest[:FESTIVAL_WINDOW]
 
@@ -328,9 +500,15 @@ def summarise(recs: List[Rec], bad_lines: int, source: str) -> Dict[str, Any]:
         "festival_fx_first12": len({x for r in fest12 for x in r.fx}),
         "festival_recipes_all": len({r.recipe for r in fest if r.recipe}),
         "festival_fx_all": len({x for r in fest for x in r.fx}),
+        "fx_derived_from_recipes": fx_derived,
+        "recipe_fx_recipes": len(recipe_fx) if recipe_fx else 0,
         "levels": by_level,
-        "stress": level_block("STRESS", stress),
-        "natural": level_block("NATURAL", natural),
+        "stress": level_block(
+            "STRESS", stress, [r for r in att if r.stress], [r for r in fi if r.stress],
+        ),
+        "natural": level_block(
+            "NATURAL", natural, [r for r in att if not r.stress], [r for r in fi if not r.stress],
+        ),
     }
 
 
@@ -500,6 +678,9 @@ def render_markdown(after: Dict[str, Any], before: Optional[Dict[str, Any]]) -> 
     L.append("- Exit mid-vocal needs Syvenu values on fire records (`exitVocal` / `syvenuAtExit`); "
              "`n/a` means the field was absent.")
     L.append("- Festival distinct recipes / FX use the first 12 Festival fires; `all` totals are in the JSON sidecar.")
+    if after.get("fx_derived_from_recipes"):
+        L.append(f"- {after['fx_derived_from_recipes']} fire record(s) had FX derived from the recipe catalog "
+                 f"({after.get('recipe_fx_recipes', 0)} recipes; the v3 schema carries no fx field).")
     L.append("")
     L.append("## Per level")
     L.append("")
@@ -535,6 +716,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--after", required=True, type=Path, help="v3 (or legacy) telemetry JSONL to score")
     ap.add_argument("--before", type=Path, help="baseline metrics JSON or telemetry JSONL")
     ap.add_argument("--out", type=Path, help="Markdown results file (also writes <out>.json)")
+    ap.add_argument("--recipes", type=Path, default=None,
+                    help="recipe catalog dir used to derive FX types for fire records that "
+                         "carry a recipe id but no fx list (default: the repo's "
+                         "app/src/main/assets/recipes; missing dir disables derivation)")
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 when any Part A §10 gate fails or was not measured")
     args = ap.parse_args(argv)
@@ -546,7 +731,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not recs:
         print(f"error: no telemetry records in {args.after} (bad lines: {bad})", file=sys.stderr)
         return 2
-    after = summarise(recs, bad, str(args.after))
+    catalog_dir = args.recipes or default_recipe_catalog()
+    recipe_fx = load_recipe_fx(catalog_dir)
+    if args.recipes and not recipe_fx:
+        print(f"warning: no recipes loaded from {catalog_dir}; FX derivation disabled", file=sys.stderr)
+    after = summarise(recs, bad, str(args.after), recipe_fx=recipe_fx)
 
     before = None
     if args.before:

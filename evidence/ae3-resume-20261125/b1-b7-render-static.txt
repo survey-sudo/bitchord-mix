@@ -1,0 +1,177 @@
+B1.1/B7.2 render reconciliation — 2026-11-25
+Edit repository: /home/hfzhkn/bitchord-unified
+Baseline: 19da5aac1d1c5299da4d5e6896099ee469ff2c83
+Status: source reconciled and frozen for FIRST KOTLIN COMPILATION by sole dvb owner.
+Supersedes the prior concurrent-writer/integration-hold evidence. The surviving
+engine and CLI are present. No source drift occurred in the final freeze check.
+
+NOT COMPILED: neither Kotlin compilation nor Kotlin tests nor native rendering
+was run here. Python uses mocked tool boundaries; its passing tests do not prove
+Kotlin compilation or native/device audio parity. No Gradle/device/staging/commit/
+push/stash/reset/clean command was run. No other module/native/settings was edited.
+
+Coherent contract
+- Exactly one CLI handler: com.music.bitchord.djmix.render.cli.ReplayCli.
+- Application wrapper: com.music.bitchord.djmix.render.cli.ReplayCliKt.
+- Root-package ReplayCli.kt is absent; duplicate entry point remains removed.
+- Trace: replay --bundle ZIP [--out TRACE.json], schema=1, operation=decision_trace.
+- Audio: replay ZIP --out HOST.wav --renderer-bin EXEC --deck-a-pcm A.f32
+  --deck-b-pcm B.f32 [--verify-sha256 PCM_HASH] [--json]. Operation=render receipt.
+- Exit codes: 0 success/help; 1 bundle/core/compiler/render/audio/hash failure;
+  2 usage/file-I/O error. Trace and audio modes cannot silently substitute outputs.
+- Python requires the JVM --render-cli for trace OR audio. Direct native bypass
+  was removed: core ScriptExecutionGuard and exact frozen compiler comparison
+  run before any backend, independent of native parser permissiveness.
+- Codec delegates all executable geometry/envelope checks to core. Removed the
+  duplicate validateNativeBounds validator and its inconsistent early errors.
+- No invented full-reducer-event ZIP dialect remains. Actual tickless summaries
+  produce reducerReplayComplete=false and coverage complete=false, equivalent=null,
+  replayedEventCount=0. Failures in captured telemetry remain diagnostic evidence.
+- Full-input caller API replayReducer(initial, events, config) returns core
+  ReplayStep. Archive input gaps are never filled with manufactured defaults.
+- Compiler uses exact archived RecipeV2, TransitionPlanV1, RenderGeometryV1,
+  TransitionScriptV1 and nested canonical core types. It enumerates normal/no-stem
+  decisions under the explicitly reported full core capability set and preserves
+  every exact structural match. No registry/recipe/geometry repair is performed.
+- Host PCM files must be explicitly supplied and have exactly frameCount*2*4 bytes.
+  Device PCM paths are not opened/forwarded. Stem audio mapping fails explicitly;
+  no stem is dropped. Explicit user track overrides alone may name host paths.
+- Backend receives a private staged output. Engine independently validates real
+  PCM16 stereo WAV, script rate, canonical native duration, sample count and PCM
+  hash before atomic publication. Hash mismatch/absent/invalid/short WAV preserves
+  old output. Python checks the actual WAV against the operation/identity receipt.
+- samplePeak is a sample peak; no true-peak or bit-exact/device parity is claimed.
+
+Archive facts reverified against actual producers
+- Manifest schema=1, engine=3.0.0, trigger=Flag. Plan/script schema=1,
+  recipe schema=2, analysis/telemetry schema=3. No invented geometry/flags/taste
+  version fields. Full plan, recipe, script and geometry are required for replay.
+- Status keys: plan.json, recipe.json, render_geometry.json, script.json,
+  analysis_out.json, analysis_in.json, flags_snapshot.json, taste_snapshot.json,
+  events_5min.jsonl, telemetry_5min.jsonl, analysis_summary.json, audioCapture.
+- Status fields are available/entry/bytes/sha256/detail. The manifest does not
+  include itself. Rings and analysis summary always exist, possibly empty rings.
+- audioCapture maps to mix_capture.wav/flac/pcm/bin. Exact member bytes are hashed
+  with UNSALTED SHA-256. recipeSha256 equals the recipe entry hash. Asset/model
+  external bytes are not present, so only digest syntax is verified/reported.
+- flags_snapshot is effective merged policy. flags.json.sha256 sidecar hashes raw
+  flags release bytes using its first whitespace token; that sidecar is not bundled.
+- ZIP reader is root-only and bounded: 16 MiB text, 256 MiB audio, 512 MiB expanded
+  total, 513 MiB input file. All entries/statuses/sizes/hashes are checked. JVM
+  extracts nothing; Python uses exclusive root targets in its private scratch dir.
+- Invalid UTF-8, duplicate JSON keys (including escaped keys), nesting >128,
+  absent serialized fields and identity/version conflicts fail closed.
+- MixExecutor.recordDebugEvent excludes ticks and omits full event input fields.
+  TelemetryV3Writer re-stamps non-epoch positions. Ring order is retained, with
+  no invented cross-ring chronology or initial state/config/capabilities/variant.
+
+Core API alignment (read from current source, not guessed)
+- ScriptExecutionGuard.validate(script, availableCapabilities=all): MixOutcome.
+- ScriptExecutionGuard.validateFrozen(script, plan, availableCapabilities=all).
+- RecipeInterpreter.compileFrozen(recipe, plan, geometry, outRegion, inRegion,
+  stems, useNoStemVariant, availableCapabilities, dropWindowMs): MixOutcome<TransitionScriptV1>.
+  Engine uses named arguments in that exact API. Existing core ReplayStep is reused.
+- MixMachine.replay(initial, events, config): List<ReplayStep>.
+- No direct ChoreoGuard reference/import in render; no core/shared guard edited.
+- Kotlin JVM/serialization plugins inherit root 2.3.20 with no local versions.
+  JDK 17 and serialization-json 1.11.0 match existing djmix-analysis. Core declares
+  serialization-json 1.7.3; render reuses the existing host runtime/library, with
+  no new dependency coordinate. Unused coroutines removed. JUnit 4.13.2/test-junit
+  are test-only. gradle/libs.versions.toml is absent, no catalog introduced.
+
+Tests ready and actual execution
+- Python baseline after restart: 24/24 passed. Reconciled Python: 38/38 passed.
+- Kotlin ready: 28 @Test methods, all real assertions, no skip/assumeTrue/@Ignore.
+  Tests cover exact codec/FX/stems, core refusal propagation, frozen normal/no-stem
+  compiler decisions, deterministic actual-format fixture, full-input reducer
+  state/effects, hash/missing/unavailable entries, size/version/identity/JSON errors,
+  diagnostics coverage, CLI protocol/output modes, PCM requirements, stems refusal,
+  permissive backend blocked by core guard, real WAV validation, PCM hash/sample
+  peak, duration/rate failures, overwrite protection and preservation on failure.
+- Python tests cover actual behavior with temporary ZIP/JSON/WAV files and mocked
+  subprocess/decode boundaries: wrong operation/identity/hash, missing output,
+  JSON-as-WAV, stale output, stem failure, explicit-path policy, exclusive safe
+  extraction, bounded inputs and diagnostic countdown failures. No native process
+  or ffmpeg was actually run by these tests.
+
+Final commands and RCs (PYTHONPYCACHEPREFIX=/tmp/opencode/render-reconciliation-pycache)
+$ python3 tools/test_replay_bundle.py
+Ran 38 tests in 0.088s. OK. RC=0.
+Expected warnings: tickless debug summaries and explicit legacy fixture missing
+optional metadata. Check-only states core compiler/reducer were not run.
+$ python3 -m py_compile tools/replay_bundle.py tools/test_replay_bundle.py
+No output. RC=0.
+$ git diff --check
+No output. RC=0.
+$ git diff --exit-code -- settings.gradle.kts
+No output. RC=0. Live settings unchanged; module remains unincluded.
+$ git apply --check evidence/ae3-resume-20261125/wave3-settings-include.patch
+No output. RC=0. Dry check only; include is DEFERRED.
+$ git apply --numstat evidence/ae3-resume-20261125/wave3-settings-include.patch
+1  0  settings.gradle.kts. RC=0. Exactly one added include line with inline comment.
+$ grep -R -n -E '^[[:space:]]*import[[:space:]]+(android\.|androidx\.|com\.music\.bitchord\.(playback|shared|ui)\.)' djmix-render
+No matches. RC=1 (expected).
+$ grep -R -n ChoreoGuard djmix-render
+No matches. RC=1 (expected).
+$ grep -R -n -E 'object ReplayCli|fun main|mainClass' djmix-render
+build.gradle.kts:20 mainClass=com.music.bitchord.djmix.render.cli.ReplayCliKt
+cli/ReplayCli.kt:25 fun main; cli/ReplayCli.kt:27 object ReplayCli. RC=0.
+$ grep -R -n -E 'assumeTrue|@Ignore|validateNativeBounds|CapturedReducerInput|replayDiffReport|truePeak|coroutines' djmix-render
+No matches. RC=1 (expected).
+$ rg -n 'project\(":djmix-render"\)' --glob '*.kts' .
+No matches. RC=1 (expected: no dependency added to another module).
+$ wc -l <all module files> tools/replay_bundle.py tools/test_replay_bundle.py docs/BUNDLE_REPLAY.md <include patch>
+21 build.gradle.kts
+201 BundleReplayEngine.kt
+128 FlagBundleReader.kt
+105 NativeRenderBackend.kt
+81 NativeScriptJsonCodec.kt
+122 RenderContract.kt
+41 StrictJson.kt
+105 cli/ReplayCli.kt
+510 src/test/.../BundleReplayTest.kt
+772 tools/replay_bundle.py
+469 tools/test_replay_bundle.py
+128 docs/BUNDLE_REPLAY.md
+11 wave3-settings-include.patch
+RC=0. Every file <=1,500 lines. All nine module files total 1,314 lines.
+$ python3 <source assertions and SHA256 read-back>
+9 module files; 28 Kotlin tests; one CLI/main; no skips; no root duplicate;
+all files <=1,500 lines; no source trailing whitespace; absent version catalog;
+hash set unchanged on read-back. RC=0.
+Note: unified-patch blank context line contains its required single prefix space;
+source-whitespace assertions exclude the patch's diff syntax.
+
+Frozen source SHA-256 set (verify before include/first compile)
+a0ca8287d37a2de12223ccc94ae0cc30da5f2e6b93b738e34930041dc520cc98  djmix-render/build.gradle.kts
+40ce248e8535ee311df6755235c731d7ce57eac752dda86c2948070e1e3b6d6d  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/BundleReplayEngine.kt
+9045f0cffdac71bca8d2a0af548f72bf94b62081fe5bef750b6698fec5384cc9  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/FlagBundleReader.kt
+8340aaa5710cd2073b24b007dce28acb6470e205be1efb82ea421e91433c65e6  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/NativeRenderBackend.kt
+3934dccb49b70ea408c392afbe2546476d80380c60474a3933133417c8e3c9da  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/NativeScriptJsonCodec.kt
+29b7471cd766bfaf2c73446bf2f178916695f897c1dd5ee7431a94dd845907a3  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/RenderContract.kt
+16e1b9344cda0a9c8d4a59e05410ebece71af49bd3200bf0e70455722ede9c3f  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/StrictJson.kt
+8ba81854d98500a2a27385135505b143146651f88e0d9e9eb2f97b009b342345  djmix-render/src/main/kotlin/com/music/bitchord/djmix/render/cli/ReplayCli.kt
+e616f5714d801cfb0e2bf43645170cd784c5459377dc2517eb9b6fb0dcdf5cdd  djmix-render/src/test/kotlin/com/music/bitchord/djmix/render/BundleReplayTest.kt
+72e6f6f34c032648f9358bf82e9642da2fae209a71cfe3d5a9a52a9d1996f244  tools/replay_bundle.py
+df8b5693565c52dfbda2b83e7b9c47026911fdcb25b86003b3a4e27ba0cff5b8  tools/test_replay_bundle.py
+31eba6f537bc1e6ba845d686961ea7280508edaf783b768e17fed70c7fca2a04  docs/BUNDLE_REPLAY.md
+1fe7e5b4888aa82cf9f9ceeafbaec425daf20b2ba9cfdca682f29d595da8ff7d  evidence/ae3-resume-20261125/wave3-settings-include.patch
+
+Settings SHA256 (read only, unchanged):
+f62b2097248a7fe7682fd7ac6896e2782412bc5fd90eb0d8ac8b151f50083a86
+Core API hashes at source inspection (read-only; changes require rechecking API):
+db793c790544e4447543bc36d73b6f9923d575182e73bd51edb67d080e95c0da  recipes/ScriptExecutionGuard.kt
+d197e2d660c066b7f3c8f1372c8104fdbac69d98f7406459d0e4d351562d4e81  recipes/RecipeInterpreter.kt
+5751f78fceba6d50abab50a4e409c8100757c109caa8945709ccfbb4005d8104  machine/MixMachine.kt
+
+Handoff / R-next
+- Parent inspects and authorizes deferred include; only sole dvb validation owner
+  should run first Kotlin gate after its current job. Suggested tasks, NOT RUN:
+  ./gradlew --offline :djmix-render:compileKotlin :djmix-render:compileTestKotlin
+  ./gradlew --offline :djmix-render:test :djmix-render:installDist
+- A compile/test failure must be reported as such; this static record is not a pass
+  for Kotlin, native parser or device parity. Native owner retains native fixes.
+- R-next producer gap: capture full reducer events/checkpoint/config/capabilities/
+  variant decisions. No producer/core/native changes were made in this lane.
+- Reconciliation report saved separately at the requested orchestration path:
+  /home/hfzhkn/Bitchord/evidence/ae3-resume-20261125/render-reconciliation.md

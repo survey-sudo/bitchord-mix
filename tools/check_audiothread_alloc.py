@@ -26,16 +26,17 @@ import sys
 
 # Allocation/logging APIs forbidden inside @AudioThread regions (B13).
 FORBIDDEN = [
-    "FloatArray(",
-    "DoubleArray(",
-    "IntArray(",
-    "ArrayList(",
-    "HashMap(",
-    "mutableListOf(",
-    "listOf(",
-    "mapOf(",
-    "setOf(",
-    "Log.",
+    ("array constructor", re.compile(
+        r"\b(?:Byte|Short|Int|Long|Float|Double|Boolean|Char)Array\s*\(|"
+        r"\b(?:ArrayList|LinkedList|HashMap|LinkedHashMap|mutableListOf|"
+        r"mutableMapOf|mutableSetOf|arrayListOf|hashMapOf|listOf|mapOf|setOf)\s*\("
+    )),
+    ("copying/collection call", re.compile(
+        r"\.(?:copyOf|toList|toMutableList|toSet|toMutableSet|map|mapNotNull|"
+        r"filter|filterNot|sorted|sortedBy|distinct)\s*\(|\bcopyOf\s*\("
+    )),
+    ("logging call", re.compile(r"\b(?:Log|AnalysisLog|Timber)\s*\.")),
+    ("logging/printing call", re.compile(r"\b(?:println|printStackTrace)\s*\(")),
 ]
 
 # Scan roots relative to the repository root (Part B13 scope).
@@ -48,6 +49,50 @@ DEFAULT_ROOTS = [
 ]
 
 
+def _interpolation_end(text: str, start: int) -> int:
+    """Return the index of the closing brace for ``${`` at *start*.
+
+    The small scanner is deliberately lexical rather than Kotlin-AST based: it
+    understands nested braces, comments, and quoted strings so expressions in
+    interpolation remain visible without exposing braces from their strings.
+    """
+    depth = 1
+    i = start
+    n = len(text)
+    while i < n:
+        if text.startswith("//", i):
+            nl = text.find("\n", i + 2)
+            i = n if nl < 0 else nl
+            continue
+        if text.startswith("/*", i):
+            close = text.find("*/", i + 2)
+            i = n if close < 0 else close + 2
+            continue
+        if text.startswith('"""', i):
+            close = text.find('"""', i + 3)
+            i = n if close < 0 else close + 3
+            continue
+        if text[i] == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
 def strip_comments_and_strings(text: str) -> str:
     """Blank out comments and string/char literals, keeping newlines so
     line numbers survive. Brace counting and pattern matching then never
@@ -57,42 +102,75 @@ def strip_comments_and_strings(text: str) -> str:
     n = len(text)
     while i < n:
         c = text[i]
-        two = text[i : i + 2]
-        if two == "//":
+        if text.startswith("//", i):
             j = text.find("\n", i)
             j = n if j == -1 else j
             for k in range(i, j):
                 out[k] = " "
             i = j
-        elif two == "/*":
+        elif text.startswith("/*", i):
             j = text.find("*/", i + 2)
             j = n if j == -1 else j + 2
             for k in range(i, j):
                 if out[k] != "\n":
                     out[k] = " "
             i = j
-        elif two == '"""':
-            j = text.find('"""', i + 3)
-            j = n if j == -1 else j + 3
-            for k in range(i, j):
+        elif text.startswith('"""', i):
+            j = i + 3
+            expressions: list[tuple[int, int, str]] = []
+            while j < n:
+                interpolation = text.find("${", j)
+                close = text.find('"""', j)
+                if interpolation < 0 or (close >= 0 and close < interpolation):
+                    break
+                for k in range(j, interpolation):
+                    if out[k] != "\n":
+                        out[k] = " "
+                end = _interpolation_end(text, interpolation + 2)
+                expression = strip_comments_and_strings(text[interpolation:end + 1])
+                expressions.append((interpolation, min(end + 1, n), expression))
+                j = end + 1 if end < n else n
+            close = text.find('"""', j)
+            end = n if close < 0 else close + 3
+            for k in range(i, end):
                 if out[k] != "\n":
                     out[k] = " "
-            i = j
+            for start, stop, expression in expressions:
+                for k, value in enumerate(expression, start):
+                    if k < stop:
+                        out[k] = value
+            i = end
         elif c == '"':
-            out[i] = " "
             j = i + 1
             while j < n and text[j] != '"' and text[j] != "\n":
-                if text[j] == "\\" and j + 1 < n:
+                if text.startswith("${", j):
+                    end = _interpolation_end(text, j + 2)
+                    expression = strip_comments_and_strings(text[j:end + 1])
+                    for k in range(j, min(end + 1, n)):
+                        out[k] = expression[k - j]
+                    j = end + 1 if end < n else n
+                elif text[j] == "\\" and j + 1 < n:
                     out[j] = out[j + 1] = " "
                     j += 2
                 else:
                     out[j] = " "
                     j += 1
+            if j < n and text[j] == '"':
+                out[j] = " "
+                j += 1
+            out[i] = " "
             i = j
         elif c == "'":
             out[i] = " "
             j = i + 1
             while j < n and text[j] != "'" and text[j] != "\n":
+                if text[j] == "\\" and j + 1 < n:
+                    out[j] = out[j + 1] = " "
+                    j += 2
+                    continue
+                out[j] = " "
+                j += 1
+            if j < n and text[j] == "'":
                 out[j] = " "
                 j += 1
             i = j
@@ -101,64 +179,84 @@ def strip_comments_and_strings(text: str) -> str:
     return "".join(out)
 
 
+def _body_span(cleaned: str, annotation_offset: int) -> tuple[int, int] | None:
+    fun = re.search(r"\bfun\b", cleaned[annotation_offset:])
+    if not fun:
+        return None
+    fun_start = annotation_offset + fun.start()
+    parens = 0
+    open_brace = None
+    expression = None
+    i = fun_start
+    while i < len(cleaned):
+        c = cleaned[i]
+        if c == "(":
+            parens += 1
+        elif c == ")" and parens:
+            parens -= 1
+        elif parens == 0 and c == "{" and open_brace is None:
+            open_brace = i
+            break
+        elif parens == 0 and c == "=":
+            expression = i + 1
+            break
+        i += 1
+        if i - fun_start > 8192:
+            break
+    if open_brace is not None:
+        depth = 0
+        for j in range(open_brace, len(cleaned)):
+            if cleaned[j] == "{":
+                depth += 1
+            elif cleaned[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return open_brace, j + 1
+        return None
+    if expression is None:
+        return None
+    fun_line_start = cleaned.rfind("\n", 0, fun_start) + 1
+    base_indent = fun_start - fun_line_start
+    end = len(cleaned)
+    line = cleaned.find("\n", expression)
+    if line < 0:
+        return expression, end
+    current = line
+    while current < len(cleaned):
+        next_line = cleaned.find("\n", current + 1)
+        if next_line < 0:
+            next_line = len(cleaned)
+        content = cleaned[current + 1:next_line]
+        if content.strip():
+            indent = len(content) - len(content.lstrip())
+            if indent <= base_indent:
+                break
+        end = next_line
+        current = next_line
+    return expression, end
+
+
+def _regions_with_spans(cleaned: str) -> list[tuple[int, int, int]]:
+    regions = []
+    for match in re.finditer(r"@(?:[\w.]+\.)?AudioThread\b", cleaned):
+        span = _body_span(cleaned, match.end())
+        if span is not None:
+            regions.append((span[0], span[1], match.start()))
+    return regions
+
+
 def find_audiothread_regions(cleaned: str) -> list[tuple[int, int, int]]:
     """Return (start_line, end_line, annotation_line) 1-based ranges for
     every ``@AudioThread`` region: the function/block body following the
     annotation. Expression-body functions (``fun f() = ...``) cover the
     remainder of their declaration."""
-    lines = cleaned.split("\n")
-    regions: list[tuple[int, int, int]] = []
-    for idx, line in enumerate(lines):
-        if "@AudioThread" not in line:
-            continue
-        annotation_line = idx + 1
-        # Scan forward for the first '{' (the body) starting at the
-        # annotation. If a line with 'fun ' and '=' and no '{' appears
-        # first, it is an expression body.
-        depth = 0
-        seen_open = False
-        end = None
-        for j in range(idx, len(lines)):
-            cur = lines[j]
-            if not seen_open and "fun " in cur and "=" in cur and "{" not in cur:
-                # Expression body: covers this line plus any continuation
-                # lines indented further than the declaration.
-                base_indent = len(cur) - len(cur.lstrip())
-                k = j
-                while k + 1 < len(lines):
-                    nxt = lines[k + 1]
-                    if nxt.strip() == "":
-                        k += 1
-                        break
-                    indent = len(nxt) - len(nxt.lstrip())
-                    if indent > base_indent:
-                        k += 1
-                    else:
-                        break
-                end = k + 1
-                break
-            for ch in cur:
-                if ch == "{":
-                    depth += 1
-                    seen_open = True
-                elif ch == "}":
-                    depth -= 1
-                    if seen_open and depth == 0:
-                        end = j + 1
-                        break
-            if end is not None:
-                break
-            # Give up if the annotation is not attached to a body within
-            # a reasonable window (e.g. it annotates a class).
-            if j - idx > 10 and not seen_open:
-                break
-        if end is None:
-            # No body found (annotation on a class/property): flag nothing.
-            continue
-        regions.append((annotation_line, end - 1, annotation_line))
-    # Regions are (start_of_body_approx=annotation, end, annotation); the
-    # caller scans [start .. end] inclusive.
-    return regions
+    def line_number(offset: int) -> int:
+        return cleaned.count("\n", 0, offset) + 1
+
+    return [
+        (line_number(start), line_number(end - 1), line_number(annotation))
+        for start, end, annotation in _regions_with_spans(cleaned)
+    ]
 
 
 def scan_file(path: pathlib.Path) -> list[str]:
@@ -167,23 +265,17 @@ def scan_file(path: pathlib.Path) -> list[str]:
     cleaned = strip_comments_and_strings(text)
     lines = cleaned.split("\n")
     violations: list[str] = []
-    for _start, end, annotation_line in find_audiothread_regions(cleaned):
-        # Locate the body start: scan from the annotation line to the
-        # first '{' (or '=' for expression bodies) and start scanning
-        # there; the end line comes from brace matching.
-        body_start = annotation_line - 1  # 0-based fallback
-        for j in range(annotation_line - 1, end):
-            if "{" in lines[j] or "=" in lines[j]:
-                body_start = j
-                break
-        for lineno in range(body_start + 1, end + 1):
-            line = lines[lineno - 1]
-            for pattern in FORBIDDEN:
-                if pattern in line:
-                    violations.append(
-                        f"{path}:{lineno}: allocation/logging API '{pattern}' "
-                        f"inside @AudioThread (annotated at line {annotation_line})"
-                    )
+    for start, end, annotation in _regions_with_spans(cleaned):
+        fragment = cleaned[start:end]
+        fragment_start_line = cleaned.count("\n", 0, start) + 1
+        for label, pattern in FORBIDDEN:
+            for match in pattern.finditer(fragment):
+                lineno = fragment_start_line + fragment.count("\n", 0, match.start())
+                violations.append(
+                    f"{path}:{lineno}: {label} '{match.group(0).strip()}' "
+                    f"inside @AudioThread (annotated at line "
+                    f"{cleaned.count(chr(10), 0, annotation) + 1})"
+                )
     return violations
 
 
@@ -196,9 +288,11 @@ def collect_kotlin_files(root: pathlib.Path, roots: list[str]) -> list[pathlib.P
             continue
         saw_root = True
         files.extend(sorted(base.rglob("*.kt")))
-    # Fall back to the djmix-* glob for any djmix module not listed above.
-    if not any(r.startswith("djmix-") for r in roots):
-        for base in sorted(root.glob("djmix-*")):
+    # Always discover active djmix-* modules in addition to the stable roots.
+    # The configured list is a minimum, not a reason to silently drop a module.
+    for base in sorted(root.glob("djmix-*")):
+        if base.is_dir():
+            saw_root = True
             files.extend(sorted(base.rglob("*.kt")))
     if not saw_root:
         raise FileNotFoundError("no scan roots found under " + str(root))

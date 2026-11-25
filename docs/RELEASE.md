@@ -18,8 +18,9 @@ Release pipeline, versioning, signing, and rollback. Spec: Part B11, checklist C
 ## Signing
 
 Release signs with the fork key from CI secrets (`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`,
-`KEY_PASSWORD` in `.github/workflows/release.yml` → `keystore.properties`); absent secrets leave the
-build unsigned rather than failing. `app/build.gradle.kts` enables **`enableV2Signing = true` and
+`KEY_PASSWORD` in `.github/workflows/release.yml` → `keystore.properties`). The workflow **fails
+closed**: all four secrets are required before any native/synthetic/test/build gate runs, and there
+is no unsigned publish path. `app/build.gradle.kts` enables **`enableV2Signing = true` and
 `enableV3Signing = true`** for the release signing config (Android v2 + v3 signature schemes; v3 keeps
 the key-rotation lineage so future keys still install over old builds without uninstalling).
 Signing stays in CI secrets and the devbox keystore — never in git (Part B14).
@@ -43,6 +44,17 @@ Triggered manually (workflow_dispatch with optional `tag`/`draft` inputs) or by 
 Heavy work stays on the devbox (`make ae3-quality`): real-corpus `mixq`, audition, perf, soak — results
 linked from the release notes. PRs always land via `hooks-check`; the M10 gate is: hooks green in CI,
 dry-run sync ≤ 5 conflicts, pipeline produced the APK, all B12 docs present.
+
+## B15.4 thermal budget (2026-11-25)
+
+New queue analysis and background pair analysis/decode/stem/renderer preparation share an
+application-wide thermal admission gate: pause at Android `THERMAL_STATUS_SEVERE` (3, including 4+),
+resume at `THERMAL_STATUS_MODERATE` (2) or cooler. Unknown/unavailable readings proceed neutrally.
+An already-running mix/session is never stopped for thermal reasons; library background analysis
+retains its stricter MODERATE yield policy and existing WorkManager constraints are unchanged.
+Source-only implementation; tests, compilation, device/APK checks and release approval remain with
+the parent verification run. Evidence:
+`/home/hfzhkn/Bitchord/evidence/ae3-resume-20261125/b15-thermal-budget-implementation.md`.
 
 ## Release checklist (Part C3 — copy of record)
 

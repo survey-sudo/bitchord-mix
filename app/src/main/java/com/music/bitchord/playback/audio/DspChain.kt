@@ -1,11 +1,11 @@
 package com.music.bitchord.playback.audio
 
-import android.util.Log
-import com.music.bitchord.BuildConfig
 import com.music.bitchord.playback.EqualizerProcessor
 import com.music.bitchord.playback.LoudnessProcessor
 import com.music.bitchord.playback.SpatialAudioProcessor
 import com.music.bitchord.playback.TransitionFilterProcessor
+import com.music.bitchord.playback.djmix.AudioThread
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Composite DSP chain executing BitChord's custom audio processors in their canonical sequence:
@@ -38,8 +38,15 @@ class DspChain(
     val loudness: LoudnessProcessor = LoudnessProcessor(),
 ) : FloatAudioProcessor {
 
-    private var currentSampleRate: Int = 0
-    private var processCounter: Long = 0L
+    @Volatile private var currentSampleRate: Int = 0
+    private val processedBlocks = AtomicLong()
+    private val processedFrames = AtomicLong()
+
+    /** Allocate/read diagnostics on a control thread; the callback only updates counters. */
+    data class Diagnostics(val blocks: Long, val frames: Long, val sampleRate: Int)
+
+    fun diagnosticSnapshot(): Diagnostics =
+        Diagnostics(processedBlocks.get(), processedFrames.get(), currentSampleRate)
 
     override fun configure(sampleRate: Int, channelCount: Int) {
         this.currentSampleRate = sampleRate
@@ -54,28 +61,12 @@ class DspChain(
         loudness.onStreamBoundary()
     }
 
+    @AudioThread
     override fun process(block: AudioBlock) {
         if (block.frameCount == 0) return
 
-        if (BuildConfig.DEBUG) {
-            processCounter++
-            if (processCounter == 1L || processCounter % 500L == 0L) {
-                try {
-                    val count = processCounter
-                    val frames = block.frameCount
-                    val sr = currentSampleRate
-                    val spatialOn = spatial.enabled
-                    val eqOn = equalizer.isEnabled
-                    val transitionOn = transition.isFiltering
-                    Log.d(
-                        TAG,
-                        "process() #$count frames=$frames sr=$sr " +
-                            "spatial=$spatialOn eq=$eqOn transition=$transitionOn",
-                    )
-                } catch (_: Throwable) {
-                }
-            }
-        }
+        processedBlocks.incrementAndGet()
+        processedFrames.addAndGet(block.frameCount.toLong())
 
         spatial.process(block)
         equalizer.process(block)
@@ -95,14 +86,11 @@ class DspChain(
     }
 
     override fun reset() {
-        processCounter = 0L
+        processedBlocks.set(0L)
+        processedFrames.set(0L)
         spatial.reset()
         equalizer.reset()
         transition.reset()
         loudness.reset()
-    }
-
-    companion object {
-        private const val TAG = "DspChain"
     }
 }

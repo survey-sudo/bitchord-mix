@@ -9,6 +9,7 @@ import com.music.bitchord.playback.audio.AudioBlock
 import com.music.bitchord.playback.audio.FloatAudioProcessor
 import com.music.bitchord.playback.audio.PcmBoundary
 import com.music.bitchord.playback.audio.PitchStretch
+import com.music.bitchord.playback.djmix.AudioThread
 import com.music.bitchord.playback.smart.DjColour
 import com.music.bitchord.playback.smart.DjEffect
 import java.nio.ByteOrder
@@ -45,6 +46,9 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
 
     private var channelCount = 0
     private var sampleRate = 0
+
+    /** BaseAudioProcessor's reusable buffer is warmed only when a configuration is activated. */
+    private var preparedOutputBytes = 0
 
     private var currentLowPassHz = OPEN_HZ
     private var currentHighPassHz = OFF_HZ
@@ -226,6 +230,11 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      * Configures the Float32 DSP engine for [sampleRate] and [channelCount].
      */
     fun configure(sampleRate: Int, channelCount: Int) {
+        configureDsp(sampleRate, channelCount)
+        prepareOutputBuffer()
+    }
+
+    private fun configureDsp(sampleRate: Int, channelCount: Int) {
         this.sampleRate = sampleRate
         this.channelCount = channelCount
         val requiredSize = channelCount * STAGES * 2
@@ -297,6 +306,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      * Processes interleaved Float32 audio samples in [block] in-place.
      * Preserves dynamic headroom without clamping to [-1.0f, +1.0f].
      */
+    @AudioThread
     fun process(block: AudioBlock) {
         val frameCount = block.frameCount
         if (frameCount == 0 || channelCount < 1 || sampleRate <= 0) return
@@ -322,6 +332,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     private var stretchHandle = 0L
     @Volatile private var beatmatchTempo = 1f
 
+    @AudioThread
     private fun filter(block: AudioBlock, frameCount: Int) {
         val targetLow = targetLowPassHz
         val targetHigh = targetHighPassHz
@@ -395,11 +406,22 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
             )
             return AudioProcessor.AudioFormat.NOT_SET
         }
-        configure(inputAudioFormat.sampleRate, inputAudioFormat.channelCount)
+        configureDsp(inputAudioFormat.sampleRate, inputAudioFormat.channelCount)
         return inputAudioFormat
     }
 
+    private fun prepareOutputBuffer() {
+        preparedOutputBytes = AudioBlock.DEFAULT_CAPACITY_FRAMES * BYTES_PER_SAMPLE * channelCount
+        if (preparedOutputBytes > 0) {
+            replaceOutputBuffer(preparedOutputBytes).limit(0)
+            getOutput() // Restore the base class's empty-output sentinel after warming its storage.
+        }
+    }
+
     override fun onFlush() {
+        // flush activates a pending format after the previous output was drained.
+        // onConfigure can precede that drain, so it must not replace the live buffer.
+        prepareOutputBuffer()
         lowState.fill(0f)
         highState.fill(0f)
         midState.fill(0f)
@@ -451,12 +473,16 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         echoReleasing = false
         channelCount = 0
         sampleRate = 0
+        preparedOutputBytes = 0
     }
 
+    @AudioThread
     override fun queueInput(inputBuffer: java.nio.ByteBuffer) {
         val bytesPerFrame = BYTES_PER_SAMPLE * channelCount
         if (bytesPerFrame == 0) return
-        val frameCount = inputBuffer.remaining() / bytesPerFrame
+        // Media3 reoffers the unconsumed input after draining getOutput(). Keeping
+        // each piece bounded proves replaceOutputBuffer cannot grow after onFlush.
+        val frameCount = minOf(inputBuffer.remaining() / bytesPerFrame, preparedOutputBytes / bytesPerFrame)
         if (frameCount == 0) return
         val outputBuffer = replaceOutputBuffer(frameCount * bytesPerFrame)
 
@@ -469,7 +495,10 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
         val parkedMid = targetMid > -0.05f && currentMidGainDb > -0.05f
         if (parkedLowHigh && parkedMid) {
             clearStateIfNeeded()
+            val oldLimit = inputBuffer.limit()
+            inputBuffer.limit(inputBuffer.position() + minOf(inputBuffer.remaining(), preparedOutputBytes))
             outputBuffer.put(inputBuffer)
+            inputBuffer.limit(oldLimit)
             outputBuffer.flip()
             return
         }
@@ -527,6 +556,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      * filter output: a step of stale signal at the head of the blend, heard as
      * a click. Zeroed state is a filter at rest, which is what an unused one is.
      */
+    @AudioThread
     private fun clearStateIfNeeded() {
         if (!filterStateDirty) return
         lowState.fill(0f)
@@ -563,6 +593,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
      * and dry gains ramped linearly across the block so a 30ms control tick is
      * never heard as a step.
      */
+    @AudioThread
     private fun echo(block: AudioBlock, frameCount: Int) {
         if (echoSeenGeneration != echoGeneration) startEcho()
         val channels = channelCount
@@ -646,6 +677,7 @@ class TransitionFilterProcessor : BaseAudioProcessor() {
     }
 
     /** A new echo, on the audio thread: adopt any ring waiting for it and clear what it will use. */
+    @AudioThread
     private fun startEcho() {
         echoSeenGeneration = echoGeneration
         echoReleasing = false

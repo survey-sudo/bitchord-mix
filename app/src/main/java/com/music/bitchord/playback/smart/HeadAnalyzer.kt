@@ -25,6 +25,8 @@ internal data class HeadAttempt(val bytes: Long, val modelGeneration: Long)
 internal class AudioCopy(
     val key: String,
     val rendition: AudioCache.Rendition?,
+    /** Frozen for this selected copy; loop-only copies may have no producer metadata. */
+    val provenance: TrackAnalysisProvenance = TrackAnalysisProvenance.UNKNOWN,
     val open: () -> MediaDataSource?,
 )
 
@@ -40,6 +42,7 @@ internal class HeadAnalyzer(
     private val isStopped: () -> Boolean,
     private val playbackFirst: () -> Unit,
     private val analysisUriFor: (String, Uri) -> Uri?,
+    private val captureProvenance: (String, Uri, AudioCache.Rendition?) -> TrackAnalysisProvenance,
     private val analyzeMonoWindow: (
         openSource: () -> MediaDataSource?,
         startSeconds: Double,
@@ -183,6 +186,7 @@ internal class HeadAnalyzer(
         durationSeconds: Double,
         rendition: AudioCache.Rendition,
     ): TrackAnalysis? {
+        val provenance = captureProvenance(trackId, uri, rendition)
         fun openSource(): MediaDataSource? = cache.renditionDataSource(uri, rendition)
 
         // Same guard the whole-track pass applies, for the same reason: a
@@ -253,6 +257,7 @@ internal class HeadAnalyzer(
             mixInCandidates = entry?.mixInCandidates.orEmpty(),
             headBeats = grid?.let { BeatSide(it.beats, it.downbeats, it.bpm, it.beatConfidence) },
             levelWindows = listOfNotNull(head.levelWindow),
+            provenance = provenance,
         )
     }
 
@@ -316,10 +321,14 @@ internal class HeadAnalyzer(
     /** Which copy of [trackId]'s audio to read, or null when there isn't a usable one yet. */
     fun copyToRead(trackId: String, uri: Uri, durationSeconds: Double): AudioCopy? {
         if (LocalAudioSource.isLocal(uri)) {
-            return AudioCopy(key = uri.toString(), rendition = null) { LocalAudioSource.open(resolver(), uri) }
+            return AudioCopy(
+                key = uri.toString(), rendition = null, provenance = captureProvenance(trackId, uri, null),
+            ) { LocalAudioSource.open(resolver(), uri) }
         }
         val rendition = chooseRendition(trackId, uri, durationSeconds) ?: return null
-        return AudioCopy(key = rendition.key, rendition = rendition) { cache.renditionDataSource(uri, rendition) }
+        return AudioCopy(
+            key = rendition.key, rendition = rendition, provenance = captureProvenance(trackId, uri, rendition),
+        ) { cache.renditionDataSource(uri, rendition) }
     }
 
     /** djmix25 streaming fallback for loop-region decoding with no complete-rendition gate. */

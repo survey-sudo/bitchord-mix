@@ -22,6 +22,7 @@
 package com.music.bitchord.playback.smart
 
 import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
@@ -33,6 +34,7 @@ import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 
 /**
  * Beat and downbeat tracking, defaulting to Nirovi (`nirovi_int8.ort`) with Beat This!
@@ -71,9 +73,17 @@ class BeatTracker(
         val beatConfidence: Double,
     )
 
-    @Volatile private var session: OrtSession? = null
+    /** A witness owned by one successful track call, never by a previously opened session. */
+    data class Execution(
+        val modelTag: String,
+        val modelPath: String,
+        val backend: String,
+        val inputFrames: Int,
+        val coveredFrames: Int,
+    )
+
+    @Volatile private var session: OpenedSession? = null
     @Volatile private var sessionThreads = 0
-    @Volatile private var activeIsFallback = false
 
     /** Model tag recorded on the last session open / inference (`"nirovi"` or `"beat_this"`). */
     @Volatile var lastModelTag: String = MODEL_TAG_NIROVI
@@ -81,8 +91,15 @@ class BeatTracker(
 
     private val lock = Any()
 
+    private data class OpenedSession(
+        val session: OrtSession,
+        val isFallback: Boolean,
+        val tag: String,
+        val modelPath: String,
+    )
+
     /** Parsing the graph is far too expensive to repeat per track, so one session is kept. */
-    private fun session(forceFallback: Boolean = false): OrtSession? {
+    private fun session(forceFallback: Boolean = false): OpenedSession? {
         val threads = inferenceThreads().coerceIn(1, 4)
         if (!forceFallback) {
             session?.takeIf { sessionThreads == threads }?.let { return it }
@@ -91,7 +108,7 @@ class BeatTracker(
             if (!forceFallback) {
                 session?.takeIf { sessionThreads == threads }?.let { return it }
             }
-            runCatching { session?.close() }
+            session?.let { runCatching { NpuSession.close(it.session) } }
             session = null
 
             val candidates = buildList {
@@ -104,23 +121,26 @@ class BeatTracker(
             for ((path, isFallback) in candidates) {
                 val file = File(path)
                 if (!file.isFile || file.length() <= 0L) continue
-                val opened = runCatching {
+                val opened = try {
                     NpuSession.open(
                         file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
                         acceptsFixedShape = true,
                     )
-                }.onFailure {
-                    AnalysisLog.warn("Beat model open failed for ${file.name}", it)
-                }.getOrNull()
+                } catch (failure: Throwable) {
+                    if (failure is CancellationException) throw failure
+                    warnSafely("Beat model open failed for ${file.name}", failure)
+                    null
+                }
                 if (opened != null) {
-                    session = opened
+                    val tag = modelTagFor(file, isFallback)
+                    val openedSession = OpenedSession(opened, isFallback, tag, file.absolutePath)
+                    session = openedSession
                     sessionThreads = threads
-                    activeIsFallback = isFallback
-                    lastModelTag = modelTagFor(file, isFallback)
-                    return opened
+                    lastModelTag = tag
+                    return openedSession
                 }
             }
-            AnalysisLog.warn("Beat model unavailable; falling back to no grid")
+            warnSafely("Beat model unavailable; falling back to no grid")
             return null
         }
     }
@@ -146,21 +166,38 @@ class BeatTracker(
         spectrogram: MelSpectrogram.Spectrogram,
         offsetSeconds: Double = 0.0,
         melMs: Long = 0L,
+    ): Grid? = trackObserved(spectrogram, offsetSeconds, melMs, null)
+
+    /** Reports only the session that produced this call's usable raw grid. */
+    fun trackWithExecution(
+        spectrogram: MelSpectrogram.Spectrogram,
+        offsetSeconds: Double = 0.0,
+        onExecution: (Execution) -> Unit,
+    ): Grid? = trackObserved(spectrogram, offsetSeconds, 0L, onExecution)
+
+    private fun trackObserved(
+        spectrogram: MelSpectrogram.Spectrogram,
+        offsetSeconds: Double,
+        melMs: Long,
+        onExecution: ((Execution) -> Unit)?,
     ): Grid? {
+        synchronized(lock) {
         if (spectrogram.frames <= 0 || spectrogram.mels <= 0) return null
         var active = session() ?: return null
 
         val beatLogits = FloatArray(spectrogram.frames)
         val downbeatLogits = FloatArray(spectrogram.frames)
+        var coveredFrames = 0
+        val recordCoverage: ((Int) -> Unit)? = if (onExecution == null) null else { count -> coveredFrames = count }
         val inferStarted = System.currentTimeMillis()
-        if (!infer(active, spectrogram, beatLogits, downbeatLogits)) {
-            if (!activeIsFallback) {
+        if (!infer(active.session, spectrogram, beatLogits, downbeatLogits, recordCoverage)) {
+            if (!active.isFallback) {
                 val fallback = session(forceFallback = true)
                 if (fallback != null) {
                     active = fallback
                     beatLogits.fill(0f)
                     downbeatLogits.fill(0f)
-                    if (!infer(active, spectrogram, beatLogits, downbeatLogits)) return null
+                    if (!infer(active.session, spectrogram, beatLogits, downbeatLogits, recordCoverage)) return null
                 } else {
                     return null
                 }
@@ -169,9 +206,7 @@ class BeatTracker(
             }
         }
         val inferMs = System.currentTimeMillis() - inferStarted
-        AnalysisLog.warn(
-            "analysis.ms=$inferMs model=$lastModelTag mel=${melMs}ms (${spectrogram.frames} frames)",
-        )
+        warnSafely("analysis.ms=$inferMs model=${active.tag} mel=${melMs}ms (${spectrogram.frames} frames)")
 
         convertProbabilitiesToLogitsIfNeeded(beatLogits)
         convertProbabilitiesToLogitsIfNeeded(downbeatLogits)
@@ -194,7 +229,7 @@ class BeatTracker(
             .distinct()
             .sorted()
 
-        return Grid(
+        val grid = Grid(
             beats = beats,
             downbeats = downbeats,
             bpm = bpm,
@@ -205,6 +240,13 @@ class BeatTracker(
                 beatFrames.map { frame -> beatLogits.getOrElse(frame.roundToInt()) { 0f }.toDouble() },
             ),
         )
+        if (!grid.bpm.isFinite() || !grid.beatInterval.isFinite() || !grid.firstBeat.isFinite() ||
+            !grid.beatConfidence.isFinite() || grid.beats.any { !it.isFinite() } ||
+            grid.downbeats.any { !it.isFinite() }
+        ) return null
+        onExecution?.invoke(Execution(active.tag, active.modelPath, NpuSession.describe(active.session), spectrogram.frames, coveredFrames))
+        return grid
+        }
     }
 
     /**
@@ -221,34 +263,41 @@ class BeatTracker(
         spectrogram: MelSpectrogram.Spectrogram,
         beatLogits: FloatArray,
         downbeatLogits: FloatArray,
-    ): Boolean = runCatching {
+        recordCoverage: ((Int) -> Unit)? = null,
+    ): Boolean {
+        return try {
         val environment = OrtEnvironment.getEnvironment()
         val mels = spectrogram.mels
         val inputNames = session.inputNames.toList()
         val inputName = inputNames.firstOrNull { it.equals("input_spectrogram", ignoreCase = true) }
             ?: inputNames.first()
         val inputInfo = session.inputInfo[inputName]?.info as? TensorInfo
-        val inputShape = inputInfo?.shape
+        val inputShape = inputInfo?.shape ?: return false
+        if (inputInfo.type != OnnxJavaType.FLOAT || inputShape.size !in 2..3) return false
+        if (inputShape.size == 3 && inputShape[0] > 0L && inputShape[0] != 1L) return false
 
         if (inputShape != null && inputShape.isNotEmpty()) {
             val expectedMels = inputShape.last()
             if (expectedMels > 0 && expectedMels != mels.toLong()) {
-                AnalysisLog.warn("Beat model mel mismatch: expected $expectedMels, got $mels")
+                warnSafely("Beat model mel mismatch: expected $expectedMels, got $mels")
                 return false
             }
         }
 
-        val inputRank = inputShape?.size ?: 3
-        val fixed = fixedFramesFromShape(inputShape) ?: NpuSession.fixedInputFrames(session)
+        val inputRank = inputShape.size
+        val fixed = fixedFramesFromShape(inputShape)
         val chunkFrames = fixed ?: CHUNK_FRAMES
         val stride = (chunkFrames - 2 * BORDER_FRAMES).coerceAtLeast(1)
 
         val outNames = session.outputNames.toList()
+        if (outNames.size < 2) return false
         val beatOutIdx = outNames.indexOfFirst { it.equals("beat", ignoreCase = true) }.let { if (it >= 0) it else 0 }
         val downOutIdx = outNames.indexOfFirst { it.equals("downbeat", ignoreCase = true) }.let {
-            if (it >= 0) it else min(1, outNames.lastIndex)
+            if (it >= 0) it else 1
         }
+        if (beatOutIdx == downOutIdx) return false
 
+        var coveredFrames = 0
         var start = 0
         while (start < spectrogram.frames) {
             // Fixed shape (e.g. Nirovi [1, 1500, 128]): align tail chunk to end when audio is >= chunkFrames
@@ -260,7 +309,9 @@ class BeatTracker(
             if (length <= 2 * BORDER_FRAMES && start > 0) break
 
             val fedFrames = if (fixed != null) chunkFrames else length
-            val chunk = FloatArray(fedFrames * mels)
+            val elementCount = fedFrames.toLong() * mels.toLong()
+            if (elementCount <= 0L || elementCount > Int.MAX_VALUE) return false
+            val chunk = FloatArray(elementCount.toInt())
             spectrogram.values.copyInto(chunk, 0, start * mels, (start + length) * mels)
             val shape = if (inputRank == 2) {
                 longArrayOf(fedFrames.toLong(), mels.toLong())
@@ -273,28 +324,43 @@ class BeatTracker(
                     val keepFrom = if (start == 0) 0 else BORDER_FRAMES
                     val keepTo = if (start + length >= spectrogram.frames) length else length - BORDER_FRAMES
                     if (outputs.size() >= 2) {
-                        val beatBuf = (outputs.get(beatOutIdx) as OnnxTensor).floatBuffer
-                        val downBuf = (outputs.get(downOutIdx) as OnnxTensor).floatBuffer
+                        val beatTensor = outputs.get(beatOutIdx) as? OnnxTensor ?: return false
+                        val downTensor = outputs.get(downOutIdx) as? OnnxTensor ?: return false
+                        if (!validFrameTensor(beatTensor, fedFrames) || !validFrameTensor(downTensor, fedFrames)) return false
+                        val beatBuf = beatTensor.floatBuffer
+                        val downBuf = downTensor.floatBuffer
                         for (index in keepFrom until keepTo) {
                             val target = start + index
                             if (target >= beatLogits.size) break
-                            beatLogits[target] = beatBuf.get(index)
-                            downbeatLogits[target] = downBuf.get(index)
+                            val beat = beatBuf.get(index)
+                            val down = downBuf.get(index)
+                            if (!beat.isFinite() || !down.isFinite()) return false
+                            beatLogits[target] = beat
+                            downbeatLogits[target] = down
                         }
                     } else {
                         val packed = outputs.get(0) as OnnxTensor
+                        if (packed.info.type != OnnxJavaType.FLOAT) return false
                         val packedShape = packed.info.shape
+                        if (!validPackedTensor(packedShape, fedFrames)) return false
                         val buf = packed.floatBuffer
                         if (packedShape.lastOrNull() == 2L) {
                             for (index in keepFrom until keepTo) {
                                 val target = start + index
                                 if (target >= beatLogits.size) break
-                                beatLogits[target] = buf.get(index * 2)
-                                downbeatLogits[target] = buf.get(index * 2 + 1)
+                                val beat = buf.get(index * 2)
+                                val down = buf.get(index * 2 + 1)
+                                if (!beat.isFinite() || !down.isFinite()) return false
+                                beatLogits[target] = beat
+                                downbeatLogits[target] = down
                             }
                         } else {
                             return false
                         }
+                    }
+                    // Observe the contiguous validated output prefix; never count zero-filled gaps.
+                    if (keepTo > keepFrom && start + keepFrom <= coveredFrames) {
+                        coveredFrames = max(coveredFrames, min(start + keepTo, spectrogram.frames))
                     }
                 }
             }
@@ -302,17 +368,29 @@ class BeatTracker(
             if (start + length >= spectrogram.frames) break
             start += stride
         }
-        true
-    }.onFailure {
-        AnalysisLog.warn("Beat inference failed (model=$lastModelTag)", it)
-    }.getOrDefault(false)
+        val succeeded = beatLogits.all { it.isFinite() } && downbeatLogits.all { it.isFinite() }
+        if (succeeded) recordCoverage?.invoke(coveredFrames)
+        succeeded
+        } catch (failure: Throwable) {
+            if (failure is CancellationException) throw failure
+            warnSafely("Beat inference failed (model=$lastModelTag)", failure)
+            false
+        }
+    }
 
     fun release() {
         synchronized(lock) {
-            runCatching { session?.close() }
+            session?.let { runCatching { NpuSession.close(it.session) } }
             session = null
             sessionThreads = 0
-            activeIsFallback = false
+        }
+    }
+
+    private fun warnSafely(message: String, failure: Throwable? = null) {
+        try {
+            if (failure == null) AnalysisLog.warn(message) else AnalysisLog.warn(message, failure)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
         }
     }
 
@@ -362,12 +440,28 @@ class BeatTracker(
 
         private fun fixedFramesFromShape(shape: LongArray?): Int? {
             if (shape == null) return null
+            if (shape.size !in 2..3 || (shape.size == 3 && shape[0] > 0L && shape[0] != 1L)) return null
             val frameDim = when {
                 shape.size >= 3 -> shape[1]
                 shape.size == 2 -> shape[0]
                 else -> -1L
             }
             return frameDim.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+        }
+
+        private fun validFrameTensor(tensor: OnnxTensor, frames: Int): Boolean {
+            if (tensor.info.type != OnnxJavaType.FLOAT) return false
+            val shape = tensor.info.shape
+            if (shape.size !in 1..2 || (shape.size == 2 && shape[0] > 0L && shape[0] != 1L)) return false
+            val count = shape.lastOrNull() ?: return false
+            return count >= frames.toLong() && count <= Int.MAX_VALUE.toLong() &&
+                tensor.floatBuffer.remaining() >= frames
+        }
+
+        private fun validPackedTensor(shape: LongArray, frames: Int): Boolean {
+            if (shape.size !in 2..3 || shape.lastOrNull() != 2L) return false
+            if (shape.size == 3 && shape[0] > 0L && shape[0] != 1L) return false
+            return shape[shape.size - 2] >= frames.toLong()
         }
 
         /**

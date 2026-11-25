@@ -1,5 +1,8 @@
 package com.music.bitchord.playback.smart
 
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import kotlin.math.min
 
 /**
@@ -605,27 +608,66 @@ object TransitionMoves {
         val barB = if (bpmB > 1.0) 4.0 * 60.0 / bpmB else 0.0
         val landingB = script.handoff?.inLanding?.sourceSec
             ?: (c.entry.startSec + (c.entry.landingBar - c.entry.startBar) * barB)
-        return buildString {
-            append("{\"template\":\"${c.template.name}\",\"rung\":\"${c.rung}\"")
-            append(",\"score\":${fmt(c.score)}")
-            append(",\"conf\":{\"struct\":${fmt(c.struct)},\"vocal\":${fmt(c.vocalScore)},\"phrase\":${fmt(c.phraseScore)}")
-            append(",\"energy\":${fmt(c.energyScore)},\"length\":${fmt(c.lengthScore)},\"key\":${fmt(c.keyScore)},\"tempo\":${fmt(c.tempoScore)}}")
-            append(",\"exit\":{\"type\":\"${c.exit.kind}\",\"section\":\"${c.exit.sectionFn}\",\"bar\":${c.exit.releaseBar}")
-            append(",\"sec\":${fmt(c.exit.releaseSec)},\"energy\":${c.exit.energyLevel}}")
-            append(",\"entry\":{\"type\":\"${c.entry.kind}\",\"section\":\"${c.entry.landingFn}\",\"bar\":${c.entry.landingBar}")
-            append(",\"sec\":${fmt(landingB)},\"energy\":${c.entry.energyLevel},\"pickup\":${fmt(c.entry.pickupBeats.toDouble())}}")
-            append(",\"L\":{\"aSec\":${fmt(c.exit.releaseSec)},\"bSec\":${fmt(landingB)}}")
-            append(",\"P\":${c.overlapBars},\"T\":${fmt(c.tailBeats)}")
-            append(",\"bpm\":{\"a\":${fmt(bpmA)},\"b\":${fmt(bpmB)}}")
-            append(",\"aRampBars\":${c.tempoPrepBars},\"camelot\":${camelot ?: -1}")
-            append(",\"tempoPolicy\":\"${c.tempoPolicy}\",\"prepBars\":${c.tempoPrepBars}")
-            append(",\"swapRamp\":\"${c.swapRampName}\",\"swapRampMs\":${c.swapRampMs}")
-            append(",\"echo\":\"${c.echoDelayName}\",\"echoBeats\":${fmt(c.echoDelayBeats)}")
-            append(",\"vocalOverlapBeats\":${fmt(c.vocalOverlapBeats)},\"bTrimDb\":${fmt(script.bTrimDb.toDouble())}")
-            append(",\"phaseMs\":${fmt(script.phaseMs)},\"lockedAt\":${fmt(lockedAt ?: -1.0)},\"slides\":$slides")
-            append(",\"u\":$u,\"g\":$g,\"l\":$l,\"v\":${fmt(c.vocalProduct.toDouble())}}")
-        }
+        return buildJsonObject {
+            put("template", c.template.name)
+            put("rung", c.rung)
+            put("score", JsonPrimitive(fmt(c.score)))
+            put("conf", buildJsonObject {
+                put("struct", fmt(c.struct))
+                put("vocal", fmt(c.vocalScore))
+                put("phrase", fmt(c.phraseScore))
+                put("energy", fmt(c.energyScore))
+                put("length", fmt(c.lengthScore))
+                put("key", fmt(c.keyScore))
+                put("tempo", fmt(c.tempoScore))
+            })
+            put("exit", buildJsonObject {
+                put("type", c.exit.kind.toString())
+                put("section", c.exit.sectionFn.toString())
+                put("bar", c.exit.releaseBar)
+                put("sec", fmt(c.exit.releaseSec))
+                put("energy", c.exit.energyLevel)
+            })
+            put("entry", buildJsonObject {
+                put("type", c.entry.kind.toString())
+                put("section", c.entry.landingFn.toString())
+                put("bar", c.entry.landingBar)
+                put("sec", fmt(landingB))
+                put("energy", c.entry.energyLevel)
+                put("pickup", fmt(c.entry.pickupBeats.toDouble()))
+            })
+            put("L", buildJsonObject {
+                put("aSec", fmt(c.exit.releaseSec))
+                put("bSec", fmt(landingB))
+            })
+            put("P", c.overlapBars)
+            put("T", fmt(c.tailBeats))
+            put("bpm", buildJsonObject {
+                put("a", fmt(bpmA))
+                put("b", fmt(bpmB))
+            })
+            put("aRampBars", c.tempoPrepBars)
+            put("camelot", camelot ?: -1)
+            put("tempoPolicy", c.tempoPolicy)
+            put("prepBars", c.tempoPrepBars)
+            put("swapRamp", c.swapRampName)
+            put("swapRampMs", c.swapRampMs)
+            put("echo", c.echoDelayName)
+            put("echoBeats", fmt(c.echoDelayBeats))
+            put("vocalOverlapBeats", fmt(c.vocalOverlapBeats))
+            put("bTrimDb", fmt(script.bTrimDb.toDouble()))
+            put("phaseMs", fmt(script.phaseMs))
+            put("lockedAt", fmt(lockedAt ?: -1.0))
+            put("slides", slides)
+            put("u", u)
+            put("g", g)
+            put("l", l)
+            put("v", fmt(c.vocalProduct.toDouble()))
+        }.toString()
     }
 
-    private fun fmt(v: Double): String = ((v * 1000.0).toLong() / 1000.0).toString()
+    private fun fmt(v: Double): Double {
+        require(v.isFinite()) { "script JSON numbers must be finite" }
+        return (v * 1000.0).toLong() / 1000.0
+    }
 }

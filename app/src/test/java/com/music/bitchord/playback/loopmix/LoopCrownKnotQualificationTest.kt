@@ -46,7 +46,7 @@ internal object LoopCrownFixtures {
         return TrackAnalysis(tailBeats = BeatSide(beats, emptyList(), plan.out.bpm, .9))
     }
 
-    fun qualify(plan: LoopMix.Plan, knots: LoopMixSession.Companion.DeckKnots,
+    fun qualify(plan: LoopMix.Plan, knots: DeckKnots,
         clock: LoopMix.Clock = LoopMix.Clock(plan)) =
         LoopMixSession.qualifyCrownKnots(plan, clock, SAMPLE_RATE, knots)
 }
@@ -61,7 +61,7 @@ class LoopCrownKnotQualificationTest {
      */
     @Test fun plannerAnchorsCannotClaimTrackedCrownKnotsWithoutAnActualTrackedBranch() {
         assertEquals(listOf("unknown", "tracked", "clock", "native-clock"),
-            LoopMixSession.GridSource.values().map { it.telemetryValue })
+            GridSource.values().map { it.telemetryValue })
         val base = LoopCrownFixtures.plan().copy(incomingHoldSec = 8.0)
         fun anchors(pick: LoopMix.Pick) = (0..pick.beats).map { pick.loopStart + it * pick.beatSec }
         val anchored = base.copy(out = base.out.copy(anchorBeats = anchors(base.out)),
@@ -70,8 +70,8 @@ class LoopCrownKnotQualificationTest {
         val withoutAnchors = LoopCrownFixtures.knots(base)
         val k = LoopCrownFixtures.knots(anchored, c, inAnalysis = TrackAnalysis(
             headBeats = BeatSide(anchors(base.inn), emptyList(), base.inn.bpm, .9)))
-        assertEquals(LoopMixSession.GridSource.CLOCK, k.outGridSource)
-        assertEquals(LoopMixSession.GridSource.CLOCK, k.inGridSource)
+        assertEquals(GridSource.CLOCK, k.outGridSource)
+        assertEquals(GridSource.CLOCK, k.inGridSource)
         assertArrayEquals(withoutAnchors.outFrames, k.outFrames, 0.0)
         assertArrayEquals(withoutAnchors.outPositionsSec, k.outPositionsSec, 0.0)
         assertArrayEquals(withoutAnchors.inFrames, k.inFrames, 0.0)
@@ -85,8 +85,8 @@ class LoopCrownKnotQualificationTest {
         assertNull(p.out.anchorBeats)
         val analysis = LoopCrownFixtures.irregularOut(p)
         val k = LoopCrownFixtures.knots(p, outAnalysis = analysis)
-        assertEquals(LoopMixSession.GridSource.TRACKED, k.outGridSource)
-        assertEquals(LoopMixSession.GridSource.CLOCK, k.inGridSource)
+        assertEquals(GridSource.TRACKED, k.outGridSource)
+        assertEquals(GridSource.CLOCK, k.inGridSource)
         assertEquals(p.out.loopStart + 1.17 * p.out.beatSec, k.outPositionsSec[1], 1e-10)
         // Anchor evidence cannot rescue an analysis window rejected by the
         // exact pre-existing trackedBeatsInWindow coverage gate.
@@ -94,7 +94,7 @@ class LoopCrownKnotQualificationTest {
         val anchored = p.copy(out = p.out.copy(anchorBeats = tail.beats))
         val short = analysis.copy(tailBeats = tail.copy(beats = tail.beats.dropLast(1)))
         val rejected = LoopCrownFixtures.knots(anchored, outAnalysis = short)
-        assertEquals(LoopMixSession.GridSource.CLOCK, rejected.outGridSource)
+        assertEquals(GridSource.CLOCK, rejected.outGridSource)
         assertEquals(p.out.loopStart + p.out.beatSec, rejected.outPositionsSec[1], 0.0)
     }
 
@@ -112,8 +112,8 @@ class LoopCrownKnotQualificationTest {
             true, stop, 1.01)
         assertNull(p.out.anchorBeats)
         assertNull(p.inn.anchorBeats)
-        assertEquals(LoopMixSession.GridSource.TRACKED, k.outGridSource)
-        assertEquals(LoopMixSession.GridSource.TRACKED, k.inGridSource)
+        assertEquals(GridSource.TRACKED, k.outGridSource)
+        assertEquals(GridSource.TRACKED, k.inGridSource)
         assertEquals(c.beats + 2, k.outFrames.size)
         assertEquals(total + 1, k.inFrames.size)
         assertEquals(observedOut[c.beats] + .5 * 1.01, k.outPositionsSec.last(), 1e-10)
@@ -132,19 +132,19 @@ class LoopCrownKnotQualificationTest {
             nativeIncoming = true, rung = "Beat blend")
         val c = LoopMix.Clock(p)
         val native = LoopCrownFixtures.knots(p, c)
-        assertEquals(LoopMixSession.GridSource.NATIVE_CLOCK, native.inGridSource)
+        assertEquals(GridSource.NATIVE_CLOCK, native.inGridSource)
         assertEquals(p.inn.loopStart + c.beatTimes[1], native.inPositionsSec[1], 0.0)
         val held = p.copy(incomingHoldSec = 1.0)
         val heldKnots = LoopCrownFixtures.knots(held)
-        assertEquals(LoopMixSession.GridSource.CLOCK, heldKnots.inGridSource)
+        assertEquals(GridSource.CLOCK, heldKnots.inGridSource)
         assertEquals(held.inn.loopStart, heldKnots.inPositionsSec[1], 0.0)
         val observed = (0..(c.beats + c.settleBeats)).map { p.inn.loopStart + it * p.inn.beatSec * 1.01 }
         val analysis = TrackAnalysis(headBeats = BeatSide(observed, emptyList(), p.inn.bpm, .9))
         val overwritten = LoopCrownFixtures.knots(p, c, inAnalysis = analysis)
-        assertEquals(LoopMixSession.GridSource.TRACKED, overwritten.inGridSource)
+        assertEquals(GridSource.TRACKED, overwritten.inGridSource)
         assertEquals(observed[1], overwritten.inPositionsSec[1], 0.0)
         val echo = LoopCrownFixtures.knots(p.copy(rung = "Echo"), inAnalysis = analysis)
-        assertEquals(LoopMixSession.GridSource.NATIVE_CLOCK, echo.inGridSource)
+        assertEquals(GridSource.NATIVE_CLOCK, echo.inGridSource)
         assertArrayEquals(native.inPositionsSec, echo.inPositionsSec, 0.0)
     }
 
@@ -206,7 +206,7 @@ class LoopCrownKnotQualificationTest {
 
     @Test fun actualRateEndpointsAreInclusiveWithoutWideningTheEnvelope() {
         val p = LoopCrownFixtures.plan()
-        fun withRate(outRate: Double, inRate: Double): LoopMixSession.Companion.CrownKnotQualification {
+        fun withRate(outRate: Double, inRate: Double): CrownKnotQualification {
             val k = LoopCrownFixtures.knots(p)
             for (i in k.outFrames.indices) k.outPositionsSec[i] = p.out.loopStart +
                 k.outFrames[i] / LoopCrownFixtures.SAMPLE_RATE * outRate
@@ -247,9 +247,9 @@ class LoopCrownKnotQualificationTest {
         val c = LoopMix.Clock(p)
         val k = LoopCrownFixtures.knots(p, c)
         assertFalse(LoopMixSession.qualifyCrownKnots(p, c, 0, k).accepted)
-        assertFalse(LoopCrownFixtures.qualify(p, LoopMixSession.Companion.DeckKnots(
+        assertFalse(LoopCrownFixtures.qualify(p, DeckKnots(
             DoubleArray(0), DoubleArray(0), k.inFrames, k.inPositionsSec), c).accepted)
-        assertFalse(LoopCrownFixtures.qualify(p, LoopMixSession.Companion.DeckKnots(
+        assertFalse(LoopCrownFixtures.qualify(p, DeckKnots(
             k.outFrames, k.outPositionsSec.copyOf(k.outPositionsSec.size - 1), k.inFrames, k.inPositionsSec), c).accepted)
         k.inPositionsSec[0] += .01
         assertEquals("crown_actual_in_geometry", LoopCrownFixtures.qualify(p, k, c).refusal)
@@ -307,9 +307,9 @@ class LoopCrownKnotQualificationTest {
 
     @Test fun nonCrownRoutesDoNotAcquireAnActualKnotGate() {
         val p = LoopCrownFixtures.plan().copy(inLoops = false, rung = "Echo", nativeIncoming = true)
-        val empty = LoopMixSession.Companion.DeckKnots(DoubleArray(0), DoubleArray(0), DoubleArray(0), DoubleArray(0))
-        assertEquals(LoopMixSession.GridSource.UNKNOWN, empty.outGridSource)
-        assertEquals(LoopMixSession.GridSource.UNKNOWN, empty.inGridSource)
+        val empty = DeckKnots(DoubleArray(0), DoubleArray(0), DoubleArray(0), DoubleArray(0))
+        assertEquals(GridSource.UNKNOWN, empty.outGridSource)
+        assertEquals(GridSource.UNKNOWN, empty.inGridSource)
         val q = LoopCrownFixtures.qualify(p, empty)
         assertTrue(q.accepted)
         assertNull(q.outMinRate)

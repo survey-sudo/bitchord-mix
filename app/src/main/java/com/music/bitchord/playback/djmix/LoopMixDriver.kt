@@ -23,7 +23,6 @@ import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.TransitionMoves
 import com.music.bitchord.playback.smart.shouldDeclineToMix
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -97,6 +96,7 @@ internal class LoopMixDriver(
         if (state.loopCleanupContendedSession === session) return finishLoop()
         val now = System.nanoTime()
         val m = session.mixSeconds(now, out.isPlaying) ?: return
+        if (m >= session.clock.releaseAt) host.mixExecutor.requestCaptureFreeze(session.renderer, "release_at")
         if (!state.loopIncomingStarted && m >= session.inStartAt) {
             into.playWhenReady = true
             state.loopIncomingStarted = true
@@ -243,6 +243,7 @@ internal class LoopMixDriver(
     /** The mix played out: the incoming player is the song, the outgoing one is retired. */
     fun finishLoop() {
         val session = state.loopSession ?: return host.finish()
+        host.mixExecutor.requestCaptureFreeze(session.renderer, "finish")
         captureLoopExitObservation(session)
         val out = host.outgoing
         val into = host.incoming
@@ -405,6 +406,7 @@ internal class LoopMixDriver(
         state.loopCleanupContendedSession = null
         state.loopCleanupContendedSinceNanos = 0L
         val session = state.loopSession
+        session?.let { host.mixExecutor.requestCaptureFreeze(it.renderer, "bail") }
         if (session != null) captureLoopExitObservation(session)
         val bailPlan = session?.plan
         if (bailPlan != null) {
@@ -539,16 +541,14 @@ internal class LoopMixDriver(
     }
 
     fun closeLater(renderer: LoopMixRenderer) {
-        host.scope.launch(Dispatchers.IO) {
-            delay(LOOP_RENDERER_CLOSE_DELAY_MS)
-            runCatching { renderer.close() }
-        }
+        // Raw retirement must never revisit session ports: they may already serve a newer session.
+        if (host.mixExecutor.retireCaptureRenderer(renderer, LOOP_RENDERER_CLOSE_DELAY_MS)) return
+        // Never admitted: no process capture can be using this renderer. No cancelled-scope leak.
+        renderer.close()
     }
 
     fun closeSessionOffThread(session: LoopMixSession?) {
-        if (session == null) return
-        host.scope.launch(Dispatchers.IO) {
-            runCatching { session.close() }
-        }
+        // Port teardown/retirement admission must survive cancellation of the player scope.
+        session?.close()
     }
 }

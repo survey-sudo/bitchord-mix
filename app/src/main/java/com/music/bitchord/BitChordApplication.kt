@@ -32,6 +32,7 @@ import com.music.bitchord.playback.AudioCache
 import com.music.bitchord.playback.LastPlayed
 import com.music.bitchord.playback.BoundedContextPersistence
 import com.music.bitchord.playback.OriginalVersion
+import com.music.bitchord.playback.djmix.DjmixServices
 import com.music.bitchord.data.innertube.Innertube
 import com.music.bitchord.data.innertube.AndroidStreamHooks
 import com.music.bitchord.data.listentogether.ListenTogether
@@ -45,7 +46,10 @@ import com.music.bitchord.download.Downloads
 import com.music.bitchord.download.PlaylistSync
 import androidx.work.Configuration
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlin.concurrent.thread
 
@@ -61,6 +65,13 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
     /** Asked for on first use rather than at launch; see [PlaylistSync.init]. */
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder().build()
+
+    lateinit var djmixServices: DjmixServices
+        private set
+
+    private val djmixScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    fun djmixServicesOrNull(): DjmixServices? = if (::djmixServices.isInitialized) djmixServices else null
 
     @OptIn(UnstableApi::class)
     @kotlin.OptIn(ExperimentalComposeUiApi::class)
@@ -84,7 +95,6 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
         // The player is drawn by the shared UI module; this is what it reads
         // underneath — settings, the Canvas decoder, outputs, the party.
         AndroidStreamHooks.installEarly()
-        PlayerPlatform.install(AndroidPlayerHost(this))
         com.music.bitchord.ui.AppUi.install(com.music.bitchord.ui.AndroidAppUiHost)
         // The shared data layer (lyrics, the YouTube Music client) logs to
         // logcat on debug builds only, as the app's own DebugLog always has.
@@ -165,6 +175,15 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
             CoroutineScope(Dispatchers.IO).launch { Innertube.ensureSessionScope() }
         }
         AppSettings.init(this, authStore)
+        djmixServices = DjmixServices.create(this)
+        djmixScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            AppSettings.automixLearnFromReactions.collect { enabled ->
+                djmixServices.setUserLearningEnabled(enabled)
+            }
+        }
+        // SQLite hydration runs on the owner's worker; startup never waits for it.
+        djmixServices.hydrateAsync()
+        PlayerPlatform.install(AndroidPlayerHost(this))
         // After AppSettings: fetches Automix's models as soon as Automix is on,
         // rather than waiting for the first song it would mix.
         com.music.bitchord.playback.smart.AutomixModels.install(this)

@@ -442,6 +442,8 @@ class CrossfadeController(
     private val separateTransitionPair: ((left: FloatArray, right: FloatArray, sampleRate: Int) -> Pair<Pair<FloatArray, FloatArray>, Pair<FloatArray, FloatArray>>?)? = null,
     // FORK-HOOK(prepare): background pair preparer (analysis + planning + overlap stems + artwork prefetch).
     private val pairPreparer: com.music.bitchord.playback.djmix.PairPreparer? = null,
+    /** Production supplies the application owner; omitted only by isolated controller tests. */
+    private val djmixServices: com.music.bitchord.playback.djmix.DjmixServices? = null,
     /** True while a whole-track analysis pass is in flight (vc74 gate). */
     private val wholeTrackBusy: () -> Boolean = { false },
     /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
@@ -459,7 +461,7 @@ class CrossfadeController(
     private val analysisUpdates: SharedFlow<String> = MutableSharedFlow(extraBufferCapacity = 1),
 ) {
 
-    private val coordinatorHost by lazy {
+    private val coordinatorHost by lazy(LazyThreadSafetyMode.NONE) {
         object : BailFallbackHandlerHost, FadeExecutionDriverHost, TickEngineHost, VisualFeedPublisherHost, PrepCoordinatorHost, PrepAnalysisCoordinatorHost, CoordinatorBindingsHost {
             override val active: () -> ExoPlayer
                 get() = this@CrossfadeController.active
@@ -1069,13 +1071,13 @@ class CrossfadeController(
         }
     }
 
-    private val bailFallbackHandler: BailFallbackHandler by lazy { BailFallbackHandler(coordinatorHost) }
-    private val fadeExecutionDriver: FadeExecutionDriver by lazy { FadeExecutionDriver(coordinatorHost) }
-    private val tickEngine: TickEngine by lazy { TickEngine(coordinatorHost) }
-    private val visualFeedPublisher: VisualFeedPublisher by lazy { VisualFeedPublisher(coordinatorHost) }
-    private val prepCoordinator: PrepCoordinator by lazy { PrepCoordinator(coordinatorHost) }
-    private val prepAnalysisCoordinator: PrepAnalysisCoordinator by lazy { PrepAnalysisCoordinator(coordinatorHost) }
-    private val coordinatorBindings: CoordinatorBindings by lazy { CoordinatorBindings(coordinatorHost) }
+    private val bailFallbackHandler: BailFallbackHandler by lazy(LazyThreadSafetyMode.NONE) { BailFallbackHandler(coordinatorHost) }
+    private val fadeExecutionDriver: FadeExecutionDriver by lazy(LazyThreadSafetyMode.NONE) { FadeExecutionDriver(coordinatorHost) }
+    private val tickEngine: TickEngine by lazy(LazyThreadSafetyMode.NONE) { TickEngine(coordinatorHost) }
+    private val visualFeedPublisher: VisualFeedPublisher by lazy(LazyThreadSafetyMode.NONE) { VisualFeedPublisher(coordinatorHost) }
+    private val prepCoordinator: PrepCoordinator by lazy(LazyThreadSafetyMode.NONE) { PrepCoordinator(coordinatorHost, ::acceptsExecutionCallbacks) }
+    private val prepAnalysisCoordinator: PrepAnalysisCoordinator by lazy(LazyThreadSafetyMode.NONE) { PrepAnalysisCoordinator(coordinatorHost) }
+    private val coordinatorBindings: CoordinatorBindings by lazy(LazyThreadSafetyMode.NONE) { CoordinatorBindings(coordinatorHost) }
 
     private enum class Phase {
         /** Nothing in flight; watching for the next transition. */
@@ -1399,11 +1401,13 @@ class CrossfadeController(
 
     private val mixDeckAdapter: MixDeckAdapter = prepCoordinator.mixDeckAdapter
 
-    internal val mixExecutor: MixExecutor = MixExecutor(
-        deckAdapter = mixDeckAdapter,
-        config = MixMachineConfig.DEFAULT,
-        store = null,
-    )
+    private val playerEpoch = djmixServices?.beginPlayerEpoch()
+    @Volatile private var executionReleased = false
+    private fun acceptsExecutionCallbacks(): Boolean = !executionReleased &&
+        (playerEpoch?.let { djmixServices?.isCurrentPlayerEpoch(it) } ?: true)
+    internal val mixExecutor: MixExecutor = djmixServices?.createExecutor(
+        mixDeckAdapter, MixMachineConfig.DEFAULT, requireNotNull(playerEpoch),
+    ) ?: MixExecutor(deckAdapter = mixDeckAdapter, config = MixMachineConfig.DEFAULT)
 
     private fun onControllerThread(block: () -> Unit) = prepCoordinator.onControllerThread(block)
 
@@ -1543,14 +1547,18 @@ class CrossfadeController(
 
     fun start() {
         installMixInspectorFeed()
+        djmixServices?.let { pairPreparer?.attachRetainedMixOwner(it, requireNotNull(playerEpoch)) }
         tickEngine.start()
     }
 
     fun release() {
+        if (executionReleased) return
         MixInspectorFeed.setRemixAction(null)
         uiStateJob?.cancel()
         uiStateJob = null
         mixExecutor.dispatch(MixEvent.UserSkip)
+        executionReleased = true
+        mixExecutor.close()
         pairPreparer?.release()
         clearAutoMixVisual()
         tickerJob?.cancel()
@@ -2354,6 +2362,20 @@ class CrossfadeController(
     private val mixEventHost: MixEventHost = coordinatorBindings.mixEventHost
 
     private val mixEventRouter = MixEventRouter(mixEventHost)
+
+    init {
+        // Production constructs on the service/player main thread. Finish every cheap host/helper
+        // allocation after all controller dependencies exist, before start() exposes callbacks.
+        // No later prep/audio callback can become the first initializer of a NONE delegate.
+        coordinatorHost
+        bailFallbackHandler
+        fadeExecutionDriver
+        tickEngine
+        visualFeedPublisher
+        prepCoordinator
+        prepAnalysisCoordinator
+        coordinatorBindings
+    }
 
     // Reflection shims retained solely for existing unit tests (Djmix31AppTest,
     // Vc70DeclineRideAppTest, Vc70ExitLegAppTest) until M9 D1 test cleanup.

@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.DeleteSweep
@@ -30,6 +31,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.music.bitchord.djmix.core.contracts.DjLevel
 import com.music.bitchord.djmix.core.planner.BuiltInRecipeCatalog
@@ -89,12 +95,16 @@ fun DjmixDeveloperSettingsSheet(
                         selected = flags.forceLevel == null,
                         onClick = { onForceLevel(null) },
                         label = { Text("Auto") },
+                        modifier = Modifier.semantics { contentDescription = "Force level: Auto" },
                     )
                     DjLevel.entries.forEach { level ->
                         FilterChip(
                             selected = flags.forceLevel == level,
                             onClick = { onForceLevel(level) },
                             label = { Text(level.displayName()) },
+                            modifier = Modifier.semantics {
+                                contentDescription = "Force level: ${level.displayName()}"
+                            },
                         )
                     }
                 }
@@ -104,7 +114,13 @@ fun DjmixDeveloperSettingsSheet(
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Force recipe", style = MaterialTheme.typography.labelLarge)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(onClick = { recipeMenuExpanded = true }) {
+                    OutlinedButton(
+                        onClick = { recipeMenuExpanded = true },
+                        modifier = Modifier.semantics {
+                            contentDescription = "Force recipe: ${forcedRecipe ?: "Auto"}"
+                            stateDescription = if (recipeMenuExpanded) "Expanded" else "Collapsed"
+                        },
+                    ) {
                         Text(forcedRecipe ?: "Auto")
                         Icon(Icons.Rounded.ArrowDropDown, contentDescription = null)
                     }
@@ -114,6 +130,7 @@ fun DjmixDeveloperSettingsSheet(
                     ) {
                         DropdownMenuItem(
                             text = { Text("Auto (no force)") },
+                            modifier = Modifier.semantics { selected = forcedRecipe == null },
                             onClick = {
                                 recipeMenuExpanded = false
                                 onForceRecipe(null)
@@ -122,6 +139,7 @@ fun DjmixDeveloperSettingsSheet(
                         BuiltInRecipeCatalog.entries.forEach { entry ->
                             DropdownMenuItem(
                                 text = { Text("${entry.id} · ${entry.displayName}") },
+                                modifier = Modifier.semantics { selected = forcedRecipe == entry.id },
                                 onClick = {
                                     recipeMenuExpanded = false
                                     onForceRecipe(entry.id)
@@ -209,11 +227,13 @@ private fun DevSwitchRow(
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth()
+            .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange)
+            .semantics(mergeDescendants = true) {},
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 

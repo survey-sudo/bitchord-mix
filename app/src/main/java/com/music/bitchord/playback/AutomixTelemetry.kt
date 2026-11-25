@@ -3,6 +3,7 @@ package com.music.bitchord.playback
 import android.content.Context
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
+import com.music.bitchord.playback.smart.AnalysisLog
 
 /**
  * Persistent Automix transition telemetry (djmix10).
@@ -23,6 +24,8 @@ object AutomixTelemetry {
     private const val MAX_BYTES = 2_000_000L
 
     private val counter = AtomicLong(0)
+    private val failureCounter = AtomicLong(0)
+    private val lastFailureReportMs = AtomicLong(0)
     @Volatile private var dir: File? = null
 
     /** Must be called once from a Context (PlaybackService). Safe to call repeatedly. */
@@ -32,8 +35,9 @@ object AutomixTelemetry {
             val root = context.getExternalFilesDir(null) ?: context.filesDir
             root.mkdirs()
             dir = root
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
             // Telemetry is optional; playback must not depend on it.
+            recordFailure("init", error)
         }
     }
 
@@ -70,8 +74,26 @@ object AutomixTelemetry {
                 file.delete()
             }
             file.appendText(sb.toString())
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
             // Ignore: telemetry must never break playback.
+            recordFailure("write", error)
+        }
+    }
+
+    /** In-memory failure diagnostics survive a broken telemetry destination. */
+    fun failureCount(): Long = failureCounter.get()
+
+    /** Rate-limited sink for the diagnostic path; never routes through this telemetry writer. */
+    internal fun recordFailure(operation: String, error: Throwable) {
+        val count = failureCounter.incrementAndGet()
+        val now = System.currentTimeMillis()
+        val previous = lastFailureReportMs.get()
+        if ((previous == 0L || now - previous >= FAILURE_REPORT_INTERVAL_MS) &&
+            lastFailureReportMs.compareAndSet(previous, now)
+        ) {
+            runCatching {
+                AnalysisLog.warn("automix telemetry failure count=$count operation=$operation exception=${error.javaClass.name}", error)
+            }
         }
     }
 
@@ -91,4 +113,6 @@ object AutomixTelemetry {
         sb.append('"')
         return sb.toString()
     }
+
+    private const val FAILURE_REPORT_INTERVAL_MS = 60_000L
 }

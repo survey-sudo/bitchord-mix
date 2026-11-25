@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.music.bitchord.BitChordApplication
 import com.music.bitchord.data.canvas.CanvasArtwork
 import com.music.bitchord.data.canvas.CanvasRepository
 import com.music.bitchord.data.listentogether.ListenTogether
@@ -28,10 +29,12 @@ import com.music.bitchord.playback.MusicOnlyPlayback
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.AudioRouting
 import com.music.bitchord.playback.AutoMixVisualFeed
+import com.music.bitchord.playback.djmix.DjmixServices
+import com.music.bitchord.playback.djmix.ExplicitRatingIdentity
+import com.music.bitchord.playback.djmix.RetainedMixContext
 import com.music.bitchord.playback.djmix.diagnostics.DiagnosticsBundler
 import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
 import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
-import com.music.bitchord.playback.djmix.store.DjmixDatabase
 import com.music.bitchord.playback.djmix.store.TransitionRecord
 import com.music.bitchord.playback.smart.MixInspectorFeed
 import com.music.bitchord.playback.smart.MixInspectorKey
@@ -56,6 +59,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -87,15 +97,10 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
 
     override val supportsAutoMixCanvas: Boolean get() = true
 
-    // AE3 (M7) inspector/history/rating/flag/developer glue. Playback ownership
-    // (CrossfadeController / MixExecutor) stays untouched — everything here
-    // goes through the read-only [MixInspectorFeed] / [AppSettings] feeds, the
-    // store, DjmixFlags and the diagnostics bundler.
-    val djmixFlags: DjmixFlags by lazy { DjmixFlags(app) }
-    val djmixStore: DjmixAnalysisStore by lazy { DjmixAnalysisStore(DjmixDatabase(app)) }
-    private val diagnosticsBundler: DiagnosticsBundler by lazy {
-        DiagnosticsBundler(File(app.getExternalFilesDir(null), "djmix-reports"))
-    }
+    // Inspector, History and playback all use the application's process owner.
+    private val djmixServices: DjmixServices get() = (app as BitChordApplication).djmixServices
+    val djmixFlags: DjmixFlags get() = requireNotNull(djmixServices.flags)
+    val djmixStore: DjmixAnalysisStore get() = requireNotNull(djmixServices.store)
 
     init {
         // :sharedUi cannot import app/ and PlayerHost has no rating/flag
@@ -105,64 +110,79 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         MixInspectorActions.flag = { state -> flagTransition(state) }
     }
 
-    /**
-     * Persist a `👍`/`👎` for the pair the inspector is showing. The store's
-     * own `updateRating` verb owns the semantics (1 = up, -1 = down, 0 =
-     * unrated); nothing here invents a second rating path.
-     */
+    /** Rate only the archived frozen generation currently shown by the inspector. */
     fun rateTransition(state: MixInspectorState, rating: Int) {
-        val record = djmixStore.recentTransitions(100)
-            .firstOrNull { it.outId == state.current.mediaId && it.inId == state.next.mediaId }
-        if (record == null) {
-            showMessage("No recorded transition for this pair yet")
+        val identity = djmixServices.retainedMixContextFor(state)?.ratingIdentity()
+        if (identity == null) {
+            showMessage("No recorded transition for this generation yet")
             return
         }
-        val saved = djmixStore.updateRating(record.id, rating)
-        showMessage(
-            when {
-                !saved -> "Rating not saved"
-                rating >= 0 -> "Rated up"
-                else -> "Rated down"
-            },
-        )
+        scope.launch {
+            val saved = djmixServices.recordExplicitRating(identity, rating).await()
+            showMessage(
+                when {
+                    !saved -> "Rating not saved"
+                    rating > 0 -> "Rated up"
+                    rating < 0 -> "Rated down"
+                    else -> "Rating cleared"
+                },
+            )
+        }
     }
 
     /** Flag the inspected transition: write a diagnostics bundle and share it. */
     fun flagTransition(state: MixInspectorState) {
-        bundleAndShare()
+        bundleAndShare(djmixServices.retainedMixContextFor(state))
     }
 
     /** Flag a history row (Settings → History long-press / menu). */
     fun flagRecord(record: TransitionRecord) {
-        bundleAndShare()
+        bundleAndShare(djmixServices.retainedMixContextFor(record))
     }
 
     /** Newest-first transition history for Settings → History (last 100). */
-    fun historyRecords(limit: Int = 100): List<TransitionRecord> = djmixStore.recentTransitions(limit)
+    suspend fun historyRecords(limit: Int = 100): List<TransitionRecord> =
+        withContext(Dispatchers.IO) { djmixStore.recentTransitions(limit) }
 
     /** Re-rate a history row; `1` up, `-1` down, `0` clear. */
-    fun updateHistoryRating(id: Long, rating: Int): Boolean = djmixStore.updateRating(id, rating)
+    suspend fun updateHistoryRating(id: Long, rating: Int): Boolean {
+        val record = historyRecords().firstOrNull { it.id == id } ?: return false
+        val identity = djmixServices.ratingIdentityFor(record) ?: return false
+        return djmixServices.recordExplicitRating(identity, rating).await()
+    }
 
     /** Clear all learned taste weights (Settings → "Reset learned preferences"). */
-    fun resetLearnedPreferences(): Boolean = djmixStore.resetPreferences()
+    suspend fun resetLearnedPreferences(): Boolean = djmixServices.resetLearnedPreferences().await()
 
     /** Share the newest diagnostics bundle, if one exists. */
-    fun shareLatestDiagnostics(): Boolean {
-        val latest = diagnosticsBundler.listBundles().firstOrNull() ?: run {
+    suspend fun shareLatestDiagnostics(): Boolean {
+        val latest = withContext(Dispatchers.IO) {
+            djmixServices.diagnosticsBundler?.listBundles()?.firstOrNull()
+        } ?: run {
             showMessage("No diagnostics bundle yet")
             return false
         }
-        return shareFile(latest)
+        return withContext(Dispatchers.Main) { shareFile(latest) }
     }
 
-    private fun bundleAndShare() {
-        val bundle = diagnosticsBundler.bundle()
-        if (bundle == null) {
-            showMessage("Diagnostics bundle not written")
+    private fun bundleAndShare(context: RetainedMixContext?) {
+        if (context == null) {
+            showMessage("No diagnostics context for this transition")
             return
         }
-        shareFile(bundle)
-        showMessage("Flagged for diagnostics")
+        val pendingBundle = djmixServices.flagSelectedMixAsync(context)
+        scope.launch(Dispatchers.IO) {
+            val bundle = pendingBundle.await()
+            withContext(Dispatchers.Main) {
+                showMessage(
+                    when {
+                        bundle == null -> "Diagnostics bundle not written"
+                        !shareFile(bundle) -> "Diagnostics saved; could not open sharing"
+                        else -> "Flagged for diagnostics"
+                    },
+                )
+            }
+        }
     }
 
     private fun shareFile(file: File): Boolean {
@@ -382,6 +402,45 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
         onDismiss: () -> Unit,
     ) = AndroidLyricsShareSheet(hazeState = hazeState, request = request, onDismiss = onDismiss)
 }
+
+/** A held popup must never act on a newer generation of the same track pair. */
+internal fun DjmixServices.retainedMixContextFor(state: MixInspectorState): RetainedMixContext? {
+    val registry = retainedMixContexts.value
+    return listOfNotNull(registry.active, registry.lastCompleted).firstOrNull {
+        it.generation == state.generation && it.outTrackId == state.current.mediaId &&
+            it.inTrackId == state.next.mediaId && it.transitionPlanV1.recipeId == state.recipeId
+    }
+}
+
+internal fun DjmixServices.retainedMixContextFor(record: TransitionRecord): RetainedMixContext? {
+    val registry = retainedMixContexts.value
+    val generation = (archivedRatingFields(record)?.get("generation") as? JsonPrimitive)?.longOrNull
+    return listOfNotNull(registry.active, registry.lastCompleted).firstOrNull {
+        it.planId == record.planId && it.outTrackId == record.outId && it.inTrackId == record.inId &&
+            it.transitionPlanV1.recipeId == record.recipe &&
+            (it.recordId == record.id || (it.recordId == null && it.generation == generation)) &&
+            (generation == null || it.generation == generation)
+    }
+}
+
+/** Legacy rows without a frozen generation cannot safely create a learning signal. */
+internal fun DjmixServices.ratingIdentityFor(record: TransitionRecord): ExplicitRatingIdentity? {
+    val retained = retainedMixContextFor(record)
+    val fields = archivedRatingFields(record)
+    val generation = retained?.generation ?: (fields?.get("generation") as? JsonPrimitive)?.longOrNull ?: return null
+    if (record.id <= 0L || generation < 0L || record.planId.isBlank() || record.recipe.isBlank()) return null
+    return ExplicitRatingIdentity(
+        recordId = record.id,
+        planId = record.planId,
+        generation = generation,
+        recipeId = record.recipe,
+        genreClass = retained?.genreClass ?: (fields?.get("genreClass") as? JsonPrimitive)?.contentOrNull,
+    )
+}
+
+private fun archivedRatingFields(record: TransitionRecord) = runCatching {
+    Json.parseToJsonElement(record.timingsJson).jsonObject
+}.getOrNull()
 
 /**
  * The output's format line, and whether the track is reaching the DAC

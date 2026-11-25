@@ -7,6 +7,89 @@ import com.music.bitchord.playback.djmix.PrepThread
 import com.music.bitchord.playback.smart.StemKind
 import com.music.bitchord.playback.smart.StemSet
 import kotlin.math.pow
+import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReferenceArray
+
+/** Retired bit and reader count change in one CAS domain: retirement cannot miss an acquisition. */
+internal class NativeRendererLifetime(
+    private val handle: Long,
+    private val signal: () -> Unit,
+    private val destroy: (Long) -> Unit,
+) {
+    private val users = AtomicInteger(0)
+    private val destroyed = AtomicBoolean(false)
+    val isOpen: Boolean get() = handle != 0L && users.get() >= 0
+
+    fun acquire(): Long {
+        if (handle == 0L) return 0L
+        while (true) {
+            val current = users.get()
+            if (current < 0 || current == Int.MAX_VALUE) return 0L
+            if (users.compareAndSet(current, current + 1)) return handle
+        }
+    }
+
+    fun release() {
+        if (users.decrementAndGet() == Int.MIN_VALUE) signal()
+    }
+
+    fun retire() {
+        while (true) {
+            val current = users.get()
+            if (current < 0) return
+            if (users.compareAndSet(current, current or Int.MIN_VALUE)) {
+                if (current == 0) signal()
+                return
+            }
+        }
+    }
+
+    /** Only the retirement worker calls this; never from a JNI user's finally block. */
+    fun destroyIfQuiescent(): Boolean {
+        if (users.get() != Int.MIN_VALUE || !destroyed.compareAndSet(false, true)) return false
+        if (handle != 0L) destroy(handle)
+        return true
+    }
+}
+
+/** Bounded slots reserve retirement capacity BEFORE native creation; no per-close tasks or threads. */
+internal object NativeRendererRetirement {
+    private const val CAPACITY = 64
+    private val slots = AtomicReferenceArray<NativeRendererLifetime?>(CAPACITY)
+    private val pending = AtomicBoolean(false)
+    private val wake = Semaphore(0)
+    private val registrationLock = Any()
+    private val signal: () -> Unit = {
+        if (pending.compareAndSet(false, true)) wake.release()
+    }
+    private val worker = Thread({
+        while (true) {
+            wake.acquireUninterruptibly()
+            pending.set(false)
+            for (i in 0 until CAPACITY) {
+                val lifetime = slots.get(i) ?: continue
+                // Keep the sole worker alive if a failed JNI destroy throws.
+                try {
+                    if (lifetime.destroyIfQuiescent()) slots.compareAndSet(i, lifetime, null)
+                } catch (_: Throwable) {
+                    slots.compareAndSet(i, lifetime, null)
+                }
+            }
+        }
+    }, "loopmix-retire").apply { isDaemon = true; start() }
+
+    fun create(createHandle: () -> Long, destroy: (Long) -> Unit): NativeRendererLifetime =
+        synchronized(registrationLock) {
+            val slot = (0 until CAPACITY).firstOrNull { slots.get(it) == null }
+            if (slot == null) return@synchronized NativeRendererLifetime(0L, {}, {})
+            val lifetime = NativeRendererLifetime(createHandle(), signal, destroy)
+            slots.set(slot, lifetime)
+            lifetime
+        }
+}
 
 /**
  * The native loop-mix renderer (native/loopmix/): two Signalsmith Stretch
@@ -16,7 +99,9 @@ import kotlin.math.pow
  * Built and filled on a worker thread; after [prepare] only [render] (the
  * playback thread, inside the outgoing sink) and the small setters touch it.
  */
-class LoopMixRenderer internal constructor(val sampleRate: Int, private val readout: Readout?) : AutoCloseable {
+class LoopMixRenderer internal constructor(
+    val sampleRate: Int, private val readout: Readout?, lifetimeOverride: NativeRendererLifetime? = null,
+) : AutoCloseable {
     constructor(sampleRate: Int) : this(sampleRate, null)
 
     /** Native measurements and optional rendering substituted by JVM tests. */
@@ -24,16 +109,41 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         fun firstFrame(): Long
         fun heard(index: Int): Double
         fun exitGateViolations(): Int
+        fun setEnvelope(index: Int, kind: Int, times: DoubleArray, values: FloatArray, exponential: Boolean) = Unit
+        fun setLoudnessMatch(enabled: Boolean, targetLufs: Float) = Unit
+        fun setTruePeakLimiter(enabled: Boolean) = Unit
+        fun setTruePeakCeilingDb(ceilingDbtp: Float) = Unit
+        fun setPhaserEx(index: Int, rateBeats: Double, depth: Float, feedback: Float, stages: Int, stereoOffsetDeg: Float) = Unit
+        fun setPhaser(index: Int, rateBeats: Double, depth: Float, feedback: Float) = Unit
+        fun setLoudnessDropWindow(exemptStartSec: Double, exemptEndSec: Double, dropBumpLu: Float) = Unit
+        fun setCaptureEnabled(enabled: Boolean) = Unit
         fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) {
             error("This readout does not substitute rendering")
         }
     }
 
 
-    @Volatile
-    private var handle: Long = if (readout == null && available) nativeCreate(sampleRate) else 0L
+    private val lifetime = lifetimeOverride ?: NativeRendererRetirement.create(
+        createHandle = { if (readout != null) 1L else if (available) nativeCreate(sampleRate) else 0L },
+        destroy = { if (readout == null) nativeDestroy(it) },
+    )
+    private val captureSetupLock = Any()
+    @Volatile private var captureConfigurationFrozen = false
 
-    val isValid: Boolean get() = handle != 0L
+    val isValid: Boolean get() = readout == null && lifetime.isOpen
+
+    /** Inline so render acquires/releases without a lease or capturing-lambda allocation. */
+    private inline fun <T> withHandle(ifClosed: T, use: (Long) -> T): T {
+        val handle = lifetime.acquire()
+        if (handle == 0L) return ifClosed
+        try {
+            return use(handle)
+        } finally {
+            lifetime.release()
+        }
+    }
+
+    private inline fun withHandle(use: (Long) -> Unit) { withHandle(Unit, use) }
 
     /** One deck: the region (planar, at [sampleRate]), its loop, and its beat knots. */
     class DeckSetup(
@@ -61,7 +171,7 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
     private val deckFrames = IntArray(2) { -1 }
     private val deckRegionStart = DoubleArray(2) { Double.NaN }
 
-    fun setDeck(index: Int, deck: DeckSetup) {
+    fun setDeck(index: Int, deck: DeckSetup) = withHandle { handle ->
         if (index in 0..1) {
             deckFrames[index] = minOf(deck.left.size, deck.right.size)
             deckRegionStart[index] = deck.regionStart
@@ -76,66 +186,78 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * Automation over mix seconds: [KIND_GAIN] (linear), [KIND_LOW_DB] (250 Hz shelf),
      * [KIND_HIGH_PASS_HZ], [KIND_LOW_PASS_HZ] (TPT low-pass).
      */
-    fun setEnvelope(index: Int, kind: Int, times: DoubleArray, values: FloatArray, exponential: Boolean = false) =
-        nativeSetEnvelope(handle, index, kind, times, values, exponential)
+    fun setEnvelope(index: Int, kind: Int, times: DoubleArray, values: FloatArray, exponential: Boolean = false) = withHandle { handle ->
+        if (readout != null) readout.setEnvelope(index, kind, times, values, exponential)
+        else nativeSetEnvelope(handle, index, kind, times, values, exponential)
+    }
 
     /** Signalsmith's default preset when [high], the cheaper one otherwise. Call before [prepare]. */
-    fun setHighQuality(high: Boolean) = nativeSetHighQuality(handle, high)
+    fun setHighQuality(high: Boolean) = withHandle { handle -> nativeSetHighQuality(handle, high) }
 
     /** Tempo-synced ping-pong on [index]. A non-positive delay turns it off. The tail is not faded with the dry signal. */
-        fun setEcho(index: Int, delaySeconds: Double, feedback: Float, wet: Float) =
+    fun setEcho(index: Int, delaySeconds: Double, feedback: Float, wet: Float) = withHandle { handle ->
         nativeSetEcho(handle, index, delaySeconds, feedback, wet)
+    }
 
     /** Beat-synced flanger on [index]'s exit tail (wet comb rides the deck's gain, so it dissolves with it). */
-    fun setFlanger(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float) =
+    fun setFlanger(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float) = withHandle { handle ->
         nativeSetFlanger(handle, index, lfoHz, depthSeconds, feedback, wet)
+    }
 
     /** How many times a deck went silent while still audible at its stopAt (djmix11 exit gate). */
-    fun exitGateViolations(): Int = readout?.exitGateViolations() ?: nativeExitGateViolations(handle)
+    fun exitGateViolations(): Int = withHandle(0) { handle -> readout?.exitGateViolations() ?: nativeExitGateViolations(handle) }
 
     /** LR4 isolator on a phrase mix. Off for the djmix6 envelopes. */
-    fun setIsolate(index: Int, on: Boolean) = nativeSetIsolate(handle, index, on)
+    fun setIsolate(index: Int, on: Boolean) = withHandle { handle -> nativeSetIsolate(handle, index, on) }
 
-    fun prepare() = nativePrepare(handle)
+    fun prepare() = withHandle { handle ->
+        synchronized(captureSetupLock) {
+            captureConfigurationFrozen = true
+            if (readout == null) nativePrepare(handle)
+        }
+    }
 
     /** The earliest mix frame anything renders at; negative, before t0. */
-    fun firstFrame(): Long = readout?.firstFrame() ?: nativeFirstFrame(handle)
+    fun firstFrame(): Long = withHandle(0L) { handle -> readout?.firstFrame() ?: nativeFirstFrame(handle) }
 
     /**
      * Renders [frames] stereo frames from mix frame [frame] into [interleaved] at frame [offset].
      *
-     * Realtime audio thread: pointer-swap only. No allocation, no logging, no
+     * Realtime audio thread: atomic lifetime lease only. No allocation, no logging, no
      * locks the setup path may hold; everything expensive was built on a
      * [PrepThread] during READY (see `tools/check_audiothread_alloc.py`).
      */
     @AudioThread
     fun render(frame: Long, interleaved: FloatArray, offset: Int, frames: Int) {
-        if (readout != null) readout.render(frame, interleaved, offset, frames)
-        else nativeRender(handle, frame, interleaved, offset, frames)
+        if (!isValidRenderRange(interleaved.size, offset, frames)) return
+        withHandle { handle ->
+            if (readout != null) readout.render(frame, interleaved, offset, frames)
+            else nativeRender(handle, frame, interleaved, offset, frames)
+        }
     }
 
     /** Fade [index] out over 25 ms once it plays track second [trackSeconds] after its release. */
-    fun setFadeOut(index: Int, trackSeconds: Double) = nativeSetFadeOut(handle, index, trackSeconds)
+    fun setFadeOut(index: Int, trackSeconds: Double) = withHandle { handle -> nativeSetFadeOut(handle, index, trackSeconds) }
 
     /** Track seconds [index] played at the end of the last rendered block. */
-    fun heard(index: Int): Double = readout?.heard(index) ?: nativeHeard(handle, index)
+    fun heard(index: Int): Double = withHandle(0.0) { handle -> readout?.heard(index) ?: nativeHeard(handle, index) }
 
     override fun close() {
-        val h = handle
-        handle = 0L
-        if (h != 0L) nativeDestroy(h)
+        lifetime.retire()
     }
 
     /** djmix24 beat-quantized loop roll (native tightening). */
-    fun setLoopRoll(index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double, totalRollBeats: Double) =
+    fun setLoopRoll(index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double, totalRollBeats: Double) = withHandle { handle ->
         nativeSetLoopRoll(handle, index, enabled, rollStartSec, beatSec, releaseSec, totalRollBeats)
+    }
 
     /** djmix24 stereo plate reverb wash (pre-allocated in prepare). */
-    fun setReverb(index: Int, roomSize: Float, damping: Float, wet: Float) =
+    fun setReverb(index: Int, roomSize: Float, damping: Float, wet: Float) = withHandle { handle ->
         nativeSetReverb(handle, index, roomSize, damping, wet)
+    }
 
     /** djmix24 Cytomic SVF Q (0.707 default, ~0.95 musical buildup). */
-    fun setSvfQ(index: Int, q: Float) = nativeSetSvfQ(handle, index, q)
+    fun setSvfQ(index: Int, q: Float) = withHandle { handle -> nativeSetSvfQ(handle, index, q) }
 
     // ---- AUTOMIX-V2(C) ---------------------------------------------------------------------
 
@@ -151,31 +273,34 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * (rate, frame count, start within 1.5 samples) leaves the deck dry. Returns whether
      * stems were attached.
      */
-    fun setDeckStems(index: Int, stems: StemSet?): Boolean {
-        if (handle == 0L || index !in 0..1) return false
+    fun setDeckStems(index: Int, stems: StemSet?): Boolean = withHandle(false) { handle ->
+        if (index !in 0..1) return@withHandle false
         nativeClearDeckStems(handle, index)
-        if (stems == null || !AutomixV2Render.stems) return false
+        if (stems == null || !AutomixV2Render.stems) return@withHandle false
         val frames = deckFrames[index]
-        if (frames <= 0 || stems.sampleRate != sampleRate || stems.frames != frames) return false
+        if (frames <= 0 || stems.sampleRate != sampleRate || stems.frames != frames) return@withHandle false
         val start = deckRegionStart[index]
-        if (!start.isFinite() || kotlin.math.abs(stems.regionStartSec - start) > 1.5 / sampleRate) return false
+        if (!start.isFinite() || kotlin.math.abs(stems.regionStartSec - start) > 1.5 / sampleRate) return@withHandle false
         var attached = 0
         for ((kind, slot) in STEM_SLOTS) {
             val l = stems.left[kind] ?: continue
             val r = stems.right[kind] ?: continue
             if (l.size != frames || r.size != frames) {
                 nativeClearDeckStems(handle, index)
-                return false
+                return@withHandle false
             }
             if (nativeSetDeckStem(handle, index, slot, l, r)) attached++
         }
         if (attached == 0) nativeClearDeckStems(handle, index)
-        return attached > 0
+        attached > 0
     }
 
     /** Phaser on [index]: LFO cycle [rateBeats] (1/16..64 beats, DJM PHASER), sweep [depth] 0..1, [feedback] -0.85..0.85. Wet = [KIND_PHASER_WET]. */
-    fun setPhaser(index: Int, rateBeats: Double, depth: Float, feedback: Float) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetPhaser(handle, index, rateBeats, depth, feedback)
+    fun setPhaser(index: Int, rateBeats: Double, depth: Float, feedback: Float) = withHandle { handle ->
+        if (AutomixV2Render.fx) {
+            if (readout != null) readout.setPhaser(index, rateBeats, depth, feedback)
+            else nativeSetPhaser(handle, index, rateBeats, depth, feedback)
+        }
     }
 
     /**
@@ -185,8 +310,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * captured and repeated every step. Depth = [KIND_GATE_DEPTH]. [beatSec] is only the
      * fallback when the knots are not a beat grid.
      */
-    fun setGate(index: Int, beatSec: Double, division: Float, swing: Float = 0f) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetGate(handle, index, beatSec, division, swing)
+    fun setGate(index: Int, beatSec: Double, division: Float, swing: Float = 0f) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetGate(handle, index, beatSec, division, swing)
     }
 
     /**
@@ -195,8 +320,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * [KIND_RISER_LEVEL] first rises above 0; level 1 is about -20 dBFS RMS. Not under the
      * deck's gain; it fades in the last 20 ms before stopAt.
      */
-    fun setRiser(index: Int, beatSec: Double, lengthBeats: Double) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetRiser(handle, index, beatSec, lengthBeats)
+    fun setRiser(index: Int, beatSec: Double, lengthBeats: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetRiser(handle, index, beatSec, lengthBeats)
     }
 
     /**
@@ -204,8 +329,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * every beat (4 ms attack, recovered by 0.6 beat) so the other deck's kick never fights
      * this bass; [fullBand] ducks the whole deck (EDM pump, -10.5 dB at depth 1). Depth = [KIND_PUMP_DEPTH].
      */
-    fun setPump(index: Int, beatSec: Double, fullBand: Boolean = false) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetPump(handle, index, beatSec, fullBand)
+    fun setPump(index: Int, beatSec: Double, fullBand: Boolean = false) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetPump(handle, index, beatSec, fullBand)
     }
 
     /**
@@ -215,8 +340,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * [KIND_BRAKE] (0..1 progress) overrides the linear timing when set. A completed brake
      * does not count as an exit-gate violation.
      */
-    fun setBrake(index: Int, startSec: Double, lengthSec: Double, spinback: Boolean = false) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetBrake(handle, index, startSec, lengthSec, spinback)
+    fun setBrake(index: Int, startSec: Double, lengthSec: Double, spinback: Boolean = false) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetBrake(handle, index, startSec, lengthSec, spinback)
     }
 
     /**
@@ -226,8 +351,9 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * 8 LU ignored). [targetLufs] is the static normalisation reference (e.g. -14): a bump may
      * not pass max(A, B, target) + 1 LU; 0 or NaN = no cap. Turns on the true-peak limiter.
      */
-    fun setLoudnessMatch(enabled: Boolean, targetLufs: Float) {
-        if (handle != 0L) nativeSetLoudnessMatch(handle, enabled && AutomixV2Render.loudness, targetLufs)
+    fun setLoudnessMatch(enabled: Boolean, targetLufs: Float) = withHandle { handle ->
+        if (readout != null) readout.setLoudnessMatch(enabled && AutomixV2Render.loudness, targetLufs)
+        else nativeSetLoudnessMatch(handle, enabled && AutomixV2Render.loudness, targetLufs)
     }
 
     /**
@@ -235,22 +361,24 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
      * "no dip" upward boost (build tension), and the drop impact bar immediately
      * following allows +[dropBumpLu] LU above the ceiling.
      */
-    fun setLoudnessDropWindow(exemptStartSec: Double, exemptEndSec: Double, dropBumpLu: Float) {
-        if (handle != 0L && AutomixV2Render.loudness) {
+    fun setLoudnessDropWindow(exemptStartSec: Double, exemptEndSec: Double, dropBumpLu: Float) = withHandle { handle ->
+        if (readout != null) readout.setLoudnessDropWindow(exemptStartSec, exemptEndSec, dropBumpLu)
+        else if (AutomixV2Render.loudness) {
             nativeSetLoudnessDropWindow(handle, exemptStartSec, exemptEndSec, dropBumpLu)
         }
     }
 
     /** 4x oversampled true-peak detection in the -1 dBTP limiter. Off = vc80 sample-peak limiter. */
-    fun setTruePeakLimiter(enabled: Boolean) {
-        if (handle != 0L) nativeSetTruePeak(handle, enabled)
+    fun setTruePeakLimiter(enabled: Boolean) = withHandle { handle ->
+        if (readout != null) readout.setTruePeakLimiter(enabled)
+        else nativeSetTruePeak(handle, enabled)
     }
 
     /** EBU R128 short-term (3 s) loudness: [OUT], [IN] (programme, pre-fader) or [BUS] (output). -120 when unknown or off. */
-    fun shortTermLufs(which: Int): Double = if (handle != 0L) nativeShortTermLufs(handle, which) else -120.0
+    fun shortTermLufs(which: Int): Double = withHandle(-120.0) { handle -> nativeShortTermLufs(handle, which) }
 
     /** The bus loudness guard's gain right now, dB. */
-    fun loudnessGuardDb(): Float = if (handle != 0L) nativeLoudnessGuardDb(handle) else 0f
+    fun loudnessGuardDb(): Float = withHandle(0f) { handle -> nativeLoudnessGuardDb(handle) }
 
     // ---- M4 Part A §5 FX & 40 s capture ------------------------------------------------
     // Setup-time setters (PrepThread / MainThread). Each is a no-op on a dead handle or
@@ -258,8 +386,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
 
     /** Loop seam crossfade length in ms on [index]. */
     @PrepThread
-    fun setLoopSeamMs(index: Int, seamMs: Double) {
-        if (handle != 0L) nativeSetLoopSeamMs(handle, index, seamMs)
+    fun setLoopSeamMs(index: Int, seamMs: Double) = withHandle { handle ->
+        nativeSetLoopSeamMs(handle, index, seamMs)
     }
 
     /** Beat-quantised loop roll with HPF sweep, boost and optional downbeat stop. [scheduleBeats] may be null. */
@@ -268,8 +396,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         index: Int, enabled: Boolean, rollStartSec: Double, beatSec: Double, releaseSec: Double,
         totalRollBeats: Double, hpfStartHz: Float, hpfEndHz: Float, boostDb: Float,
         stopOnDownbeat: Boolean, scheduleBeats: DoubleArray?,
-    ) {
-        if (handle != 0L && AutomixV2Render.fx) {
+    ) = withHandle { handle ->
+        if (AutomixV2Render.fx) {
             nativeSetLoopRollEx(
                 handle, index, enabled, rollStartSec, beatSec, releaseSec, totalRollBeats,
                 hpfStartHz, hpfEndHz, boostDb, stopOnDownbeat, scheduleBeats,
@@ -282,20 +410,21 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
     fun setEchoEx(
         index: Int, delaySeconds: Double, feedback: Float, wet: Float,
         wetHpfHz: Float, wetLpfHz: Float, pingPong: Boolean,
-    ) {
-        if (handle != 0L) nativeSetEchoEx(handle, index, delaySeconds, feedback, wet, wetHpfHz, wetLpfHz, pingPong)
+    ) = withHandle { handle ->
+        nativeSetEchoEx(handle, index, delaySeconds, feedback, wet, wetHpfHz, wetLpfHz, pingPong)
     }
 
     /** Extended flanger with stereo offset. */
     @PrepThread
-    fun setFlangerEx(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float, stereoOffsetDeg: Float) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetFlangerEx(handle, index, lfoHz, depthSeconds, feedback, wet, stereoOffsetDeg)
+    fun setFlangerEx(index: Int, lfoHz: Double, depthSeconds: Double, feedback: Float, wet: Float, stereoOffsetDeg: Float) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetFlangerEx(handle, index, lfoHz, depthSeconds, feedback, wet, stereoOffsetDeg)
     }
 
     /** Extended phaser with stage count and stereo offset. */
     @PrepThread
-    fun setPhaserEx(index: Int, rateBeats: Double, depth: Float, feedback: Float, stages: Int, stereoOffsetDeg: Float) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetPhaserEx(handle, index, rateBeats, depth, feedback, stages, stereoOffsetDeg)
+    fun setPhaserEx(index: Int, rateBeats: Double, depth: Float, feedback: Float, stages: Int, stereoOffsetDeg: Float) = withHandle { handle ->
+        if (readout != null) readout.setPhaserEx(index, rateBeats, depth, feedback, stages, stereoOffsetDeg)
+        else if (AutomixV2Render.fx) nativeSetPhaserEx(handle, index, rateBeats, depth, feedback, stages, stereoOffsetDeg)
     }
 
     /** Extended riser: noise band, level, uplifter, optional snare roll and reverse reverb. */
@@ -304,8 +433,8 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         index: Int, beatSec: Double, lengthBeats: Double, noiseStartHz: Float, noiseEndHz: Float,
         noiseLevelPeak: Float, uplifterOctaves: Float, includeSnareRoll: Boolean,
         reverseReverbBeats: Double, startSec: Double,
-    ) {
-        if (handle != 0L && AutomixV2Render.fx) {
+    ) = withHandle { handle ->
+        if (AutomixV2Render.fx) {
             nativeSetRiserEx(
                 handle, index, beatSec, lengthBeats, noiseStartHz, noiseEndHz, noiseLevelPeak,
                 uplifterOctaves, includeSnareRoll, reverseReverbBeats, startSec,
@@ -315,69 +444,160 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
 
     /** One-shot impact hit at [triggerMixSec]. */
     @PrepThread
-    fun setImpact(index: Int, triggerMixSec: Double, peakDbfs: Float, lowThumpHz: Float, noiseBurstMs: Double) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetImpact(handle, index, triggerMixSec, peakDbfs, lowThumpHz, noiseBurstMs)
+    fun setImpact(index: Int, triggerMixSec: Double, peakDbfs: Float, lowThumpHz: Float, noiseBurstMs: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetImpact(handle, index, triggerMixSec, peakDbfs, lowThumpHz, noiseBurstMs)
     }
 
     /** Gate with separate start/end division and a time window. */
     @PrepThread
-    fun setGateEx(index: Int, beatSec: Double, divStart: Float, divEnd: Float, swing: Float, startSec: Double, endSec: Double) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetGateEx(handle, index, beatSec, divStart, divEnd, swing, startSec, endSec)
+    fun setGateEx(index: Int, beatSec: Double, divStart: Float, divEnd: Float, swing: Float, startSec: Double, endSec: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetGateEx(handle, index, beatSec, divStart, divEnd, swing, startSec, endSec)
     }
 
     /** Vinyl brake with end rate, LPF sweep and end fade. */
     @PrepThread
-    fun setBrakeEx(index: Int, startSec: Double, lengthSec: Double, endRate: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetBrakeEx(handle, index, startSec, lengthSec, endRate, lpfStartHz, lpfEndHz, endFadeMs)
+    fun setBrakeEx(index: Int, startSec: Double, lengthSec: Double, endRate: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetBrakeEx(handle, index, startSec, lengthSec, endRate, lpfStartHz, lpfEndHz, endFadeMs)
     }
 
     /** Tape stop with wow depth/rate and LPF sweep. */
     @PrepThread
-    fun setTapeStop(index: Int, startSec: Double, lengthSec: Double, wowDepth: Float, wowRateHz: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) {
-        if (handle != 0L && AutomixV2Render.fx) {
+    fun setTapeStop(index: Int, startSec: Double, lengthSec: Double, wowDepth: Float, wowRateHz: Float, lpfStartHz: Float, lpfEndHz: Float, endFadeMs: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) {
             nativeSetTapeStop(handle, index, startSec, lengthSec, wowDepth, wowRateHz, lpfStartHz, lpfEndHz, endFadeMs)
         }
     }
 
     /** Spinback (reverse varispeed) with peak reverse speed and silence gap. */
     @PrepThread
-    fun setSpinback(index: Int, startSec: Double, lengthSec: Double, peakReverseSpeed: Double, silenceGapSec: Double) {
-        if (handle != 0L && AutomixV2Render.fx) nativeSetSpinback(handle, index, startSec, lengthSec, peakReverseSpeed, silenceGapSec)
+    fun setSpinback(index: Int, startSec: Double, lengthSec: Double, peakReverseSpeed: Double, silenceGapSec: Double) = withHandle { handle ->
+        if (AutomixV2Render.fx) nativeSetSpinback(handle, index, startSec, lengthSec, peakReverseSpeed, silenceGapSec)
     }
 
     /** Filter sweep (HPF or LPF) with Q ramp over [startSec, endSec]. */
     @PrepThread
-    fun setSweep(index: Int, isHighPass: Boolean, startHz: Float, endHz: Float, qStart: Float, qEnd: Float, startSec: Double, endSec: Double, exponential: Boolean) {
-        if (handle != 0L && AutomixV2Render.fx) {
+    fun setSweep(index: Int, isHighPass: Boolean, startHz: Float, endHz: Float, qStart: Float, qEnd: Float, startSec: Double, endSec: Double, exponential: Boolean) = withHandle { handle ->
+        if (AutomixV2Render.fx) {
             nativeSetSweep(handle, index, isHighPass, startHz, endHz, qStart, qEnd, startSec, endSec, exponential)
         }
     }
 
     /** True-peak limiter ceiling in dBTP. */
     @PrepThread
-    fun setTruePeakCeilingDb(ceilingDbtp: Float) {
-        if (handle != 0L) nativeSetTruePeakCeilingDb(handle, ceilingDbtp)
+    fun setTruePeakCeilingDb(ceilingDbtp: Float) = withHandle { handle ->
+        if (readout != null) readout.setTruePeakCeilingDb(ceilingDbtp)
+        else nativeSetTruePeakCeilingDb(handle, ceilingDbtp)
     }
-
-    /** Arms or disarms the 40 s ring-buffer capture of the output bus. */
-    @MainThread
-    fun setCaptureEnabled(enabled: Boolean) {
-        if (handle != 0L) nativeSetCaptureEnabled(handle, enabled)
-    }
-
-    /** Frames captured so far (0 when capture is off or the handle is dead). */
-    @MainThread
-    fun capturedFrames(): Long = if (handle != 0L) nativeCapturedFrames(handle) else 0L
 
     /**
-     * Copies up to [maxFrames] captured stereo frames into [out] (interleaved, length >= 2*maxFrames).
-     * Returns the number of frames copied. Called from the diagnostics path, never from render.
+     * Arms or disarms capture before [prepare]. Calls after preparation are ignored:
+     * capture configuration must not race audio-thread writes to the native ring buffer.
+     */
+    @MainThread
+    fun setCaptureEnabled(enabled: Boolean) {
+        synchronized(captureSetupLock) {
+            if (captureConfigurationFrozen) return
+            withHandle { handle ->
+                if (readout != null) readout.setCaptureEnabled(enabled)
+                else nativeSetCaptureEnabled(handle, enabled)
+            }
+        }
+    }
+
+    /** Requests a capture freeze at the next safe render block boundary. No-op if not armed/frozen. */
+    @MainThread
+    fun requestCaptureFreeze() = withHandle { handle ->
+        if (readout == null) nativeRequestCaptureFreeze(handle)
+    }
+
+    /** Capture snapshot status, polled by worker/controller. */
+    enum class CaptureReadStatus(val nativeValue: Int) {
+        UNAVAILABLE(0),
+        PENDING(1),
+        FROZEN(2),
+        NO_DATA(3);
+
+        companion object {
+            fun fromNative(value: Int): CaptureReadStatus =
+                entries.firstOrNull { it.nativeValue == value } ?: UNAVAILABLE
+        }
+    }
+
+    data class CaptureSnapshotInfo(
+        val status: CaptureReadStatus,
+        val snapshotId: Long,
+        val sampleRate: Int,
+        val channels: Int,
+        val firstMixFrame: Long,
+        val lastMixFrame: Long,
+        val frameCount: Int,
+        val totalWrittenFrames: Long,
+    )
+
+    /** Polls capture snapshot metadata. Never copies sample payload. */
+    @MainThread
+    fun getCaptureSnapshotInfo(): CaptureSnapshotInfo = withHandle(
+        CaptureSnapshotInfo(CaptureReadStatus.UNAVAILABLE, 0L, sampleRate, 2, -1L, -1L, 0, 0L),
+    ) { handle ->
+        if (readout != null) {
+            CaptureSnapshotInfo(CaptureReadStatus.UNAVAILABLE, 0L, sampleRate, 2, -1L, -1L, 0, 0L)
+        } else {
+            val raw = nativeGetCaptureSnapshotInfo(handle)
+            if (raw == null || raw.size < 8) {
+                CaptureSnapshotInfo(CaptureReadStatus.UNAVAILABLE, 0L, sampleRate, 2, -1L, -1L, 0, 0L)
+            } else {
+                CaptureSnapshotInfo(
+                    status = CaptureReadStatus.fromNative(raw[0].toInt()),
+                    snapshotId = raw[1],
+                    sampleRate = raw[2].toInt(),
+                    channels = raw[3].toInt(),
+                    firstMixFrame = raw[4],
+                    lastMixFrame = raw[5],
+                    frameCount = raw[6].toInt(),
+                    totalWrittenFrames = raw[7],
+                )
+            }
+        }
+    }
+
+    /** Frames available in frozen snapshot (0 when not frozen/empty/unavailable). */
+    @MainThread
+    fun capturedFrames(): Long = withHandle(0L) { handle ->
+        val info = if (readout == null) nativeGetCaptureSnapshotInfo(handle) else null
+        if (info != null && info.size >= 7 && info[0].toInt() == CaptureReadStatus.FROZEN.nativeValue) info[6] else 0L
+    }
+
+    /**
+     * Legacy read path. Safe-refusal unless capture is frozen: returns 0 when pending/unavailable.
+     * Never copies live ring data while render may still write it.
      */
     @MainThread
     fun readCapturedAudio(out: FloatArray, maxFrames: Int): Int =
-        if (handle != 0L) nativeReadCapturedAudio(handle, out, maxFrames) else 0
+        withHandle(0) { handle ->
+            if (readout != null) 0 else nativeReadCapturedAudio(handle, out, maxFrames)
+        }
+
+    /**
+     * Reads frozen snapshot samples into [out] (interleaved, length >= 2*maxFrames).
+     * Returns frames copied, or 0 if not frozen/empty/unavailable. Does not block on render thread.
+     */
+    @MainThread
+    fun readFrozenCapture(out: FloatArray, maxFrames: Int): Int =
+        withHandle(0) { handle ->
+            if (readout != null) 0 else nativeReadFrozenCapture(handle, out, maxFrames)
+        }
 
     companion object {
+        /** Allocation-free overflow-safe range check shared by render and pure-JVM tests. */
+        internal fun isValidRenderRange(outputSize: Int, offset: Int, frames: Int): Boolean =
+            offset >= 0 && frames > 0 && 2L * (offset.toLong() + frames.toLong()) <= outputSize.toLong()
+
+        /** Legacy one-winner assertion seam; production uses the in-flight lifetime protocol above. */
+        internal fun closeNativeHandle(handle: AtomicLong, destroy: (Long) -> Unit) {
+            val owned = handle.getAndSet(0L)
+            if (owned != 0L) destroy(owned)
+        }
+
         const val OUT = 0
         const val IN = 1
         /** [shortTermLufs] index of the output bus. */
@@ -557,8 +777,13 @@ class LoopMixRenderer internal constructor(val sampleRate: Int, private val read
         )
         @JvmStatic private external fun nativeSetTruePeakCeilingDb(handle: Long, ceilingDbtp: Float)
         @JvmStatic private external fun nativeSetCaptureEnabled(handle: Long, enabled: Boolean)
+        @JvmStatic private external fun nativeRequestCaptureFreeze(handle: Long)
+        @JvmStatic private external fun nativeGetCaptureSnapshotInfo(handle: Long): LongArray?
         @JvmStatic private external fun nativeCapturedFrames(handle: Long): Long
         @JvmStatic private external fun nativeReadCapturedAudio(
+            handle: Long, outInterleaved: FloatArray, maxFrames: Int,
+        ): Int
+        @JvmStatic private external fun nativeReadFrozenCapture(
             handle: Long, outInterleaved: FloatArray, maxFrames: Int,
         ): Int
     }

@@ -97,11 +97,15 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.isTraversalGroup
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -170,51 +174,6 @@ private val SecondaryText = Color.White.copy(alpha = 0.55f)
 
 private val InspectorText = Color.White.copy(alpha = 0.88f)
 private const val UnknownMeasurement = "—"
-
-/**
- * AE3 (M7): single source of truth for the player Automix chip text
- * (Part A §7 / B9.1). Derived ONLY from the shared [AutomixStatus] +
- * [MixInspectorState] feeds, so `:sharedUi` stays pure KMP and never needs the
- * `djmix-core` [com.music.bitchord.djmix.core.contracts.MixUiState] directly —
- * the engine publishes the same wording through `AutomixStatus.headline`
- * (minus the legacy `" · locked"` tag, stripped here).
- *
- * - `PREPARING` -> `"Preparing mix · XX%"` (from [AutomixStatus.progress]).
- * - `READY` / `ARMED` -> `"<RecipeName> in m:ss"` (headline, uncluttered).
- * - `MOVED` -> `"Moved to m:ss · stems ready soon"` (headline). The engine
- *   bounds the `MOVED` phase itself, so the READY text takes over as soon as
- *   the machine advances — no UI-side timer needed.
- * - `RUNNING` -> `"Mixing · <RecipeName>"`.
- * - `LAST_RESORT` (`state == "echo"`) -> `"Ending with echo-out"`.
- *
- * No rung, tempo or "locked" clutter. Returns null outside the active arc
- * (`IDLE` / `DONE` / `CANCELLED` / `suspended`) so the player shows nothing.
- */
-fun automixChipLabel(status: AutomixStatus?, inspector: MixInspectorState?): String? {
-    if (status == null) return null
-    val phase = inspector?.phase
-    if (phase == MixInspectorPhase.IDLE ||
-        phase == MixInspectorPhase.DONE ||
-        phase == MixInspectorPhase.CANCELLED
-    ) return null
-    val recipe = status.planType.takeIf { it.isNotBlank() }
-        ?: inspector?.recipeName?.takeIf { it.isNotBlank() }
-    val cleanHeadline = status.headline.trimEnd('.').removeSuffix(" · locked").trim()
-    return when (status.state) {
-        "echo" -> "Ending with echo-out"
-        "suspended" -> null
-        "mixing" -> recipe?.let { "Mixing · $it" }
-            ?: cleanHeadline.takeIf { it.isNotBlank() }
-        "ready", "arming" -> cleanHeadline.takeIf { it.isNotBlank() }
-            ?: recipe
-        "preparing" -> if (status.style == "moved") {
-            cleanHeadline.takeIf { it.isNotBlank() }
-        } else {
-            "Preparing mix · ${(status.progress * 100f).roundToInt().coerceIn(0, 100)}%"
-        }
-        else -> cleanHeadline.takeIf { it.isNotBlank() }
-    }
-}
 
 /** Short "why this rung" line shared by the player status and the mix popup. */
 internal fun automixReasonLine(status: AutomixStatus?): String {
@@ -285,7 +244,7 @@ internal fun MixViewPopup(
     val progress = PlayerSettings.smartMixProgress.collectAsStateWithLifecycle()
     var shown by remember { mutableStateOf(false) }
     LaunchedEffect(visible) { shown = visible }
-    val reduceAnimation by PlayerSettings.reduceAnimation.collectAsStateWithLifecycle()
+    val reduceAnimation = rememberAutomixReducedMotion()
     val scrimAlpha by animateFloatAsState(if (shown) 1f else 0f, tween(if (reduceAnimation) 0 else 200), label = "mixViewScrim")
     val reduceDynamicBlur by PlayerSettings.reduceDynamicBlur.collectAsStateWithLifecycle()
     val title = stringResource(Res.string.mix_inspector_title)
@@ -519,17 +478,16 @@ private fun MixInspectorDetailsContent(
             text = inspectorReadinessText(state),
             style = MaterialTheme.typography.labelLarge,
             color = Color.White,
-            modifier = Modifier.semantics {
-                contentDescription = "Readiness: " + inspectorReadinessText(state)
+            modifier = Modifier.clearAndSetSemantics {
+                contentDescription = inspectorReadinessContentDescription(state)
             },
         )
         Spacer(Modifier.height(6.dp))
-        // One-line placement "Why" (optionally suffixed with a taste note
-        // when the feed already carries one).
+        // The reason and frozen delta stay separate until presentation.
         val why = state.reason?.takeIf { it.isNotBlank() }
             ?: stringResource(Res.string.mix_inspector_reason_pending)
         Text(
-            text = why,
+            text = inspectorWhyText(why, state.tasteAdjustment, state.learningEnabled),
             style = MaterialTheme.typography.bodyMedium,
             color = InspectorText,
         )
@@ -543,9 +501,10 @@ private fun MixInspectorDetailsContent(
         ) {
             if (state.remixAvailable && onRemix != null) {
                 val remixRejected = stringResource(Res.string.mix_inspector_remix_rejected)
-                TextButton(onClick = {
-                    if (!onRemix()) PlayerPlatform.host.showMessage(remixRejected)
-                }) { Text("Try another mix") }
+                TextButton(
+                    onClick = { if (!onRemix()) PlayerPlatform.host.showMessage(remixRejected) },
+                    modifier = Modifier.semantics { contentDescription = "Try another mix" },
+                ) { Text("Try another mix") }
             }
             Spacer(Modifier.weight(1f))
             if (onThumbsUp != null) {
@@ -583,7 +542,12 @@ private fun MixInspectorDetailsContent(
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.weight(1f).semantics { heading() },
             )
-            IconButton(onClick = { detailsExpanded = !detailsExpanded }) {
+            IconButton(
+                onClick = { detailsExpanded = !detailsExpanded },
+                modifier = Modifier.semantics {
+                    stateDescription = if (detailsExpanded) "Expanded" else "Collapsed"
+                },
+            ) {
                 Icon(
                     if (detailsExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                     contentDescription = if (detailsExpanded) "Hide details" else "Show details",
@@ -906,28 +870,6 @@ private fun inspectorMs(value: Long?): String =
     value?.let { stringResource(Res.string.mix_inspector_ms, it) } ?: UnknownMeasurement
 
 /**
- * Readiness bar text (Part A §7 / B9.2): `"Analysis ✓ · Plan ✓ · Stems x/y ·
- * Renderer ✓"`. Derived only from the feed: measured timings mark a stage
- * done, otherwise the phase ordinal does; stem counts come straight from
- * [MixInspectorState.stemCount] / [MixInspectorState.stemsReady], never
- * inferred from phase alone.
- */
-private fun inspectorReadinessText(state: MixInspectorState): String {
-    fun mark(done: Boolean) = if (done) "✓" else "✗"
-    val analysisDone = state.analysisMs != null || state.phase.ordinal >= MixInspectorPhase.PLANNED.ordinal
-    val planDone = state.planMs != null || state.phase.ordinal >= MixInspectorPhase.PREPARED.ordinal
-    val required = state.stemCount ?: 0
-    val ready = when (state.stemsReady) {
-        true -> required
-        else -> 0
-    }
-    val rendererDone = state.path?.isNotBlank() == true ||
-        state.phase.ordinal >= MixInspectorPhase.BUILDING.ordinal
-    return "Analysis ${mark(analysisDone)} · Plan ${mark(planDone)} · " +
-        "Stems $ready/$required · Renderer ${mark(rendererDone)}"
-}
-
-/**
  * Labelled FX lanes (Part A §7): one chip per active effect, its colour
  * paired with its text label so colour is never the sole information.
  */
@@ -1003,7 +945,7 @@ internal fun MixViewContent(
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         DeckHeader(view.outgoing, sweep, Modifier.padding(horizontal = 14.dp))
         Spacer(Modifier.height(12.dp))
-        MixDecks(view, progress, live, sweep)
+        MixDecks(view, progress, live, sweep, reduceMotion)
         Spacer(Modifier.height(12.dp))
         DeckHeader(view.incoming, sweep, Modifier.padding(horizontal = 14.dp))
         // FORK-HOOK(player-status): one-line "why" footer matching player status
@@ -1170,7 +1112,13 @@ private fun DeckNumbers(deck: MixDeck) {
 
 /** The two waveform decks, the transition frame across them, and the blend's length under them. */
 @Composable
-private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Boolean, sweep: State<Float>) {
+private fun MixDecks(
+    view: MixTransitionView,
+    progress: State<Float>,
+    live: Boolean,
+    sweep: State<Float>,
+    reduceMotion: Boolean,
+) {
     val outColors = rememberWaveColors(view.outgoing.artworkUrl)
     val inColors = rememberWaveColors(view.incoming.artworkUrl)
     val pending = view.outgoing.analysing || view.incoming.analysing
@@ -1191,7 +1139,16 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                 .clip(RoundedCornerShape(14.dp))
                 .background(PanelColor.copy(alpha = 0.85f)),
         )
-        Canvas(Modifier.fillMaxSize()) {
+        Canvas(Modifier.fillMaxSize().semantics {
+            contentDescription = "Transition timeline. Outgoing track, top waveform. Incoming track, bottom waveform. " +
+                "Waveform layers show lows, mids and highs. Lines show the fade levels."
+            if (live) {
+                progressBarRangeInfo = ProgressBarRangeInfo(
+                    progress.value.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f,
+                    0f..1f,
+                )
+            }
+        }) {
             val deckHeight = DeckHeight.toPx()
             val topDeck = DeckTop.toPx()
             val bottomDeck = size.height - DeckBottomInset.toPx() - deckHeight
@@ -1212,7 +1169,7 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
             }
             // The playhead, through both decks at once: they are the same moment.
             // Gone once the blend is over rather than parked at its end.
-            if (live) {
+            if (live && !reduceMotion) {
                 val x = size.width * (BoxStart + (BoxEnd - BoxStart) * progress.value.coerceIn(0f, 1f))
                 drawLine(
                     color = Color.White.copy(alpha = 0.9f),
@@ -1267,8 +1224,24 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                     fontWeight = FontWeight.Medium,
                 )
             }
+            if (live && reduceMotion) {
+                StaticMixProgressLabel(progress)
+            }
         }
     }
+}
+
+/** Keep measured progress available without a continuously travelling playhead. */
+@Composable
+private fun StaticMixProgressLabel(progress: State<Float>) {
+    val fraction = progress.value.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    val percent = (fraction * 100f).roundToInt()
+    Text(
+        text = " · $percent%",
+        color = Color.White,
+        fontSize = 13.sp,
+        modifier = Modifier.clearAndSetSemantics { contentDescription = "Mix progress: $percent percent" },
+    )
 }
 
 /**
@@ -1614,10 +1587,10 @@ internal fun MixViewOverlay(hazeState: HazeState) {
         if (heldBlend) {
             // Follow the last timing/phase update for this preparation, but
             // never replace it with the pair after the metadata handoff.
-            val heldKey = heldInspector?.key
-            if (currentInspector != null && currentInspector.key == heldKey) {
-                heldInspector = currentInspector
-            } else if (heldKey == null && currentInspector?.mixActive == true &&
+            val snapshot = heldInspector
+            if (snapshot != null) {
+                heldInspector = inspectorHeldSnapshot(snapshot, currentInspector)
+            } else if (currentInspector?.mixActive == true &&
                 held?.matchesInspector(currentInspector) == true
             ) {
                 // The lightweight feed may arrive after the legacy waveform.
@@ -1667,7 +1640,7 @@ internal fun MixViewOverlay(hazeState: HazeState) {
     }
     PlayerBackHandler(enabled = open) { MixViewRequest.open = false }
     if (!open && !hasDetails) return
-    val displayedInspector = heldInspector?.let { snapshot ->
+    val displayedInspector = heldInspector?.let { inspectorHeldSnapshot(it, currentInspector) }?.let { snapshot ->
         // A held sheet is read-only as soon as playback has moved to another
         // generation, even if its last snapshot had offered a remix.
         snapshot.copy(

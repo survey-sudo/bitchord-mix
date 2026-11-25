@@ -42,8 +42,8 @@ buildscript {
  * release tag's alone.
  */
 // FORK-HOOK(version): fork monotonic versioning + upstream release base
-extra["bitchordVersionCode"] = 94
-extra["bitchordVersionName"] = "1.10-djmix52"
+extra["bitchordVersionCode"] = 95
+extra["bitchordVersionName"] = "1.10-djmix53"
 extra["bitchordUpstreamBase"] = "1.10"
 
 /*

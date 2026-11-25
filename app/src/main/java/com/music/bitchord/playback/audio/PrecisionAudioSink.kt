@@ -13,9 +13,11 @@ import androidx.media3.exoplayer.audio.ForwardingAudioSink
 import com.music.bitchord.BuildConfig
 import com.music.bitchord.playback.AudioOutputStatus
 import com.music.bitchord.playback.MixDebug
+import com.music.bitchord.playback.djmix.AudioThread
 import com.music.bitchord.playback.loopmix.LoopMixPort
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Precision audio sink intercepting decoder PCM buffers before Media3's internal
@@ -95,7 +97,22 @@ class PrecisionAudioSink(
     var activeFormat: Format? = null
         private set
 
-    private var processCounter: Long = 0L
+    private val processedBlocks = AtomicLong()
+    private val processedFrames = AtomicLong()
+    private val priorityFailures = AtomicLong()
+    private val configurationLogFailures = AtomicLong()
+
+    /** Read on the control/diagnostic thread; no snapshot is allocated in a callback. */
+    data class Diagnostics(
+        val blocks: Long,
+        val frames: Long,
+        val priorityFailures: Long,
+        val configurationLogFailures: Long,
+    )
+
+    fun diagnosticSnapshot(): Diagnostics = Diagnostics(
+        processedBlocks.get(), processedFrames.get(), priorityFailures.get(), configurationLogFailures.get(),
+    )
 
     /**
      * Media3 creates and owns the thread that calls handleBuffer(), so its
@@ -311,6 +328,7 @@ class PrecisionAudioSink(
         )
     }
 
+    @AudioThread
     override fun handleBuffer(
         inputBuffer: ByteBuffer,
         presentationTimeUs: Long,
@@ -321,7 +339,11 @@ class PrecisionAudioSink(
         // passthrough is audio work too.
         if (!audioPrioritySet) {
             audioPrioritySet = true
-            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (_: Throwable) {
+                priorityFailures.incrementAndGet()
+            }
         }
         if (!isPrecisionActive) {
             return delegate.handleBuffer(inputBuffer, presentationTimeUs, encodedAccessUnitCount)
@@ -408,23 +430,8 @@ class PrecisionAudioSink(
             )
             if (decodedFrames <= 0) break
 
-            if (BuildConfig.DEBUG) {
-                processCounter++
-                if (processCounter == 1L || processCounter % 500L == 0L) {
-                    try {
-                        val count = processCounter
-                        val active = isPrecisionActive
-                        val inEnc = inEncoding.name
-                        val outEnc = outEncoding.name
-                        val frames = decodedFrames
-                        Log.d(
-                            TAG,
-                            "handleBuffer() #$count precisionActive=$active inEnc=$inEnc outEnc=$outEnc frames=$frames",
-                        )
-                    } catch (_: Throwable) {
-                    }
-                }
-            }
+            processedBlocks.incrementAndGet()
+            processedFrames.addAndGet(decodedFrames.toLong())
 
             val loopBlockUs = advanceTimestamp(presentationTimeUs, framesEmittedForInput)
             var tookOverHere = false
@@ -495,6 +502,7 @@ class PrecisionAudioSink(
     }
 
     /** [presentationTimeUs] moved on by [frames], or left alone when the rate is unknown. */
+    @AudioThread
     private fun advanceTimestamp(presentationTimeUs: Long, frames: Long): Long {
         if (frames <= 0L || configuredSampleRate <= 0 || presentationTimeUs == C.TIME_UNSET) {
             return presentationTimeUs
@@ -503,6 +511,7 @@ class PrecisionAudioSink(
     }
 
     /** Tracks only the exact splice buffer; full consumption is not presentation or audibility. */
+    @AudioThread
     private fun handleOutputBuffer(
         buffer: ByteBuffer,
         presentationTimeUs: Long,
@@ -598,6 +607,7 @@ class PrecisionAudioSink(
     }
 
     /** A new arm (or a disarm): whatever the sink was doing for the last one is dropped. */
+    @AudioThread
     private fun adoptLoopGeneration(port: LoopMixPort) {
         loopGeneration = port.generation
         loopGenerating = false
@@ -616,6 +626,7 @@ class PrecisionAudioSink(
      * from its decks' pre-roll on, and from 25 ms before mix frame 0 crosses the
      * song's own audio over to it. True once the block reaches frame 0.
      */
+    @AudioThread
     private fun spliceLoop(arm: LoopMixPort.OutArm, blockUs: Long, frames: Int): Boolean {
         if (blockUs == C.TIME_UNSET || frames <= 0 || audioBlock.channelCount != 2) return false
         val trackUs = blockUs - loop.streamOffsetUs
@@ -659,6 +670,7 @@ class PrecisionAudioSink(
      * block, for as long as the delegate takes it. The song's own input is
      * never consumed again (false, always), so the renderer keeps coming back.
      */
+    @AudioThread
     private fun generateLoop(arm: LoopMixPort.OutArm, outEncoding: PcmEncoding): Boolean {
         if (outputByteBuffer.hasRemaining()) {
             val consumed = handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
@@ -692,6 +704,7 @@ class PrecisionAudioSink(
     }
 
     /** The incoming side: nothing heard before the handover, then 25 ms up to full. */
+    @AudioThread
     private fun silenceUntilHandover(arm: LoopMixPort.InArm, blockUs: Long, frames: Int) {
         if (blockUs == C.TIME_UNSET || frames <= 0) return
         loopInStarted = true
@@ -717,6 +730,7 @@ class PrecisionAudioSink(
     }
 
     /** Shifts are applied only while this player is silent with time to spare. */
+    @AudioThread
     private fun canShift(arm: LoopMixPort.InArm, presentationTimeUs: Long): Boolean {
         if (presentationTimeUs == C.TIME_UNSET) return false
         val trackUs = advanceTimestamp(presentationTimeUs, framesEmittedForInput) - loop.streamOffsetUs
@@ -724,6 +738,7 @@ class PrecisionAudioSink(
     }
 
     /** [frames] of silence, timed as the next frames on the delegate's clock. */
+    @AudioThread
     private fun writeSilence(frames: Int, trackBlockUs: Long, outEncoding: PcmEncoding): Boolean {
         if (outputByteBuffer.hasRemaining()) {
             val consumed = handleOutputBuffer(outputByteBuffer, pendingPresentationTimeUs, 0)
@@ -748,6 +763,7 @@ class PrecisionAudioSink(
      * A few hundred microseconds of timestamp rounding is normal; a seek,
      * a flushed sink, or a dropped buffer is not.
      */
+    @AudioThread
     private fun noteIncomingTimeline(blockUs: Long, frames: Int) {
         if (blockUs == C.TIME_UNSET || frames <= 0 || configuredSampleRate <= 0) {
             lastIncomingEndUs = C.TIME_UNSET
@@ -785,7 +801,8 @@ class PrecisionAudioSink(
         dspChain.transition.leadUs = 0L
         loopInterrupted()
         streaming = false
-        processCounter = 0L
+        processedBlocks.set(0L)
+        processedFrames.set(0L)
         outputByteBuffer.clear()
         outputByteBuffer.flip()
         audioBlock.clear()
@@ -961,6 +978,8 @@ class PrecisionAudioSink(
     }
 
     private fun ensureBuffers(channelCount: Int) {
+        // All callback branches use <= capacityFrames (decode, silence, generated mix).
+        // Float is the widest output; loopScratch is stereo and only used by stereo splices.
         if (audioBlock.channelCount != channelCount) {
             audioBlock = AudioBlock(channelCount = channelCount, capacityFrames = DEFAULT_CAPACITY_FRAMES)
         } else {
@@ -973,6 +992,8 @@ class PrecisionAudioSink(
         }
         outputByteBuffer.clear()
         outputByteBuffer.flip()
+        check(outputByteBuffer.capacity() >= audioBlock.capacityFrames * channelCount * 4)
+        check(loopScratch.size >= audioBlock.capacityFrames * 2)
     }
 
     /**
@@ -1042,6 +1063,7 @@ class PrecisionAudioSink(
                     "configure() precisionActive=$precisionActive inputEncoding=$inputEncoding sr=$sampleRate ch=$channelCount targetOutputEncoding=$targetOutputEncoding enableFloatOutput=$enableFloatOutput delegateEncoding=$delegateEncoding",
                 )
             } catch (_: Throwable) {
+                configurationLogFailures.incrementAndGet()
             }
         }
     }

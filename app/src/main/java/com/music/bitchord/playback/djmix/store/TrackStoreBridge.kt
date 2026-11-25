@@ -19,12 +19,15 @@ package com.music.bitchord.playback.djmix.store
 
 import android.content.Context
 import android.util.Log
+import com.music.bitchord.BitChordApplication
 import com.music.bitchord.playback.smart.AutomixModels
 import com.music.bitchord.playback.smart.PhraseMaps
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.TrackAnalysisProvenance
 import com.music.bitchord.playback.smart.structure.AutomixV2Structure
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
+import java.security.MessageDigest
 
 /**
  * Bridge between smart analysis runtime memory state and the persisted
@@ -40,17 +43,24 @@ class TrackStoreBridge(
     private val provisional: MutableSet<String>,
     private val restoreAttempted: MutableSet<String>,
     private val onAnalysisUpdated: (String) -> Unit,
+    /** Optional source/rendition fingerprint supplied by the analyzer. */
+    private val contentHashForTrack: (String) -> String? = { null },
+    /** Resolved on first background use; the process owner retains store ownership. */
+    private val storeProvider: () -> DjmixAnalysisStore? = {
+        (context.applicationContext as? BitChordApplication)?.djmixServicesOrNull()?.store
+    },
 ) {
 
     // ---- AE3 djmix.db store wiring (Wave 3C-1) ------------------------------
     //
-    // Lazy for the same reason [resolver] is: this analyzer is a field
+    // Lazy because this analyzer is a field
     // initializer on the playback service, which runs before the service has
-    // a base context attached, and `DjmixDatabase` needs `applicationContext`.
+    // a base context attached. Do not resolve applicationContext at construction.
     // First access happens on a background thread after construction, never
-    // in the init block.
+    // in the init block. An unavailable owner leaves the legacy store path active;
+    // the bridge never creates or closes a database/store of its own.
     val djmixStore: DjmixAnalysisStore? by lazy {
-        runCatching { DjmixAnalysisStore(DjmixDatabase(context)) }
+        runCatching { storeProvider() }
             .onFailure { Log.w(TAG, "djmix store unavailable", it) }
             .getOrNull()
     }
@@ -79,9 +89,9 @@ class TrackStoreBridge(
     }
 
     /**
-     * Model versions a persisted row must match to read as fresh. Keys and
-     * values are exactly what [persistToDjmixStore] writes, so a row we wrote
-     * ourselves never reads stale against ourselves.
+     * Current declared model constants, captured only for a new producer pass
+     * and compared with recorded declarations on restore. These do not identify
+     * executed model bytes, an inference session, provider, or runtime.
      */
     fun currentModelVersions(): Map<String, String> = mapOf(
         "nirovi" to AutomixModels.NIROVI.sha256,
@@ -98,13 +108,38 @@ class TrackStoreBridge(
     fun restoreFromDjmixStore(trackId: String): Boolean {
         triggerDjmixMigrationOnce()
         val activeStore = djmixStore ?: return false
+        val expectedHash = runCatching { contentHashForTrack(trackId) }.getOrNull()?.takeIf { it.isNotBlank() }
         val lookup = runCatching {
-            activeStore.getAnalysis(trackId, expectedContentHash = null, currentModelVersions())
+            fun read(hash: String?): AnalysisLookupResult {
+                // The map also transports reserved provenance metadata. Compare
+                // only actual recorded model declarations, never metadata keys.
+                val result = activeStore.getAnalysis(trackId, hash, emptyMap())
+                val row = (result as? AnalysisLookupResult.Fresh)?.analysis ?: return result
+                val declared = TrackAnalysisProvenance.declaredModels(row.modelVersions)
+                val current = currentModelVersions()
+                val stale = DjmixAnalysisStore.staleReason(row.schema, declared, current)
+                return if (stale == null) result else AnalysisLookupResult.Stale(reason = stale)
+            }
+            val exact = expectedHash?.let {
+                read(it)
+            }
+            val result = exact?.takeIf { it is AnalysisLookupResult.Fresh }
+                ?: read(null)
+            result to expectedHash
         }.onFailure { Log.w(TAG, "djmix store lookup failed for $trackId", it) }.getOrNull()
             ?: return false
-        val fresh = (lookup as? AnalysisLookupResult.Fresh)?.analysis ?: return false
+        val fresh = (lookup.first as? AnalysisLookupResult.Fresh)?.analysis ?: return false
+        if (!isContentHashCompatible(fresh.contentHash, expectedHash)) return false
         if (!fresh.isUsable) return false
-        val restored = TrackAnalysisV3Mapper.fromV3(fresh)
+        // Keep the source row's blank hash blank. Today's compatible fingerprint
+        // cannot establish the source of a historical, unkeyed analysis.
+        val projected = TrackAnalysisV3Mapper.fromV3(fresh)
+        val provenance = projected.provenance ?: TrackAnalysisProvenance.UNKNOWN
+        val legacyCompatible = expectedHash == null || fresh.contentHash.isBlank()
+        val restored = projected.copy(provenance = provenance.copy(
+            status = if (legacyCompatible) "legacy_compatible_unverified" else provenance.status,
+            hashCompatibility = if (legacyCompatible) "legacy_compatible_unverified" else "matching_declared_hash_unverified",
+        ))
         if (!restored.isUsable) return false
         // A stored FULL supersedes a provisional HEAD in memory; anything
         // else only lands when nothing is known yet (putIfAbsent).
@@ -137,22 +172,40 @@ class TrackStoreBridge(
             results[trackId]?.quality == TrackAnalysis.QUALITY_FULL
         ) return
         val activeStore = djmixStore ?: return
+        val provenance = analysis.provenance ?: return
+        val contentHash = provenance.sourceHash?.takeIf { it.isNotBlank() }
+            ?: return // Never replace a previously keyed row with an empty hash.
         runCatching {
             val map = PhraseMaps.get(trackId)
             val v3 = TrackAnalysisV3Mapper.toV3(
                 trackId = trackId,
-                contentHash = "",
+                contentHash = contentHash,
                 analysis = analysis,
                 phraseMap = map,
                 songMap = map,
-                modelVersions = currentModelVersions(),
+                modelVersions = provenance.declaredModelVersions.orEmpty(),
             )
             if (v3.analysisLevel.name == "NONE") return@runCatching
             activeStore.putAnalysis(v3, System.currentTimeMillis())
         }.onFailure { Log.w(TAG, "djmix store persist failed for $trackId", it) }
     }
 
-    private companion object {
-        const val TAG = "BitChordTrackStoreBridge"
+    companion object {
+        private const val TAG = "BitChordTrackStoreBridge"
+
+        /** Stable SHA-256 key for a source/rendition metadata fingerprint. */
+        fun contentHashFromFingerprint(trackId: String, fingerprint: String?): String? {
+            val value = fingerprint?.trim().orEmpty()
+            if (trackId.isBlank() || value.isBlank()) return null
+            val digest = MessageDigest.getInstance("SHA-256").digest("$trackId\u0000$value".toByteArray())
+            return digest.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        }
+
+        /** An empty hash is accepted only as a legacy row; known mismatches are never fresh. */
+        fun isContentHashCompatible(storedHash: String, expectedHash: String?): Boolean = when {
+            expectedHash.isNullOrBlank() -> true
+            storedHash.isBlank() -> true
+            else -> storedHash == expectedHash
+        }
     }
 }

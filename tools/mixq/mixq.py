@@ -49,6 +49,10 @@ except ImportError:  # pragma: no cover - environment guard
 
 SR = 48000
 TOOL_VERSION = "1.0.0"
+TRUE_PEAK_LIMIT_DBTP = -1.0
+# Avoid rejecting an exactly-at-limit PCM value because dB conversion rounds a
+# mathematically exact -1 dBTP to -0.9999999999999997 on some platforms.
+GATE_FLOAT_TOLERANCE = 1e-9
 
 # ---------------------------------------------------------------------------
 # WAV I/O (PCM16 / float32, mono/stereo, manual RIFF parse so float32 WAVs
@@ -753,17 +757,26 @@ def get_curve_array(meta: dict, *keys):
     curve = pick(meta, *keys, default=None)
     if curve is None:
         return None, None
+    def checked(times, values):
+        times, values = np.asarray(times, dtype=float), np.asarray(values, dtype=float)
+        if (times.ndim != 1 or values.ndim != 1 or len(times) != len(values) or not len(times)
+                or not np.isfinite(times).all() or not np.isfinite(values).all()
+                or (len(times) > 1 and not (np.diff(times) > 0).all())):
+            raise ValueError("Metadata curve must contain finite values on a strictly increasing timeline")
+        return times, values
     if isinstance(curve, dict):
         times = curve.get("times") or curve.get("t")
         values = curve.get("values") or curve.get("v")
         if times is not None and values is not None and len(times) == len(values):
-            return np.array(times, dtype=float), np.array(values, dtype=float)
+            return checked(times, values)
     if isinstance(curve, (list, tuple)) and len(curve) and isinstance(curve[0], (list, tuple)) and len(curve[0]) == 2:
-        return np.array([float(p[0]) for p in curve]), np.array([float(p[1]) for p in curve])
+        return checked([float(p[0]) for p in curve], [float(p[1]) for p in curve])
     if isinstance(curve, (list, tuple)) and len(curve) and isinstance(curve[0], (int, float)):
         fps = float(pick(meta, "vocalFps", "curveFps", "syvenuFps", default=50.0))
+        if not np.isfinite(fps) or fps <= 0:
+            raise ValueError("Metadata curve fps must be positive and finite")
         vals = np.array(curve, dtype=float)
-        return np.arange(len(vals)) / fps, vals
+        return checked(np.arange(len(vals)) / fps, vals)
     return None, None
 
 
@@ -795,13 +808,13 @@ def placement_violations(meta: dict, beat_sec: float) -> tuple[int, dict]:
     # Exit mid-vocal: Syvenu > 0.5 within +-1 beat of the exit.
     if exit_sec is not None:
         for dt in (-beat_sec, 0.0, beat_sec):
-            v = get_curve_at(meta, "vocalOut", "vocalActivityOut", "syvenuOut", "vocal_curve_out", time_sec=float(exit_sec) + dt, default=0.0)
+            v = get_curve_at(meta, "placementVocalOut", "vocalOut", "vocalActivityOut", "syvenuOut", "vocal_curve_out", time_sec=float(exit_sec) + dt, default=0.0)
             if v > 0.5:
                 violations.append("exit-mid-vocal")
                 break
     # Entry mid-vocal at Subtle/Club.
     if entry_sec is not None and level in ("SUBTLE", "CLUB"):
-        v = get_curve_at(meta, "vocalIn", "vocalActivityIn", "syvenuIn", "vocal_curve_in", time_sec=float(entry_sec), default=0.0)
+        v = get_curve_at(meta, "placementVocalIn", "vocalIn", "vocalActivityIn", "syvenuIn", "vocal_curve_in", time_sec=float(entry_sec), default=0.0)
         if v > 0.5:
             violations.append("entry-mid-vocal")
     # Bass clash > 1 beat.
@@ -870,7 +883,7 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     try:
         tp = true_peak_db(left, right)
         metrics["truePeakDb"] = round(tp, 2)
-        gates["truePeak"] = bool(tp <= -1.0)
+        gates["truePeak"] = bool(tp <= TRUE_PEAK_LIMIT_DBTP + GATE_FLOAT_TOLERANCE)
         methods["truePeak"] = "4x-FFT-oversampled"
     except ValueError as e:
         metrics["truePeakDb"] = None
@@ -883,7 +896,7 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     low_period, low_times = lowband_beat_estimate(mag, freqs, hop)
     flux_times = frame_times[pick_peaks(onset, min_dist=8, thresh_frac=0.35)]
     # Prefer metadata beat times when supplied (Nirovi on the mix).
-    meta_beats = pick(meta, "beatTimesIn", "beat_times_in", "beatsIn", default=None)
+    meta_beats = pick(meta, "beatTimesMix", "beatTimesIn", "beat_times_in", "beatsIn", default=None)
     grading = swap_sec
     if isinstance(meta_beats, (list, tuple)) and len(meta_beats) > 3:
         onset_times = np.array(meta_beats, dtype=np.float64)
@@ -930,19 +943,15 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     t_go, g_out = get_curve_array(meta, "gainOut", "gain_out", "outGainCurve")
     t_gi, g_in = get_curve_array(meta, "gainIn", "gain_in", "inGainCurve")
     if v_out is not None and v_in is not None and t_out is not None and t_in is not None:
-        methods["vocalOverlap"] = "syvenu-curves-gain-weighted"
+        has_gains = g_out is not None and t_go is not None and g_in is not None and t_gi is not None
+        methods["vocalOverlap"] = "syvenu-curves-gain-weighted" if has_gains else "syvenu-curves-unweighted-gains-unavailable"
         dur = max(trans_end - trans_start, 0.0)
-        steps = 400
-        grid = np.linspace(trans_start, trans_end, steps)
-        dt = dur / max(steps - 1, 1)
-        ov = 0.0
-        for t in grid:
-            vo = float(np.interp(t, t_out, v_out))
-            vi = float(np.interp(t, t_in, v_in))
-            go = float(np.interp(t, t_go, g_out)) if g_out is not None and t_go is not None else 1.0
-            gi = float(np.interp(t, t_gi, g_in)) if g_in is not None and t_gi is not None else 1.0
-            ov += min(vo, vi) * min(go, gi) * dt
-        vocal_overlap = float(ov)
+        grid = np.linspace(trans_start, trans_end, max(2, int(math.ceil(dur * 50.0)) + 1))
+        vo, vi = np.interp(grid, t_out, v_out), np.interp(grid, t_in, v_in)
+        go = np.interp(grid, t_go, g_out) if g_out is not None and t_go is not None else np.ones_like(grid)
+        gi = np.interp(grid, t_gi, g_in) if g_in is not None and t_gi is not None else np.ones_like(grid)
+        weighted = np.minimum(np.clip(vo, 0, 1), np.clip(vi, 0, 1)) * np.minimum(np.clip(go, 0, 1), np.clip(gi, 0, 1))
+        vocal_overlap = float(np.sum((weighted[:-1] + weighted[1:]) * 0.5 * np.diff(grid)))
     else:
         methods["vocalOverlap"] = "vocal-band-proxy-standalone"
         presence = vocal_envelope(mag, freqs)
@@ -1035,6 +1044,20 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     methods["silence"] = gap_detail.pop("method", "rms-10ms-windows")
     metrics["_silenceDetail"] = gap_detail
 
+    # A playback-frozen render must not earn a production quality PASS from
+    # standalone kick/bass proxies. Those remain useful labelled diagnostics.
+    if meta.get("canonicalPlaybackGeometry"):
+        evidence_gaps = []
+        if "beatTimesMix" not in meta:
+            evidence_gaps.append("Nirovi beat times on the rendered mix are unavailable")
+        if pick(meta, "bassOverlapBeats", "bass_clash_beats", "bassClashBeats", default=None) is None:
+            evidence_gaps.append("Two-source bass-overlap measurement is unavailable")
+        if methods["vocalOverlap"] != "syvenu-curves-gain-weighted":
+            evidence_gaps.append("Source Syvenu curves and frozen vocal gain lanes are incomplete")
+        gates["analysisEvidence"] = not evidence_gaps
+        methods["analysisEvidence"] = "measured-inputs-required"
+        warnings.extend(evidence_gaps)
+
     # Aggregate cleanups
     lufs_detail = metrics.pop("_lufsDetail", {})
     flux_detail = metrics.pop("_fluxDetail", {})
@@ -1066,7 +1089,7 @@ def analyze_file(path: str, meta: dict | None) -> dict:
     return entry
 
 
-_RECIPE_RE = re.compile(r"^(S|C|F)\d+$", re.IGNORECASE)
+_RECIPE_RE = re.compile(r"^(?:S[1-6]|C[1-9]|F(?:[1-9]|1[01]))$", re.IGNORECASE)
 _AUTO_RE = re.compile(r"^AUTO", re.IGNORECASE)
 
 
@@ -1105,6 +1128,10 @@ def resolve_meta_for_file(basename: str, meta: dict | None) -> dict:
                     return item
     if basename in meta and isinstance(meta[basename], dict):
         return meta[basename]
+    # Canonical single-render metadata legitimately contains nested source
+    # hashes and stem windows; these are not a collection of per-file records.
+    if meta.get("canonicalPlaybackGeometry") is True:
+        return meta
     # Single-file meta: no keyed entries, use it wholesale.
     if not any(isinstance(v, dict) for k, v in meta.items() if k not in ("files", "items", "pairs", "entries")):
         return meta

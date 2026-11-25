@@ -33,21 +33,83 @@ it does not promote unexecuted integration work to a passed milestone.
   dispatch repair. Committed `CrossfadeController.kt` is **2,381** lines. Its helper
   size gate is satisfied in that committed scope; the broader M9/D4 and integrated
   runtime gates remain open. Subsequent service-lifecycle edits are a separate batch.
-- R2 canonical runtime sources are frozen: the two confirmed app compile defects
-  are repaired, six canonical-only recipe IDs no longer need legacy aliases/previews,
-  regional peak-safe gain precedes compilation, and same-recipe no-stem geometry is
-  retained. Parent verified all ten recorded file hashes/line counts. **17 new R2
-  tests await execution**; R4 owns the remaining inspector/remix and production
-  executor/history/learning/Flag-context wiring.
+- R2's original ten-file/17-test source freeze was verified, then independent
+  review found a native-user retirement race and frozen straight-timing drift.
+  The same writer froze both repairs with 25 tests; all eleven source fingerprints
+  matched and independent review statically closes the original P1/P2 findings.
+  Review then exposed exact-string exclusions bypassing the early unavailable-
+  analysis fallback. The bounded parent filter/result-guard repair now has four
+  additive default/injected fallback cases and a twelve-path current freeze:
+  **25 canonical + 4 lifetime tests**, still unexecuted. Review caught and the
+  parent corrected a String/enum identity expression and invalid draft default-
+  refusal expectations before compilation. The earlier freeze is historical for
+  changed paths. Core last-resort selection also refuses instead of reviving
+  excluded S4. App compilation/execution remains required.
 - Core gate2 configures the corrected JavaExec classpath. Core gate3 actually runs
-  recipe lint: **26 RecipeV2 definitions PASS**. Core tests do not yet have acceptance:
-  their CLI test driver failed compilation on an array variance mismatch. The
-  one-line type repair retains all four tests/assertions and is assigned to the
-  serialized gate4, along with the two inference-wrapper return fixes.
-- `djmix-analysis` and `djmix-render` exist but their reconciled APIs, root module
-  registration, real shared geometry/pipeline reuse, and `djmix-android` boundary
-  remain implementation/integration work. A synthetic or explicit frozen-input
-  replay is not arbitrary-pair production audition or device bit-exact parity.
+  recipe lint: **26 RecipeV2 definitions PASS**. Gate4 closes the CLI-test type
+  failure: **47 core / 19 focused shared tests PASS**, shared JVM compile RC0,
+  nonempty raw XML with zero failures/errors/skips. Parent independently parsed
+  the XML. Unchanged inputs reuse lint evidence; no running job was duplicated.
+- R4 source is refrozen (33 focused tests present, unexecuted): production uses
+  the process owner/executor, exact generation/epoch contexts and canonical
+  Inspector/remix identity. All eight controller delegates initialize before
+  publication without synchronized lazy acquisition; current controller is
+  **2,403** lines. Analyzer store reuse is also frozen with six new behavioral
+  tests; verified analysis provenance and output capture remain unavailable seams.
+- Both standalone host modules are now registered. Render's first Gradle attempt
+  failed before compilation because the host lacked its declared JDK17 toolchain.
+  The pinned JDK17 environment correction passed while preserving Java21 binary
+  hashes and global alternatives. The byte-identical 359-file render snapshot now
+  compiles, runs **28/28 tests**, and produces `installDist` (all RC0; parent parsed
+  nonempty XML). The original worker then failed its JShell fixture smoke. A
+  smoke-only Java launcher correction passed the installed CLI twice with identical
+  trace bytes and the exact captured script; no Gradle/source rerun was needed.
+  This is a **decision-trace** gate, not renderer WAV or complete reducer replay.
+  Analysis has direct native-backed JUnit **21/21**, audition Python **21/21**,
+  mixq Python **13/13**, and one exact-hash synthetic Nirovi/Syvenu smoke. Its direct
+  compiler/dependency setup is not the pending Gradle boundary gate. The temporary
+  playback source allowlist/decoder carrier must not become an app/shared dependency.
+  ADR0012 selects real shared production geometry/types, concrete-plan/retiming and
+  artifact ownership extraction after the runtime review/gates. Frozen-input export
+  is not arbitrary-pair production audition or device bit-exact parity.
+- Native host extraction/parser completion survived its exhausted session: five
+  scoped plus three unchanged production hashes matched. Parent reconciled all
+  91 saved command/RC/log receipts, five identical probe logs, and three 52-case
+  malformed matrices (51 typed refusals with output preserved in each). All 51
+  original malformed input bytes remain unchanged. The normal/sanitizer WAV hashes
+  match. The historical transport fixture still truthfully reports
+  `violations=1`; a separate completed-physical-fade telemetry correction now has
+  focused positive/negative and unchanged-PCM validation in progress, not a quality PASS.
+  That focused validation is now parent-accepted: **18/18** current normal and
+  ASan/UBSan cases pass, the retained pre-fix source fails only the three intended
+  completed-fade cases, focused PCM is identical across all three builds, and the
+  canonical WAV remains byte-identical with the corrected counter zero. Ten host
+  probe runs are RC0. This is telemetry correctness, not listening/quality acceptance.
+- The eight captured audio/JNI deltas now have exact-HEAD static review with no
+  new P0/P1/P2 finding; all eight source hashes still match. The inherited stretch
+  configured/caller channel mismatch has a separate bounded native/JNI regression
+  lane. Parent accepted its focused host evidence: configured/caller channel mismatch is rejected before pinning, pre-fix ASan reproduces a real heap-buffer overflow, four g++/clang++ normal/sanitizer suites pass, and legitimate mono/stereo PCM is byte-identical to direct `PitchStretch`. Android consumer compilation remains pending. Static review is not allocation profiling or device parity.
+- B14/D4 tooling is refrozen and parent-checked: **55 invariant fixtures** and
+  **15 scanner self-tests** pass. The actual invariant gate remains **RC1** with
+  11 policy findings (one API-key-shaped constant and ten embedded machine paths).
+  Current D4 measurements expose a lexical triage backlog; they are not the
+  reasoned defect counts required by the plan. No threshold/suppression or CI
+  wiring was added to disguise these open gates; D1 cleanup remains last.
+- Analysis provenance was corrected after parent rejection. Verified: the Android
+  content hash is a source/rendition metadata fingerprint, not PCM; the preparer's
+  retained analysis projection carries empty provenance; current model constants
+  are not per-analysis runtime identity; blank/unknown compatibility is legacy
+  compatibility, not verified provenance. No provenance implementation was added.
+- B14 secret-scan remediation map is read-only and complete for the 11 findings.
+  The API-key literal was redacted from the parent-preserved artifact, and any
+  future archival/native path cleanup must be a separately recorded intentional
+  change rather than a byte-identity-preserving edit.
+- Renderer capture reconnaissance recorded an honest B7 gap: the native 40-second
+  ring is preallocated in `prepare()`, but a released atomic counter does not make
+  non-atomic sample reads coherent; the JNI read allocates per call; the Kotlin
+  lifetime prevents handle UAF but not a capture snapshot generation; no producer
+  populates `RetainedMixContext.audioCaptureRef`; and no FLAC encoder exists.
+  `capture=null` remains truthful. No capture implementation is claimed.
 - This archival commit preserves **ten byte-identical historical payloads** and
   repairs active baseline/playbook/hook/ownership references. Parent whitespace
   check returned RC0 and hooks **32/32** after the reference repair. B12.12 remains
@@ -63,6 +125,20 @@ Evidence: `../Bitchord/work/ae3-batch-reconciliation-20261125.md`,
 `recipe-cli-test-type-fix.json`, `archive-identity.json`, and
 `archive-reference-checks.json` in that evidence directory. Older results below
 apply only to their recorded immutable source snapshots.
+
+Subsequent checked evidence in the same directory: `validation-core-gate4-parent-evidence-check.json`,
+`validation-render-gate1-owner-handoff.md`, `r2-independent-review.md`,
+`r4-production-composition-followup.md`, `r4-store-followup-parent-check.json`,
+`store-owner-reuse.md`, `analysis-exporter-integration.md`, and
+`analysis-parent-freeze-verification.json`. These updates promote no item to done.
+Latest verified additions: `r2-reviewer-blocker-recheck.md`,
+`parent-r2-native-freeze-check-20261125.json`, `parent-render-gate2-xml-evidence.json`,
+`validation-render-gate2-cli-smoke-repair/result.json`,
+`parent-cli-smoke-audio-freeze-check.json`, `audio-jni-independent-review.md`,
+`audio-jni-exact-diff/manifest.json`, and `core-last-resort-exclusion-repair.md`.
+Native raw-receipt reconciliation: `native-final/parent-historical-host-evidence-check.json`.
+Current R2/tooling freeze: `r2-early-fallback-exclusion-tests.md`,
+`parent-fallback-tooling-final-check/result.json`, and `b14-d4-tooling.txt`.
 
 ## 2026-11-25 historical evidence correction and earlier acceptance batch
 
@@ -150,7 +226,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | A§3.2.4 Locks and second executor | done | `49d40a7f` | Separate model/stem locks (`stemLock` held during separation); SCNet on dedicated `djmix-stems` single-thread executor; `PairPreparerTest` pins thread names + lock | — |
 | A§3.3.1 Dynamic-int8 SCNet | todo | — | — | Export `scnet_dyn_int8.onnx` via `tools/models/quantize.py`, pin sha; target at or under 3 s per 11 s chunk at 4 threads; audition decides int8 retention. |
 | A§3.3.2 Required stems only | todo | — | — | Add `Recipe.requiredStems`; separate only overlap window plus-minus 1 bar; one pass gives 4 stems, savings in decks and window. |
-| A§3.3.3 Separate ahead, disk cache | todo | — | — | Separate likely next pair once frozen; 160 MB cache keyed `trackId + window`. |
+| A§3.3.3 Separate ahead, disk cache | doing | uncommitted source | `shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/StemCache.kt`; `shared/src/commonMain/kotlin/com/music/bitchord/playback/smart/Stems.kt` | Existing containing-region cache has the 160 MiB disk default; atomic replacement hardening is an active independent implementation lane. Current integrated compilation and READY-speed/device gates remain pending. |
 | A§3.3.4 No-stem variant at commit | todo | — | — | Same recipe no-stem variant (isolator EQ); no level downgrade, no move for stems. |
 | A§4.1 Exit rules | doing | `49d40a7f` | `PairPlanner`/`PlacementEvaluator` exit rules: first boundary after last chorus/drop in outro else vocal < 0.25 next phrase; never mid-vocal at ±1 beat (except deliberate acapella recipes C3/F4); never in build; one phrase after swap | Device gate pending (M3). |
 | A§4.2 Entry rules | doing | `49d40a7f` | Intro first downbeat / boundary before first vocal; drop downbeat recipes; pre-roll caps 32 Club / 64 Festival; silent intros skipped | Device gate pending (M3). |
@@ -164,7 +240,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | A§5.5 Phaser | todo | — | — | 6–8 all-pass stages, LFO 1 per bar tunable, feedback 0.6, stereo 90 degrees, wet 0 to 0.7 across tunnel. |
 | A§5.6 Riser plus Impact | todo | — | — | 3 layers noise sweep 300 Hz to 8 kHz, uplifter octave, snare roll last 2 bars, 1-beat reverse-reverb tail, impact thump minus 6 dBFS on 1. Rewrite `dj_fx.h` Riser plus new Impact. |
 | A§5.7 Brake plus tape-stop | todo | — | — | Exp rate 1.0 to 0 over 1–2 beats, pitch follows rate, LPF 18 kHz to 800 Hz, 10 ms fade; tape-stop variant with wow; phrase end only. Rewrite on pre-stretch pointer. |
-| A§5.8 Spinback | todo | — | — | Reverse to about 3x over 1/2 beat, 1-beat gap, IN on 1. |
+| A§5.8 Spinback | doing | uncommitted source | `../Bitchord/evidence/ae3-resume-20261125/spinback-unit-implementation.md` | Compiled gap seconds now derive from the frozen beat clock, with enabled-only migration and pre-mutation renderer validation. Source-complete unit fix; integrated compilation and audition remain pending. |
 | A§5.9 Echo out | todo | — | — | Ping-pong 1/2 or 3/4 beat, feedback 55–70 percent, wet HPF 250 Hz LPF 6 kHz, throw on last beat. |
 | A§5.10 Gate / stutter | todo | — | — | 1/8 to 1/16 trance gate, swing 0–10 percent, depth 0 to 1 over 2 bars, release on 1. |
 | A§5.11 FX coverage unit test | todo | — | — | Club needs loop, roll, sweep, flanger, phaser, echo; Festival adds riser, brake, spinback, gate; test asserts coverage. |
@@ -217,15 +293,15 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B2.7 Replay test | done | `4d92f84b` | `MixMachineReplayTest` 9 tests incl. JSON round-trip replay | Deterministic `replay` + 8 end-to-end device replays; on-device log replay remains M8 diagnostics. |
 | B3.1 Storage Room | doing | `28b67dcf` | `djmix.db` WAL store: `track_analysis`, `stem_index`, `transition_history`, `preference` + v3 mapper + migration; JSON/`PhraseMaps`/`StemCache` deletion pending | `DjmixStoreContractTest` 6/6; survives-restart on device pending. |
 | B3.2.1 Queue job | doing | `28b67dcf` | `QueueAnalysisWorker` + `QueuePrepRegistry` wiring in `PlaybackService` (next 5 to FULL, background priority) | READY-speed gate in M5. |
-| B3.2.2 Library job | todo | — | — | Charging and idle: liked, downloads, recent, newest first; stop under 30 percent battery or thermal at or above MODERATE. |
+| B3.2.2 Library job | doing | uncommitted source | `app/src/main/java/com/music/bitchord/playback/djmix/work/LibraryAnalysisWorker.kt` | Charging/idle, battery and thermal guards already exist. Local recent-track coverage and cancellation handling are an active independent implementation lane; newest-first precision must follow actual local metadata. Integrated compilation/device behavior remain pending. |
 | B3.2.3 Cold pairs budget | todo | — | — | With both jobs running most transitions start READY; §3 budget becomes the cold-case budget. |
 | B4.1 ModelRegistry | todo | — | — | Bundled `models.json`, overridable by `models-v1`; fields id/version/sha/bytes/source/frontend/io/backends/role/minEngine; 8 models listed in B4.1. |
 | B4.2 Backend interface | todo | — | — | `InferenceBackend` with `CpuOrt` and `QnnAddon`; QNN only if available, self-test passed, benchmark faster; choice visible in Inspector and Developer settings. |
 | B4.3 Own NPU add-on | todo | — | — | Code-less `npu-addon/v73` package, QAIRT jniLibs plus runner, QNN assets, fork-key signed; GHA per arch; `npu-addons.json`; prefer ours, accept Orchard. |
 | B4.4 Measured gates | todo | — | — | `docs/NPU.md`: per-model CPU/NPU latency median of 7, cold compile and cached open, self-test agreement, thermal at 10-min soak start/end. |
-| B5.1 Recipes as data | todo | — | — | `recipes/*.json` schema recipe v2: id, name, level, family, requirements, length options, placement, steps, no-stem variant, energy delta, abruptness. |
-| B5.2 Interpreter | todo | — | — | `djmix-core/recipes` recipe plus context to `TransitionScript`; ChoreoGuard validates every script. |
-| B5.3 Linter | todo | — | — | Unit test plus CLI: schema, anchors, splice/handover neutrality, lows never doubled, FX budget, abrupt only where allowed, per-level coverage. |
+| B5.1 Recipes as data | doing | existing implementation plus uncommitted integration | `djmix-core/src/commonMain/resources/recipes/`; `../Bitchord/evidence/ae3-resume-20261125/validation-core-gate4-parent-evidence-check.json` | The 26 RecipeV2 definitions and recorded lint evidence exist. Current production integration and real-corpus/listening gates remain open; historical snapshot results are not current release acceptance. |
+| B5.2 Interpreter | doing | uncommitted source | `../Bitchord/evidence/ae3-resume-20261125/adr0012-analysis-artifact-cutover.md`; `spinback-unit-implementation.md` in the same evidence directory | Canonical compileFrozen is the compiler; app/host consume shared concrete-plan and geometry code. Shared mapper/artifact cutover is source-complete; latest clock/provenance/inference additions remain uncompiled. |
+| B5.3 Linter | doing | recorded core gate plus uncommitted integration | `../Bitchord/evidence/ae3-resume-20261125/validation-core-gate4-parent-evidence-check.json` | The recorded core gate establishes 26 recipe definitions passing lint for that snapshot. Preserve that evidence; current integrated gates remain open, with no claim that pending runtime/audio behavior has passed. |
 | B5.4 Recipe Lab | todo | — | — | Developer settings: pick 2 tracks plus recipe/Auto, exit/entry over waveforms, Preview renders 30 s offline; debug live reload from `Android/data/.../files/recipes/`. |
 | B5.5 20 plus 6 library | todo | — | — | 20 fixed per §5; add C8 Loop roll out, C9 Filter ping-pong, F9 Backspin into drop, F10 Echo freeze, F11 Riser plus impact cut, S6 Breakdown blend; each audition render plus Inspector one-liner. |
 | B6.1 Corpus | todo | — | — | `golden-pairs/` devbox only, never git, `pairs.json`; 40 pairs all genres with 6 jumps, 4 tempo over 8 percent, 4 album, 4 silent intros; owner adds via Flag. |

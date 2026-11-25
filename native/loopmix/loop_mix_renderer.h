@@ -453,9 +453,36 @@ class Renderer {
   /** True-peak limiter ceiling in dBTP (default -1.0 dBTP). */
   void setTruePeakCeilingDb(float ceilingDbtp);
   /** Enables 40 s pre-allocated capture ring buffer (call before prepare()). */
-  void setCaptureEnabled(bool enabled) { captureEnabled_ = enabled; }
+  void setCaptureEnabled(bool enabled);
+  /** Request capture freeze (controller/worker thread). No-op if not armed or already frozen/requested. */
+  void requestCaptureFreeze();
+  /** Capture state for polling. */
+  enum class CaptureReadStatus : int {
+    kUnavailable = 0,      // not armed/enabled for this session
+    kPending = 1,          // armed but not yet frozen (or freeze requested, awaiting render ack)
+    kFrozen = 2,           // frozen snapshot ready
+    kNoData = 3            // frozen but no frames captured (empty)
+  };
+  struct CaptureSnapshotInfo {
+    CaptureReadStatus status = CaptureReadStatus::kUnavailable;
+    int64_t snapshotId = 0;
+    int sampleRate = 0;
+    int channels = 2;
+    int64_t firstMixFrame = -1;   // mix frame of first sample in snapshot (chronological)
+    int64_t lastMixFrame = -1;    // mix frame of last sample in snapshot (chronological)
+    int frameCount = 0;           // number of frames in snapshot (<= cap)
+    int64_t totalWrittenFrames = 0; // total frames written before freeze (for diagnostics)
+  };
+  /** Poll snapshot info (thread-safe). Does not copy samples. */
+  CaptureSnapshotInfo getCaptureSnapshotInfo() const;
+  /**
+   * Copy frozen snapshot samples into outInterleaved (interleaved float). Returns frames copied, or 0 if not frozen/unavailable.
+   * Only valid after status is Frozen (and will remain valid for this frozen snapshot under current API contract:
+   * no rearm/reset allowed while reader may consume in this design; caller should treat snapshot as immutable).
+   */
+  int readFrozenCapture(float* outInterleaved, int maxFrames) const;
+  /** Legacy compatibility: returns frozen snapshot frame count; 0 when not frozen/unavailable. */
   int64_t capturedFrames() const;
-  int readCapturedAudio(float* outInterleaved, int maxFrames) const;
   /**
    * Short-term loudness tracking with per-deck matching and the summed-bus
    * "no dip / no bump" guard during overlaps; [targetLufs] (e.g. -14, the
@@ -515,10 +542,25 @@ class Renderer {
   std::vector<float> limitRingL_, limitRingR_;
   int limitRingPos_ = 0;
   // Optional 40 s audio ring-buffer capture (enabled/allocated in prepare() when requested).
-  bool captureEnabled_ = false;
+  std::atomic<bool> captureEnabled_{false};  // intent flag; config frozen after prepare()
+  std::atomic<bool> captureConfigFrozen_{false};  // set in prepare(); refuses post-prepare rearm/races
   std::vector<float> captureRing_;
   int captureCapFrames_ = 0;
   std::atomic<int64_t> captureWriteFrames_{0};
+
+  /** Capture protocol state machine (render-thread + reader safe via atomics). */
+  enum class CaptureState : int {
+    kDisabled = 0,
+    kArmed = 1,
+    kFrozen = 2
+  };
+  std::atomic<CaptureState> captureState_{CaptureState::kDisabled};
+  std::atomic<bool> captureFreezeRequested_{false};
+  // Set at freeze time (written by render thread before publishing Frozen with release).
+  int64_t captureSessionStartMixFrame_ = -1;
+  int64_t captureFrozenTotalWritten_ = 0;
+  int64_t captureFrozenStartMixFrame_ = -1;
+  int64_t captureSnapshotId_ = 0;
 
   // AUTOMIX-V2(C) state. Pre-allocated in prepare(); render thread only after that.
   bool loudnessOn_ = false;

@@ -366,7 +366,13 @@ data class SpinbackFxParams(
     val startMixSec: Double = 0.0,
     val lengthSec: Double = 0.25,
     val peakReverseSpeed: Double = 3.0,
+    /** Silence gap source in beats (JSON-authored; preserved for source intent). */
     val silenceGapBeats: Double = 1.0,
+    /** Compiled silence gap in seconds, computed once via frozen compileFrozen ctx.beatSec.
+      *  Derived: silenceGapSec = silenceGapBeats * ctx.beatSec.
+      *  Written by RecipeInterpreter.compileFrozen; consumed by bridge/host adapters.
+      */
+    val silenceGapSec: Double = 0.0,
 )
 
 /** Typed parameters for tempo-synced stereo ping-pong echo out. */

@@ -38,6 +38,7 @@ import com.music.bitchord.data.web.QuietWebChromeClient
 
 class PoTokenWebView private constructor(
     context: Context,
+    private val apiKey: String,
     // to be used exactly once only during initialization!
     private val continuation: Continuation<PoTokenWebView>,
 ) : PoTokenMinter {
@@ -377,7 +378,7 @@ class PoTokenWebView private constructor(
                     "User-Agent" to USER_AGENT,
                     "Accept" to "application/json",
                     "Content-Type" to "application/json+protobuf",
-                    "x-goog-api-key" to GOOGLE_API_KEY,
+                    "x-goog-api-key" to apiKey,
                     "x-user-agent" to "grpc-web-javascript/0.1",
                 ).toHeaders())
                 .url(url)
@@ -440,7 +441,6 @@ class PoTokenWebView private constructor(
 
     companion object {
         private const val TAG = "PoTokenWebView"
-        private const val GOOGLE_API_KEY = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw"
         private const val REQUEST_KEY = "O43z0dpjhgX20SCx4KAo"
         private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.3"
@@ -455,13 +455,15 @@ class PoTokenWebView private constructor(
 
         private val httpClient: OkHttpClient get() = Http.client
 
-        suspend fun getNewPoTokenGenerator(context: Context): PoTokenWebView {
+        suspend fun getNewPoTokenGenerator(context: Context, apiKey: String? = null): PoTokenWebView {
+            val resolvedApiKey = apiKey?.trim()?.takeIf { it.isNotEmpty() }
+                ?: throw PoTokenException("BotGuard PoToken unavailable: no API key configured")
             var created: PoTokenWebView? = null
             try {
                 return withTimeout(INIT_TIMEOUT_MS) {
                     withContext(Dispatchers.Main) {
                         suspendCancellableCoroutine { cont ->
-                            val potWv = PoTokenWebView(context, cont)
+                            val potWv = PoTokenWebView(context, resolvedApiKey, cont)
                             created = potWv
                             potWv.loadHtmlAndObtainBotguard()
                         }

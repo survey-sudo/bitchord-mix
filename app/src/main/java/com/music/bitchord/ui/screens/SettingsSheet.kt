@@ -172,14 +172,13 @@ import com.music.bitchord.playback.smart.AutomixModels
 import com.music.bitchord.djmix.core.contracts.DjLevel
 import com.music.bitchord.djmix.core.contracts.ENGINE_VERSION
 import com.music.bitchord.playback.djmix.diagnostics.DiagnosticsBundler
-import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
 import com.music.bitchord.playback.djmix.npu.NpuSelfTestRunner
-import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
-import com.music.bitchord.playback.djmix.store.DjmixDatabase
+import com.music.bitchord.playback.djmix.store.TransitionRecord
 import com.music.bitchord.ui.djmix.AutomixFirstRunDialog
 import com.music.bitchord.ui.djmix.DjmixDeveloperSettingsSheet
 import com.music.bitchord.ui.djmix.MixHistoryScreen
 import com.music.bitchord.R
+import com.music.bitchord.BitChordApplication
 import com.music.bitchord.data.sources.DeviceCodecs
 import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.settings.DownloadQuality
@@ -189,8 +188,12 @@ import com.music.bitchord.data.settings.PlayerTheme
 import com.music.bitchord.data.stats.Backup
 import com.music.bitchord.playback.AudioCache
 import com.music.bitchord.ui.player.fullBleedArtworkAvailable
+import com.music.bitchord.ui.player.ratingIdentityFor
+import com.music.bitchord.ui.player.retainedMixContextFor
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import java.io.File
 import java.util.Locale
@@ -405,14 +408,15 @@ fun SettingsScreen(
     }
     var showPerformanceWarning by remember { mutableStateOf(false) }
     var showPerformanceConfirmation by remember { mutableStateOf(false) }
-    // AE3 (M7): first-run explainer, history sheet, dev sheet + its flags/store.
+    // AE3 (M7): first-run explainer, history and developer sheets share the process owner.
     var showAutomixFirstRun by remember { mutableStateOf(false) }
     var showMixHistory by remember { mutableStateOf(false) }
     var showDjmixDeveloper by remember { mutableStateOf(false) }
     var mixHistoryTick by remember { mutableIntStateOf(0) }
-    val djmixFlags = remember(context) { DjmixFlags(context) }
+    val djmixServices = remember(context) { (context.applicationContext as BitChordApplication).djmixServices }
+    val djmixFlags = requireNotNull(djmixServices.flags)
     val developerFlags by djmixFlags.flags.collectAsStateWithLifecycle()
-    val djmixStore = remember(context) { DjmixAnalysisStore(DjmixDatabase(context)) }
+    val djmixStore = requireNotNull(djmixServices.store)
     // Populate the cached NPU line once; a stored verdict wins over
     // recomputation so a later self-test is never clobbered here.
     LaunchedEffect(Unit) {
@@ -1127,6 +1131,7 @@ fun SettingsScreen(
                             onCheckedChange = { on ->
                                 AppSettings.setAutomixLearnFromReactions(on)
                                 djmixFlags.setLearningEnabled(on)
+                                djmixServices.setUserLearningEnabled(on)
                             },
                         )
                     },
@@ -1134,6 +1139,7 @@ fun SettingsScreen(
                         val on = !automixLearn
                         AppSettings.setAutomixLearnFromReactions(on)
                         djmixFlags.setLearningEnabled(on)
+                        djmixServices.setUserLearningEnabled(on)
                     },
                 )
             }
@@ -1143,12 +1149,14 @@ fun SettingsScreen(
                     title = "Reset learned preferences",
                     subtitle = "Clear everything Automix learned from your reactions",
                     onClick = {
-                        val cleared = djmixStore.resetPreferences()
-                        Toast.makeText(
-                            context,
-                            if (cleared) "Learned preferences cleared" else "Could not clear preferences",
-                            Toast.LENGTH_SHORT,
-                        ).show()
+                        backupScope.launch {
+                            val cleared = djmixServices.resetLearnedPreferences().await()
+                            Toast.makeText(
+                                context,
+                                if (cleared) "Learned preferences cleared" else "Could not clear preferences",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
                     },
                 )
             }
@@ -2583,6 +2591,7 @@ fun SettingsScreen(
             onLearnToggle = { on ->
                 AppSettings.setAutomixLearnFromReactions(on)
                 djmixFlags.setLearningEnabled(on)
+                djmixServices.setUserLearningEnabled(on)
             },
             onDismiss = {
                 AppSettings.setAutomixFirstRunShown(true)
@@ -2592,31 +2601,44 @@ fun SettingsScreen(
         )
     }
 
-    // AE3 (M7): last 100 transitions. Rating/flag go straight to the store /
-    // diagnostics bundler (Wave 4E-v2 screen never touches storage itself).
+    // AE3 (M7): last 100 transitions; ratings and diagnostics retain exact archival identity.
     if (showMixHistory) {
         ModalBottomSheet(
             onDismissRequest = { showMixHistory = false },
             contentWindowInsets = { androidx.compose.foundation.layout.WindowInsets() },
         ) {
-            val records = remember(mixHistoryTick) { djmixStore.recentTransitions(100) }
+            var records by remember { mutableStateOf<List<TransitionRecord>>(emptyList()) }
+            LaunchedEffect(djmixServices, mixHistoryTick) {
+                records = withContext(Dispatchers.IO) { djmixStore.recentTransitions(100) }
+            }
             MixHistoryScreen(
                 records = records,
                 onRecordClick = {},
                 onRate = { id, rating ->
-                    djmixStore.updateRating(id, rating)
-                    mixHistoryTick++
+                    val record = records.firstOrNull { it.id == id }
+                    backupScope.launch {
+                        val identity = record?.let { djmixServices.ratingIdentityFor(it) }
+                        val saved = identity?.let { djmixServices.recordExplicitRating(it, rating).await() } == true
+                        if (saved) mixHistoryTick++ else {
+                            Toast.makeText(context, "Rating not saved", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 },
-                onFlag = {
-                    val bundler = DiagnosticsBundler(
-                        File(context.getExternalFilesDir(null), "djmix-reports"),
-                    )
-                    val bundle = bundler.bundle()
-                    val intent = bundle?.let { DiagnosticsBundler.buildShareChooser(context, it) }
-                    if (intent != null) {
-                        context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                onFlag = { record ->
+                    val retained = djmixServices.retainedMixContextFor(record)
+                    if (retained == null) {
+                        Toast.makeText(context, "No diagnostics context for this transition", Toast.LENGTH_SHORT).show()
                     } else {
-                        Toast.makeText(context, "Flagged for diagnostics", Toast.LENGTH_SHORT).show()
+                        val pendingBundle = djmixServices.flagSelectedMixAsync(retained)
+                        backupScope.launch {
+                            val bundle = pendingBundle.await()
+                            val intent = bundle?.let { DiagnosticsBundler.buildShareChooser(context, it) }
+                            if (intent != null) {
+                                context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                            } else {
+                                Toast.makeText(context, "Diagnostics could not be shared", Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     }
                 },
             )
@@ -2658,16 +2680,16 @@ fun SettingsScreen(
                 ).show()
             },
             onExportDiagnostics = {
-                val latest = runCatching {
-                    DiagnosticsBundler(
-                        File(context.getExternalFilesDir(null), "djmix-reports"),
-                    ).listBundles().firstOrNull()
-                }.getOrNull()
-                val intent = latest?.let { DiagnosticsBundler.buildShareChooser(context, it) }
-                if (intent != null) {
-                    context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
-                } else {
-                    Toast.makeText(context, "No diagnostics bundle yet", Toast.LENGTH_SHORT).show()
+                backupScope.launch {
+                    val latest = withContext(Dispatchers.IO) {
+                        djmixServices.diagnosticsBundler?.listBundles()?.firstOrNull()
+                    }
+                    val intent = latest?.let { DiagnosticsBundler.buildShareChooser(context, it) }
+                    if (intent != null) {
+                        context.startActivity(intent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                    } else {
+                        Toast.makeText(context, "No diagnostics bundle yet", Toast.LENGTH_SHORT).show()
+                    }
                 }
             },
             onSafeMode = djmixFlags::setSafeMode,

@@ -88,6 +88,10 @@ data class MixInspectorState(
     /** The engine owns the deadline and allowed-recipe checks. The UI never estimates this. */
     val remixAvailable: Boolean = false,
     val remixUnavailableReason: String? = null,
+    /** Actual score delta of the selected frozen plan. */
+    val tasteAdjustment: Double = 0.0,
+    /** Effective playback-owned policy; an unwired publisher fails closed. */
+    val learningEnabled: Boolean = false,
 ) {
     val key: MixInspectorKey get() = MixInspectorKey(generation, current.mediaId, next.mediaId)
     val mixActive: Boolean get() = phase == MixInspectorPhase.RUNNING

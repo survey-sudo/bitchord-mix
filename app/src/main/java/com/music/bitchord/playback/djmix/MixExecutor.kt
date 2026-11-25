@@ -4,14 +4,18 @@ import com.music.bitchord.djmix.core.contracts.DeckTarget
 import com.music.bitchord.djmix.core.contracts.DjLevel
 import com.music.bitchord.djmix.core.contracts.ENGINE_VERSION
 import com.music.bitchord.djmix.core.contracts.ExecutionPath
+import com.music.bitchord.djmix.core.contracts.FailureKind
 import com.music.bitchord.djmix.core.contracts.MixTelemetryV3
 import com.music.bitchord.djmix.core.contracts.MixUiState
 import com.music.bitchord.djmix.core.contracts.TelemetryEventType
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
+import com.music.bitchord.djmix.core.contracts.RefusalReason
+import com.music.bitchord.djmix.core.contracts.RecipeV2
 import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
 import com.music.bitchord.djmix.core.contracts.TransitionScriptV1
 import com.music.bitchord.djmix.core.learning.TasteModel
 import com.music.bitchord.djmix.core.learning.TasteSignal
+import com.music.bitchord.djmix.core.recipes.RecipeRegistry
 import com.music.bitchord.djmix.core.machine.MixEffect
 import com.music.bitchord.djmix.core.machine.MixEvent
 import com.music.bitchord.djmix.core.machine.MixMachine
@@ -24,12 +28,33 @@ import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
 import com.music.bitchord.playback.djmix.diagnostics.FlagsSnapshot
 import com.music.bitchord.playback.djmix.diagnostics.TelemetryV3Writer
 import com.music.bitchord.playback.djmix.store.DjmixAnalysisStore
+import com.music.bitchord.playback.loopmix.LoopMixRenderer
+import com.music.bitchord.playback.loopmix.LoopMixSession
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import org.json.JSONObject
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CompletableJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
+
+/** Detached history payload shared by the Android store adapter and deterministic integration tests. */
+data class TerminalTransitionRecord(
+    val outId: String, val inId: String, val planId: String, val recipe: String, val level: String,
+    val path: String, val timingsJson: String, val outcome: String, val createdAtMs: Long,
+)
 
 /**
  * Deck surface [MixExecutor] drives. Implemented in Wave 3C-2 by the
@@ -101,16 +126,64 @@ class MixExecutor(
     private val diagnosticsBundler: DiagnosticsBundler? = null,
     private val tasteModel: TasteModel? = null,
     private val flags: DjmixFlags? = null,
+    private val flagsProvider: () -> FlagsSnapshot = { flags?.flags?.value ?: FlagsSnapshot.defaults() },
+    private val learningPolicyProvider: () -> Boolean = { true },
+    private val onTasteStateChanged: ((Map<String, Double>) -> Unit)? = null,
+    private val tasteEpochProvider: () -> Long = { 0L },
+    private val onTasteStateChangedForEpoch: ((Long, Map<String, Double>) -> Unit)? = null,
+    private val tasteCallbackDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val retainedMixContextProvider: () -> RetainedMixContext? = { null },
+    private val recipeProvider: ((String) -> RecipeV2?)? = RecipeRegistry::byId,
+    private val onTransitionRecorded: ((ExplicitRatingIdentity) -> Unit)? = null,
+    private val clockMs: () -> Long = System::currentTimeMillis,
+    initialGeneration: Long = 0L,
+    private val playerEpoch: Long? = null,
+    private val callbackAdmission: () -> Boolean = { true },
+    private val onGenerationChanged: (Long) -> Unit = {},
+    private val onTerminalEntered: (TransitionPlanV1) -> Unit = {},
+    private val onDebugEvent: (String, Long, String) -> Unit = { _, _, _ -> },
+    private val transitionRecorder: ((TerminalTransitionRecord) -> Long)? = null,
+    private val captureIntentProvider: () -> Boolean = { false },
+    private val onCaptureSessionAdmitted: (LoopMixSession) -> Boolean = { false },
+    private val onCaptureFreezeRequested: (LoopMixRenderer, String) -> Unit = { _, _ -> },
+    private val onCaptureRetirement: (LoopMixRenderer, Long) -> Boolean = { _, _ -> false },
+    private val monotonicClockMs: () -> Long = { System.nanoTime() / 1_000_000L },
 ) {
     private val lock = Any()
 
-    private var state: MixState = MixState.Idle()
+    private var state: MixState = MixState.Idle(generation = initialGeneration)
+    private var closed = false
+
+    internal fun capturePreparationEpoch(): Long? = synchronized(lock) {
+        playerEpoch?.takeIf { !closed && callbackAdmission() && captureIntentProvider() }
+    }
+
+    internal fun admitCaptureSession(session: LoopMixSession): Boolean = synchronized(lock) {
+        !closed && callbackAdmission() && session.captureConfigured && onCaptureSessionAdmitted(session)
+    }
+
+    internal fun requestCaptureFreeze(renderer: LoopMixRenderer, reason: String) {
+        // Already admitted captures belong to the process, including after this executor closes.
+        onCaptureFreezeRequested(renderer, reason)
+    }
+
+    internal fun retireCaptureRenderer(renderer: LoopMixRenderer, delayMs: Long = 0L): Boolean =
+        onCaptureRetirement(renderer, delayMs)
+    private val pendingTerminalWrites = AtomicInteger()
+    private val asyncWorkFailures = AtomicLong()
 
     /** The plan of the last terminal (DONE/FAILED) mix, for [flagCurrentOrLastMix]. */
     private var lastMixPlan: TransitionPlanV1? = null
 
     /** Bounded in-memory ring of recent app events (JSONL lines) for a flag bundle. */
     private val recentEvents = ArrayDeque<String>()
+    private val completedMixes = LinkedHashSet<String>()
+    private val implicitTasteTracker = ImplicitTasteTracker()
+    private val workerJob: CompletableJob = SupervisorJob()
+    private val tasteScope = CoroutineScope(workerJob + tasteCallbackDispatcher)
+    private val tasteChanges = Channel<TastePersistenceSnapshot>(Channel.CONFLATED)
+    private val terminalWrites = Channel<TerminalWrite>(TERMINAL_QUEUE_CAPACITY)
+    private val telemetryTasks = Channel<() -> Unit>(256)
 
     private val _uiState = MutableStateFlow(MixMachine.uiStateFor(state, config))
     val uiState: StateFlow<MixUiState> = _uiState.asStateFlow()
@@ -120,6 +193,55 @@ class MixExecutor(
 
     private val _isTransitioning = MutableStateFlow(false)
     val isTransitioningFlow: StateFlow<Boolean> = _isTransitioning.asStateFlow()
+
+    init {
+        tasteScope.launch {
+            for (change in tasteChanges) {
+                runCatching { onTasteStateChangedForEpoch?.invoke(change.epoch, change.weights) }
+                    .onFailure { recordAsyncFailure("taste_epoch_callback", it) }
+                runCatching { onTasteStateChanged?.invoke(change.weights) }
+                    .onFailure { recordAsyncFailure("taste_callback", it) }
+            }
+        }
+        tasteScope.launch {
+            for (task in telemetryTasks) runCatching { task() }.onFailure { recordAsyncFailure("telemetry_callback", it) }
+        }
+        tasteScope.launch {
+            for (write in terminalWrites) {
+                try {
+                    recordTerminal(write)
+                } catch (error: Exception) {
+                    recordAsyncFailure("terminal_history", error)
+                } finally { pendingTerminalWrites.decrementAndGet() }
+            }
+        }
+    }
+
+    private fun recordTerminal(write: TerminalWrite) {
+        if (transitionRecorder == null && store == null) return
+        val record = TerminalTransitionRecord(
+            outId = write.pair.outTrackId, inId = write.pair.inTrackId, planId = write.plan.planId,
+            recipe = write.plan.recipeId, level = write.djLevel.name, path = write.path,
+            timingsJson = "{\"frozenExitMs\":${write.plan.frozenExitMs}," +
+                "\"frozenEntryMs\":${write.plan.frozenEntryMs},\"overlapDurationMs\":${write.plan.overlapDurationMs}," +
+                "\"barDurationMs\":${write.plan.barDurationMs},\"generation\":${write.generation}" +
+                (playerEpoch?.let { ",\"playerEpoch\":$it" } ?: "") + "}",
+            outcome = write.outcome, createdAtMs = write.createdAtMs,
+        )
+        val recordId = transitionRecorder?.invoke(record) ?: store?.recordTransition(
+            outId = record.outId, inId = record.inId, planId = record.planId, recipe = record.recipe,
+            level = record.level, path = record.path, timingsJson = record.timingsJson,
+            outcome = record.outcome, createdAtMs = record.createdAtMs,
+        ) ?: -1L
+        check(recordId > 0L) { "terminal history write failed" }
+        val retained = retainedMixContextProvider()?.takeIf { it.planId == write.plan.planId && it.generation == write.generation }
+        onTransitionRecorded?.invoke(ExplicitRatingIdentity(recordId, write.plan.planId, write.generation, write.plan.recipeId, retained?.genreClass))
+    }
+
+    private fun recordAsyncFailure(operation: String, error: Throwable) {
+        asyncWorkFailures.incrementAndGet()
+        AutomixTelemetry.recordFailure(operation, error)
+    }
 
     /** Current machine state (lock-safe). */
     fun currentState(): MixState = synchronized(lock) { state }
@@ -131,42 +253,188 @@ class MixExecutor(
      * the remaining effects still run.
      */
     fun dispatch(event: MixEvent): Pair<MixState, List<MixEffect>> {
-        synchronized(lock) {
+        val changes = ArrayList<TastePersistenceSnapshot>(1)
+        val terminalRecords = ArrayList<TerminalWrite>(1)
+        val result = synchronized(lock) {
+            if (closed || !callbackAdmission()) {
+                implicitTasteTracker.invalidate()
+                return state to emptyList()
+            }
+            // Admit no new opportunity while the bounded archival lane is saturated.
+            if (event is MixEvent.NextKnown && pendingTerminalWrites.get() >= TERMINAL_QUEUE_CAPACITY) {
+                asyncWorkFailures.incrementAndGet()
+                return state to emptyList()
+            }
             val previous = state
-            val (next, effects) = MixMachine.reduce(previous, event, config)
-            state = next
-            _stateFlow.value = next
+            // A skip names the audible track before reduction/effects can advance the pair.
+            recordPostCompletionSkip(previous, event, changes)
+            val (next, initialEffects) = MixMachine.reduce(previous, event, config)
+            val policyRefusal = policyRefusal(previous, event)
+            val reduced = if (policyRefusal != null && event !is MixEvent.RendererError && next !is MixState.Failed) {
+                val error = MixEvent.RendererError(
+                    code = FailureKind.RENDERER_PREPARE_ERROR,
+                    message = "policy_refused:$policyRefusal",
+                )
+                val (failed, failureEffects) = MixMachine.reduce(next, error, config)
+                failed to failureEffects
+            } else next to initialEffects
+            val finalNext = reduced.first
+            val effects = if (policyRefusal != null && event !is MixEvent.RendererError) reduced.second else initialEffects
+            state = finalNext
+            onGenerationChanged(finalNext.generation)
+            _stateFlow.value = finalNext
             // Recompute rather than trusting only ShowUi payloads: the
             // machine emits ShowUi on most paths but not on every pause/
             // resume/tick path, and uiStateFor is the single source of truth.
-            _uiState.value = MixMachine.uiStateFor(next, config)
-            _isTransitioning.value = next is MixState.Running || next is MixState.HandingOver
+            _uiState.value = MixMachine.uiStateFor(finalNext, config)
+            _isTransitioning.value = finalNext is MixState.Running || finalNext is MixState.HandingOver
 
             checkCountdownHonesty(previous, event, effects)
 
             for (effect in effects) {
-                runCatching { execute(effect) }.onFailure {
-                    AutomixTelemetry.event(
-                        "mix.executor.effect_failed",
-                        mapOf(
-                            "engine" to ENGINE_VERSION,
-                            "eventType" to "mix.executor.effect_failed",
-                            "state" to next.stateKind.name,
-                            "generation" to next.generation,
-                            "planId" to next.plan?.planId,
-                            "effect" to effect::class.simpleName,
-                            "detail" to (it.message ?: it::class.simpleName),
-                        ),
-                    )
+                val failed = runCatching { execute(effect) }.exceptionOrNull()
+                if (failed != null) {
+                    enqueueTelemetry {
+                        AutomixTelemetry.event(
+                            "mix.executor.effect_failed",
+                            mapOf(
+                                "engine" to ENGINE_VERSION,
+                                "eventType" to "mix.executor.effect_failed",
+                                "state" to finalNext.stateKind.name,
+                                "generation" to finalNext.generation,
+                                "planId" to finalNext.plan?.planId,
+                                "effect" to effect::class.simpleName,
+                                "detail" to (failed.message ?: failed::class.simpleName),
+                            ),
+                        )
+                    }
+                    emitAdapterFailure(effect, failed, finalNext)
+                    if (effect is MixEffect.Arm || effect is MixEffect.Start || effect is MixEffect.Handover) {
+                        val failedState = state
+                        if (failedState !is MixState.Done && failedState !is MixState.Failed) {
+                            dispatch(
+                                MixEvent.RendererError(
+                                    code = FailureKind.RENDERER_PREPARE_ERROR,
+                                    message = "adapter_${effect::class.simpleName?.lowercase()}_failed:${failed.message ?: failed::class.simpleName}",
+                                ),
+                            )
+                        }
+                        break
+                    }
                 }
             }
 
             // AE3 M8: recent-event ring for "Flag this mix", implicit taste
             // signals from user events, and terminal records.
-            recordDebugEvent(event, next)
-            recordUserTasteSignals(previous, event, next)
-            recordTerminalIfEntered(previous, next, effects)
-            return next to effects
+            recordDebugEvent(event, state)
+            recordUserTasteSignals(previous, event, state, changes)
+            recordTerminalIfEntered(previous, event, state, effects, changes, terminalRecords)
+            if (policyRefusal != null) emitPolicyRefusal(finalNext, policyRefusal)
+            changes.forEach { tasteChanges.trySend(it) }
+            terminalRecords.forEach {
+                pendingTerminalWrites.incrementAndGet()
+                if (terminalWrites.trySend(it).isFailure) {
+                    pendingTerminalWrites.decrementAndGet()
+                    asyncWorkFailures.incrementAndGet()
+                }
+            }
+            state to effects
+        }
+        return result
+    }
+
+    /** Stops callback work when the epoch owner is disposed. */
+    fun close() {
+        synchronized(lock) {
+            if (closed) return
+            closed = true
+            implicitTasteTracker.invalidate()
+            tasteChanges.close()
+            terminalWrites.close()
+            telemetryTasks.close()
+            // Completing the parent drains admitted work and then releases every epoch worker.
+            workerJob.complete()
+        }
+    }
+
+    /** Nonblocking lifecycle join for tests/control lanes after [close]. */
+    suspend fun awaitClosed() = workerJob.join()
+
+    fun asyncWorkFailureCount(): Long = asyncWorkFailures.get()
+
+    private fun enqueueTelemetry(task: () -> Unit) {
+        if (telemetryTasks.trySend(task).isFailure) asyncWorkFailures.incrementAndGet()
+    }
+
+    /** Confirms earlier telemetry callbacks have drained; intended for tests and control lanes. */
+    fun flushTelemetryAsync(): Deferred<Unit> {
+        val done = CompletableDeferred<Unit>()
+        if (telemetryTasks.trySend { done.complete(Unit) }.isFailure) {
+            done.completeExceptionally(IllegalStateException("executor closed"))
+        }
+        return done
+    }
+
+    private fun policyRefusal(previous: MixState, event: MixEvent): String? {
+        if (event !is MixEvent.PlanFrozen) return null
+        if (previous !is MixState.Preparing && previous !is MixState.Moved) return null
+        if (event.generation != previous.generation || event.plan.generation != previous.generation ||
+            previous.pair?.outTrackId != event.plan.outTrackId || previous.pair?.inTrackId != event.plan.inTrackId
+        ) return null
+        val snapshot = runCatching { flagsProvider().detached() }
+            .getOrElse { FlagsSnapshot(safeMode = true, learningEnabled = false) }
+        val candidate = event.plan
+        val recipe = runCatching { recipeProvider?.invoke(candidate.recipeId) }.getOrNull()
+        val excluded = when (previous) {
+            is MixState.Preparing -> previous.excludedRecipeIds
+            is MixState.Moved -> previous.excludedRecipeIds
+            else -> emptySet()
+        }
+        return when {
+            candidate.recipeId in excluded -> "recipe_excluded:${candidate.recipeId}"
+            recipeProvider != null && recipe == null -> "recipe_unavailable:${candidate.recipeId}"
+            else -> snapshot.executionRefusal(candidate, recipe)
+        }
+    }
+
+    private fun emitPolicyRefusal(state: MixState, refusal: String) {
+        enqueueTelemetry {
+            runCatching {
+                telemetryWriter?.emit(
+                    eventType = TelemetryEventType.MIX_REFUSED,
+                    state = state.stateKind.name,
+                    planId = state.plan?.planId,
+                    generation = state.generation,
+                    outId = state.pair?.outTrackId.orEmpty(),
+                    inId = state.pair?.inTrackId.orEmpty(),
+                    recipeId = state.plan?.recipeId,
+                    reason = RefusalReason.RENDERER_UNAVAILABLE,
+                    detail = "policy_refused:$refusal",
+                )
+            }
+        }
+        enqueueTelemetry {
+            AutomixTelemetry.event("mix.executor.policy_refused", mapOf("reason" to refusal, "planId" to state.plan?.planId, "generation" to state.generation))
+        }
+    }
+
+    private fun emitAdapterFailure(effect: MixEffect, error: Throwable, state: MixState) {
+        val critical = effect is MixEffect.Arm || effect is MixEffect.Start || effect is MixEffect.Handover
+        enqueueTelemetry {
+            runCatching {
+                telemetryWriter?.emit(
+                    eventType = if (critical) TelemetryEventType.MIX_FAILED else TelemetryEventType.MIX_REFUSED,
+                    state = state.stateKind.name,
+                    planId = state.plan?.planId,
+                    generation = state.generation,
+                    outId = state.pair?.outTrackId.orEmpty(),
+                    inId = state.pair?.inTrackId.orEmpty(),
+                    recipeId = state.plan?.recipeId,
+                    path = if (critical) ExecutionPath.CLASSIC_RENDERER_UNAVAILABLE else null,
+                    reason = RefusalReason.RENDERER_UNAVAILABLE,
+                    detail = "effect=${effect::class.simpleName} error=${error.message ?: error::class.simpleName}",
+                )
+            }
         }
     }
 
@@ -217,8 +485,10 @@ class MixExecutor(
                 // (and the 5-minute ring a flag bundle ships) in addition to the
                 // existing AutomixTelemetry logging. Writer failures must never
                 // break effect execution.
-                runCatching { telemetryWriter?.write(effect.telemetry) }
-                logTelemetry(effect.telemetry)
+                enqueueTelemetry {
+                    runCatching { telemetryWriter?.write(effect.telemetry) }
+                    logTelemetry(effect.telemetry)
+                }
             }
         }
     }
@@ -258,18 +528,20 @@ class MixExecutor(
         if (effects.none { it is MixEffect.Start }) return
         val driftMs = abs(event.positionMs - previous.armAtMs)
         if (driftMs <= config.countdownToleranceMs) return
-        AutomixTelemetry.event(
-            "mix.countdown.broken",
-            mapOf(
-                "engine" to ENGINE_VERSION,
-                "eventType" to "mix.countdown.broken",
-                "planId" to previous.plan.planId,
-                "generation" to previous.generation,
-                "state" to previous.stateKind.name,
-                "countdownBroken" to true,
-                "detail" to "positionMs=${event.positionMs} armAtMs=${previous.armAtMs} driftMs=$driftMs toleranceMs=${config.countdownToleranceMs}",
-            ),
-        )
+        enqueueTelemetry {
+            AutomixTelemetry.event(
+                "mix.countdown.broken",
+                mapOf(
+                    "engine" to ENGINE_VERSION,
+                    "eventType" to "mix.countdown.broken",
+                    "planId" to previous.plan.planId,
+                    "generation" to previous.generation,
+                    "state" to previous.stateKind.name,
+                    "countdownBroken" to true,
+                    "detail" to "positionMs=${event.positionMs} armAtMs=${previous.armAtMs} driftMs=$driftMs toleranceMs=${config.countdownToleranceMs}",
+                ),
+            )
+        }
     }
 
     /**
@@ -281,52 +553,62 @@ class MixExecutor(
      * already covered by the `Emit` routing, so the record is never
      * duplicated), and feeds the outcome into [TasteModel].
      */
-    private fun recordTerminalIfEntered(previous: MixState, next: MixState, effects: List<MixEffect>) {
+    private fun recordTerminalIfEntered(
+        previous: MixState,
+        event: MixEvent,
+        next: MixState,
+        effects: List<MixEffect>,
+        changes: MutableList<TastePersistenceSnapshot>,
+        terminalRecords: MutableList<TerminalWrite>,
+    ) {
         val terminal = when (next) {
             is MixState.Done -> "DONE"
             is MixState.Failed -> "FAILED"
-            else -> null
+            else -> if (previous.plan != null && next.plan == null) "CANCELLED" else null
         } ?: return
         if (previous is MixState.Done || previous is MixState.Failed) return
-        lastMixPlan = next.plan
+        val terminalState = if (terminal == "CANCELLED") previous else next
+        val plan = terminalState.plan ?: return
+        val key = "${plan.planId}:${plan.generation}"
+        if (!completedMixes.add(key)) return
+        while (completedMixes.size > TERMINAL_DEDUPE_LIMIT) completedMixes.remove(completedMixes.first())
+        lastMixPlan = plan
+        if (event is MixEvent.HandoverComplete && previous is MixState.HandingOver && next is MixState.Done &&
+            previous.generation == next.generation && previous.plan.planId == next.plan.planId
+        ) {
+            rememberSuccessfulCompletion(next)
+        } else {
+            implicitTasteTracker.invalidate()
+        }
+        onTerminalEntered(plan)
         val alreadyEmitted = effects.any { effect ->
             effect is MixEffect.Emit && (
                 (terminal == "DONE" && effect.telemetry.eventType == TelemetryEventType.MIX_DONE) ||
-                    (terminal == "FAILED" && effect.telemetry.eventType == TelemetryEventType.MIX_FAILED)
+                    (terminal == "FAILED" && effect.telemetry.eventType == TelemetryEventType.MIX_FAILED) ||
+                    (terminal == "CANCELLED" && effect.telemetry.eventType == TelemetryEventType.MIX_REFUSED)
                 )
         }
-        if (!alreadyEmitted) recordTerminalTelemetry(next, terminal)
-        recordMixOutcomeTaste(next)
-        val activeStore = store ?: return
-        val pair = next.pair ?: return
-        val plan = next.plan ?: return
-        val path = when (next) {
-            is MixState.Failed -> "CLASSIC_RENDERER_UNAVAILABLE"
-            else -> if (plan.isLastResort) "LAST_RESORT_MUSICAL_EXIT" else "PREPARER_FROZEN"
+        val pair = terminalState.pair
+        if (!alreadyEmitted) {
+            enqueueTelemetry {
+                recordTerminalTelemetry(terminalState, terminal)
+            }
         }
-        val timingsJson = "{\"frozenExitMs\":${plan.frozenExitMs}," +
-            "\"frozenEntryMs\":${plan.frozenEntryMs}," +
-            "\"overlapDurationMs\":${plan.overlapDurationMs}," +
-            "\"barDurationMs\":${plan.barDurationMs}}"
-        runCatching {
-            activeStore.recordTransition(
-                outId = pair.outTrackId,
-                inId = pair.inTrackId,
-                planId = plan.planId,
-                recipe = plan.recipeId,
-                level = next.djLevel.name,
-                path = path,
-                timingsJson = timingsJson,
-                outcome = terminal,
-                createdAtMs = System.currentTimeMillis(),
-            )
+        if (pair != null) {
+            val path = when (next) {
+                is MixState.Failed -> "CLASSIC_RENDERER_UNAVAILABLE"
+                else -> if (plan.isLastResort) "LAST_RESORT_MUSICAL_EXIT" else "PREPARER_FROZEN"
+            }
+            terminalRecords += TerminalWrite(plan, pair, terminalState.djLevel, plan.generation, terminal, path, clockMs())
         }
+        if (event is MixEvent.HandoverComplete) recordMixOutcomeTaste(next, changes)
     }
 
     // ---- AE3 M8: telemetry / taste / "Flag this mix" helpers ---------------------
 
     /** Effective flag snapshot; code defaults when no flag source is wired. */
-    private fun flagsSnapshot(): FlagsSnapshot = flags?.flags?.value ?: FlagsSnapshot.defaults()
+    private fun flagsSnapshot(): FlagsSnapshot = runCatching { flagsProvider().detached() }
+        .getOrElse { flags?.flags?.value?.detached() ?: FlagsSnapshot(safeMode = true, learningEnabled = false) }
 
     /**
      * Taste-learning gate: honors the [FlagsSnapshot] cleanly — learning only
@@ -337,23 +619,74 @@ class MixExecutor(
     private fun tasteSignalAllowed(recipeId: String?): Boolean {
         if (recipeId.isNullOrBlank() || tasteModel == null) return false
         val snapshot = flagsSnapshot()
-        return snapshot.learningEnabled && snapshot.isRecipeAllowed(recipeId)
+        return snapshot.learningEnabled && runCatching { learningPolicyProvider() }.getOrDefault(false) && snapshot.isRecipeAllowed(recipeId)
     }
 
-    /** Applies one taste signal through the flags gate; a no-op when gated off. */
-    private fun applyTasteSignal(signal: TasteSignal, recipeId: String) {
+    /** Model mutation and detached persistence snapshot share the owner's explicit monitor. */
+    private fun applyTasteSignal(signal: TasteSignal, recipeId: String, genreClass: String? = null, changes: MutableList<TastePersistenceSnapshot>) {
         val model = tasteModel ?: return
-        if (!tasteSignalAllowed(recipeId)) return
-        runCatching { model.applySignal(signal, recipeId) }
+        runCatching {
+            synchronized(model) {
+                if (!tasteSignalAllowed(recipeId)) return@synchronized
+                model.learningEnabled = true
+                model.applySignal(signal, recipeId, genreClass)
+                changes += TastePersistenceSnapshot(tasteEpochProvider(), model.toPreferenceMap())
+            }
+        }
     }
 
     /** A clean DONE is one full playthrough of its recipe (Part B8.1 streak logic). */
-    private fun recordMixOutcomeTaste(next: MixState) {
+    private fun recordMixOutcomeTaste(next: MixState, changes: MutableList<TastePersistenceSnapshot>) {
         val model = tasteModel ?: return
         if (next !is MixState.Done) return
         val recipeId = next.plan?.recipeId ?: return
-        if (!tasteSignalAllowed(recipeId)) return
-        runCatching { model.noteFullPlaythrough(recipeId) }
+        runCatching {
+            synchronized(model) {
+                if (!tasteSignalAllowed(recipeId)) return@synchronized
+                model.learningEnabled = true
+                model.noteFullPlaythrough(recipeId)
+                changes += TastePersistenceSnapshot(tasteEpochProvider(), model.toPreferenceMap())
+            }
+        }
+    }
+
+    /** Only an admitted clean handover establishes a post-completion skip window. */
+    private fun rememberSuccessfulCompletion(next: MixState.Done) {
+        val model = tasteModel
+        val completed = if (model == null) null else runCatching {
+            synchronized(model) {
+                val plan = next.plan
+                if (closed || !callbackAdmission() || !tasteSignalAllowed(plan.recipeId) ||
+                    plan.generation != next.generation || plan.outTrackId != next.pair.outTrackId ||
+                    plan.inTrackId != next.pair.inTrackId
+                ) return@synchronized null
+                ImplicitTasteTracker.CompletedMix(
+                    planId = plan.planId, generation = plan.generation, recipeId = plan.recipeId,
+                    outTrackId = plan.outTrackId, inTrackId = plan.inTrackId,
+                    completedAtMs = monotonicClockMs(), tasteEpoch = tasteEpochProvider(),
+                )
+            }
+        }.getOrNull()
+        implicitTasteTracker.recordCompletion(next.generation, completed)
+    }
+
+    /** Consume before effects; reset validation and model mutation share the model monitor. */
+    private fun recordPostCompletionSkip(previous: MixState, event: MixEvent, changes: MutableList<TastePersistenceSnapshot>) {
+        if (!implicitTasteTracker.hasPendingCompletion) return
+        val model = tasteModel ?: return
+        runCatching {
+            synchronized(model) {
+                val completed = implicitTasteTracker.observe(
+                    state = previous,
+                    nowMs = runCatching { monotonicClockMs() }.getOrNull(),
+                    tasteEpoch = runCatching { tasteEpochProvider() }.getOrNull(),
+                    executorCurrent = !closed && callbackAdmission(),
+                    learningAllowed = ::tasteSignalAllowed,
+                    userSkip = event is MixEvent.UserSkip,
+                ) ?: return@synchronized
+                applyTasteSignal(TasteSignal.EarlySkipWithin15s, completed.recipeId, changes = changes)
+            }
+        }.onFailure { implicitTasteTracker.invalidate() }
     }
 
     /**
@@ -371,7 +704,11 @@ class MixExecutor(
         }
         runCatching {
             writer.emit(
-                eventType = if (terminal == "DONE") TelemetryEventType.MIX_DONE else TelemetryEventType.MIX_FAILED,
+                eventType = when (terminal) {
+                    "DONE" -> TelemetryEventType.MIX_DONE
+                    "CANCELLED" -> TelemetryEventType.MIX_REFUSED
+                    else -> TelemetryEventType.MIX_FAILED
+                },
                 state = next.stateKind.name,
                 planId = plan?.planId,
                 generation = next.generation,
@@ -383,40 +720,41 @@ class MixExecutor(
                 reason = (next as? MixState.Failed)?.reason,
                 detail = when (next) {
                     is MixState.Failed -> next.message.ifBlank { "outcome=failed kind=${next.kind.name}" }
-                    else -> "outcome=done"
+                    else -> "outcome=${terminal.lowercase()}"
                 },
             )
         }
     }
 
     /**
-     * Implicit taste signals from user-initiated events during a transition:
-     * a skip inside [EARLY_SKIP_WINDOW_MS] of the mix starting is one
-     * [TasteSignal.EarlySkipWithin15s]; a backwards seek while the blend runs
-     * is one [TasteSignal.SeekBackDuringMix].
+     * A backwards seek while the blend runs is one [TasteSignal.SeekBackDuringMix].
+     * Post-completion skips are handled separately before effects advance the pair.
      */
-    private fun recordUserTasteSignals(previous: MixState, event: MixEvent, next: MixState) {
+    private fun recordUserTasteSignals(
+        previous: MixState,
+        event: MixEvent,
+        next: MixState,
+        changes: MutableList<TastePersistenceSnapshot>,
+    ) {
         if (tasteModel == null) return
         val inTransition = previous is MixState.Running || previous is MixState.HandingOver ||
             next is MixState.Running || next is MixState.HandingOver
-        if (!inTransition) return
-        val recipeId = (previous.plan ?: next.plan)?.recipeId ?: return
+        val signalPlan = previous.plan ?: next.plan
+        val recipeId = signalPlan?.recipeId ?: lastMixPlan?.recipeId ?: return
         when (event) {
-            is MixEvent.UserSkip -> run {
-                // startedAtMs/lastPositionMs are outgoing-deck positions, so
-                // their difference is real elapsed mix time at the skip.
-                val running = (previous as? MixState.Running) ?: (next as? MixState.Running) ?: return@run
-                val elapsedMixMs = running.lastPositionMs - running.startedAtMs
-                if (elapsedMixMs in 0..EARLY_SKIP_WINDOW_MS) {
-                    applyTasteSignal(TasteSignal.EarlySkipWithin15s, recipeId)
-                }
-            }
             is MixEvent.UserSeek -> run {
-                val positionMs = (previous as? MixState.Running)?.lastPositionMs
-                    ?: (next as? MixState.Running)?.lastPositionMs
-                    ?: return@run
+                if (!inTransition) return@run
+                val positionMs = when (val active = previous) {
+                    is MixState.Running -> active.lastPositionMs
+                    is MixState.HandingOver -> active.lastPositionMs
+                    else -> when (val updated = next) {
+                        is MixState.Running -> updated.lastPositionMs
+                        is MixState.HandingOver -> updated.lastPositionMs
+                        else -> return@run
+                    }
+                }
                 if (event.toMs < positionMs) {
-                    applyTasteSignal(TasteSignal.SeekBackDuringMix, recipeId)
+                    applyTasteSignal(TasteSignal.SeekBackDuringMix, recipeId, changes = changes)
                 }
             }
             else -> Unit
@@ -426,19 +764,23 @@ class MixExecutor(
     /** One JSONL app-event line into the bounded ring (ticks excluded as noise). */
     private fun recordDebugEvent(event: MixEvent, next: MixState) {
         if (event is MixEvent.Tick) return
-        runCatching {
-            recentEvents.addLast(
-                JSONObject()
-                    .put("ts", System.currentTimeMillis())
-                    .put("event", event.eventKind.name)
-                    .put("state", next.stateKind.name)
-                    .put("generation", next.generation)
-                    .put("planId", next.plan?.planId)
-                    .put("outId", next.pair?.outTrackId)
-                    .put("inId", next.pair?.inTrackId)
-                    .toString(),
-            )
-            while (recentEvents.size > RECENT_EVENT_LIMIT) recentEvents.removeFirst()
+        enqueueTelemetry {
+            val line = runCatching {
+                buildJsonObject {
+                    put("ts", clockMs())
+                    put("event", event.eventKind.name)
+                    put("state", next.stateKind.name)
+                    put("generation", next.generation)
+                    put("planId", next.plan?.planId)
+                    put("outId", next.pair?.outTrackId)
+                    put("inId", next.pair?.inTrackId)
+                }.toString()
+            }.getOrNull() ?: return@enqueueTelemetry
+            synchronized(lock) {
+                recentEvents.addLast(line)
+                while (recentEvents.size > RECENT_EVENT_LIMIT) recentEvents.removeFirst()
+            }
+            next.plan?.let { onDebugEvent(it.planId, next.generation, line) }
         }
     }
 
@@ -460,7 +802,9 @@ class MixExecutor(
     ): File? {
         val bundler = diagnosticsBundler ?: return null
         // Snapshot under the lock; the zip I/O below runs outside it.
+        val retained = runCatching { retainedMixContextProvider()?.detached() }.getOrNull()
         val (plan, events) = synchronized(lock) {
+            if (retained != null) return@synchronized retained.transitionPlanV1 to (recentEvents.toList() + retained.recentEvents)
             val currentPlan = state.plan ?: lastMixPlan ?: return null
             currentPlan to recentEvents.toList()
         }
@@ -468,12 +812,19 @@ class MixExecutor(
         return runCatching {
             bundler.bundle(
                 plan = plan,
-                script = script,
+                script = script ?: retained?.transitionScript,
                 events5min = events,
-                telemetry5min = telemetry,
-                outAnalysis = outAnalysis,
-                inAnalysis = inAnalysis,
-                audioCapture = audioCapture,
+                telemetry5min = telemetry + retained?.telemetryLines.orEmpty(),
+                outAnalysis = outAnalysis ?: retained?.analysisA,
+                inAnalysis = inAnalysis ?: retained?.analysisB,
+                audioCapture = audioCapture ?: retained?.audioCaptureRef,
+                frozenRecipe = retained?.frozenRecipe,
+                renderGeometry = retained?.renderGeometry,
+                flagsSnapshot = retained?.flagsSnapshot ?: flagsSnapshot(),
+                tasteSnapshot = retained?.tasteSnapshot ?: tasteModel?.let { synchronized(it) { it.snapshot() } },
+                assetSha256 = retained?.assetSha256.orEmpty(),
+                modelSha256 = retained?.modelSha256.orEmpty(),
+                retainedContext = retained,
             )
         }.onFailure {
             AutomixTelemetry.event(
@@ -488,6 +839,9 @@ class MixExecutor(
         }.getOrNull()
     }
 
+    /** Flag action variant that moves zip creation/compression completely off the caller lane. */
+    suspend fun flagCurrentOrLastMixAsync(): File? = withContext(Dispatchers.IO) { flagCurrentOrLastMix() }
+
     /**
      * Records an explicit Inspector thumbs-[thumbsUp] rating (Part B8.1) for
      * [recipeId], or the current / last mix's recipe when null, into the
@@ -495,20 +849,47 @@ class MixExecutor(
      * disallows learning for the recipe.
      */
     fun recordUserTasteOverride(thumbsUp: Boolean, recipeId: String? = null) {
-        val id = recipeId
-            ?: synchronized(lock) { state.plan?.recipeId ?: lastMixPlan?.recipeId }
-            ?: return
-        applyTasteSignal(
-            if (thumbsUp) TasteSignal.ExplicitThumbsUp else TasteSignal.ExplicitThumbsDown,
-            id,
-        )
+        val changes = ArrayList<TastePersistenceSnapshot>(1)
+        synchronized(lock) {
+            if (closed || !callbackAdmission()) return
+            val id = recipeId ?: state.plan?.recipeId ?: lastMixPlan?.recipeId ?: return
+            applyTasteSignal(if (thumbsUp) TasteSignal.ExplicitThumbsUp else TasteSignal.ExplicitThumbsDown, id, changes = changes)
+            changes.forEach { tasteChanges.trySend(it) }
+        }
+    }
+
+    /** Applies feedback only when the visible UI still names this exact frozen generation. */
+    fun recordUserTasteOverride(identity: ExplicitRatingIdentity, thumbsUp: Boolean): Boolean {
+        val changes = ArrayList<TastePersistenceSnapshot>(1)
+        val accepted = synchronized(lock) {
+            if (closed || !callbackAdmission()) return false
+            val plan = state.plan ?: lastMixPlan ?: return false
+            if (identity.planId != plan.planId || identity.generation != plan.generation || identity.recipeId != plan.recipeId) return false
+            applyTasteSignal(
+                if (thumbsUp) TasteSignal.ExplicitThumbsUp else TasteSignal.ExplicitThumbsDown,
+                identity.recipeId, identity.genreClass, changes,
+            )
+            changes.forEach { tasteChanges.trySend(it) }
+            true
+        }
+        return accepted && changes.isNotEmpty()
     }
 
     private companion object {
-        /** A skip within this much of the mix starting counts as [TasteSignal.EarlySkipWithin15s]. */
-        const val EARLY_SKIP_WINDOW_MS = 15_000L
-
         /** Bound on the in-memory app-event ring handed to a diagnostics bundle. */
         const val RECENT_EVENT_LIMIT = 256
+        const val TERMINAL_DEDUPE_LIMIT = 512
+        const val TERMINAL_QUEUE_CAPACITY = 64
     }
+
+    private data class TastePersistenceSnapshot(val epoch: Long, val weights: Map<String, Double>)
+    private data class TerminalWrite(
+        val plan: TransitionPlanV1,
+        val pair: PairKey,
+        val djLevel: DjLevel,
+        val generation: Long,
+        val outcome: String,
+        val path: String,
+        val createdAtMs: Long,
+    )
 }

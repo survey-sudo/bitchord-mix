@@ -41,6 +41,8 @@ void PitchStretch::configure(int channels, int sampleRate) {
   s->stretch.setTransposeFactor(1.f / s->tempo);
 }
 
+int PitchStretch::configuredChannels() const { return state_->channels; }
+
 void PitchStretch::setTempo(float tempo) {
   // A ratio past a small nudge is not a beatmatch. 100x, a BPM, or NaN
   // all land on 1. Anything still inside half-speed..double-speed is pulled

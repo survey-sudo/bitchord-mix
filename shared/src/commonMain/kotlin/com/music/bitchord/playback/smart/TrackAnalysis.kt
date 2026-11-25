@@ -141,6 +141,13 @@ data class TrackAnalysis(
      * when measured. Empty when Syvenu did not run.
      */
     val vocalPresence50fps: List<Float> = emptyList(),
+    /**
+     * Provenance frozen with this exact analysis instance, when one was
+     * captured or restored. Null means unknown/legacy: never infer it from
+     * current model constants. Declared constants here are not measured
+     * runtime identity; see [TrackAnalysisProvenance].
+     */
+    val provenance: TrackAnalysisProvenance? = null,
 ) {
     /**
      * Whether this analysis actually describes a track, as opposed to standing

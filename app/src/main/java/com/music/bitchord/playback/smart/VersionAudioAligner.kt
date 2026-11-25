@@ -159,7 +159,7 @@ object VersionAudioAligner {
             // swap then goes out with no shift even though the offset was
             // computed. The field log caught exactly that race, with the
             // correlation succeeding 10 ms over a tighter budget.
-            var decodes: Pair<Pair<AudioDecoder.Pcm, Double>?, Pair<AudioDecoder.Pcm, Double>?> =
+            var decodes: Pair<Pair<Pcm, Double>?, Pair<Pcm, Double>?> =
                 null to null
             val decodeMs = measureTimeMillis {
                 decodes = coroutineScope {

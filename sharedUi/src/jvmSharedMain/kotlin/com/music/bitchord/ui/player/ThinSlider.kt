@@ -17,6 +17,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -42,6 +43,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.music.bitchord.data.settings.MixBlend
@@ -49,6 +56,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.roundToInt
 
 /**
  * Apple Music's scrubber: a hairline capsule with no thumb knob, which
@@ -105,15 +113,22 @@ fun ThinSlider(
      */
     vibrant: Boolean = false,
 ) {
+    val reducedMotion = rememberAutomixReducedMotion()
     var dragging by remember { mutableStateOf(false) }
-    val height by animateDpAsState(
-        targetValue = if (dragging) activeHeight else idleHeight,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMediumLow,
-        ),
-        label = "sliderHeight",
-    )
+    val targetHeight = if (dragging) activeHeight else idleHeight
+    val height = if (reducedMotion) {
+        targetHeight
+    } else {
+        val animatedHeight by animateDpAsState(
+            targetValue = targetHeight,
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMediumLow,
+            ),
+            label = "sliderHeight",
+        )
+        animatedHeight
+    }
     // The sheen gets a minimum beat even when the switch resolves instantly —
     // a cached offset can land in a few hundred milliseconds — so its entry,
     // its sweep and its hand-over to the progress bar always play out as one
@@ -122,8 +137,10 @@ fun ThinSlider(
     // so rapid toggling never blinks the bar out mid-morph.
     var shownLoading by remember { mutableStateOf(loading) }
     var sheenStart by remember { mutableStateOf(System.nanoTime()) }
-    LaunchedEffect(loading) {
-        if (loading) {
+    LaunchedEffect(loading, reducedMotion) {
+        if (reducedMotion) {
+            shownLoading = loading
+        } else if (loading) {
             sheenStart = System.nanoTime()
             shownLoading = true
         } else {
@@ -135,29 +152,68 @@ fun ThinSlider(
     // Both operations let the sheen claim the bar. A version switch is latched for a minimum
     // beat; a version swap's crossfade follows the audio engine and fades when it finishes.
     // An Automix blend has its own treatment — the beat pulse — and keeps the fill.
-    val sheenVisible = shownLoading || (mixing && mixPulse?.active != true)
+    val sheenVisible = (if (reducedMotion) loading else shownLoading) || (mixing && mixPulse?.active != true)
     // The window fades in when it is first known and out when it goes, and
     // the last one is kept drawn for the fade-out rather than vanishing.
     var shownWindow by remember { mutableStateOf(transitionWindow) }
     LaunchedEffect(transitionWindow) {
         if (transitionWindow != null) shownWindow = transitionWindow
     }
-    val windowAlpha by animateFloatAsState(
-        targetValue = if (transitionWindow != null) 1f else 0f,
-        animationSpec = tween(durationMillis = WINDOW_FADE_MS, easing = FastOutSlowInEasing),
-        label = "transitionWindowAlpha",
-    )
-    val fillFactor by animateFloatAsState(
-        targetValue = if (sheenVisible) 0f else 1f,
-        animationSpec = tween(durationMillis = MORPH_MS, easing = FastOutSlowInEasing),
-        label = "fillFactor",
-    )
+    val targetWindowAlpha = if (transitionWindow != null) 1f else 0f
+    val windowAlpha = if (reducedMotion) {
+        targetWindowAlpha
+    } else {
+        val animatedAlpha by animateFloatAsState(
+            targetValue = targetWindowAlpha,
+            animationSpec = tween(durationMillis = WINDOW_FADE_MS, easing = FastOutSlowInEasing),
+            label = "transitionWindowAlpha",
+        )
+        animatedAlpha
+    }
+    val targetFillFactor = if (sheenVisible) 0f else 1f
+    val fillFactor = if (reducedMotion) {
+        targetFillFactor
+    } else {
+        val animatedFactor by animateFloatAsState(
+            targetValue = targetFillFactor,
+            animationSpec = tween(durationMillis = MORPH_MS, easing = FastOutSlowInEasing),
+            label = "fillFactor",
+        )
+        animatedFactor
+    }
+    val fraction = value.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    val morphDuration = if (reducedMotion) 0 else MORPH_MS
 
     Box(
         modifier = modifier
             .fillMaxWidth()
             // Generous invisible touch target — the visible bar is only ~7dp.
             .height(activeHeight + 22.dp)
+            .semantics {
+                if (mixPulse != null) contentDescription = "Playback position"
+                progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+                stateDescription = buildString {
+                    append("${(fraction * 100f).roundToInt()} percent")
+                    if (loading) append(". Loading")
+                    if (mixing || mixPulse?.active == true) append(". Mixing")
+                    transitionWindow?.let { window ->
+                        if (window.start.isFinite() && window.endInclusive.isFinite()) {
+                            val start = (window.start.coerceIn(0f, 1f) * 100f).roundToInt()
+                            val end = (window.endInclusive.coerceIn(0f, 1f) * 100f).roundToInt()
+                            append(". Planned mix from $start to $end percent")
+                        }
+                    }
+                }
+                setProgress { target ->
+                    if (!target.isFinite()) return@setProgress false
+                    val next = target.coerceIn(0f, 1f)
+                    if (next == fraction) return@setProgress false
+                    onValueChange(next)
+                    onValueChangeFinished?.invoke()
+                    true
+                }
+            }
+            .focusable()
             // One gesture loop for both taps and drags. Two separate detectors
             // — a drag one plus a tap one — meant taps never landed: the drag
             // detector took the pointer and a tap has no drag to report.
@@ -268,16 +324,20 @@ fun ThinSlider(
             // capsule is full-bleed, so that slide started past the screen
             // edge and flew in from outside the display. Same duration and
             // curve as the fill's retraction, so the swap reads as one morph.
-            enter = fadeIn(tween(durationMillis = MORPH_MS, easing = FastOutSlowInEasing)) +
+            enter = fadeIn(tween(durationMillis = morphDuration, easing = FastOutSlowInEasing)) +
                 scaleIn(
-                    animationSpec = tween(durationMillis = MORPH_MS, easing = FastOutSlowInEasing),
+                    animationSpec = tween(durationMillis = morphDuration, easing = FastOutSlowInEasing),
                     initialScale = 0f,
                     transformOrigin = TransformOrigin(0f, 0.5f),
                 ),
-            exit = fadeOut(tween(durationMillis = MORPH_MS, easing = FastOutSlowInEasing)),
+            exit = fadeOut(tween(durationMillis = morphDuration, easing = FastOutSlowInEasing)),
         ) {
             // Outside the dodge, so in plain white rather than its grey ink.
-            MixSheen(height = height, color = if (vibrant) Color.White.copy(alpha = 0.92f) else activeColor)
+            MixSheen(
+                height = height,
+                color = if (vibrant) Color.White.copy(alpha = 0.92f) else activeColor,
+                reducedMotion = reducedMotion,
+            )
         }
     }
 }
@@ -352,6 +412,12 @@ fun rememberMixPulse(mixBlend: () -> MixBlend?, enabled: Boolean): MixPulse {
     val active = pulse.active
     val playing = pulse.playing
     LaunchedEffect(active, playing, enabled) {
+        if (!enabled) {
+            pulse.coverAnim.snapTo(if (active) 1f else 0f)
+            pulse.depthAnim.snapTo(0f)
+            pulse.locked = false
+            return@LaunchedEffect
+        }
         launch {
             pulse.coverAnim.animateTo(
                 if (active) 1f else 0f,
@@ -366,7 +432,6 @@ fun rememberMixPulse(mixBlend: () -> MixBlend?, enabled: Boolean): MixPulse {
                 tween(durationMillis = PULSE_FADE_MS, easing = FastOutSlowInEasing),
             )
         }
-        if (!enabled) return@LaunchedEffect
         // The pulse's own beat clock. The blend publishes a beat anchor every fade tick, and
         // each one is re-derived from player positions that wobble by a few tens of ms — drawn
         // straight, that wobble is the pulse lurching. So this runs a free phase at the blend's
@@ -457,20 +522,24 @@ private const val LOADING_MIN_MS = 600L
  * at each edge rather than restarting from the far one.
  */
 @Composable
-private fun MixSheen(height: Dp, color: Color) {
-    val transition = rememberInfiniteTransition(label = "mixSheen")
-    val phase by transition.animateFloat(
-        initialValue = -SHEEN_BAND_FRACTION,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1000, easing = LinearEasing),
-            // Reverses rather than restarting: a restart teleports the band
-            // back to the far edge every second, which is a hitch the eye
-            // catches each time. Ping-pong has no edge to fall off.
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "mixSheenPhase",
-    )
+private fun MixSheen(height: Dp, color: Color, reducedMotion: Boolean) {
+    val phase = if (reducedMotion) {
+        // Keep loading/mixing feedback visible with a stationary highlight.
+        (1f - SHEEN_BAND_FRACTION) / 2f
+    } else {
+        val transition = rememberInfiniteTransition(label = "mixSheen")
+        val animatedPhase by transition.animateFloat(
+            initialValue = -SHEEN_BAND_FRACTION,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1000, easing = LinearEasing),
+                // Reverse at each edge so the highlight never jumps back.
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "mixSheenPhase",
+        )
+        animatedPhase
+    }
     Canvas(
         Modifier
             .fillMaxWidth()

@@ -42,6 +42,7 @@ internal interface StemWindowHost {
     val stemExecutor: ExecutorService
     val stemLock: Any
     fun isAborted(gen: Long): Boolean
+    fun awaitPrepThermalBudget(gen: Long): Boolean = true
     fun nowMs(): Long
     fun positionSec(): Double
     fun songMapFor(trackId: String, analysis: TrackAnalysis): SongMap?
@@ -50,7 +51,12 @@ internal interface StemWindowHost {
     fun capabilities(): Int
     fun recentRecipeIdsSnapshot(): List<String>
     fun currentTransitionsSinceLastAbrupt(): Int
-    fun tasteWeights(): Map<String, Double>
+    fun tasteWeights(
+        outTrackId: String,
+        outAnalysis: TrackAnalysis,
+        inTrackId: String,
+        inAnalysis: TrackAnalysis,
+    ): Map<String, Double> = emptyMap()
     fun selectPlan(input: PlanInput): SelectedPlan?
     fun resolveTransitionPlanV1(
         selected: SelectedPlan,
@@ -91,6 +97,7 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
         reuseFrom: PreparedPair?,
     ) {
         fun isAborted(): Boolean = host.isAborted(gen)
+        if (!host.awaitPrepThermalBudget(gen)) return
 
         val outMap = if (rawOut.isUsable) host.songMapFor(request.outTrack.id, rawOut) else null
         val inMap = if (rawIn.isUsable) host.songMapFor(request.inTrack.id, rawIn) else null
@@ -131,8 +138,9 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
             transitionsSinceLastAbrupt = host.currentTransitionsSinceLastAbrupt(),
             minExitMs = request.minExitMs,
             preferNoStemVariant = request.preferNoStemVariant,
-            tasteWeights = host.tasteWeights(),
+            tasteWeights = host.tasteWeights(request.outTrack.id, outA, request.inTrack.id, inA).toMap(),
             machineGeneration = gen,
+            excludedRecipeIds = request.excludedRecipeIds,
         )
         val selected = host.selectPlan(input)
         val planMs = (host.nowMs() - planStartMs).coerceAtLeast(0L)
@@ -229,6 +237,9 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
             analysisSignature = sig,
             straightRateMode = selected.straightRateMode,
             transitionPlanV1 = planV1,
+            frozenRecipe = selected.frozenRecipe,
+            frozenOutAnalysisV3 = selected.plannerOutAnalysis,
+            frozenInAnalysisV3 = selected.plannerInAnalysis,
             useNoStemVariant = request.preferNoStemVariant,
         )
         host.publishIfCurrent(gen) { plannedPair }
@@ -251,12 +262,18 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
             it.outId == request.outTrack.id && it.inId == request.inTrack.id && it.sampleRate == request.sampleRate
         }
         val outRegion = sliceLoopRegion(reusableSamePair?.outRegion, request.sampleRate, outBounds.first, outBounds.second)
-            ?: host.decodeRegion(request.outTrack, outBounds.first, outBounds.second, request.sampleRate)
+            ?: run {
+                if (!host.awaitPrepThermalBudget(gen)) return
+                host.decodeRegion(request.outTrack, outBounds.first, outBounds.second, request.sampleRate)
+            }
         if (isAborted()) return
         host.publishIfCurrent(gen) { it.copy(outRegion = outRegion) }
 
         val inRegion = sliceLoopRegion(reusableSamePair?.inRegion, request.sampleRate, inBounds.first, inBounds.second)
-            ?: host.decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
+            ?: run {
+                if (!host.awaitPrepThermalBudget(gen)) return
+                host.decodeRegion(request.inTrack, inBounds.first, inBounds.second, request.sampleRate)
+            }
         if (isAborted()) return
 
         val coverageReason = if (effectivePlan == null) {
@@ -423,6 +440,7 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
                 var stemMsIn = 0L
 
                 if (needSepOut && outRegion != null && outStemInput != null) {
+                    if (!host.awaitPrepThermalBudget(gen)) return@execute
                     val t0 = host.nowMs()
                     val rawOutStems = synchronized(host.stemLock) {
                         if (isAborted()) null
@@ -443,6 +461,7 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
                 if (isAborted()) return@execute
 
                 if (needSepIn && inRegion != null && inStemInput != null) {
+                    if (!host.awaitPrepThermalBudget(gen)) return@execute
                     val t0 = host.nowMs()
                     val rawInStems = synchronized(host.stemLock) {
                         if (isAborted()) null
@@ -549,28 +568,40 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
             outId = request.outTrack.id,
             inId = request.inTrack.id,
             albumOrder = request.albumOrder,
-            preferredScript = selected.previewScript.takeIf {
+            preferredScript = if (planV1 != null) selected.previewScript else selected.previewScript.takeIf {
                 request.preferNoStemVariant || (outStems == null && inStems == null)
             },
+            frozenRecipeOnly = planV1 != null,
+            frozenRecipeId = planV1?.recipeId,
         )
         if (host.isAborted(gen)) return
 
-        if (script == null) {
+        val canonicalRecipe = selected.frozenRecipe?.takeIf { it.id == planV1?.recipeId }
+        if ((planV1 != null && canonicalRecipe == null) || (planV1 == null && script == null)) {
             host.publishIfCurrent(gen) {
                 it.copy(
                     state = PrepState.IDLE,
                     outRegion = outRegion,
                     inRegion = inRegion,
                     lastRefusalReason = RefusalReason.CHOREOGRAPHY_UNAVAILABLE,
-                    timings = it.timings.copy(fallbackReason = "same-level-choreography-unavailable"),
+                    timings = it.timings.copy(fallbackReason = if (planV1 != null) {
+                        "canonical_frozen_recipe_missing_or_mismatched"
+                    } else "same-level-choreography-unavailable"),
                 )
             }
             return
         }
 
-        val usedOutStems = if (script.outUsesStems) outStems else null
-        val usedInStems = if (script.inUsesStems) inStems else null
-        val usedNoStemVariant = request.preferNoStemVariant || (!script.outUsesStems && !script.inUsesStems && stemsRequired > 0)
+        val usedNoStemVariant = if (planV1 != null) {
+            request.preferNoStemVariant || stemsCompleted < stemsRequired ||
+                (planV1.requiredStems.isEmpty() && canonicalRecipe!!.requirements.requiredStems.isNotEmpty())
+        } else request.preferNoStemVariant || (script?.outUsesStems != true && script?.inUsesStems != true && stemsRequired > 0)
+        val usedOutStems = if (planV1 != null) {
+            outStems.takeIf { !usedNoStemVariant && planV1.requiredStems.any { it.deck == CoreDeckTarget.OUT } }
+        } else outStems.takeIf { script?.outUsesStems == true }
+        val usedInStems = if (planV1 != null) {
+            inStems.takeIf { !usedNoStemVariant && planV1.requiredStems.any { it.deck == CoreDeckTarget.IN } }
+        } else inStems.takeIf { script?.inUsesStems == true }
         val stemsCount = maxOf(usedOutStems?.stemCount ?: 0, usedInStems?.stemCount ?: 0)
         val leadSec = (windowStartSec - host.positionSec()).coerceAtLeast(0.0)
         val readyAtMs = host.nowMs()
@@ -598,8 +629,8 @@ internal class StemWindowPlanner(private val host: StemWindowHost) {
                     preparedLeadSec = leadSec,
                     path = selected.pathHint,
                     level = request.djLevel.name,
-                    move = script.move.name,
-                    fxCount = script.fxCount,
+                    move = canonicalRecipe?.family?.name ?: script?.move?.name.orEmpty(),
+                    fxCount = if (planV1 != null) 0 else script?.fxCount ?: 0,
                     stems = stemsCount,
                     fallbackReason = selected.fallbackReason,
                 ),

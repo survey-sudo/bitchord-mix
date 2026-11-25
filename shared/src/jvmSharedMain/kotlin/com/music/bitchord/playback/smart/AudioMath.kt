@@ -1,6 +1,5 @@
 package com.music.bitchord.playback.smart
 
-import androidx.media3.common.util.UnstableApi
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.min
@@ -11,8 +10,7 @@ import kotlin.math.sqrt
  * [seconds] is what was actually decoded, which for a partially cached file
  * may be less than requested.
  */
-@UnstableApi
-internal class AnalysisRegion(
+class AnalysisRegion(
     val grid: BeatTracker.Grid?,
     val seconds: Double,
     val features: TrackFeatures.Features? = null,
@@ -23,14 +21,14 @@ internal class AnalysisRegion(
 )
 
 /** One beat list across windows: reconciled cleanly across overlapping boundaries. */
-internal class SeamedBeats(
+class SeamedBeats(
     val beats: List<Double>,
     val downbeats: List<Double>,
     val confidence: Double,
 )
 
 /** A window's 22.05 kHz model audio, flux onsets, level curve, and optional DSP features. */
-internal class MonoInputs(
+class MonoInputs(
     val forModel: FloatArray?,
     val derived: TrackFeatures.Features?,
     val onsets: List<Double>,
@@ -41,14 +39,13 @@ internal class MonoInputs(
  * Window partitioning, beat-seam reconciliation, onset snapping, and mono PCM feature
  * extraction helpers extracted from [TrackAnalyzer] (M9 slice T-4).
  */
-@UnstableApi
-internal object AudioMath {
+object AudioMath {
 
     /** Overlap between neighbouring fallback windows, so a beat on a seam is seen from both sides. */
-    internal const val WINDOW_OVERLAP_SECONDS = 1.0
+    const val WINDOW_OVERLAP_SECONDS = 1.0
 
     /** Fallback window partitioning for tracks exceeding the whole-model length cap. */
-    internal fun modelWindows(headEnd: Double, tailStart: Double, duration: Double, span: Double): List<Pair<Double, Double>> {
+    fun modelWindows(headEnd: Double, tailStart: Double, duration: Double, span: Double): List<Pair<Double, Double>> {
         val spans = if (tailStart <= headEnd) {
             listOf(0.0 to duration)
         } else {
@@ -73,7 +70,7 @@ internal object AudioMath {
     }
 
     /** Reconciles beat and downbeat lists across overlapping fallback analysis windows. */
-    internal fun seamBeats(regions: List<AnalysisRegion>): SeamedBeats {
+    fun seamBeats(regions: List<AnalysisRegion>): SeamedBeats {
         val graded = regions.filter { it.grid != null }.sortedBy { it.start }
         if (graded.isEmpty()) return SeamedBeats(emptyList(), emptyList(), 0.0)
         var weighted = 0.0
@@ -93,7 +90,7 @@ internal object AudioMath {
     }
 
     /** The model's grid over [from]..[to], or null where it found too few beats there. */
-    internal fun beatSide(all: SeamedBeats, from: Double, to: Double): BeatSide? {
+    fun beatSide(all: SeamedBeats, from: Double, to: Double): BeatSide? {
         val beats = all.beats.filter { it >= from && it <= to }
         val bpm = BeatTracker.tempoFromBeats(beats)
         if (bpm <= 0) return null
@@ -106,7 +103,7 @@ internal object AudioMath {
     }
 
     /** Converts a [BeatSide] back to a single [BeatTracker.Grid]. */
-    internal fun BeatSide.toGrid(): BeatTracker.Grid = BeatTracker.Grid(
+    fun BeatSide.toGrid(): BeatTracker.Grid = BeatTracker.Grid(
         beats = beats,
         downbeats = downbeats,
         bpm = bpm,
@@ -119,7 +116,7 @@ internal object AudioMath {
      * Pulls the model's beats onto spectral-flux onsets, at most 35 ms, and
      * lowers confidence when the onsets are there but do not lock to the grid.
      */
-    internal fun snapGrid(grid: BeatTracker.Grid, onsets: List<Double>): BeatTracker.Grid {
+    fun snapGrid(grid: BeatTracker.Grid, onsets: List<Double>): BeatTracker.Grid {
         if (onsets.size < 8) return grid
         val beats = GridRepair.snapToOnsets(grid.beats, onsets)
         val downs = GridRepair.snapToOnsets(grid.downbeats, onsets)
@@ -142,7 +139,7 @@ internal object AudioMath {
     }
 
     /** Fraction of [beats] with an onset within 70 ms. Sparse flux does not get to reject a grid. */
-    internal fun onsetCoverage(beats: List<Double>, onsets: List<Double>): Double {
+    fun onsetCoverage(beats: List<Double>, onsets: List<Double>): Double {
         if (beats.isEmpty() || onsets.isEmpty()) return 0.0
         var hits = 0
         for (beat in beats) {
@@ -152,7 +149,7 @@ internal object AudioMath {
     }
 
     /** Nearest timestamp in sorted [onsets] to [beat], or null when [onsets] is empty. */
-    internal fun nearestOnset(onsets: List<Double>, beat: Double): Double? {
+    fun nearestOnset(onsets: List<Double>, beat: Double): Double? {
         if (onsets.isEmpty()) return null
         var low = 0
         var high = onsets.size - 1
@@ -166,7 +163,7 @@ internal object AudioMath {
     }
 
     /** Half-wave spectral flux onsets over mono PCM. Times are track seconds. */
-    internal fun fluxOnsets(pcm: AudioDecoder.Pcm, start: Double): List<Double> {
+    fun fluxOnsets(pcm: Pcm, start: Double): List<Double> {
         val rate = pcm.sampleRate
         if (rate <= 0.0 || pcm.samples.isEmpty()) return emptyList()
         val hop = (rate / 200.0).toInt().coerceAtLeast(1)
@@ -209,7 +206,7 @@ internal object AudioMath {
     }
 
     /** RMS level over mono PCM in frames of 1 / [LEVEL_FRAME_RATE] s, on the [levelFromRms] scale. */
-    internal fun levelCurve(pcm: AudioDecoder.Pcm, actualStart: Double): CurveWindow? {
+    fun levelCurve(pcm: Pcm, actualStart: Double): CurveWindow? {
         val frame = (pcm.sampleRate / LEVEL_FRAME_RATE).toInt()
         if (frame <= 0) return null
         val count = pcm.samples.size / frame
@@ -232,8 +229,8 @@ internal object AudioMath {
     }
 
     /** Resamples and derives level, onset, and scalar feature inputs for one decoded mono window. */
-    internal fun monoWindowInputs(
-        pcm: AudioDecoder.Pcm,
+    fun monoWindowInputs(
+        pcm: Pcm,
         actualStart: Double,
         seconds: Double,
         deriveFeatures: Boolean,

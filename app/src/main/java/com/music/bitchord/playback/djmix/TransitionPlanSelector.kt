@@ -6,36 +6,21 @@ import com.music.bitchord.djmix.core.contracts.MixOutcome
 import com.music.bitchord.djmix.core.contracts.RefusalReason
 import com.music.bitchord.djmix.core.contracts.TimeRangeMs
 import com.music.bitchord.djmix.core.contracts.TrackAnalysisV3
-import com.music.bitchord.djmix.core.contracts.TransitionGeometry
 import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
 import com.music.bitchord.djmix.core.planner.PairPlanner
 import com.music.bitchord.djmix.core.planner.PlannerRequest
+import com.music.bitchord.djmix.core.contracts.RecipeV2
 import com.music.bitchord.playback.djmix.store.TrackAnalysisV3Mapper
-import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.LyricCue
-import com.music.bitchord.playback.smart.PhraseConfig
 import com.music.bitchord.playback.smart.PhraseMaps
-import com.music.bitchord.playback.smart.PhrasePlanner
 import com.music.bitchord.playback.smart.PhraseScript
 import com.music.bitchord.playback.smart.SongMap
 import com.music.bitchord.playback.smart.TrackAnalysis
-import com.music.bitchord.playback.smart.TransitionMoves
-import com.music.bitchord.playback.smart.alignTempoOctave
-import com.music.bitchord.playback.smart.camelotCode
 import com.music.bitchord.playback.smart.choreo.ChoreoScript
 import com.music.bitchord.playback.smart.choreo.ChoreoSessionGlue
 import com.music.bitchord.playback.smart.choreo.DjLevel
 import com.music.bitchord.playback.smart.choreo.RecipeId
-import com.music.bitchord.playback.smart.choreo.StructureView
-import com.music.bitchord.playback.smart.entryKeyConfidence
-import com.music.bitchord.playback.smart.entryKeyForMix
-import com.music.bitchord.playback.smart.exitKeyConfidence
-import com.music.bitchord.playback.smart.exitKeyForMix
-import com.music.bitchord.playback.smart.regionalCamelotSteps
-import com.music.bitchord.playback.smart.shouldDeclineToMix
-import kotlin.math.abs
-import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /** Frozen planning inputs supplied to [TransitionPlanSelector] for a `(outTrack, inTrack)` pair. */
@@ -67,6 +52,7 @@ data class PlanInput(
     val machineGeneration: Long = 0L,
     val outDecodeRangeMs: TimeRangeMs? = null,
     val inDecodeRangeMs: TimeRangeMs? = null,
+    val excludedRecipeIds: Set<String> = emptySet(),
 )
 
 /** Selected transition geometry, concrete `LoopMix.Plan`, and frozen V1 contract for [PairPreparer]. */
@@ -81,7 +67,12 @@ data class SelectedPlan(
     val straightRateMode: StraightRateMode? = null,
     val previewScript: ChoreoScript? = null,
     val transitionPlanV1: TransitionPlanV1? = null,
+    /** Exact registry value selected by [transitionPlanV1]; never a legacy recipe alias. */
+    val frozenRecipe: RecipeV2? = null,
     val refusalReason: RefusalReason? = null,
+    /** Exact projected inputs passed to PairPlanner; absent for paths that did not use it. */
+    val plannerOutAnalysis: TrackAnalysisV3? = null,
+    val plannerInAnalysis: TrackAnalysisV3? = null,
 )
 
 /** Strategy interface that selects and freezes a transition plan from [PlanInput]. */
@@ -110,8 +101,15 @@ class DefaultTransitionPlanSelector(
         }
         val outDur = input.outTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: outA.duration
         val inDur = input.inTrack.durationSec.takeIf { it.isFinite() && it > 1.0 } ?: inA.duration
+        val excludedRecipeIds = input.excludedRecipeIds + input.excludedRecipes.map { it.code }
         if (input.preferStraight && (!outA.isUsable || !inA.isUsable)) {
-            return straightFallback(input)
+            val fallback = straightFallback(input) ?: return null
+            val recipeId = fallback.transitionPlanV1?.recipeId ?: fallback.previewScript?.recipeId
+            if (recipeId != null && recipeId in excludedRecipeIds) return SelectedPlan(
+                plan = null, fallbackReason = "straight_recipe_excluded:$recipeId",
+                refusalReason = RefusalReason.CHOREOGRAPHY_UNAVAILABLE,
+            )
+            return fallback
         }
 
         val outV3 = toV3ForPlanner(input.outTrack.id, outA, PhraseMaps.get(input.outTrack.id), input.outSongMap, outDur)
@@ -128,7 +126,7 @@ class DefaultTransitionPlanSelector(
             minExitMs = input.minExitMs,
             recentRecipeIds = input.recentRecipeIds,
             transitionsSinceLastAbrupt = input.transitionsSinceLastAbrupt,
-            excludedRecipeIds = input.excludedRecipes.map { it.code }.toSet(),
+            excludedRecipeIds = excludedRecipeIds,
             preferNoStemVariant = input.preferNoStemVariant || !input.stemsExpected,
             tasteWeights = input.tasteWeights,
             outDecodeRangeMs = input.outDecodeRangeMs,
@@ -151,361 +149,66 @@ class DefaultTransitionPlanSelector(
             )
         }
 
-        return buildConcreteFromPlanV1(outcome.value, input, outDur, inDur)
-    }
-
-    private fun buildConcreteFromPlanV1(
-        v1: TransitionPlanV1,
-        input: PlanInput,
-        outDur: Double,
-        inDur: Double,
-    ): SelectedPlan? {
-        val outA = input.outAnalysis
-        val inA = input.inAnalysis
-        val exitSec = v1.frozenExitMs / 1000.0
-        val entrySec = v1.frozenEntryMs / 1000.0
-        val barSec = (v1.barDurationMs / 1000.0).coerceAtLeast(0.5)
-        val overlapBars = (v1.overlapDurationMs.toDouble() / v1.barDurationMs.coerceAtLeast(500L))
-            .roundToInt().coerceIn(1, 16)
-        val requestedRecipe = RecipeId.fromCode(v1.recipeId) ?: fallbackChoreoRecipeId(v1)
-        val effectiveNoStem = input.preferNoStemVariant || !input.stemsExpected || v1.requiredStems.isEmpty()
-
-        // Try matching LOOP geometry via candidate builder only when aligned to PairPlanner's frozen window.
-        if (!input.preferStraight && v1.geometry == TransitionGeometry.LOOP) {
-            val crown = LoopMix.plan(
-                out = outA,
-                outDuration = outDur,
-                inn = inA,
-                inDuration = inDur,
-                earliestOutSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
-                sungOut = input.sungOut,
-                sungIn = input.sungIn,
-                playableOutDurationSec = outDur,
-            )
-            if (crown != null && abs(crown.out.loopStart - exitSec) <= 1.5 * barSec &&
-                abs(crown.inn.loopStart - entrySec) <= 2.0 * barSec
-            ) {
-                val stamped = stamp(crown, outA, inA)
-                val prep = ChoreoSessionGlue.prepare(
-                    plan = stamped,
-                    script = null,
-                    outAnalysis = outA,
-                    inAnalysis = inA,
-                    outSongMap = input.outSongMap,
-                    inSongMap = input.inSongMap,
-                    level = input.djLevel,
-                    outId = input.outTrack.id,
-                    inId = input.inTrack.id,
-                    sampleRate = input.sampleRate,
-                    albumOrder = input.albumOrder,
-                    stemsExpected = !effectiveNoStem,
-                    excludedRecipes = input.excludedRecipes,
-                    capsOverride = input.caps,
-                )?.let { base ->
-                    ChoreoSessionGlue.Prep(
-                        plan = base.plan,
-                        forced = base.forced,
-                        forcedRecipe = requestedRecipe,
-                        caps = base.caps,
-                        level = base.level,
-                        outStructure = base.outStructure,
-                        inStructure = base.inStructure,
-                        pairKey = base.pairKey,
-                        albumOrder = base.albumOrder,
-                        note = base.note,
-                        sampleRate = base.sampleRate,
-                        straightRateMode = base.straightRateMode,
-                        excludedRecipes = base.excludedRecipes,
-                    )
-                }
-                if (prep != null && prep.plan.handoff == null) {
-                    return SelectedPlan(
-                        plan = prep.plan,
-                        phraseScript = null,
-                        v2Prep = prep,
-                        exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
-                        entryCueSec = prep.plan.inn.loopStart,
-                        pathHint = "v2-native",
-                        transitionPlanV1 = alignV1Timing(v1, prep.plan),
-                    )
-                }
-            }
-        }
-
-        // Try matching BRIDGE geometry via PhrasePlanner / LoopMix.bridge only when aligned to PairPlanner's window.
-        if (!input.preferStraight && v1.geometry == TransitionGeometry.BRIDGE) {
-            val steps = regionalCamelotSteps(outA, inA)
-            val phraseChoice = if (PhraseConfig.PHRASE_PLANNER_ENABLED && !shouldDeclineToMix(outA, inA)) {
-                runCatching {
-                    PhrasePlanner.select(
-                        input.outSongMap,
-                        input.inSongMap,
-                        steps,
-                        outA.bpm,
-                        inA.bpm,
-                        earliestExitSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
-                        playableOutDurationSec = outDur,
-                        outAnalysis = outA,
-                        inAnalysis = inA,
-                    )
-                }.getOrNull()
-            } else null
-            if (phraseChoice != null) {
-                val script = TransitionMoves.compile(
-                    phraseChoice, outA.bpm, inA.bpm,
-                    outgoingId = input.outTrack.id,
-                    incomingId = input.inTrack.id,
-                )
-                if (abs(script.plan.out.loopStart - exitSec) <= 1.5 * barSec &&
-                    abs(script.plan.inn.loopStart - entrySec) <= 2.0 * barSec
-                ) {
-                    val stamped = stamp(script.plan, outA, inA)
-                    val base = ChoreoSessionGlue.prepare(
-                        plan = stamped,
-                        script = script,
-                        outAnalysis = outA,
-                        inAnalysis = inA,
-                        outSongMap = input.outSongMap,
-                        inSongMap = input.inSongMap,
-                        level = input.djLevel,
-                        outId = input.outTrack.id,
-                        inId = input.inTrack.id,
-                        sampleRate = input.sampleRate,
-                        albumOrder = input.albumOrder,
-                        stemsExpected = !effectiveNoStem,
-                        excludedRecipes = input.excludedRecipes,
-                        capsOverride = input.caps,
-                    )
-                    if (base != null && base.plan.handoff == null) {
-                        val prep = ChoreoSessionGlue.Prep(
-                            plan = base.plan,
-                            forced = base.forced,
-                            forcedRecipe = requestedRecipe,
-                            caps = base.caps,
-                            level = base.level,
-                            outStructure = base.outStructure,
-                            inStructure = base.inStructure,
-                            pairKey = base.pairKey,
-                            albumOrder = base.albumOrder,
-                            note = base.note,
-                            sampleRate = base.sampleRate,
-                            straightRateMode = base.straightRateMode,
-                            excludedRecipes = base.excludedRecipes,
-                        )
-                        return SelectedPlan(
-                            plan = prep.plan,
-                            phraseScript = script,
-                            v2Prep = prep,
-                            exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
-                            entryCueSec = prep.plan.inn.loopStart,
-                            pathHint = "v2-native",
-                            transitionPlanV1 = alignV1Timing(v1, prep.plan),
-                        )
-                    }
-                }
-            }
-            val bridge = LoopMix.bridge(
-                out = outA,
-                outDuration = outDur,
-                inn = inA,
-                inDuration = inDur,
-                earliestOutSec = (exitSec - barSec).coerceAtLeast(input.positionSec + 0.5),
-                sungOut = input.sungOut,
-                sungIn = input.sungIn,
-                playableOutDurationSec = outDur,
-            )
-            if (bridge != null && bridge.handoff == null &&
-                abs(bridge.out.loopStart - exitSec) <= 1.5 * barSec &&
-                abs(bridge.inn.loopStart - entrySec) <= 2.0 * barSec
-            ) {
-                val stamped = stamp(bridge, outA, inA)
-                val base = ChoreoSessionGlue.prepare(
-                    plan = stamped,
-                    script = null,
-                    outAnalysis = outA,
-                    inAnalysis = inA,
-                    outSongMap = input.outSongMap,
-                    inSongMap = input.inSongMap,
-                    level = input.djLevel,
-                    outId = input.outTrack.id,
-                    inId = input.inTrack.id,
-                    sampleRate = input.sampleRate,
-                    albumOrder = input.albumOrder,
-                    stemsExpected = !effectiveNoStem,
-                    excludedRecipes = input.excludedRecipes,
-                    capsOverride = input.caps,
-                )
-                if (base != null) {
-                    val prep = ChoreoSessionGlue.Prep(
-                        plan = base.plan,
-                        forced = base.forced,
-                        forcedRecipe = requestedRecipe,
-                        caps = base.caps,
-                        level = base.level,
-                        outStructure = base.outStructure,
-                        inStructure = base.inStructure,
-                        pairKey = base.pairKey,
-                        albumOrder = base.albumOrder,
-                        note = base.note,
-                        sampleRate = base.sampleRate,
-                        straightRateMode = base.straightRateMode,
-                        excludedRecipes = base.excludedRecipes,
-                    )
-                    return SelectedPlan(
-                        plan = prep.plan,
-                        phraseScript = null,
-                        v2Prep = prep,
-                        exitWindowSec = prep.plan.out.loopStart..(prep.plan.out.loopStart + LoopMix.Clock(prep.plan).releaseAt),
-                        entryCueSec = prep.plan.inn.loopStart,
-                        pathHint = "v2-native",
-                        transitionPlanV1 = alignV1Timing(v1, prep.plan),
-                    )
-                }
-            }
-        }
-
-        // Anchored straight geometry preserving PairPlanner's {frozenExitMs, frozenEntryMs, recipe}.
-        return buildStraightFromV1(v1, input, outDur, inDur, overlapBars, requestedRecipe)
-            ?: straightFallback(input)?.copy(transitionPlanV1 = v1)
-    }
-
-    private fun buildStraightFromV1(
-        v1: TransitionPlanV1,
-        input: PlanInput,
-        outDur: Double,
-        inDur: Double,
-        requestedBars: Int,
-        requestedRecipe: RecipeId,
-    ): SelectedPlan? {
-        val outA = input.outAnalysis
-        val inA = input.inAnalysis
-        val outBpm = outA.tailBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-            ?: outA.bpm.takeIf { it.isFinite() && it > 1.0 } ?: 120.0
-        val inBpm = inA.headBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-            ?: inA.bpm.takeIf { it.isFinite() && it > 1.0 } ?: outBpm
-        val rateMode = StraightMixGeometry.rateMode(outA, inA, input.djLevel)
-        val folded = alignTempoOctave(outBpm, inBpm)
-        val fold = if (rateMode == StraightRateMode.BEAT_MATCH) inBpm / folded else 1.0
-        val exitSec = (v1.frozenExitMs / 1000.0).coerceAtLeast(0.0)
-        val entrySec = (v1.frozenEntryMs / 1000.0).coerceAtLeast(0.0)
-        val outStruct = StructureView.best(input.outSongMap, outA)
-        val inStruct = StructureView.best(input.inSongMap, inA)
-        val recipeForStraight = if (requestedRecipe == RecipeId.C5) {
-            RecipeId.C2
-        } else requestedRecipe
-
-        var bars = requestedBars.coerceIn(1, 16)
-        var fitted: LoopMix.Plan? = null
-        while (bars >= 1) {
-            val enter = if (bars >= 4) 1 else 0
-            val exit = if (bars >= 2) 1 else 0
-            val cand = LoopMix.Plan(
-                out = LoopMix.Pick(exitSec, exitSec, 0, 60.0 / outBpm, outBpm, 0.0, LoopMix.Check.MASK),
-                inn = LoopMix.Pick(entrySec, entrySec, 0, 60.0 / inBpm, inBpm, 0.0, LoopMix.Check.MASK),
-                fold = fold,
-                enterBars = enter,
-                rampBars = bars - enter - exit,
-                exitBars = exit,
-                totalBars = bars,
-                outLoops = false,
-                inLoops = false,
-                nativeIncoming = rateMode == StraightRateMode.RATE_ONE,
-                targetBpmOverride = if (rateMode == StraightRateMode.RATE_ONE) 0.0 else null,
-                rung = v1.recipeName.ifBlank { "Straight" },
-                alternativeKind = "v2-straight",
-            )
-            val span = LoopMix.Clock(cand).releaseAt
-            val req = runCatching {
-                LoopMixSession.decodeRequirements(cand, input.sampleRate, outA, inA, rateMode, input.djLevel)
-            }.getOrNull()
-            if (req != null && exitSec + span <= outDur + 0.5 && entrySec < inDur) {
-                fitted = cand
-                break
-            }
-            bars--
-        }
-        val placed = fitted ?: return null
-        val stamped = stamp(placed, outA, inA)
-        val prep = ChoreoSessionGlue.Prep(
-            plan = stamped,
-            forced = null,
-            forcedRecipe = recipeForStraight,
-            caps = input.caps,
-            level = input.djLevel,
-            outStructure = outStruct,
-            inStructure = inStruct,
-            pairKey = "${input.outTrack.id}->${input.inTrack.id}",
-            albumOrder = input.albumOrder,
-            note = "core-planner:${v1.recipeId}:${rateMode.name.lowercase()}",
-            sampleRate = input.sampleRate,
-            straightRateMode = rateMode,
-            excludedRecipes = input.excludedRecipes,
+        // Also enforce exclusions on the last-resort result: it must not revive
+        // a recipe excluded by the current remix request.
+        if (outcome.value.recipeId in plannerReq.excludedRecipeIds) return SelectedPlan(
+            plan = null, fallbackReason = "canonical_recipe_excluded:${outcome.value.recipeId}",
+            refusalReason = RefusalReason.CHOREOGRAPHY_UNAVAILABLE,
         )
-        val previewScript = ChoreoSessionGlue.withoutStems(
-            prep, stamped, LoopMix.Clock(stamped), input.sampleRate, outA, inA,
-            input.sungOut, input.sungIn, recipeForStraight,
-        ) ?: ChoreoSessionGlue.withoutStems(
-            prep, stamped, LoopMix.Clock(stamped), input.sampleRate, outA, inA,
-            input.sungOut, input.sungIn, null,
+
+        return buildConcreteFromPlanV1(outcome.value, input, outDur, inDur)?.copy(
+            plannerOutAnalysis = outV3,
+            plannerInAnalysis = inV3,
+        )
+    }
+
+    internal fun buildConcreteFromPlanV1(
+        v1: TransitionPlanV1,
+        input: PlanInput,
+        outDur: Double,
+        inDur: Double,
+    ): SelectedPlan? {
+        val concrete = PlaybackPlanConcretizer.buildConcreteFromPlanV1(
+            v1, input.toPlaybackInput(), outDur, inDur,
+            configuration = ChoreoSessionGlue.preparationConfiguration(),
+            history = ChoreoSessionGlue.preparationHistory("${input.outTrack.id}->${input.inTrack.id}"),
+            onPreparationFailure = ChoreoSessionGlue::recordPreparationFailure,
         ) ?: return null
-        val span = LoopMix.Clock(stamped).releaseAt
-        val alignedV1 = v1.copy(
-            frozenExitMs = (stamped.out.loopStart * 1000.0).roundToLong(),
-            frozenEntryMs = (stamped.inn.loopStart * 1000.0).roundToLong(),
-            overlapDurationMs = (span * 1000.0).roundToLong().coerceAtLeast(500L),
-        )
-        return SelectedPlan(
-            plan = stamped,
-            v2Prep = prep,
-            entryCueSec = stamped.inn.loopStart,
-            exitWindowSec = stamped.out.loopStart..(stamped.out.loopStart + span),
-            pathHint = "v2-straight",
-            straightRateMode = rateMode,
-            fallbackReason = if (v1.isLastResort) "last-resort-musical-exit" else "",
-            previewScript = previewScript,
-            transitionPlanV1 = alignedV1,
-        )
-    }
-
-    private fun alignV1Timing(v1: TransitionPlanV1, plan: LoopMix.Plan): TransitionPlanV1 {
-        val clock = LoopMix.Clock(plan)
-        val exitMs = (plan.out.loopStart * 1000.0).roundToLong().coerceAtLeast(0L)
-        val entryMs = (plan.inn.loopStart * 1000.0).roundToLong().coerceAtLeast(0L)
-        val overlapMs = (clock.releaseAt * 1000.0).roundToLong().coerceAtLeast(1L)
-        return v1.copy(
-            frozenExitMs = exitMs,
-            frozenEntryMs = entryMs,
-            swapDownbeatMs = v1.swapDownbeatMs.coerceIn(exitMs, exitMs + overlapMs),
-            overlapDurationMs = overlapMs,
-        )
-    }
-
-    private fun fallbackChoreoRecipeId(v1: TransitionPlanV1): RecipeId = when (v1.recipeId) {
-        "S6" -> RecipeId.S2
-        "C8" -> RecipeId.C2
-        "C9" -> RecipeId.C1
-        "F9" -> RecipeId.F7
-        "F10" -> RecipeId.F1
-        "F11" -> RecipeId.F5
-        else -> when (v1.djLevel) {
-            CoreDjLevel.SUBTLE -> RecipeId.S4
-            CoreDjLevel.CLUB -> RecipeId.C2
-            CoreDjLevel.FESTIVAL -> RecipeId.F5
+        val prep = concrete.v2Prep?.let(ChoreoSessionGlue::fromSharedPreparation)
+        val plan = concrete.plan
+        val previewScript = concrete.previewRecipe?.let { legacyRecipe ->
+            if (prep == null || plan == null) null else ChoreoSessionGlue.withoutStems(
+                prep, plan, LoopMix.Clock(plan), input.sampleRate, input.outAnalysis, input.inAnalysis,
+                input.sungOut, input.sungIn, legacyRecipe, requirePlannedRecipe = true,
+            )
         }
+        return SelectedPlan(
+            plan = plan, phraseScript = concrete.phraseScript, v2Prep = prep,
+            exitWindowSec = concrete.exitWindowSec, entryCueSec = concrete.entryCueSec,
+            pathHint = concrete.pathHint, fallbackReason = concrete.fallbackReason,
+            straightRateMode = concrete.straightRateMode, previewScript = previewScript,
+            transitionPlanV1 = concrete.transitionPlanV1, frozenRecipe = concrete.frozenRecipe,
+            refusalReason = concrete.refusalReason,
+        )
     }
 
-    private fun stamp(plan: LoopMix.Plan, out: TrackAnalysis, inn: TrackAnalysis): LoopMix.Plan {
-        val steps = regionalCamelotSteps(out, inn)
-        val left = camelotCode(exitKeyForMix(out))
-        val right = camelotCode(entryKeyForMix(inn))
-        val keys = if (left != null && right != null) "$left→$right" else plan.keys
-        val outConf = exitKeyConfidence(out)
-        val inConf = entryKeyConfidence(inn)
-        val keyClash = steps != null && steps > 2 && outConf >= 0.5 && inConf >= 0.5
-        val clash = plan.clash || (plan.rung != "Echo" && keyClash)
-        val carve = plan.carve || (plan.rung == "Beat blend" && keyClash)
-        return plan.copy(clash = clash, carve = carve, keys = keys)
-    }
+    /** Same source-to-millisecond projection as ScriptExecutionGuard, including tracked knots. */
+    internal fun matchesFrozenSources(
+        v1: TransitionPlanV1, plan: LoopMix.Plan, input: PlanInput, rateMode: StraightRateMode? = null,
+    ): Boolean = PlaybackPlanConcretizer.matchesFrozenSources(v1, plan, input.toPlaybackInput(), rateMode)
+
+    /** Validate before PlanFrozen: no shortened bars, shifted hold, or incompatible knot clock. */
+    internal fun matchesFrozenTiming(
+        v1: TransitionPlanV1, plan: LoopMix.Plan, input: PlanInput, rateMode: StraightRateMode,
+    ): Boolean = PlaybackPlanConcretizer.matchesFrozenTiming(v1, plan, input.toPlaybackInput(), rateMode)
+
+    private fun PlanInput.toPlaybackInput(): PlaybackPlanConcretizer.Input = PlaybackPlanConcretizer.Input(
+        outId = outTrack.id, inId = inTrack.id, outAnalysis = outAnalysis, inAnalysis = inAnalysis,
+        outSongMap = outSongMap, inSongMap = inSongMap, sungOut = sungOut, sungIn = sungIn,
+        djLevel = djLevel, sampleRate = sampleRate, positionSec = positionSec,
+        albumOrder = albumOrder, stemsExpected = stemsExpected, preferStraight = preferStraight,
+        excludedRecipes = excludedRecipes, caps = caps, preferNoStemVariant = preferNoStemVariant,
+    )
 }
 
 /** Maps runtime [DjLevel] to `:djmix-core` [CoreDjLevel]. */
@@ -541,7 +244,7 @@ internal fun toV3ForPlanner(
         phraseMap = phraseMap,
         songMap = songMap,
         modelVersions = emptyMap(),
-    )
+    ).snapshotForPlanner()
     if (normalizedAnalysis.isUsable && v3.beatsMs.isEmpty() && v3.bpm > 1.0 && v3.durationMs > 0L) {
         val beatMs = (60_000.0 / v3.bpm).roundToLong().coerceAtLeast(250L)
         val firstMs = (normalizedAnalysis.firstBeat.takeIf { it.isFinite() && it >= 0.0 } ?: 0.0)
@@ -558,9 +261,27 @@ internal fun toV3ForPlanner(
         }
         return v3.copy(
             analysisLevel = if (v3.analysisLevel == AnalysisLevel.NONE) AnalysisLevel.HEAD_TAIL else v3.analysisLevel,
-            beatsMs = beats,
-            downbeatsMs = if (v3.downbeatsMs.isEmpty()) downs else v3.downbeatsMs,
+            beatsMs = beats.toList(),
+            downbeatsMs = if (v3.downbeatsMs.isEmpty()) downs.toList() else v3.downbeatsMs,
         )
     }
     return v3
 }
+
+/** Detach every V3 collection before planning so later analysis/map mutation cannot relabel a plan. */
+private fun TrackAnalysisV3.snapshotForPlanner(): TrackAnalysisV3 = copy(
+    beatsMs = beatsMs.toList(),
+    downbeatsMs = downbeatsMs.toList(),
+    shortTermLufsCurve = shortTermLufsCurve.toList(),
+    energyCurve = energyCurve.toList(),
+    vocalPresence50fps = vocalPresence50fps.toList(),
+    modelVersions = modelVersions.toMap(),
+    structure = structure.copy(
+        sections = structure.sections.toList(),
+        phrases = structure.phrases.toList(),
+        builds = structure.builds.toList(),
+        drops = structure.drops.toList(),
+        breakdowns = structure.breakdowns.toList(),
+        chorusFamilies = structure.chorusFamilies.map { it.copy(occurrenceStartMs = it.occurrenceStartMs.toList()) },
+    ),
+)

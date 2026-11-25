@@ -320,7 +320,9 @@ object NpuRuntime {
         for (i in 0 until n) {
             val av = a[i].toDouble()
             val bv = b[i].toDouble()
-            if (av.isNaN() || bv.isNaN()) return LogitDiff(Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, n)
+            if (!av.isFinite() || !bv.isFinite()) {
+                return LogitDiff(Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, n)
+            }
             val d = abs(av - bv)
             if (d > maxAbs) maxAbs = d
             sum += d
@@ -361,10 +363,17 @@ object NpuRuntime {
      * not faster than CPU (production then stays on CPU, nothing is disabled); else PASS.
      */
     fun judgeSelfTest(diff: LogitDiff, peakF: Double?, qnnMs: Double, cpuMs: Double): NpuVerdict {
-        if (diff.maxAbs.isNaN() || diff.maxAbs > AutomixV2Npu.selfTestMaxAbs) return NpuVerdict.MISMATCH
-        if (diff.meanAbs > AutomixV2Npu.selfTestMeanAbs) return NpuVerdict.MISMATCH
-        if (peakF != null && peakF < AutomixV2Npu.selfTestMinPeakF) return NpuVerdict.MISMATCH
-        if (cpuMs > 0 && qnnMs * AutomixV2Npu.minSpeedup > cpuMs) return NpuVerdict.SLOW
+        if (diff.count <= 0 || !diff.maxAbs.isFinite() || !diff.meanAbs.isFinite() ||
+            diff.maxAbs < 0.0 || diff.meanAbs < 0.0 ||
+            !cpuMs.isFinite() || !qnnMs.isFinite() || cpuMs <= 0.0 || qnnMs <= 0.0
+        ) return NpuVerdict.MISMATCH
+        if (diff.maxAbs > AutomixV2Npu.selfTestMaxAbs || diff.meanAbs > AutomixV2Npu.selfTestMeanAbs) {
+            return NpuVerdict.MISMATCH
+        }
+        if (peakF != null && (!peakF.isFinite() || peakF !in 0.0..1.0 || peakF < AutomixV2Npu.selfTestMinPeakF)) {
+            return NpuVerdict.MISMATCH
+        }
+        if (qnnMs * AutomixV2Npu.minSpeedup > cpuMs) return NpuVerdict.SLOW
         return NpuVerdict.PASS
     }
 }

@@ -234,6 +234,93 @@ fi
 so_tmp=$(mktemp -d "${TMPDIR:-/tmp}/bitchord-elf.XXXXXX")
 so_list=$(printf '%s\n' "$listing" | grep -oE 'lib/[^ ]*\.so$' | sort -u)
 align_ok=1
+check_elf_load_alignment() {
+  local elf="$1" output token value count=0
+  parse_alignment() {
+    token="$1"
+    if [[ "$token" =~ ^0[xX][0-9a-fA-F]+$ ]]; then
+      value=$((16#${token:2}))
+    elif [[ "$token" =~ ^[0-9]+$ ]]; then
+      value=$((10#$token))
+    else
+      return 1
+    fi
+    [ "$value" -gt 0 ] && [ $((value & (value - 1))) -eq 0 ] && [ "$value" -ge 16384 ]
+  }
+
+  if [ "${AUDIT_FORCE_PYTHON_ELF:-0}" != 1 ] && command -v readelf >/dev/null 2>&1; then
+    output=$(readelf -lW "$elf" 2>/dev/null) || return 1
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*LOAD[[:space:]] ]] || continue
+      count=$((count + 1))
+      token="${line##* }"
+      parse_alignment "$token" || return 1
+    done <<< "$output"
+  elif [ "${AUDIT_FORCE_PYTHON_ELF:-0}" != 1 ] && command -v objdump >/dev/null 2>&1; then
+    output=$(objdump -p "$elf" 2>/dev/null) || return 1
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*LOAD[[:space:]] ]] || continue
+      count=$((count + 1))
+      token=$(printf '%s\n' "$line" | sed -nE 's/.*[[:space:]]align[[:space:]]+([^[:space:]]+).*/\1/p')
+      [ -n "$token" ] || return 1
+      if [[ "$token" =~ ^2\*\*([0-9]+)$ ]]; then
+        local exponent="${BASH_REMATCH[1]}"
+        [ "$exponent" -ge 14 ] || return 1
+      else
+        parse_alignment "$token" || return 1
+      fi
+    done <<< "$output"
+  else
+    python3 - "$elf" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+try:
+    data = open(path, "rb").read()
+    if len(data) < 16 or data[:4] != b"\x7fELF":
+        raise ValueError("not an ELF")
+    elf_class = data[4]
+    endian = "<" if data[5] == 1 else ">" if data[5] == 2 else None
+    if endian is None or elf_class not in (1, 2):
+        raise ValueError("unsupported ELF header")
+    if elf_class == 2:
+        if len(data) < 64:
+            raise ValueError("truncated ELF header")
+        e_phoff, = struct.unpack_from(endian + "Q", data, 32)
+        e_phentsize, e_phnum = struct.unpack_from(endian + "HH", data, 54)
+        align_offset, min_size = 48, 56
+    else:
+        if len(data) < 52:
+            raise ValueError("truncated ELF header")
+        e_phoff, = struct.unpack_from(endian + "I", data, 28)
+        e_phentsize, e_phnum = struct.unpack_from(endian + "HH", data, 42)
+        align_offset, min_size = 28, 32
+    if e_phentsize < min_size:
+        raise ValueError("invalid program-header size")
+    count = 0
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if off < 0 or off + e_phentsize > len(data):
+            raise ValueError("truncated program-header table")
+        p_type, = struct.unpack_from(endian + "I", data, off)
+        if p_type != 1:
+            continue
+        count += 1
+        align, = struct.unpack_from(endian + ("Q" if elf_class == 2 else "I"), data, off + align_offset)
+        if align < 16384 or align == 0 or (align & (align - 1)) != 0:
+            raise ValueError("invalid PT_LOAD alignment")
+    if count == 0:
+        raise ValueError("no PT_LOAD segments")
+except (OSError, ValueError, struct.error) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(1)
+PY
+    return $?
+  fi
+  [ "$count" -gt 0 ]
+}
+
 for so in $so_list; do
   dest="$so_tmp/$(printf '%s' "$so" | tr '/' '_')"
   if ! unzip -p "$APK" "$so" > "$dest" 2>/dev/null; then
@@ -241,34 +328,8 @@ for so in $so_list; do
     align_ok=0
     continue
   fi
-  if command -v readelf >/dev/null 2>&1; then
-    worst=0
-    while read -r tok; do
-      [ -n "$tok" ] || continue
-      dec=$((tok))
-      [ "$dec" -gt "$worst" ] && worst=$dec
-    done < <(readelf -lW "$dest" 2>/dev/null | awk '$1=="LOAD"{print $NF}')
-  else
-    worst=$(python3 - "$dest" <<'PY'
-import struct, sys
-data = open(sys.argv[1], "rb").read()
-if data[:4] != b"\x7fELF" or data[4] != 2:
-    print(0); raise SystemExit
-e_phoff, = struct.unpack_from("<Q", data, 0x20)
-e_phentsize, e_phnum = struct.unpack_from("<HH", data, 0x36)
-best = 0
-for i in range(e_phnum):
-    off = e_phoff + i * e_phentsize
-    if struct.unpack_from("<I", data, off)[0] != 1:
-        continue
-    align, = struct.unpack_from("<Q", data, off + 48)
-    best = max(best, align)
-print(best)
-PY
-)
-  fi
-  if [ -z "${worst:-}" ] || [ "${worst:-0}" -lt 16384 ]; then
-    bad "$so is not 16 KiB-page aligned (max PT_LOAD align ${worst:-0}, need >= 16384)"
+  if ! check_elf_load_alignment "$dest"; then
+    bad "$so has a malformed, missing, non-power-of-two, or sub-16 KiB PT_LOAD alignment"
     align_ok=0
   fi
 done

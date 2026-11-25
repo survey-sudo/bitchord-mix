@@ -13,6 +13,7 @@ import android.net.Uri
 import android.widget.Toast
 import android.os.Bundle
 import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import com.music.bitchord.data.TelemetryProvenance
 import kotlinx.coroutines.sync.Mutex
@@ -97,6 +98,7 @@ import com.music.bitchord.playback.audio.bitperfect.usb.UsbDirectDevices
 import com.music.bitchord.playback.audio.bluetooth.BluetoothAudioTracker
 import com.music.bitchord.playback.audio.bluetooth.BluetoothTelemetry
 import com.music.bitchord.MainActivity
+import com.music.bitchord.BitChordApplication
 import com.music.bitchord.data.listentogether.ListenTogether
 import com.music.bitchord.data.listentogether.partyQueueIndexOf
 import com.music.bitchord.data.listentogether.partyUpcomingAfter
@@ -154,7 +156,9 @@ import com.music.bitchord.data.sources.SourceStream
 import com.music.bitchord.data.sources.StreamFormat
 import com.music.bitchord.data.sources.TrackMatcher
 import com.music.bitchord.playback.djmix.work.QueueAnalysisWorker
+import com.music.bitchord.playback.djmix.work.LibraryAnalysisWorker
 import com.music.bitchord.playback.djmix.work.QueuePrepRegistry
+import com.music.bitchord.playback.djmix.DjmixServices
 import com.music.bitchord.playback.smart.AutomixAnalysisSource
 import com.music.bitchord.playback.smart.VersionAudioAligner
 import com.music.bitchord.ui.player.discardBlockedAutoMixAmbient
@@ -181,6 +185,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -334,6 +339,10 @@ private fun Song.canStartStation(): Boolean =
  */
 @UnstableApi
 class PlaybackService : MediaLibraryService() {
+
+    /** Process-owned learning/store services; never construct a second database here. */
+    private val processDjmixServices: DjmixServices?
+        get() = (applicationContext as? BitChordApplication)?.djmixServicesOrNull()
 
     private var mediaSession: MediaLibrarySession? = null
     private val searchResults = ConcurrentHashMap<String, List<Song>>()
@@ -649,6 +658,49 @@ class PlaybackService : MediaLibraryService() {
      * track.
      */
     private var spare: ExoPlayer? = null
+
+    /**
+     * Main-thread snapshot of [player]'s position in ms, for readers that
+     * must not touch ExoPlayer from their own thread.
+     *
+     * ExoPlayer is confined to the thread it was built on (the main thread),
+     * so the `djmix-prep` executor must never call `player.currentPosition`
+     * directly — that threw IllegalStateException on device and the
+     * process-wide uncaught handler then killed the process.
+     * [refreshPlayerPositionSnapshot] is the only writer and runs on the
+     * main thread: a [PLAYER_POSITION_SNAPSHOT_INTERVAL_MS] Handler tick
+     * plus immediate refreshes at every [player] reassignment. The prep
+     * thread only ever reads this atomic value through [createPairPreparer]'s
+     * `positionSecProvider`, which is therefore safe from any thread, and
+     * its staleness is bounded by one tick interval.
+     */
+    private val playerPositionMsSnapshot = AtomicLong(0L)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val playerPositionSnapshotTick = object : Runnable {
+        override fun run() {
+            refreshPlayerPositionSnapshot()
+            mainHandler.postDelayed(this, PLAYER_POSITION_SNAPSHOT_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Records the session player's current position. Main thread only — this
+     * is the single place the prep path's position is read off ExoPlayer.
+     *
+     * A failed read keeps the previous snapshot rather than resetting it to
+     * zero or crashing the main thread: the value is only planner input
+     * (and [com.music.bitchord.playback.djmix.PairPreparer] clamps it
+     * against the main-thread-captured `PrepRequest.positionSec` anyway),
+     * and the next tick retries. A null [player] records 0, matching the
+     * old provider's `(player?.currentPosition ?: 0L)` fallback.
+     */
+    private fun refreshPlayerPositionSnapshot() {
+        val posMs = runCatching { player?.currentPosition ?: 0L }.getOrElse {
+            Log.w("BitChord", "player position snapshot read failed; keeping previous", it)
+            return
+        }
+        playerPositionMsSnapshot.set(posMs.coerceAtLeast(0L))
+    }
 
     private var crossfade: CrossfadeController? = null
 
@@ -2017,6 +2069,10 @@ class PlaybackService : MediaLibraryService() {
         )
         player = exoPlayer
         spare = sparePlayer
+        // Prime the prep snapshot and start its main-thread tick. This runs
+        // on the main thread in onCreate, before any prep task can run.
+        refreshPlayerPositionSnapshot()
+        mainHandler.post(playerPositionSnapshotTick)
         // Both sinks feed the same session id, so the system equalizer and any
         // other effect attached to the app applies to whichever player happens
         // to be audible. Without it a crossfade would audibly change EQ halfway
@@ -2098,6 +2154,8 @@ class PlaybackService : MediaLibraryService() {
 
         // FORK-HOOK(service-wiring): initialize AutomixTelemetry + v2 controller wiring
         AutomixTelemetry.init(this)
+        // B3.2.2: keep the full-library analysis backlog wired without making it part of playback.
+        runCatching { LibraryAnalysisWorker.enqueuePeriodic(applicationContext) }
         // AE3 queue worker: TrackAnalyzer is the QueuePrepDelegate (ensureFullAnalysis).
         QueuePrepRegistry.delegate = trackAnalyzer.queuePrepDelegate
         val controller = createCrossfadeController()
@@ -2243,12 +2301,17 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
-    private fun createPairPreparer(): com.music.bitchord.playback.djmix.PairPreparer =
-        com.music.bitchord.playback.djmix.PairPreparer(
+    private fun createPairPreparer(): com.music.bitchord.playback.djmix.PairPreparer {
+        // Main thread (onCreate / output rebuild): re-prime so a prep task
+        // that runs before the first Handler tick still reads a live
+        // position rather than the initial zero.
+        refreshPlayerPositionSnapshot()
+        return com.music.bitchord.playback.djmix.PairPreparer(
             scope = scope,
             analysisFor = { id -> trackAnalyzer.analysisFor(id) },
             analysisUpdates = trackAnalyzer.analysisUpdates,
             analysisRunningFor = { id -> trackAnalyzer.isAnalysing(id) },
+            thermalStatus = { com.music.bitchord.playback.djmix.PrepThermalGate.currentStatus(this) },
             sungFor = { id -> crossfade?.lyricSpansFor(id) },
             canUseStems = { trackAnalyzer.canUseStems() },
             planSelector = com.music.bitchord.playback.djmix.DefaultTransitionPlanSelector(),
@@ -2269,8 +2332,19 @@ class PlaybackService : MediaLibraryService() {
                 }
             },
             onArtworkPrefetch = ::prefetchAutoMixIncoming,
-            positionSecProvider = { (player?.currentPosition ?: 0L).coerceAtLeast(0L) / 1000.0 },
+            // Thread-confined: PairPreparer invokes this on djmix-prep, where
+            // calling player.currentPosition throws IllegalStateException
+            // (ExoPlayer is main-thread confined). Read the main-thread
+            // snapshot instead; its refresh is the only player access.
+            positionSecProvider = { playerPositionMsSnapshot.get().coerceAtLeast(0L) / 1000.0 },
+            store = processDjmixServices?.store,
+            inspectorLearningEnabled = processDjmixServices?.effectiveLearningEnabledFlow
+                ?: kotlinx.coroutines.flow.MutableStateFlow(false).asStateFlow(),
+            plannerWeightsProvider = { genreClass ->
+                processDjmixServices?.plannerWeights(genreClass.trim().takeIf { it.isNotEmpty() }).orEmpty()
+            },
         )
+    }
 
     private fun createCrossfadeController() = CrossfadeController(
             scope,
@@ -2414,6 +2488,7 @@ class PlaybackService : MediaLibraryService() {
                 trackAnalyzer.separateTransitionBothWindows(left, right, rate)
             },
             pairPreparer = createPairPreparer(),
+            djmixServices = requireNotNull(processDjmixServices) { "Process DjmixServices must precede playback" },
             syncedLines = ::loopMixLyrics,
             loudnessGain = ::loudnessGainFor,
             onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },
@@ -3035,6 +3110,9 @@ class PlaybackService : MediaLibraryService() {
 
         player = incoming
         spare = outgoing
+        // Main thread: the prep snapshot must track the new session player
+        // at once, not up to one tick later.
+        refreshPlayerPositionSnapshot()
 
         val heldFilter = activeFilter
         activeFilter = spareFilter
@@ -4394,6 +4472,9 @@ class PlaybackService : MediaLibraryService() {
         // first callback reads already describes the new arrangement.
         player = incoming
         spare = outgoing
+        // Main thread: the prep snapshot must track the new session player
+        // at once, not up to one tick later.
+        refreshPlayerPositionSnapshot()
         val heldFilter = activeFilter
         activeFilter = spareFilter
         spareFilter = heldFilter
@@ -8164,6 +8245,9 @@ class PlaybackService : MediaLibraryService() {
         )
         player = newActive
         spare = newSpare
+        // Main thread (output rebuild): snapshot now tracks the rebuilt
+        // session player; the running tick keeps it fresh.
+        refreshPlayerPositionSnapshot()
         newSpare.audioSessionId = newActive.audioSessionId
         AppSettings.audioSessionId.value = newActive.audioSessionId
         applySettings(newActive)
@@ -8861,6 +8945,7 @@ class PlaybackService : MediaLibraryService() {
 
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(playerPositionSnapshotTick)
         crossfade?.cancelAutoMixVisual()
         invalidateQueueUndo()
         queueUndoRestoreBatch = null
@@ -10767,6 +10852,14 @@ class PlaybackService : MediaLibraryService() {
 
         /** How often played-seconds are sampled off the player. */
         const val PROGRESS_SAMPLE_MS = 5_000L
+
+        /**
+         * How often the main thread refreshes the player-position snapshot
+         * the djmix prep thread reads. Short enough that planner positions
+         * (which are second-granular) never meaningfully go stale, long
+         * enough that the tick costs one cached position read per interval.
+         */
+        const val PLAYER_POSITION_SNAPSHOT_INTERVAL_MS = 250L
 
         /** How often [driveDirectWindow] checks whether the next track's window has opened. */
         const val DIRECT_WINDOW_STEP_MS = 500L

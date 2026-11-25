@@ -17,33 +17,13 @@ import com.music.bitchord.playback.smart.choreo.RecipeId
 import com.music.bitchord.playback.smart.choreo.Recipes
 import com.music.bitchord.playback.smart.choreo.StructureView
 import com.music.bitchord.playback.smart.planTransition
-import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToLong
 
-/** Explicit execution policy, not a change to the stored musical evidence. */
-enum class StraightRateMode { BEAT_MATCH, RATE_ONE }
-
 /** Shared prepare/build geometry. A synthetic timing clock never manufactures beat confidence. */
 internal object StraightMixGeometry {
-    fun rateMode(out: TrackAnalysis?, inn: TrackAnalysis?, level: DjLevel): StraightRateMode {
-        val a = out?.tailBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-            ?: out?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-        val b = inn?.headBeats?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-            ?: inn?.bpm?.takeIf { it.isFinite() && it > 1.0 }
-        val ca = out?.tailBeats?.confidence ?: out?.beatConfidence ?: 0.0
-        val cb = inn?.headBeats?.confidence ?: inn?.beatConfidence ?: 0.0
-        if (a == null || b == null || !ca.isFinite() || !cb.isFinite() || minOf(ca, cb) < 0.4) {
-            return StraightRateMode.RATE_ONE
-        }
-        val folded = alignTempoOctave(a, b)
-        val ratio = folded / a
-        // Both decks, including the initial inverse rate, must fit the level's cap.
-        return if (ratio.isFinite() && ratio > 0.0 &&
-            abs(ratio - 1.0) <= level.maxStretch + 1e-9 &&
-            abs(1.0 / ratio - 1.0) <= level.maxStretch + 1e-9
-        ) StraightRateMode.BEAT_MATCH else StraightRateMode.RATE_ONE
-    }
+    fun rateMode(out: TrackAnalysis?, inn: TrackAnalysis?, level: DjLevel): StraightRateMode =
+        StraightRatePolicy.rateMode(out, inn, level)
 
     fun classicPlan(input: PlanInput): TransitionPlan = planTransition(
         analysis = input.outAnalysis,
@@ -85,7 +65,7 @@ internal object StraightMixGeometry {
         var best: SelectedPlan? = null
         var bestScore = Double.NEGATIVE_INFINITY
         for (recipe in Recipes.forLevel(input.djLevel)) {
-            if (recipe.id in input.excludedRecipes || recipe.requiresOutLoop) continue
+            if (recipe.id in input.excludedRecipes || recipe.id.code in input.excludedRecipeIds || recipe.requiresOutLoop) continue
             val minimum = maxOf(1, ceil(recipe.minOverlapBars).toInt())
             var bars = recipe.barRange.first.coerceAtLeast(minimum)
             var plan: LoopMix.Plan? = null

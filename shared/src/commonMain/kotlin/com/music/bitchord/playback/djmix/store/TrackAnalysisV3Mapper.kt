@@ -17,6 +17,7 @@ import com.music.bitchord.playback.smart.SectionKind
 import com.music.bitchord.playback.smart.SectionRole
 import com.music.bitchord.playback.smart.SongMap
 import com.music.bitchord.playback.smart.TrackAnalysis
+import com.music.bitchord.playback.smart.TrackAnalysisProvenance
 import com.music.bitchord.playback.smart.structure.StructureResult
 import kotlin.math.roundToLong
 
@@ -37,6 +38,16 @@ import kotlin.math.roundToLong
  * - `integratedLufs` has no legacy source; it is the mean of the per-section
  *   LUFS when a map carries measured values, otherwise the -14 LUFS default.
  * - `shortTermLufsCurve` has no legacy source and is left empty.
+ *
+ * Provenance is not dropped: [fromV3] attaches the row's declared
+ * `contentHash`/`modelVersions`/`schema` as a frozen
+ * [com.music.bitchord.playback.smart.TrackAnalysisProvenance] so a later
+ * store-row rewrite or model-registry change cannot re-label the instance.
+ * Those values stay *declared* metadata: the app hash is a source/rendition
+ * fingerprint (not a PCM digest) and model constants are not measured runtime
+ * identity. [toV3] prefers the instance's frozen provenance. Reserved labelled
+ * entries in the existing modelVersions map preserve its status/hash semantics
+ * without changing the V3 contract. Unknown legacy declarations stay unknown.
  *
  * Pure and total: never throws on plausible inputs, never touches I/O.
  */
@@ -60,6 +71,10 @@ object TrackAnalysisV3Mapper {
     ): TrackAnalysisV3 {
         val map = songMap ?: phraseMap
         val resolvedTrackId = trackId.ifBlank { analysis.trackId.ifBlank { map?.trackKey.orEmpty() } }
+        // Captured unknowns are authoritative too; explicit arguments cannot
+        // backfill/relabel a restored instance using today's registry or source.
+        val provenance = analysis.provenance?.detached()
+            ?: TrackAnalysisProvenance.storeDeclared(contentHash, modelVersions, 3)
         val durationSec = when {
             analysis.duration > 0.0 -> analysis.duration
             map != null && map.durationSec > 0.0 -> map.durationSec
@@ -87,8 +102,9 @@ object TrackAnalysisV3Mapper {
         val beatsMs = beatsMsOf(analysis, downbeatsMs, bpm)
 
         return TrackAnalysisV3(
+            schema = provenance.declaredSchemaVersion?.takeIf { it == 3 } ?: 3,
             trackId = resolvedTrackId,
-            contentHash = contentHash,
+            contentHash = provenance.sourceHash.orEmpty(),
             durationMs = durationMs,
             analysisLevel = analysisLevelOf(analysis),
             bpm = bpm,
@@ -105,7 +121,7 @@ object TrackAnalysisV3Mapper {
             silentIntroEndMs = analysis.audibleStartTime?.let { (it * 1000.0).roundToLong().coerceAtLeast(0L) } ?: 0L,
             audibleEndMs = ((analysis.contentEndTime.takeIf { it > 0.0 } ?: durationSec) * 1000.0).roundToLong()
                 .coerceIn(0L, durationMs),
-            modelVersions = modelVersions,
+            modelVersions = provenance.toModelVersions(),
         )
     }
 
@@ -118,9 +134,17 @@ object TrackAnalysisV3Mapper {
         modelVersions: Map<String, String>,
     ): TrackAnalysisV3 = toV3(trackId, contentHash, analysis, songMap, songMap, modelVersions)
 
+    /** Project the exact instance's provenance; absent metadata remains explicitly unknown. */
+    fun toV3(trackId: String, analysis: TrackAnalysis, songMap: SongMap?): TrackAnalysisV3 =
+        toV3(trackId, "", analysis, songMap, songMap, emptyMap())
+
     /**
      * Restores a planner-compatible [TrackAnalysis] from a persisted [v3].
      * Fields with no V3 counterpart come back empty/derived (see class doc).
+     *
+     * The row's declared provenance rides along on the restored instance so the
+     * frozen value cannot be replaced later by a different store row or by
+     * currently installed model constants.
      */
     fun fromV3(v3: TrackAnalysisV3): TrackAnalysis {
         val durationSec = v3.durationMs / 1000.0
@@ -189,6 +213,11 @@ object TrackAnalysisV3Mapper {
             keyTailConfidence = 0.0,
             instrumentalWindows = emptyList(),
             vocalPresence50fps = v3.vocalPresence50fps,
+            provenance = TrackAnalysisProvenance.storeDeclared(
+                contentHash = v3.contentHash,
+                modelVersions = v3.modelVersions,
+                schemaVersion = v3.schema,
+            ),
         )
     }
 

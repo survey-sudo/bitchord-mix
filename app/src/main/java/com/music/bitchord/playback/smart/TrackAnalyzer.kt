@@ -30,6 +30,8 @@ import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import androidx.media3.common.util.UnstableApi
 import com.music.bitchord.data.YtMusicRepository
 import com.music.bitchord.data.listentogether.ListenTogether
@@ -39,20 +41,30 @@ import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.TrackMatcher
 import com.music.bitchord.playback.AudioCache
+import com.music.bitchord.playback.djmix.PrepThermalGate
 import com.music.bitchord.playback.djmix.npu.InferenceBackend
 import com.music.bitchord.playback.djmix.npu.NpuAddon
 import com.music.bitchord.playback.djmix.npu.SelfTestRecord
 import com.music.bitchord.playback.djmix.store.TrackStoreBridge
 import com.music.bitchord.playback.djmix.work.QueuePrepDelegate
 import com.music.bitchord.playback.djmix.work.QueuePrepRegistry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
@@ -86,6 +98,25 @@ internal fun wholeTrackExecutor(): java.util.concurrent.ExecutorService =
         }
     }
 
+internal enum class AnalysisFailureStage(val wireName: String) { HEAD("head"), WHOLE("whole"), STORE("store"), MODEL("model") }
+
+internal data class AnalysisFailure(
+    val stage: AnalysisFailureStage,
+    val operation: String,
+    val trackId: String,
+    val exceptionClass: String,
+)
+
+internal fun recordAnalysisFailure(failure: AnalysisFailure, error: Throwable) {
+    runCatching {
+        AnalysisLog.warn(
+            "analysis_failure stage=${failure.stage.wireName} operation=${failure.operation} " +
+                "track=${failure.trackId} exception=${failure.exceptionClass}",
+            error,
+        )
+    }
+}
+
 @UnstableApi
 class TrackAnalyzer(private val context: Context, private val cache: AudioCache) {
 
@@ -114,7 +145,10 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             context.getSystemService(PowerManager::class.java)?.let { power ->
                 thermalStatus = power.currentThermalStatus
-                power.addThermalStatusListener(Runnable::run) { thermalStatus = it }
+                power.addThermalStatusListener(Runnable::run) {
+                    thermalStatus = it
+                    backgroundUpdates.update { generation -> generation + 1 }
+                }
             }
         }
     }
@@ -257,6 +291,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      */
     private val _analysisUpdates = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val analysisUpdates: SharedFlow<String> = _analysisUpdates
+    private val backgroundUpdates = MutableStateFlow(0L)
+    @Volatile private var released = false
 
     /** Terminal-failure / stalled ids for this session (bounded; retried only on explicit change). */
     private val failed = ConcurrentHashMap.newKeySet<String>()
@@ -283,6 +319,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     /** trackId -> rendition key the provisional is tagged with (never persisted). */
     private val sourceProvisionalKeys = ConcurrentHashMap<String, String>()
     private val sourceAnalysisUris = ConcurrentHashMap<String, Uri>()
+    /** Last canonical analysis URI, used to pin persisted rows to a rendition fingerprint. */
+    private val analysisUris = ConcurrentHashMap<String, Uri>()
+    private val analysisDurations = ConcurrentHashMap<String, Double>()
     private val sourceResolutions = ConcurrentHashMap.newKeySet<String>()
     private val sourceResolutionAttempted = ConcurrentHashMap.newKeySet<String>()
     private val sourceResolutionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -306,6 +345,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         provisional = provisional,
         restoreAttempted = restoreAttempted,
         onAnalysisUpdated = ::emitUpdate,
+        contentHashForTrack = ::contentHashForTrack,
     )
 
     private val queuePrepLock = Any()
@@ -330,6 +370,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         isStopped = { stopped },
         playbackFirst = ::playbackFirst,
         analysisUriFor = ::analysisUriFor,
+        captureProvenance = ::producerProvenance,
         analyzeMonoWindow = { openSource, startSeconds, endSeconds, deriveFeatures, includeVocals ->
             wholeTrackPipeline.analyzeMonoWindow(openSource, startSeconds, endSeconds, deriveFeatures, includeVocals)
         },
@@ -355,33 +396,57 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         copyToRead = { trackId, uri, durationSeconds -> headAnalyzer.copyToRead(trackId, uri, durationSeconds) },
     )
 
-    /**
-     * Queue-worker surface: raises [trackId] to FULL when a URI is known.
-     * Without a URI (the common case for an id-only queue entry) this can
-     * only report whether FULL is already in hand; the playback path's
-     * `request(trackId, uri, ...)` remains the way to earn it.
-     */
-    suspend fun ensureFullAnalysis(trackId: String): Boolean {
-        if (trackId.isBlank()) return false
-        storeBridge.triggerDjmixMigrationOnce()
-        ensureQueuePrepRegistered()
-        // AE3 M6: cheap guarded post of the add-on NPU bridge pass.
-        npuStemBridge.scheduleNpuBridgeSetupOnce()
-        if (results[trackId]?.quality == TrackAnalysis.QUALITY_FULL && results[trackId]?.isUsable == true) {
-            return true
-        }
-        val uri = sourceAnalysisUris[trackId] ?: return false
-        val duration = results[trackId]?.duration ?: 0.0
-        request(trackId, uri, duration)
-        // request() is async; poll briefly on the worker's IO dispatcher.
-        repeat(20) {
-            if (results[trackId]?.quality == TrackAnalysis.QUALITY_FULL && results[trackId]?.isUsable == true) {
-                return true
+    /** ID-only workers resolve disk-backed sources on IO and await real FULL/terminal updates. */
+    suspend fun ensureFullAnalysis(trackId: String): Boolean = withContext(Dispatchers.IO) {
+        withTimeoutOrNull(WHOLE_TRACK_DEADLINE_MS) {
+            try {
+                currentCoroutineContext().ensureActive()
+                if (trackId.isBlank() || backgroundRefused() || trackId in cancelled) return@withTimeoutOrNull false
+                storeBridge.triggerDjmixMigrationOnce()
+                ensureQueuePrepRegistered()
+                npuStemBridge.scheduleNpuBridgeSetupOnce()
+                if (hasUsableFull(trackId)) return@withTimeoutOrNull true
+                val source = BackgroundTrackResolver(context, cache).resolve(
+                    trackId, sourceAnalysisUris[trackId] ?: analysisUris[trackId],
+                    analysisDurations[trackId] ?: results[trackId]?.duration,
+                ) ?: return@withTimeoutOrNull false
+                // An ordinary head pass may already own this ID; join it before requesting FULL.
+                if (trackId in running && awaitBackgroundPass(trackId)) return@withTimeoutOrNull true
+                currentCoroutineContext().ensureActive()
+                if (backgroundRefused() || trackId in cancelled || trackId in failed || trackId in stalled) {
+                    return@withTimeoutOrNull false
+                }
+                val job = currentCoroutineContext().job
+                request(trackId, source.uri, source.durationSeconds) { job.isActive && !backgroundRefused() }
+                awaitBackgroundPass(trackId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                AnalysisLog.warn("Background FULL analysis unavailable for $trackId", error)
+                false
             }
-            delay(250)
-        }
-        return results[trackId]?.quality == TrackAnalysis.QUALITY_FULL && results[trackId]?.isUsable == true
+        } ?: false
     }
+
+    private fun hasUsableFull(trackId: String): Boolean = results[trackId]?.let {
+        it.quality == TrackAnalysis.QUALITY_FULL && it.isUsable && trackId !in provisional && trackId !in sourcePending
+    } == true
+
+    private fun backgroundRefused(): Boolean {
+        if (released || stopped) return true
+        val thermalRefused = PrepThermalGate.shouldPause(PrepThermalGate.currentStatus(context))
+        return thermalRefused || overheated || !AutomixModels.isReady()
+    }
+
+    private suspend fun awaitBackgroundPass(trackId: String): Boolean =
+        combine(backgroundUpdates, AutomixModels.state, ListenTogether.state) { _, _, _ ->
+            when {
+                backgroundRefused() || trackId in cancelled -> false
+                hasUsableFull(trackId) -> true
+                trackId in failed || trackId in stalled || trackId !in running -> false
+                else -> null
+            }
+        }.first { it != null } == true
 
     /**
      * Queue-worker pair prep. Ensures both analyses exist when their URIs are known.
@@ -456,12 +521,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             try {
                 // AE3 djmix.db first: a fresh HEAD_TAIL/FULL row restores without ORT.
                 if (storeBridge.restoreFromDjmixStore(trackId)) return@execute
-                val stored = store.load(trackId) ?: return@execute
+                val stored = store.load(trackId)?.let {
+                    it.copy(provenance = it.provenance?.detached() ?: TrackAnalysisProvenance.UNKNOWN)
+                } ?: return@execute
                 if (results.putIfAbsent(trackId, stored) == null) {
                     Log.d(TAG, "Restored analysis for $trackId: bpm=${stored.bpm} conf=${stored.beatConfidence}")
                     emitUpdate(trackId)
                 }
             } catch (error: Throwable) {
+                recordAnalysisFailure(
+                    AnalysisFailure(AnalysisFailureStage.STORE, "restore", trackId, error.javaClass.name), error,
+                )
                 Log.w(TAG, "Restore of $trackId failed", error)
             }
         }
@@ -469,20 +539,46 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
 
     /** Emits [trackId] on [analysisUpdates] (never blocks; buffer is 64). */
     private fun emitUpdate(trackId: String) {
+        backgroundUpdates.update { it + 1 }
         _analysisUpdates.tryEmit(trackId)
     }
 
     /** Disk load from a compute thread, via the I/O pool with a hard timeout. */
-    private fun loadFromDisk(trackId: String): TrackAnalysis? = runCatching {
-        ioExecutor.submit<TrackAnalysis?> { store.load(trackId) }.get(STORE_LOAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-    }.getOrNull()
+    private fun loadFromDisk(trackId: String): TrackAnalysis? = try {
+        ioExecutor.submit<TrackAnalysis?> {
+            store.load(trackId)?.let {
+                it.copy(provenance = it.provenance?.detached() ?: TrackAnalysisProvenance.UNKNOWN)
+            }
+        }.get(STORE_LOAD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+    } catch (error: Throwable) {
+        recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.STORE, "load", trackId, error.javaClass.name), error)
+        null
+    }
 
     /** Head-byte fetches run on the I/O pool, not the audio thread. */
     private fun requestHeadAsync(analysisUri: Uri) {
         try {
-            ioExecutor.execute { cache.requestAnalysisHead(analysisUri) }
-        } catch (_: Throwable) {
-            runCatching { cache.requestAnalysisHead(analysisUri) }
+            ioExecutor.execute {
+                try {
+                    cache.requestAnalysisHead(analysisUri)
+                } catch (error: Throwable) {
+                    recordAnalysisFailure(
+                        AnalysisFailure(AnalysisFailureStage.HEAD, "request", analysisUri.toString(), error.javaClass.name), error,
+                    )
+                }
+            }
+        } catch (error: Throwable) {
+            recordAnalysisFailure(
+                AnalysisFailure(AnalysisFailureStage.HEAD, "dispatch", analysisUri.toString(), error.javaClass.name), error,
+            )
+            try {
+                cache.requestAnalysisHead(analysisUri)
+            } catch (fallbackError: Throwable) {
+                recordAnalysisFailure(
+                    AnalysisFailure(AnalysisFailureStage.HEAD, "fallback_request", analysisUri.toString(), fallbackError.javaClass.name),
+                    fallbackError,
+                )
+            }
         }
     }
 
@@ -491,7 +587,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         synchronized(reaperLock) {
             try {
                 modelReaper?.cancel(false)
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
+                recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.MODEL, "reaper_cancel", "", error.javaClass.name), error)
             }
             modelReaper = null
         }
@@ -507,15 +604,22 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 modelReaper = reaperExecutor.schedule(
                     {
                         if (running.isEmpty()) {
-                            tracker.release()
-                            vocalPresence.release()
-                            vocals.release()
+                            try {
+                                tracker.release()
+                                vocalPresence.release()
+                                vocals.release()
+                            } catch (error: Throwable) {
+                                recordAnalysisFailure(
+                                    AnalysisFailure(AnalysisFailureStage.MODEL, "reaper_release", "", error.javaClass.name), error,
+                                )
+                            }
                         }
                     },
                     MODEL_IDLE_REAP_MS,
                     TimeUnit.MILLISECONDS,
                 )
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
+                recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.MODEL, "reaper_schedule", "", error.javaClass.name), error)
             }
         }
     }
@@ -540,6 +644,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         grid: BeatTracker.Grid?,
         feats: TrackFeatures.Features?,
         level: CurveWindow?,
+        provenance: TrackAnalysisProvenance,
     ) {
         if (grid == null && feats == null) return
         val bpm = grid?.bpm ?: feats?.bpm ?: 0.0
@@ -565,6 +670,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             mixInCandidates = feats?.mixInCandidates.orEmpty(),
             headBeats = grid?.let { BeatSide(it.beats, it.downbeats, it.bpm, it.beatConfidence) },
             levelWindows = listOfNotNull(level),
+            provenance = provenance,
         )
         provisional.add(trackId)
         results[trackId] = intermediate
@@ -632,23 +738,27 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      * Runs in up to two passes (Pass-1 head/grid on [headExecutor] vs Pass-2
      * whole-track on [executor]).
      */
-    fun request(trackId: String, uri: Uri, durationSeconds: Double) {
+    fun request(trackId: String, uri: Uri, durationSeconds: Double) = request(trackId, uri, durationSeconds, null)
+
+    private fun request(trackId: String, uri: Uri, durationSeconds: Double, backgroundActive: (() -> Boolean)?) {
+        val requireFull = backgroundActive != null
         if (trackId.isBlank()) return
+        if (requireFull && backgroundActive?.invoke() != true) return
         if (stopped) return
         storeBridge.triggerDjmixMigrationOnce()
         ensureQueuePrepRegistered()
         npuStemBridge.scheduleNpuBridgeSetupOnce()
         if (trackId in running) return
         if (overheated) {
+            rememberAnalysisSource(trackId, uri, durationSeconds)
             restoreOnce(trackId)
             return
         }
+        val analysisUri = analysisUriFor(trackId, uri) ?: return
+        rememberAnalysisSource(trackId, analysisUri, durationSeconds)
         restoreOnce(trackId)
         if (!AutomixModels.isReady()) return
         val modelGeneration = AutomixModels.availabilityGeneration.value
-        val analysisUri = analysisUriFor(trackId, uri) ?: return
-
-        restoreOnce(trackId)
 
         val local = LocalAudioSource.isLocal(analysisUri)
 
@@ -660,6 +770,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 .filter { it.isComplete && it.key !in badRenditions }
         }
         val usableComplete = local || complete.isNotEmpty()
+        // Background resolution never starts a speculative head fetch or source match.
+        if (requireFull && !usableComplete) return
+        if (requireFull) sourcePending.remove(trackId)
 
         val recorded = results[trackId]
         val untried = renditionModelGenerations[trackId] != modelGeneration || if (local) {
@@ -669,6 +782,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val supersedable = when {
             recorded == null -> false
+            requireFull && recorded.isUsable && recorded.quality != TrackAnalysis.QUALITY_FULL -> usableComplete
             trackId in provisional && trackId in sourcePending -> analysisUri != uri && usableComplete
             trackId in provisional -> usableComplete
             else -> !recorded.isUsable && untried
@@ -723,21 +837,23 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     }
                 }
                 // AE3: a fresh djmix.db HEAD_TAIL/FULL row restores here before decode/ORT.
-                if (storeBridge.restoreFromDjmixStore(trackId)) return@execute
+                if (storeBridge.restoreFromDjmixStore(trackId) && (!requireFull || hasUsableFull(trackId))) return@execute
                 try {
                     val landed = results[trackId]
-                    if (landed != null && landed.isUsable && trackId !in provisional) return@execute
+                    if (landed != null && landed.isUsable && trackId !in provisional &&
+                        (!requireFull || hasUsableFull(trackId))) return@execute
+                    if (requireFull && backgroundActive?.invoke() != true) return@execute
                     if (stopped || trackId in cancelled) return@execute
                     if (usableComplete) {
                         val outcome = wholeTrackPipeline.analyze(
                             trackId,
                             analysisUri,
                             durationSeconds,
-                            onGridReady = { effective, grid, feats, level ->
-                                publishIntermediate(trackId, effective, grid, feats, level)
+                            onGridReady = { effective, grid, feats, level, provenance ->
+                                publishIntermediate(trackId, effective, grid, feats, level, provenance)
                             },
                             shouldAbort = {
-                                stopped || trackId in cancelled ||
+                                stopped || trackId in cancelled || (requireFull && backgroundActive?.invoke() != true) ||
                                     (requestSeq.get() != seqAtQueue && lastRequestedTrackId != trackId && results[trackId]?.isUsable == true) ||
                                     (elapsedNow() - startedAtElapsed > WHOLE_TRACK_DEADLINE_MS)
                             },
@@ -756,8 +872,20 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                             failed.remove(trackId)
                             stalled.remove(trackId)
                             if (!wasSource) {
-                                store.save(trackId, whole)
-                                storeBridge.persistToDjmixStore(trackId, whole)
+                                try {
+                                    store.save(trackId, whole)
+                                } catch (error: Throwable) {
+                                    recordAnalysisFailure(
+                                        AnalysisFailure(AnalysisFailureStage.STORE, "legacy_save", trackId, error.javaClass.name), error,
+                                    )
+                                }
+                                try {
+                                    storeBridge.persistToDjmixStore(trackId, whole)
+                                } catch (error: Throwable) {
+                                    recordAnalysisFailure(
+                                        AnalysisFailure(AnalysisFailureStage.STORE, "djmix_save", trackId, error.javaClass.name), error,
+                                    )
+                                }
                             }
                             restoreAttempted.add(trackId)
                             emitUpdate(trackId)
@@ -786,11 +914,19 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                         headAnalyzer.analyzeHead(trackId, analysisUri, durationSeconds, headRendition!!)?.let { head ->
                             provisional.add(trackId)
                             results[trackId] = head
-                            storeBridge.persistToDjmixStore(trackId, head)
+                            try {
+                                storeBridge.persistToDjmixStore(trackId, head)
+                            } catch (error: Throwable) {
+                                recordAnalysisFailure(
+                                    AnalysisFailure(AnalysisFailureStage.STORE, "head_save", trackId, error.javaClass.name), error,
+                                )
+                            }
                             emitUpdate(trackId)
                         }
                     }
                 } catch (error: Throwable) {
+                    val stage = if (usableComplete) AnalysisFailureStage.WHOLE else AnalysisFailureStage.HEAD
+                    recordAnalysisFailure(AnalysisFailure(stage, "analyze", trackId, error.javaClass.name), error)
                     Log.w(TAG, "Analysis of $trackId failed", error)
                     rememberTerminal(failed, trackId)
                     val keepIntermediate = trackId in provisional && results[trackId]?.isUsable == true
@@ -805,6 +941,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     emitUpdate(trackId)
                 }
             } catch (error: Throwable) {
+                val stage = if (usableComplete) AnalysisFailureStage.WHOLE else AnalysisFailureStage.HEAD
+                recordAnalysisFailure(AnalysisFailure(stage, "worker", trackId, error.javaClass.name), error)
                 Log.w(TAG, "Analysis of $trackId failed", error)
                 rememberTerminal(failed, trackId)
                 emitUpdate(trackId)
@@ -815,6 +953,15 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 emitUpdate(trackId)
                 if (running.isEmpty()) scheduleModelReaper()
             }
+        }
+    }
+
+    private fun rememberAnalysisSource(trackId: String, uri: Uri, durationSeconds: Double) {
+        analysisUris[trackId] = uri
+        if (durationSeconds.isFinite() && durationSeconds > 0.0) {
+            analysisDurations[trackId] = durationSeconds
+        } else {
+            analysisDurations.remove(trackId)
         }
     }
 
@@ -849,6 +996,9 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                         Log.d(TAG, "No YouTube match for Automix analysis of $trackId")
                     }
                 } catch (error: Throwable) {
+                    recordAnalysisFailure(
+                        AnalysisFailure(AnalysisFailureStage.MODEL, "source_match", trackId, error.javaClass.name), error,
+                    )
                     Log.d(TAG, "YouTube match failed for Automix analysis of $trackId: ${error.message}")
                 } finally {
                     sourceResolutionAttempted.add(trackId)
@@ -862,6 +1012,68 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             runCatching { cache.cacheKeyOf(playbackUri) }.getOrElse { playbackUri.toString() },
         )
         return playbackUri
+    }
+
+    /** Capture the selected local copy, never the playback URI's possibly different rendition. */
+    private fun producerProvenance(
+        trackId: String,
+        uri: Uri,
+        rendition: AudioCache.Rendition?,
+    ): TrackAnalysisProvenance {
+        val hash = runCatching {
+            when {
+                rendition != null -> contentHashForRendition(trackId, rendition)
+                LocalAudioSource.isLocal(uri) -> contentHashForUri(trackId, uri)
+                else -> null // No exact local rendition: do not fingerprint a guessed URI/cache key.
+            }
+        }.getOrNull()
+        val provenance = TrackAnalysisProvenance.producerCaptured(
+            sourceFingerprintHash = hash,
+            declaredModelVersions = storeBridge.currentModelVersions(),
+        )
+        return if (hash != null) provenance else provenance.copy(sourceHashRole = AnalysisSourceHashRole.UNKNOWN)
+    }
+
+    private fun contentHashForTrack(trackId: String): String? {
+        val uri = sourceAnalysisUris[trackId] ?: analysisUris[trackId] ?: return null
+        if (LocalAudioSource.isLocal(uri)) return contentHashForUri(trackId, uri)
+        // Restore compares against the same eligible copy selection as a new whole-track pass.
+        // With no exact complete local rendition, compatibility remains unknown.
+        val rendition = headAnalyzer.chooseRendition(trackId, uri, analysisDurations[trackId] ?: 0.0) ?: return null
+        return contentHashForRendition(trackId, rendition)
+    }
+
+    private fun contentHashForRendition(trackId: String, rendition: AudioCache.Rendition): String? =
+        rendition.takeIf { it.key.isNotBlank() && it.contentLength > 0L }?.let {
+            TrackStoreBridge.contentHashFromFingerprint(trackId, "rendition:${it.key}:${it.contentLength}")
+        }
+
+    private fun contentHashForUri(trackId: String, uri: Uri): String? {
+        val path = uri.path
+        val file = path?.let(::File)?.takeIf { it.isFile }
+        val fingerprint = if (file != null) {
+            "file:${file.canonicalPath}:${file.length()}:${file.lastModified()}"
+        } else if (uri.scheme == "content") {
+            val contentMetadata = runCatching {
+                resolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED),
+                    null, null, null,
+                )?.use { cursor ->
+                    if (!cursor.moveToFirst()) null else {
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        val modifiedIndex = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                        val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) cursor.getLong(sizeIndex) else -1L
+                        val modified = if (modifiedIndex >= 0 && !cursor.isNull(modifiedIndex)) cursor.getLong(modifiedIndex) else -1L
+                        if (size < 0L && modified < 0L) null else "$size:$modified"
+                    }
+                }
+            }.getOrNull()
+            "content:${uri.authority}:${contentMetadata ?: return null}"
+        } else {
+            return null // No local file/content metadata: never guess a remote cache rendition.
+        }
+        return TrackStoreBridge.contentHashFromFingerprint(trackId, fingerprint)
     }
 
     private suspend fun findYouTubeMatch(target: TrackMatcher.Target): com.music.bitchord.data.model.Song? {
@@ -917,9 +1129,17 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         }
         val began = SystemClock.elapsedRealtime()
         onStep?.invoke("stream")
-        val copy = runCatching { headAnalyzer.copyToRead(trackId, uri, durationSeconds) }.getOrNull()
-            ?: runCatching { headAnalyzer.streamingCopyForLoop(trackId, uri, durationSeconds) }.getOrNull()
-            ?: return null
+        val copy = try {
+            headAnalyzer.copyToRead(trackId, uri, durationSeconds)
+        } catch (error: Throwable) {
+            recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.HEAD, "copy", trackId, error.javaClass.name), error)
+            null
+        } ?: try {
+            headAnalyzer.streamingCopyForLoop(trackId, uri, durationSeconds)
+        } catch (error: Throwable) {
+            recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.HEAD, "stream_copy", trackId, error.javaClass.name), error)
+            null
+        } ?: return null
         onStep?.invoke("decode")
         val (stereo, start) = copy.open()?.use { source ->
             AudioDecoder.decodeRegionStereo(source, max(0.0, fromSeconds), toSeconds) { yieldOrStopped() }
@@ -976,7 +1196,12 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
             sourceAnalysisUris[trackId] ?: return null
         }
         val began = SystemClock.elapsedRealtime()
-        val copy = runCatching { headAnalyzer.copyToRead(trackId, analysisUri, durationSeconds) }.getOrNull() ?: return null
+        val copy = try {
+            headAnalyzer.copyToRead(trackId, analysisUri, durationSeconds)
+        } catch (error: Throwable) {
+            recordAnalysisFailure(AnalysisFailure(AnalysisFailureStage.HEAD, "waveform_copy", trackId, error.javaClass.name), error)
+            null
+        } ?: return null
         val chosen = SystemClock.elapsedRealtime()
         val bands = copy.open()?.use { source ->
             MixWaveform.build(source, fromSeconds, toSeconds, bins) { stopped }
@@ -991,6 +1216,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     }
 
     fun release() {
+        released = true
+        backgroundUpdates.update { it + 1 }
         cancelModelReaper()
         try {
             reaperExecutor.shutdownNow()
@@ -1001,6 +1228,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         ioExecutor.shutdownNow()
         sourceResolutionScope.cancel()
         sourceAnalysisUris.clear()
+        analysisUris.clear()
+        analysisDurations.clear()
         sourceResolutions.clear()
         sourceResolutionAttempted.clear()
         headAnalyzer.clear()

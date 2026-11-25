@@ -7,6 +7,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.util.Log
+import com.music.bitchord.playback.smart.NpuRuntime
 import java.io.File
 import java.nio.FloatBuffer
 
@@ -66,8 +67,13 @@ class CpuOrtBackend : InferenceBackend {
         val options = OrtSession.SessionOptions().apply {
             setIntraOpNumThreads(2)
         }
-        val session = env.createSession(model.file.absolutePath, options)
-        return CpuSession(env, session)
+        try {
+            val session = env.createSession(model.file.absolutePath, options)
+            return CpuSession(env, session, options)
+        } catch (failure: Throwable) {
+            runCatching { options.close() }
+            throw failure
+        }
     }
 
     override fun selfTest(model: ModelSpec): SelfTestResult {
@@ -83,6 +89,7 @@ class CpuOrtBackend : InferenceBackend {
     private class CpuSession(
         private val env: OrtEnvironment,
         private val session: OrtSession,
+        private val options: OrtSession.SessionOptions,
     ) : Session {
         override val ep: String = "CPU"
 
@@ -92,7 +99,9 @@ class CpuOrtBackend : InferenceBackend {
             shape: IntArray,
             outputName: String,
             outSize: Int,
-        ): FloatArray? = runCatching {
+        ): FloatArray? = synchronized(lock) {
+            if (closed) return@synchronized null
+            runCatching {
             val longShape = LongArray(shape.size) { shape[it].toLong() }
             OnnxTensor.createTensor(env, FloatBuffer.wrap(data), longShape).use { tensor ->
                 session.run(mapOf(inputName to tensor)).use { outputs ->
@@ -102,10 +111,18 @@ class CpuOrtBackend : InferenceBackend {
                     FloatArray(n).also { buf.get(it) }
                 }
             }
-        }.getOrNull()
+            }.getOrNull()
+        }
 
+        private val lock = Any()
+        @Volatile private var closed = false
         override fun close() {
-            runCatching { session.close() }
+            synchronized(lock) {
+                if (closed) return
+                closed = true
+                runCatching { session.close() }
+                runCatching { options.close() }
+            }
         }
     }
 }
@@ -121,9 +138,13 @@ class QnnAddonBackend(
     override val id: String = "qnn-v73"
 
     override fun isAvailable(): Boolean =
-        OrchardNpuBridge.bridgeLoaded() && addon() != null
+        NpuRuntime.RUNTIME_AVAILABLE && NpuRuntime.productionQnnAllowed() &&
+            OrchardNpuBridge.bridgeLoaded() && addon() != null
 
     override fun open(model: ModelSpec): Session {
+        check(NpuRuntime.RUNTIME_AVAILABLE && NpuRuntime.productionQnnAllowed()) {
+            "NPU runtime gate is closed"
+        }
         val current = addon() ?: throw IllegalStateException("NPU add-on not installed")
         check(OrchardNpuBridge.bridgeLoaded()) { "NPU bridge not loaded" }
         val staged = OrchardNpuBridge.stageQnnModels(context, current)
@@ -148,6 +169,7 @@ class QnnAddonBackend(
         }
 
     private class QnnSession(private val handle: Long) : Session {
+        private val lock = Any()
         @Volatile private var closed = false
         override val ep: String = "QNN"
 
@@ -158,14 +180,18 @@ class QnnAddonBackend(
             outputName: String,
             outSize: Int,
         ): FloatArray? {
-            if (closed) return null
-            return OrchardNpuBridge.run(handle, inputName, data, shape, outSize)
+            synchronized(lock) {
+                if (closed) return null
+                return OrchardNpuBridge.run(handle, inputName, data, shape, outSize)
+            }
         }
 
         override fun close() {
-            if (closed) return
-            closed = true
-            OrchardNpuBridge.close(handle)
+            synchronized(lock) {
+                if (closed) return
+                closed = true
+                OrchardNpuBridge.close(handle)
+            }
         }
     }
 

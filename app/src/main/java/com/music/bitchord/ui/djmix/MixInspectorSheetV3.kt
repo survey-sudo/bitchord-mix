@@ -1,9 +1,10 @@
 package com.music.bitchord.ui.djmix
 
-import android.provider.Settings
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -38,13 +39,19 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.djmix.core.contracts.MixUiState
 import com.music.bitchord.djmix.core.contracts.TransitionPlanV1
-import com.music.bitchord.djmix.core.learning.TasteModel
+import com.music.bitchord.ui.player.automixPlayheadAnimationDurationMillis
+import com.music.bitchord.ui.player.rememberAutomixReducedMotion
 
 /**
  * One labelled FX segment on the Inspector timeline. [label] is always drawn as
@@ -110,7 +117,7 @@ fun MixInspectorSheetV3(
             onThumbsUp = onThumbsUp,
             onThumbsDown = onThumbsDown,
             onFlag = onFlag,
-            modifier = Modifier.padding(horizontal = 20.dp),
+            modifier = Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
         )
     }
 }
@@ -131,21 +138,19 @@ fun MixInspectorContent(
     onFlag: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val context = LocalContext.current
-    val reducedMotion = remember(context) {
-        runCatching {
-            Settings.Global.getFloat(
-                context.contentResolver,
-                Settings.Global.ANIMATOR_DURATION_SCALE,
-                1.0f,
-            ) == 0f
-        }.getOrDefault(false)
+    val reducedMotion = rememberAutomixReducedMotion()
+    val learningEnabled by AppSettings.automixLearnFromReactions.collectAsStateWithLifecycle()
+    val targetFraction = playheadFraction.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 0f
+    val timelineFraction = if (reducedMotion) {
+        targetFraction
+    } else {
+        val animatedFraction by animateFloatAsState(
+            targetValue = targetFraction,
+            animationSpec = tween(durationMillis = automixPlayheadAnimationDurationMillis(reducedMotion)),
+            label = "inspectorPlayhead",
+        )
+        animatedFraction
     }
-    val animatedFraction by animateFloatAsState(
-        targetValue = playheadFraction.coerceIn(0f, 1f),
-        animationSpec = tween(durationMillis = if (reducedMotion) 0 else 250),
-        label = "inspectorPlayhead",
-    )
     var detailsExpanded by remember { mutableStateOf(false) }
 
     Column(
@@ -180,7 +185,7 @@ fun MixInspectorContent(
             plan = plan,
             outWaveform = outWaveform,
             inWaveform = inWaveform,
-            playheadFraction = animatedFraction,
+            playheadFraction = timelineFraction,
             fxLanes = fxLanes,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -190,13 +195,15 @@ fun MixInspectorContent(
             Text(
                 text = readinessText(state),
                 style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.semantics {
-                    contentDescription = "Readiness: ${readinessText(state)}"
+                modifier = Modifier.clearAndSetSemantics {
+                    contentDescription = readinessContentDescription(state)
                 },
             )
             LinearProgressIndicator(
                 progress = { (state.progressPct / 100f).coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().semantics {
+                    contentDescription = "Mix preparation progress"
+                },
             )
         }
 
@@ -204,15 +211,8 @@ fun MixInspectorContent(
         val why = state.inspectorReason.ifBlank {
             plan?.placementReasons?.firstOrNull().orEmpty()
         }
-        val tasteBadge = plan?.let { TasteModel.formatTasteBadge(it.tasteAdjustment) }
-        if (why.isNotBlank() || tasteBadge != null) {
-            val whyText = buildString {
-                if (why.isNotBlank()) append(why)
-                if (tasteBadge != null) {
-                    if (isNotEmpty()) append(" · ")
-                    append(tasteBadge)
-                }
-            }
+        val whyText = inspectorWhyText(why, plan?.tasteAdjustment ?: 0.0, learningEnabled)
+        if (whyText.isNotBlank()) {
             Text(text = whyText, style = MaterialTheme.typography.bodySmall)
         }
 
@@ -223,7 +223,10 @@ fun MixInspectorContent(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (state.canRemix) {
-                TextButton(onClick = onRemix) { Text("Try another mix") }
+                TextButton(
+                    onClick = onRemix,
+                    modifier = Modifier.semantics { contentDescription = "Try another mix" },
+                ) { Text("Try another mix") }
             }
             Spacer(Modifier.weight(1f))
             IconButton(onClick = onThumbsUp) {
@@ -247,6 +250,9 @@ fun MixInspectorContent(
             Text("Details", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
             IconButton(
                 onClick = { detailsExpanded = !detailsExpanded },
+                modifier = Modifier.semantics {
+                    stateDescription = if (detailsExpanded) "Expanded" else "Collapsed"
+                },
             ) {
                 Icon(
                     if (detailsExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
@@ -315,6 +321,7 @@ private fun TransitionTimeline(
     val outColor = MaterialTheme.colorScheme.primary
     val inColor = MaterialTheme.colorScheme.secondary
     val markerColor = MaterialTheme.colorScheme.tertiary
+    val labelColor = MaterialTheme.colorScheme.onSurface
     val lanePalette = listOf(
         Color(0xFF7C4DFF), Color(0xFF00B0FF), Color(0xFF00C853),
         Color(0xFFFF9100), Color(0xFFE040FB), Color(0xFF00B8D4),
@@ -330,7 +337,14 @@ private fun TransitionTimeline(
     Canvas(
         modifier = modifier
             .height(TIMELINE_HEIGHT)
-            .semantics { contentDescription = "Transition timeline: outgoing and incoming waveforms" },
+            .semantics {
+                contentDescription = buildString {
+                    append("Transition timeline. OUT: outgoing track, top waveform. IN: incoming track, bottom waveform.")
+                    if (plan != null) append(" Shaded overlap and SWAP downbeat marker.")
+                    if (fxLanes.isNotEmpty()) append(" Effects: ${fxLanes.joinToString { it.label }}.")
+                }
+                progressBarRangeInfo = ProgressBarRangeInfo(playheadFraction, 0f..1f)
+            },
     ) {
         val w = size.width
         val h = size.height
@@ -350,6 +364,16 @@ private fun TransitionTimeline(
                 topLeft = Offset(x0, 0f),
                 size = Size((x1 - x0).coerceAtLeast(2f), h),
             )
+            if (x1 - x0 >= 48f * density) {
+                drawContext.canvas.nativeCanvas.apply {
+                    val paint = android.graphics.Paint().apply {
+                        color = labelColor.toArgb()
+                        textSize = 10f * density
+                        isAntiAlias = true
+                    }
+                    drawText("OVERLAP", x0 + 3f * density, h - FX_LANE_HEIGHT.toPx() - 3f * density, paint)
+                }
+            }
         }
 
         fun drawBars(values: List<Float>, top: Float, height: Float, color: Color) {
@@ -369,6 +393,15 @@ private fun TransitionTimeline(
         }
         drawBars(outWaveform, 0f, outH, outColor)
         drawBars(inWaveform, inTop, inH, inColor)
+        drawContext.canvas.nativeCanvas.apply {
+            val paint = android.graphics.Paint().apply {
+                color = labelColor.toArgb()
+                textSize = 11f * density
+                isAntiAlias = true
+            }
+            drawText("OUT", 4f * density, 14f * density, paint)
+            drawText("IN", 4f * density, inTop + 14f * density, paint)
+        }
 
         // Swap downbeat marker (line + text label, never colour alone).
         plan?.let {
@@ -410,14 +443,6 @@ private fun TransitionTimeline(
         val px = playheadFraction.coerceIn(0f, 1f) * w
         drawLine(Color.White, Offset(px, 0f), Offset(px, h), strokeWidth = 2f)
     }
-}
-
-/** `"Analysis ✓ · Plan ✓ · Stems 3/4 · Renderer ✗"`-style readiness string. */
-private fun readinessText(state: MixUiState): String {
-    val r = state.readiness
-    fun mark(done: Boolean) = if (done) "✓" else "✗"
-    return "Analysis ${mark(r.analysisDone)} · Plan ${mark(r.planDone)} · " +
-        "Stems ${r.stemsReady}/${r.stemsRequired} · Renderer ${mark(r.rendererReady)}"
 }
 
 private val TIMELINE_HEIGHT = 140.dp

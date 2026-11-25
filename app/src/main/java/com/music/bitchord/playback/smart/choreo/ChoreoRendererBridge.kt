@@ -1,6 +1,9 @@
 package com.music.bitchord.playback.smart.choreo
 
 import android.util.Log
+import com.music.bitchord.djmix.core.contracts.DeckTarget
+import com.music.bitchord.djmix.core.contracts.EnvelopeKind
+import com.music.bitchord.djmix.core.contracts.TransitionScriptV1
 import com.music.bitchord.playback.loopmix.LoopMixRenderer
 import com.music.bitchord.playback.smart.StemSet
 
@@ -110,6 +113,141 @@ internal object ChoreoRendererBridge {
                 renderer.setLoudnessDropWindow(script.dropExemptStartSec, script.dropExemptEndSec, script.dropBumpLu)
             }
         }
+    }
+
+    /**
+     * Installs the executable canonical script without going through the legacy
+     * choreography model. The caller must have validated the frozen script and
+     * attached every declared stem before invoking this overload.
+     */
+    fun apply(
+        renderer: LoopMixRenderer,
+        script: TransitionScriptV1,
+        caps: Int = LoopMixRenderer.V2_CAPABILITIES,
+        outStemsAttached: Boolean = true,
+        inStemsAttached: Boolean = true,
+    ) {
+        fun deck(target: DeckTarget): Int = if (target == DeckTarget.OUT) LoopMixRenderer.OUT else LoopMixRenderer.IN
+        fun cap(kind: EnvelopeKind): Int? = when (kind) {
+            EnvelopeKind.STEM_VOCALS, EnvelopeKind.STEM_DRUMS, EnvelopeKind.STEM_BASS,
+            EnvelopeKind.STEM_OTHER -> ChoreoCaps.STEMS
+            EnvelopeKind.FILTER_RES -> ChoreoCaps.FILTER_RES
+            EnvelopeKind.FILTER_KNOB -> ChoreoCaps.FILTER_KNOB
+            EnvelopeKind.PHASER_WET -> ChoreoCaps.PHASER
+            EnvelopeKind.GATE_DEPTH -> ChoreoCaps.GATE
+            EnvelopeKind.RISER_LEVEL -> ChoreoCaps.RISER
+            EnvelopeKind.PUMP_DEPTH -> ChoreoCaps.PUMP
+            EnvelopeKind.BRAKE -> ChoreoCaps.BRAKE
+            else -> null
+        }
+        // Defensive precondition: canonical compiled spinback gap must be resolved before
+        // any renderer mutation. Normal session path validates via ScriptExecutionGuard;
+        // direct internal callers must also fail before partial renderer setup.
+        val spinbackGapSec: Double? = script.fxParams.spinback?.takeIf { it.enabled }?.let { spin ->
+            require(ChoreoCaps.has(caps, ChoreoCaps.SPINBACK))
+            if (spin.silenceGapSec > 0.0 || spin.silenceGapBeats <= 0.0) {
+                spin.silenceGapSec
+            } else {
+                error("spinback enabled with silenceGapBeats=${spin.silenceGapBeats} but no compiled silenceGapSec")
+            }
+        }
+        for (lane in script.envelopes) {
+            val stemLane = lane.kind.isStem
+            val stemsAttached = if (lane.deck == DeckTarget.OUT) outStemsAttached else inStemsAttached
+            if (stemLane && !stemsAttached) {
+                throw IllegalStateException("canonical stem lane without attached stems: ${lane.deck}/${lane.kind}")
+            }
+            val capAvailable = when (lane.kind) {
+                EnvelopeKind.GATE_DEPTH -> ChoreoCaps.has(caps, ChoreoCaps.GATE) || ChoreoCaps.has(caps, ChoreoCaps.STUTTER)
+                EnvelopeKind.BRAKE -> ChoreoCaps.has(caps, ChoreoCaps.BRAKE) || ChoreoCaps.has(caps, ChoreoCaps.SPINBACK)
+                else -> cap(lane.kind)?.let { ChoreoCaps.has(caps, it) } ?: true
+            }
+            if (!capAvailable) {
+                throw IllegalStateException("canonical lane capability unavailable: ${lane.kind}")
+            }
+            renderer.setEnvelope(
+                deck(lane.deck), lane.kind.nativeId,
+                lane.timesSec.toDoubleArray(), lane.values.toFloatArray(), lane.exponential,
+            )
+        }
+        val fx = script.fxParams
+        fx.outSvfQ?.let { renderer.setSvfQ(LoopMixRenderer.OUT, it) }
+        fx.inSvfQ?.let { renderer.setSvfQ(LoopMixRenderer.IN, it) }
+        fx.loop?.takeIf { it.enabled }?.let {
+            renderer.setLoopSeamMs(LoopMixRenderer.OUT, it.seamCrossfadeMs)
+        }
+        fx.roll?.takeIf { it.enabled }?.let {
+            renderer.setLoopRollEx(deck(it.deck), true, it.startMixSec, it.beatSec, it.releaseMixSec,
+                it.totalBeats, it.hpfStartHz, it.hpfEndHz, it.boostDb, it.stopOnDownbeat,
+                it.scheduleBeats.toDoubleArray())
+        }
+        fx.sweep?.takeIf { it.enabled }?.let {
+            renderer.setSweep(deck(it.deck), it.isHighPass, it.startHz, it.endHz, it.qStart, it.qEnd,
+                it.startMixSec ?: 0.0, it.endMixSec ?: 0.0, it.exponential)
+        }
+        fx.incomingSweep?.takeIf { it.enabled }?.let {
+            renderer.setSweep(deck(it.deck), it.isHighPass, it.startHz, it.endHz, it.qStart, it.qEnd,
+                it.startMixSec ?: 0.0, it.endMixSec ?: 0.0, it.exponential)
+        }
+        fx.echo?.takeIf { it.enabled }?.let {
+            renderer.setEchoEx(deck(it.deck), it.delaySec, it.feedback, it.wet, it.wetHpfHz, it.wetLpfHz, it.pingPong)
+        }
+        fx.reverb?.takeIf { it.enabled }?.let { renderer.setReverb(deck(it.deck), it.roomSize, it.damping, it.wet) }
+        fx.flanger?.takeIf { it.enabled }?.let {
+            renderer.setFlangerEx(deck(it.deck), it.lfoHz, it.depthSec, it.feedback, it.wetPeak, it.stereoOffsetDeg)
+        }
+        fx.phaser?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.PHASER))
+            renderer.setPhaserEx(deck(it.deck), it.rateBeats, it.depth, it.feedback, it.stages, it.stereoOffsetDeg)
+        }
+        fx.riser?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.RISER))
+            renderer.setRiserEx(deck(it.deck), it.beatSec, it.lengthBeats, it.noiseSweepStartHz, it.noiseSweepEndHz,
+                it.noiseLevelPeak, it.uplifterOctaves, it.includeSnareRoll, it.reverseReverbTailBeats, 0.0)
+        }
+        fx.impact?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.RISER))
+            renderer.setImpact(deck(it.deck), it.triggerMixSec, it.peakDbfs, it.lowThumpHz, it.noiseBurstMs)
+        }
+        fx.gate?.takeIf { it.enabled }?.let {
+            val required = if (it.isStutter) ChoreoCaps.STUTTER else ChoreoCaps.GATE
+            require(ChoreoCaps.has(caps, required))
+            renderer.setGate(deck(it.deck), it.beatSec, if (it.isStutter) -it.divisionStepsPerBeat else it.divisionStepsPerBeat, it.swing)
+        }
+        fx.pump?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.PUMP))
+            renderer.setPump(deck(it.deck), it.beatSec, it.fullBand)
+        }
+        fx.brake?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.BRAKE))
+            renderer.setBrakeEx(deck(it.deck), it.startMixSec, it.lengthSec, it.endRate, it.lpfStartHz, it.lpfEndHz, it.endFadeMs)
+        }
+        fx.tapeStop?.takeIf { it.enabled }?.let {
+            require(ChoreoCaps.has(caps, ChoreoCaps.BRAKE))
+            renderer.setTapeStop(deck(it.deck), it.startMixSec, it.lengthSec, it.wowDepth, it.wowRateHz, it.lpfStartHz, it.lpfEndHz, it.endFadeMs)
+        }
+        fx.spinback?.takeIf { it.enabled }?.let {
+            val gapSec = checkNotNull(spinbackGapSec) {
+                "spinback enabled but compiled silenceGapSec precondition missing"
+            }
+            renderer.setSpinback(deck(it.deck), it.startMixSec, it.lengthSec, it.peakReverseSpeed, gapSec)
+        }
+        if (fx.isolate) {
+            renderer.setIsolate(LoopMixRenderer.OUT, true)
+            renderer.setIsolate(LoopMixRenderer.IN, true)
+        }
+        if (script.loudness.enabled || script.dropWindowMs != null || script.loudness.dropBumpLu != 0f) {
+            require(ChoreoCaps.has(caps, ChoreoCaps.LOUDNESS)) { "canonical loudness capability unavailable" }
+        }
+        if (script.loudness.truePeakLimiter) {
+            require(ChoreoCaps.has(caps, ChoreoCaps.TRUE_PEAK)) { "canonical true-peak capability unavailable" }
+        }
+        renderer.setLoudnessMatch(script.loudness.enabled, script.loudness.targetLufs)
+        script.dropWindowMs?.let {
+            renderer.setLoudnessDropWindow(it.startMs / 1000.0, it.endMs / 1000.0, script.loudness.dropBumpLu)
+        }
+        renderer.setTruePeakLimiter(script.loudness.truePeakLimiter)
+        renderer.setTruePeakCeilingDb(script.loudness.truePeakCeilingDbtp)
     }
 
     /** Static normalisation reference for the loudness guard's bump cap (streaming-typical). */

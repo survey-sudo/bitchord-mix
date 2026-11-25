@@ -927,6 +927,10 @@ internal class LoopArmDriver(
         outPort: LoopMixPort,
         inPort: LoopMixPort,
     ) {
+        if (!session.claimForAttachment()) {
+            mixDriver?.loopFallBack("prepared_session_retired")
+            return
+        }
         host.initiatingExitReason = null
         host.capturedTakeoverSpliceBufferStatus = null
         host.capturedLoopTookOver = null
@@ -962,6 +966,7 @@ internal class LoopArmDriver(
             host.onArmIncoming(item, afterId)
         }
         into.playWhenReady = false
+        host.mixExecutor.admitCaptureSession(session)
         inPort.armIncoming(LoopMixPort.InArm((session.handoverTrack * 1_000_000).roundToLong()))
         state.deckTiming.begin("incoming prepare")
         into.prepare()
@@ -1155,9 +1160,7 @@ internal class LoopArmDriver(
     }
 
     fun closeSessionOffThread(session: LoopMixSession?) {
-        if (session == null) return
-        host.scope.launch(Dispatchers.IO) {
-            runCatching { session.close() }
-        }
+        // Native destruction is asynchronous; do not enqueue ownership transfer on a dying scope.
+        session?.close()
     }
 }

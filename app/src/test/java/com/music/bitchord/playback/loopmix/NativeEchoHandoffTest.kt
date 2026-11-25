@@ -293,7 +293,7 @@ class NativeEchoHandoffTest {
                 assertEquals("Echo", built.plan.rung)
                 assertEquals(false, built.configuredOutLoops)
                 assertEquals(false, built.configuredInLoops)
-                assertEquals(LoopMixSession.GridSource.NATIVE_CLOCK, built.outGridSource)
+                assertEquals(GridSource.NATIVE_CLOCK, built.outGridSource)
 
                 // Keep geometry, decoder samples and level matching identical across the renders.
                 // Full is the production configuration. The references suppress selected OUT lanes.

@@ -119,6 +119,7 @@ import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -243,9 +244,10 @@ internal fun PlayerScrubber(
     // scrubber and its labels thirty times a second for a change only the
     // canvas needs.
     val mixBlend = PlayerSettings.smartMixBlend.collectAsStateWithLifecycle()
-    val reduceAnimation by PlayerSettings.reduceAnimation.collectAsStateWithLifecycle()
+    val reduceAnimation = rememberAutomixReducedMotion()
     // One clock for the bar and the "Mixing" label, so they breathe on the same beat.
     val mixPulse = rememberMixPulse({ mixBlend.value }, enabled = !reduceAnimation)
+    val mixingShown by remember { derivedStateOf { mixPulse.cover > 0f } }
     Column(Modifier.fillMaxWidth()) {
         val ink = sliderInk()
         ThinSlider(
@@ -304,13 +306,12 @@ internal fun PlayerScrubber(
             ) {
                 centerLabel()
             }
-            val mixingShown by remember { derivedStateOf { mixPulse.cover > 0f } }
             if (mixingShown) {
                 MixingLabel(mixPulse, Modifier.align(Alignment.Center))
             }
         }
         // FORK-HOOK(mix-inspector): an early entry point independent of popup-only waveforms.
-        UpcomingTransitionChip(mixing = mixing)
+        UpcomingTransitionChip(mixing = mixing || mixingShown)
     }
 }
 
@@ -327,7 +328,7 @@ private fun MixingLabel(pulse: MixPulse, modifier: Modifier = Modifier) {
     // "Mixing · <RecipeName>" while the blend runs.
     val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
     val inspector by PlayerSettings.mixInspector.collectAsStateWithLifecycle()
-    val label = automixChipLabel(status, inspector) ?: stringResource(Res.string.mixing)
+    val label = rememberAutomixChipLabel(status, inspector) ?: stringResource(Res.string.mixing)
     Text(
         text = label,
         modifier = modifier
@@ -370,12 +371,12 @@ private fun UpcomingTransitionChip(mixing: Boolean) {
     val status by PlayerSettings.automixStatus.collectAsStateWithLifecycle()
     // The one clean Automix chip text (AE3 M7 / Part A §7): null outside the
     // active arc, so no chip renders before a mix exists or after it ends.
-    val label = automixChipLabel(status, inspector)
+    val label = rememberAutomixChipLabel(status, inspector)
     Box(
         modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
         contentAlignment = Alignment.Center,
     ) {
-        if (label == null) return@Box
+        if (label == null || mixing) return@Box
         val openLabel = stringResource(Res.string.mix_inspector_upcoming_open)
         Box(
             modifier = Modifier
@@ -572,16 +573,24 @@ private fun AutomixStatusLine(
     // The one clean Automix chip text (AE3 M7 / Part A §7) — no rung, tempo
     // or "locked" tag on the headline. The rung/reason line survives only in
     // the expanded diagnostics below (behind the tap).
-    val chip = automixChipLabel(status, inspector)
+    val chip = rememberAutomixChipLabel(status, inspector)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .semantics {
-                contentDescription = "Automix: ${chip ?: status?.headline ?: fallback}"
+                val visibleLabel = chip ?: status?.headline ?: fallback
+                contentDescription = status?.let {
+                    val progress = it.progress.takeIf { value -> value.isFinite() && value >= 0f }
+                        ?.coerceIn(0f, 1f)?.let { value -> " Progress ${(value * 100f).roundToInt()}%." }.orEmpty()
+                    "Automix: $visibleLabel. Transition style: ${it.style.ifBlank { "unknown" }}.$progress"
+                } ?: "Automix: $visibleLabel"
+                stateDescription = if (expanded) "Details expanded" else "Details collapsed"
             }
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
+                role = Role.Button,
+                onClickLabel = if (expanded) "Hide Automix details" else "Show Automix details",
                 enabled = status != null,
             ) { expanded = !expanded },
     ) {

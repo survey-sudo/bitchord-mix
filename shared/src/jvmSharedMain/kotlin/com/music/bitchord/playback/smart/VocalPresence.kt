@@ -22,6 +22,7 @@
 package com.music.bitchord.playback.smart
 
 import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
@@ -29,6 +30,7 @@ import java.io.File
 import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.min
+import kotlinx.coroutines.CancellationException
 
 /**
  * Vocal-presence detection with Syvenu (`syvenu.ort`).
@@ -47,27 +49,41 @@ class VocalPresence(
     private val npuCacheDir: () -> File? = { null },
 ) {
 
-    @Volatile private var session: OrtSession? = null
+    /** A witness owned by one successful track call. Session open alone never emits it. */
+    data class Execution(
+        val modelTag: String,
+        val modelPath: String,
+        val backend: String,
+        val inputFrames: Int,
+        val coveredFrames: Int,
+    )
+
+    private data class OpenedSession(val session: OrtSession, val modelPath: String)
+
+    @Volatile private var session: OpenedSession? = null
     @Volatile private var sessionThreads = 0
     private val lock = Any()
 
-    private fun session(): OrtSession? {
+    private fun session(): OpenedSession? {
         val threads = inferenceThreads().coerceIn(1, 4)
         session?.takeIf { sessionThreads == threads }?.let { return it }
         synchronized(lock) {
             session?.takeIf { sessionThreads == threads }?.let { return it }
-            runCatching { session?.close() }
+            runCatching { session?.session?.close() }
             session = null
             return runCatching {
                 val file = File(modelPath())
                 if (!file.isFile || file.length() <= 0L) return@runCatching null
                 NpuSession.open(
                     file.absolutePath, threads, npuConfig(), npuVendor(), npuBackendPath(), npuCacheDir(),
-                ).also {
+                ).let { OpenedSession(it, file.absolutePath) }.also {
                     session = it
                     sessionThreads = threads
                 }
-            }.onFailure { AnalysisLog.warn("Syvenu vocal presence model unavailable", it) }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                warnSafely("Syvenu vocal presence model unavailable", it)
+            }
                 .getOrNull()
         }
     }
@@ -85,45 +101,68 @@ class VocalPresence(
      * - Input: `mel` float32`[1, frames, 128]`
      * - Output: `presence` float32`[1, frames]` (probabilities already sigmoid-normalized in `0..1` at 50 fps).
      */
-    fun track(spectrogram: MelSpectrogram.Spectrogram): FloatArray? {
+    fun track(spectrogram: MelSpectrogram.Spectrogram): FloatArray? = trackObserved(spectrogram, null)
+
+    /** Reports the successful session together with coverage from this invocation only. */
+    fun trackWithExecution(
+        spectrogram: MelSpectrogram.Spectrogram,
+        onExecution: (Execution) -> Unit,
+    ): FloatArray? = trackObserved(spectrogram, onExecution)
+
+    private fun trackObserved(
+        spectrogram: MelSpectrogram.Spectrogram,
+        onExecution: ((Execution) -> Unit)?,
+    ): FloatArray? {
+        synchronized(lock) {
         if (spectrogram.frames <= 0 || spectrogram.mels <= 0) return null
+        val expectedSize = spectrogram.frames.toLong() * spectrogram.mels.toLong()
+        if (expectedSize > Int.MAX_VALUE || spectrogram.values.size.toLong() < expectedSize) return null
         val active = session() ?: return null
         val presence = FloatArray(spectrogram.frames)
+        var coveredFrames = 0
+        val recordCoverage: ((Int) -> Unit)? = if (onExecution == null) null else { count -> coveredFrames = count }
         val started = System.currentTimeMillis()
-        if (!infer(active, spectrogram, presence)) return null
-        AnalysisLog.warn(
+        if (!infer(active.session, spectrogram, presence, recordCoverage)) return null
+        warnSafely(
             "syvenu.ms=${System.currentTimeMillis() - started} frames=${spectrogram.frames}",
         )
+        onExecution?.invoke(Execution("syvenu", active.modelPath, NpuSession.describe(active.session), spectrogram.frames, coveredFrames))
         return presence
+        }
     }
 
     private fun infer(
         session: OrtSession,
         spectrogram: MelSpectrogram.Spectrogram,
         presence: FloatArray,
-    ): Boolean = runCatching {
+        recordCoverage: ((Int) -> Unit)? = null,
+    ): Boolean {
+        return try {
         val environment = OrtEnvironment.getEnvironment()
         val mels = spectrogram.mels
         val inputNames = session.inputNames.toList()
         val inputName = inputNames.firstOrNull { it.equals("mel", ignoreCase = true) }
             ?: inputNames.first()
         val inputInfo = session.inputInfo[inputName]?.info as? TensorInfo
-        val inputShape = inputInfo?.shape
-        if (inputShape != null && inputShape.isNotEmpty()) {
-            val expectedMels = inputShape.last()
-            if (expectedMels > 0 && expectedMels != mels.toLong()) {
-                AnalysisLog.warn("Syvenu mel mismatch: expected $expectedMels, got $mels")
-                return false
-            }
+        val inputShape = inputInfo?.shape ?: return false
+        if (inputInfo.type != OnnxJavaType.FLOAT || inputShape.size != 3 ||
+            (inputShape[0] > 0L && inputShape[0] != 1L)
+        ) return false
+        val expectedMels = inputShape[2]
+        if (expectedMels > 0 && expectedMels != mels.toLong()) {
+            warnSafely("Syvenu mel mismatch: expected $expectedMels, got $mels")
+            return false
         }
 
         val outNames = session.outputNames.toList()
+        if (outNames.isEmpty()) return false
         val outIdx = outNames.indexOfFirst { it.equals("presence", ignoreCase = true) }.let { if (it >= 0) it else 0 }
 
         val fixed = NpuSession.fixedInputFrames(session)
         val chunkFrames = fixed ?: CHUNK_FRAMES
         val stride = (chunkFrames - 2 * BORDER_FRAMES).coerceAtLeast(1)
 
+        var coveredFrames = 0
         var start = 0
         while (start < spectrogram.frames) {
             if (fixed != null && start > 0 && start + chunkFrames > spectrogram.frames) {
@@ -133,20 +172,34 @@ class VocalPresence(
             if (length <= 2 * BORDER_FRAMES && start > 0) break
 
             val fedFrames = if (fixed != null) chunkFrames else length
-            val chunk = FloatArray(fedFrames * mels)
+            val elementCount = fedFrames.toLong() * mels.toLong()
+            if (elementCount <= 0L || elementCount > Int.MAX_VALUE) return false
+            val chunk = FloatArray(elementCount.toInt())
             spectrogram.values.copyInto(chunk, 0, start * mels, (start + length) * mels)
             val shape = longArrayOf(1L, fedFrames.toLong(), mels.toLong())
 
             OnnxTensor.createTensor(environment, FloatBuffer.wrap(chunk), shape).use { tensor ->
                 session.run(mapOf(inputName to tensor)).use { outputs ->
-                    val outBuf = (outputs.get(outIdx) as OnnxTensor).floatBuffer
+                    val tensor = outputs.get(outIdx) as? OnnxTensor ?: return false
+                    val outputShape = tensor.info.shape
+                    if (tensor.info.type != OnnxJavaType.FLOAT || outputShape.size !in 1..2 ||
+                        (outputShape.size == 2 && outputShape[0] > 0L && outputShape[0] != 1L) ||
+                        (outputShape.last() > 0L && outputShape.last() < fedFrames.toLong())
+                    ) return false
+                    val outBuf = tensor.floatBuffer
+                    if (outBuf.remaining() < fedFrames) return false
                     val keepFrom = if (start == 0) 0 else BORDER_FRAMES
                     val keepTo = if (start + length >= spectrogram.frames) length else length - BORDER_FRAMES
                     for (index in keepFrom until keepTo) {
                         val target = start + index
                         if (target >= presence.size) break
                         val v = outBuf.get(index)
+                        if (!v.isFinite()) return false
                         presence[target] = if (v.isFinite()) v.coerceIn(0f, 1f) else 0f
+                    }
+                    // Observe the contiguous validated output prefix; never count zero-filled gaps.
+                    if (keepTo > keepFrom && start + keepFrom <= coveredFrames) {
+                        coveredFrames = max(coveredFrames, min(start + keepTo, spectrogram.frames))
                     }
                 }
             }
@@ -154,16 +207,29 @@ class VocalPresence(
             if (start + length >= spectrogram.frames) break
             start += stride
         }
-        true
-    }.onFailure {
-        AnalysisLog.warn("Syvenu inference failed", it)
-    }.getOrDefault(false)
+        val succeeded = presence.all { it.isFinite() }
+        if (succeeded) recordCoverage?.invoke(coveredFrames)
+        succeeded
+        } catch (failure: Throwable) {
+            if (failure is CancellationException) throw failure
+            warnSafely("Syvenu inference failed", failure)
+            false
+        }
+    }
 
     fun release() {
         synchronized(lock) {
-            runCatching { session?.close() }
+            session?.let { runCatching { NpuSession.close(it.session) } }
             session = null
             sessionThreads = 0
+        }
+    }
+
+    private fun warnSafely(message: String, failure: Throwable? = null) {
+        try {
+            if (failure == null) AnalysisLog.warn(message) else AnalysisLog.warn(message, failure)
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
         }
     }
 

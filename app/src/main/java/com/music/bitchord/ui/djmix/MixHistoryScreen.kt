@@ -1,6 +1,6 @@
 package com.music.bitchord.ui.djmix
 
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,11 +30,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.music.bitchord.playback.djmix.store.TransitionRecord
 import java.text.SimpleDateFormat
@@ -84,16 +84,21 @@ fun MixHistoryScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .pointerInput(record.id) {
-                        detectTapGestures(
-                            onTap = { onRecordClick(record) },
-                            onLongPress = { menuExpanded = true },
-                        )
-                    }
+                    .combinedClickable(
+                        onClickLabel = "Open mix summary",
+                        onLongClickLabel = "Rate or flag this mix",
+                        role = Role.Button,
+                        onClick = { onRecordClick(record) },
+                        onLongClick = { menuExpanded = true },
+                    )
                     .semantics(mergeDescendants = true) {
                         contentDescription = "Mix ${record.recipe}, ${record.level}, " +
-                            "tap for summary, long press to rate or flag"
-                        role = Role.Button
+                            timeFormat.format(Date(record.createdAt))
+                        stateDescription = when (record.rating) {
+                            1 -> "Rated up"
+                            -1 -> "Rated down"
+                            else -> "Not rated"
+                        }
                     }
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -113,17 +118,22 @@ fun MixHistoryScreen(
                 when (record.rating) {
                     1 -> Icon(
                         Icons.Rounded.ThumbUp,
-                        contentDescription = "Rated up",
+                        contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
                     )
                     -1 -> Icon(
                         Icons.Rounded.ThumbDown,
-                        contentDescription = "Rated down",
+                        contentDescription = null,
                         tint = MaterialTheme.colorScheme.error,
                     )
                 }
                 Box {
-                    IconButton(onClick = { menuExpanded = true }) {
+                    IconButton(
+                        onClick = { menuExpanded = true },
+                        modifier = Modifier.semantics {
+                            stateDescription = if (menuExpanded) "Expanded" else "Collapsed"
+                        },
+                    ) {
                         Icon(Icons.Rounded.MoreVert, contentDescription = "Rate or flag this mix")
                     }
                     DropdownMenu(
@@ -132,6 +142,7 @@ fun MixHistoryScreen(
                     ) {
                         DropdownMenuItem(
                             text = { Text("👍 Rate up") },
+                            modifier = Modifier.semantics { selected = record.rating == 1 },
                             leadingIcon = {
                                 Icon(
                                     Icons.Rounded.ThumbUp,
@@ -139,7 +150,7 @@ fun MixHistoryScreen(
                                 )
                             },
                             trailingIcon = if (record.rating == 1) {
-                                { Icon(Icons.Rounded.Check, contentDescription = "Current rating") }
+                                { Icon(Icons.Rounded.Check, contentDescription = null) }
                             } else null,
                             onClick = {
                                 menuExpanded = false
@@ -148,6 +159,7 @@ fun MixHistoryScreen(
                         )
                         DropdownMenuItem(
                             text = { Text("👎 Rate down") },
+                            modifier = Modifier.semantics { selected = record.rating == -1 },
                             leadingIcon = {
                                 Icon(
                                     Icons.Rounded.ThumbDown,
@@ -155,7 +167,7 @@ fun MixHistoryScreen(
                                 )
                             },
                             trailingIcon = if (record.rating == -1) {
-                                { Icon(Icons.Rounded.Check, contentDescription = "Current rating") }
+                                { Icon(Icons.Rounded.Check, contentDescription = null) }
                             } else null,
                             onClick = {
                                 menuExpanded = false

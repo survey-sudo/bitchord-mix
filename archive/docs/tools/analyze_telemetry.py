@@ -21,9 +21,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-DEFAULT_INPUT = (
-    "/home/hfzhkn/Bitchord/evidence/bitchord-device-evidence/"
-    "vc71-device/automix-telemetry-latest.jsonl"
+# Portable default: preserves the historical evidence tail path relative to
+# the current user's home directory, without embedding a developer-home literal
+# in tracked source. Callers can override with --input.
+DEFAULT_INPUT = str(
+    Path.home()
+    / "Bitchord"
+    / "evidence"
+    / "bitchord-device-evidence"
+    / "vc71-device"
+    / "automix-telemetry-latest.jsonl"
 )
 DEFAULT_VC71_SINCE_TS = 1794730998000
 

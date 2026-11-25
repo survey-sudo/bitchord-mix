@@ -6,6 +6,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <cmath>
 #include <new>
 #include <vector>
 
@@ -43,23 +44,58 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetDeck(
     JNIEnv* env, jclass, jlong handle, jint index, jfloatArray left, jfloatArray right,
     jdouble regionStart, jlong loopStart, jlong loopEnd, jdouble releaseAt,
     jdoubleArray knotFrames, jdoubleArray knotPositions, jboolean runOn, jdouble stopAt,
-    jdouble preroll, jfloat level) {
+     jdouble preroll, jfloat level) {
+  if (env->ExceptionCheck() || handle == 0 || left == nullptr || right == nullptr ||
+      knotFrames == nullptr || knotPositions == nullptr || !std::isfinite(regionStart) ||
+      !std::isfinite(releaseAt) || !std::isfinite(stopAt) || !std::isfinite(preroll) ||
+      !std::isfinite(level)) return;
   Deck* deck = DeckOf(handle, index);
   if (deck == nullptr) return;
-  const jsize frames = std::min(env->GetArrayLength(left), env->GetArrayLength(right));
-  deck->left.resize(frames);
-  deck->right.resize(frames);
-  env->GetFloatArrayRegion(left, 0, frames, deck->left.data());
-  env->GetFloatArrayRegion(right, 0, frames, deck->right.data());
+  const jsize leftFrames = env->GetArrayLength(left);
+  if (env->ExceptionCheck()) return;
+  const jsize rightFrames = env->GetArrayLength(right);
+  if (env->ExceptionCheck() || leftFrames <= 0 || leftFrames != rightFrames) return;
+  std::vector<float> leftCopy;
+  std::vector<float> rightCopy;
+  try {
+    leftCopy.resize(static_cast<size_t>(leftFrames));
+    rightCopy.resize(static_cast<size_t>(rightFrames));
+  } catch (const std::bad_alloc&) {
+    return;
+  }
+  env->GetFloatArrayRegion(left, 0, leftFrames, leftCopy.data());
+  if (env->ExceptionCheck()) return;
+  env->GetFloatArrayRegion(right, 0, rightFrames, rightCopy.data());
+  if (env->ExceptionCheck()) return;
+  if (!std::all_of(leftCopy.begin(), leftCopy.end(), [](float v) { return std::isfinite(v); }) ||
+      !std::all_of(rightCopy.begin(), rightCopy.end(), [](float v) { return std::isfinite(v); })) return;
+  const jsize knotFrameCount = env->GetArrayLength(knotFrames);
+  if (env->ExceptionCheck()) return;
+  const jsize knotPositionCount = env->GetArrayLength(knotPositions);
+  if (env->ExceptionCheck() || knotFrameCount != knotPositionCount) return;
+  std::vector<double> knotTimes;
+  std::vector<double> knotValues;
+  try {
+    knotTimes.resize(static_cast<size_t>(knotFrameCount));
+    knotValues.resize(static_cast<size_t>(knotPositionCount));
+  } catch (const std::bad_alloc&) {
+    return;
+  }
+  env->GetDoubleArrayRegion(knotFrames, 0, knotFrameCount, knotTimes.data());
+  if (env->ExceptionCheck()) return;
+  env->GetDoubleArrayRegion(knotPositions, 0, knotPositionCount, knotValues.data());
+  if (env->ExceptionCheck()) return;
+  if (!std::all_of(knotTimes.begin(), knotTimes.end(), [](double v) { return std::isfinite(v); }) ||
+      !std::all_of(knotValues.begin(), knotValues.end(), [](double v) { return std::isfinite(v); })) return;
+
+  deck->left = std::move(leftCopy);
+  deck->right = std::move(rightCopy);
   deck->regionStart = regionStart;
   deck->loopStart = loopStart;
   deck->loopEnd = loopEnd;
   deck->releaseAt = releaseAt;
-  const jsize knots = std::min(env->GetArrayLength(knotFrames), env->GetArrayLength(knotPositions));
-  deck->knotTimes.resize(knots);
-  deck->knotPositions.resize(knots);
-  env->GetDoubleArrayRegion(knotFrames, 0, knots, deck->knotTimes.data());
-  env->GetDoubleArrayRegion(knotPositions, 0, knots, deck->knotPositions.data());
+  deck->knotTimes = std::move(knotTimes);
+  deck->knotPositions = std::move(knotValues);
   deck->runOn = runOn;
   deck->stopAt = stopAt;
   deck->preroll = preroll;
@@ -153,11 +189,25 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeFirstFrame(JNIEnv
 JNIEXPORT void JNICALL
 Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeRender(
     JNIEnv* env, jclass, jlong handle, jlong frame, jfloatArray interleaved, jint offsetFrames, jint frames) {
-  if (handle == 0 || frames <= 0) return;
+  if (env->ExceptionCheck() || handle == 0 || interleaved == nullptr || offsetFrames < 0 || frames < 0) return;
+  if (frames == 0) return;
+  const jsize arrayLength = env->GetArrayLength(interleaved);
+  if (env->ExceptionCheck() || arrayLength < 0) return;
+  const jsize capacityFrames = arrayLength / 2;
+  if (offsetFrames > capacityFrames || frames > capacityFrames - offsetFrames) return;
   // Critical access: no copy of the block, and render() itself never calls back into Java.
   auto* samples = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(interleaved, nullptr));
   if (samples == nullptr) return;
-  From(handle)->render(frame, samples + 2 * offsetFrames, frames);
+  if (env->ExceptionCheck()) {
+    env->ReleasePrimitiveArrayCritical(interleaved, samples, JNI_ABORT);
+    return;
+  }
+  jfloat* output = samples + static_cast<jlong>(offsetFrames) * 2;
+  From(handle)->render(frame, output, frames);
+  const jlong sampleCount = static_cast<jlong>(frames) * 2;
+  for (jlong i = 0; i < sampleCount; ++i) {
+    if (!std::isfinite(output[i])) output[i] = 0.0f;
+  }
   env->ReleasePrimitiveArrayCritical(interleaved, samples, 0);
 }
 
@@ -392,15 +442,71 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeCapturedFrames(
   return handle != 0 ? static_cast<jlong>(From(handle)->capturedFrames()) : 0;
 }
 
+JNIEXPORT void JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeRequestCaptureFreeze(
+    JNIEnv*, jclass, jlong handle) {
+  if (handle != 0) From(handle)->requestCaptureFreeze();
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeGetCaptureSnapshotInfo(
+    JNIEnv* env, jclass, jlong handle) {
+  if (env->ExceptionCheck()) return nullptr;
+  jlongArray out = env->NewLongArray(8);
+  if (out == nullptr || env->ExceptionCheck()) return nullptr;
+  jlong vals[8] = {0, 0, 0, 0, -1, -1, 0, 0};
+  if (handle != 0) {
+    const auto info = From(handle)->getCaptureSnapshotInfo();
+    vals[0] = static_cast<jlong>(info.status);
+    vals[1] = static_cast<jlong>(info.snapshotId);
+    vals[2] = static_cast<jlong>(info.sampleRate);
+    vals[3] = static_cast<jlong>(info.channels);
+    vals[4] = static_cast<jlong>(info.firstMixFrame);
+    vals[5] = static_cast<jlong>(info.lastMixFrame);
+    vals[6] = static_cast<jlong>(info.frameCount);
+    vals[7] = static_cast<jlong>(info.totalWrittenFrames);
+  }
+  env->SetLongArrayRegion(out, 0, 8, vals);
+  return out;
+}
+
+// Legacy read: safe-refusal unless frozen. Never copies live ring data.
 JNIEXPORT jint JNICALL
 Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeReadCapturedAudio(
     JNIEnv* env, jclass, jlong handle, jfloatArray outInterleaved, jint maxFrames) {
-  if (handle == 0 || outInterleaved == nullptr || maxFrames <= 0) return 0;
+  if (env->ExceptionCheck() || handle == 0 || outInterleaved == nullptr || maxFrames <= 0) return 0;
   const jsize len = env->GetArrayLength(outInterleaved);
+  if (env->ExceptionCheck() || len < 2) return 0;
   const int capped = std::min(static_cast<int>(maxFrames), static_cast<int>(len / 2));
   if (capped <= 0) return 0;
-  std::vector<float> tmp(static_cast<size_t>(capped) * 2, 0.f);
-  const int copied = From(handle)->readCapturedAudio(tmp.data(), capped);
+  std::vector<float> tmp;
+  try {
+    tmp.assign(static_cast<size_t>(capped) * 2, 0.f);
+  } catch (const std::bad_alloc&) {
+    return 0;
+  }
+  const int copied = From(handle)->readFrozenCapture(tmp.data(), capped);
+  if (copied > 0) {
+    env->SetFloatArrayRegion(outInterleaved, 0, copied * 2, tmp.data());
+  }
+  return copied;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeReadFrozenCapture(
+    JNIEnv* env, jclass, jlong handle, jfloatArray outInterleaved, jint maxFrames) {
+  if (env->ExceptionCheck() || handle == 0 || outInterleaved == nullptr || maxFrames <= 0) return 0;
+  const jsize len = env->GetArrayLength(outInterleaved);
+  if (env->ExceptionCheck() || len < 2) return 0;
+  const int capped = std::min(static_cast<int>(maxFrames), static_cast<int>(len / 2));
+  if (capped <= 0) return 0;
+  std::vector<float> tmp;
+  try {
+    tmp.assign(static_cast<size_t>(capped) * 2, 0.f);
+  } catch (const std::bad_alloc&) {
+    return 0;
+  }
+  const int copied = From(handle)->readFrozenCapture(tmp.data(), capped);
   if (copied > 0) {
     env->SetFloatArrayRegion(outInterleaved, 0, copied * 2, tmp.data());
   }

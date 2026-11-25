@@ -430,63 +430,34 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
         val appContext = context.applicationContext
         if (isMigrationDone()) return LegacyMigrationResult(alreadyMigrated = true)
         val nowMs = System.currentTimeMillis()
-        var migratedStems = 0
-        var staleAnalysis = 0
-        var deletedLegacyFiles = 0
 
-        // Legacy analysis JSON.
-        val legacyAnalysisDir = File(appContext.filesDir, LEGACY_ANALYSIS_DIR)
-        runCatching {
-            legacyAnalysisDir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
-                ?.forEach { file ->
-                    staleAnalysis++
-                    if (file.delete()) deletedLegacyFiles++
-                }
-            // .tmp leftovers from interrupted AnalysisStore.save writes.
-            legacyAnalysisDir.listFiles { f -> f.isFile && f.name.endsWith(".tmp") }
-                ?.forEach { file -> if (file.delete()) deletedLegacyFiles++ }
-            if (!legacyAnalysisDir.delete() && legacyAnalysisDir.exists()) {
-                AnalysisLog.warn("djmix migration: legacy analysis dir left non-empty: $legacyAnalysisDir")
-            }
+        // Legacy analysis JSON: every entry is stale for V3 by definition, so
+        // it is counted and deleted (same fate AnalysisStore.load gives them
+        // on read, ADR 0009).
+        val analysis = runCatching {
+            cleanLegacyAnalysisDir(File(appContext.filesDir, LEGACY_ANALYSIS_DIR))
         }.onFailure { AnalysisLog.warn("djmix migration: legacy analysis cleanup failed", it) }
+            .getOrDefault(LegacyDirCleanup())
 
-        // Legacy StemCache files.
-        val legacyStemDir = File(appContext.cacheDir, LEGACY_STEM_DIR)
+        // Legacy StemCache files: valid ones move under noBackupFilesDir/stems
+        // and are indexed; junk is deleted.
         val destDir = stemsDir(appContext).apply { mkdirs() }
-        runCatching {
-            legacyStemDir.listFiles { f -> f.isFile && f.name.endsWith(STEM_SUFFIX) }
-                ?.forEach { file ->
-                    val stem = parseLegacyStemName(file.name)
-                    if (stem == null || !hasStemMagic(file)) {
-                        if (file.delete()) deletedLegacyFiles++
-                        return@forEach
-                    }
-                    val target = File(destDir, file.name)
-                    if (!moveInto(file, target)) {
-                        AnalysisLog.warn("djmix migration: could not move legacy stem ${file.name}")
-                        return@forEach
-                    }
-                    val windowStartMs = stem.startSample * 1000L / stem.sampleRate
-                    val windowEndMs = windowStartMs + stem.frames * 1000L / stem.sampleRate
-                    val lastUsed = target.lastModified().takeIf { it > 0L } ?: nowMs
-                    if (registerStem(stem.trackHash, windowStartMs, windowEndMs, stem.tag, target.absolutePath, target.length(), lastUsed)) {
-                        migratedStems++
-                    } else {
-                        AnalysisLog.warn("djmix migration: stem moved but index failed: ${target.name}")
-                    }
-                }
-            legacyStemDir.listFiles { f -> f.isFile && f.name.endsWith(".tmp") }
-                ?.forEach { file -> if (file.delete()) deletedLegacyFiles++ }
-            if (!legacyStemDir.delete() && legacyStemDir.exists()) {
-                AnalysisLog.warn("djmix migration: legacy stem dir left non-empty: $legacyStemDir")
+        val stems = runCatching {
+            migrateLegacyStemFiles(File(appContext.cacheDir, LEGACY_STEM_DIR), destDir, nowMs) { stem, windowStartMs, windowEndMs, target ->
+                registerStem(
+                    stem.trackHash, windowStartMs, windowEndMs, stem.tag,
+                    target.absolutePath, target.length(),
+                    target.lastModified().takeIf { it > 0L } ?: nowMs,
+                )
             }
         }.onFailure { AnalysisLog.warn("djmix migration: legacy stem migration failed", it) }
+            .getOrDefault(LegacyStemMigration())
 
         markMigrationDone(nowMs)
         return LegacyMigrationResult(
-            migratedStems = migratedStems,
-            staleAnalysis = staleAnalysis,
-            deletedLegacyFiles = deletedLegacyFiles,
+            migratedStems = stems.migratedStems,
+            staleAnalysis = analysis.staleAnalysis,
+            deletedLegacyFiles = analysis.deletedFiles + stems.deletedFiles,
         )
     }
 
@@ -514,26 +485,6 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
             )
         }.onFailure { AnalysisLog.warn("djmix migration: marker write failed", it) }
     }
-
-    private fun moveInto(source: File, target: File): Boolean = runCatching {
-        if (target.exists()) target.delete()
-        if (source.renameTo(target)) return true
-        // renameTo fails across volumes; both dirs are internal here, but fall
-        // back to copy+delete rather than losing the stem.
-        source.copyTo(target, overwrite = true)
-        source.delete()
-        true
-    }.onFailure { AnalysisLog.warn("djmix migration: move failed for ${source.name}", it) }
-        .getOrDefault(false)
-
-    private fun hasStemMagic(file: File): Boolean = runCatching {
-        file.inputStream().use { input ->
-            val head = ByteArray(4)
-            val read = input.read(head)
-            read == 4 && head[0] == 0x42.toByte() && head[1] == 0x43.toByte() &&
-                head[2] == 0x53.toByte() && head[3] == 0x54.toByte() // "BCST", StemCache.MAGIC
-        }
-    }.getOrDefault(false)
 
     // ---- Row model -------------------------------------------------------------
 
@@ -636,6 +587,93 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
                 frames = frames,
             )
         }
+
+        /**
+         * Deletes the legacy analysis cache layout (`filesDir/smart_analysis/`):
+         * every `.json` entry counts as stale and is deleted, `.tmp` leftovers
+         * from interrupted saves are deleted, and the directory itself is
+         * removed when empty. Pure file layout (no DB); unit-tested on the JVM.
+         */
+        internal fun cleanLegacyAnalysisDir(dir: File): LegacyDirCleanup {
+            var staleAnalysis = 0
+            var deletedFiles = 0
+            dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }
+                ?.forEach { file ->
+                    staleAnalysis++
+                    if (file.delete()) deletedFiles++
+                }
+            dir.listFiles { f -> f.isFile && f.name.endsWith(".tmp") }
+                ?.forEach { file -> if (file.delete()) deletedFiles++ }
+            if (!dir.delete() && dir.exists()) {
+                AnalysisLog.warn("djmix migration: legacy analysis dir left non-empty: $dir")
+            }
+            return LegacyDirCleanup(staleAnalysis = staleAnalysis, deletedFiles = deletedFiles)
+        }
+
+        /**
+         * Moves valid legacy StemCache files from `cacheDir/stems/` into
+         * [destDir], invoking [register] per successfully moved stem with its
+         * parsed name and playback window in ms. Files with an unparseable
+         * name or bad magic are deleted (the index must never point at
+         * phantom bytes), `.tmp` leftovers are deleted, and the directory is
+         * removed when empty. Pure file layout (no DB); unit-tested on the JVM.
+         */
+        internal fun migrateLegacyStemFiles(
+            legacyStemDir: File,
+            destDir: File,
+            nowMs: Long,
+            register: (stem: LegacyStemName, windowStartMs: Long, windowEndMs: Long, target: File) -> Boolean,
+        ): LegacyStemMigration {
+            var migratedStems = 0
+            var deletedFiles = 0
+            destDir.mkdirs()
+            legacyStemDir.listFiles { f -> f.isFile && f.name.endsWith(STEM_SUFFIX) }
+                ?.forEach { file ->
+                    val stem = parseLegacyStemName(file.name)
+                    if (stem == null || !hasStemMagic(file)) {
+                        if (file.delete()) deletedFiles++
+                        return@forEach
+                    }
+                    val target = File(destDir, file.name)
+                    if (!moveInto(file, target)) {
+                        AnalysisLog.warn("djmix migration: could not move legacy stem ${file.name}")
+                        return@forEach
+                    }
+                    val windowStartMs = stem.startSample * 1000L / stem.sampleRate
+                    val windowEndMs = windowStartMs + stem.frames * 1000L / stem.sampleRate
+                    if (register(stem, windowStartMs, windowEndMs, target)) {
+                        migratedStems++
+                    } else {
+                        AnalysisLog.warn("djmix migration: stem moved but index failed: ${target.name}")
+                    }
+                }
+            legacyStemDir.listFiles { f -> f.isFile && f.name.endsWith(".tmp") }
+                ?.forEach { file -> if (file.delete()) deletedFiles++ }
+            if (!legacyStemDir.delete() && legacyStemDir.exists()) {
+                AnalysisLog.warn("djmix migration: legacy stem dir left non-empty: $legacyStemDir")
+            }
+            return LegacyStemMigration(migratedStems = migratedStems, deletedFiles = deletedFiles)
+        }
+
+        private fun moveInto(source: File, target: File): Boolean = runCatching {
+            if (target.exists()) target.delete()
+            if (source.renameTo(target)) return true
+            // renameTo fails across volumes; both dirs are internal here, but fall
+            // back to copy+delete rather than losing the stem.
+            source.copyTo(target, overwrite = true)
+            source.delete()
+            true
+        }.onFailure { AnalysisLog.warn("djmix migration: move failed for ${source.name}", it) }
+            .getOrDefault(false)
+
+        private fun hasStemMagic(file: File): Boolean = runCatching {
+            file.inputStream().use { input ->
+                val head = ByteArray(4)
+                val read = input.read(head)
+                read == 4 && head[0] == 0x42.toByte() && head[1] == 0x43.toByte() &&
+                    head[2] == 0x53.toByte() && head[3] == 0x54.toByte() // "BCST", StemCache.MAGIC
+            }
+        }.getOrDefault(false)
     }
 }
 
@@ -683,6 +721,18 @@ data class LegacyMigrationResult(
     val staleAnalysis: Int = 0,
     val deletedLegacyFiles: Int = 0,
     val alreadyMigrated: Boolean = false,
+)
+
+/** File-layout counts from [DjmixAnalysisStore.cleanLegacyAnalysisDir]. */
+data class LegacyDirCleanup(
+    val staleAnalysis: Int = 0,
+    val deletedFiles: Int = 0,
+)
+
+/** File-layout counts from [DjmixAnalysisStore.migrateLegacyStemFiles]. */
+data class LegacyStemMigration(
+    val migratedStems: Int = 0,
+    val deletedFiles: Int = 0,
 )
 
 /** Parsed legacy StemCache file name; see [DjmixAnalysisStore.parseLegacyStemName]. */

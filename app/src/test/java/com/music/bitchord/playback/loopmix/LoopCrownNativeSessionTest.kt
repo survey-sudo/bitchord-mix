@@ -79,8 +79,8 @@ class LoopCrownNativeSessionTest {
             try {
                 assertEquals(true, session.configuredOutLoops)
                 assertEquals(true, session.configuredInLoops)
-                assertEquals(LoopMixSession.GridSource.CLOCK, session.outGridSource)
-                assertEquals(LoopMixSession.GridSource.CLOCK, session.inGridSource)
+                assertEquals(GridSource.CLOCK, session.outGridSource)
+                assertEquals(GridSource.CLOCK, session.inGridSource)
                 val c = session.clock
                 val sr = LoopCrownFixtures.SAMPLE_RATE
                 val k = LoopCrownFixtures.knots(p, c)
@@ -175,8 +175,8 @@ class LoopCrownNativeSessionTest {
             assertTrue(p.inLoops)
             assertEquals(false, session.configuredOutLoops)
             assertEquals(false, session.configuredInLoops)
-            assertEquals(LoopMixSession.GridSource.CLOCK, session.outGridSource)
-            assertEquals(LoopMixSession.GridSource.NATIVE_CLOCK, session.inGridSource)
+            assertEquals(GridSource.CLOCK, session.outGridSource)
+            assertEquals(GridSource.NATIVE_CLOCK, session.inGridSource)
             val block = FloatArray(512 * 2)
             var frame = session.renderer.firstFrame()
             var energy = 0.0
@@ -212,8 +212,8 @@ class LoopCrownNativeSessionTest {
             assertNotNull(session.plan.inn.anchorBeats)
             assertEquals(true, session.configuredOutLoops)
             assertEquals(true, session.configuredInLoops)
-            assertEquals(LoopMixSession.GridSource.TRACKED, session.outGridSource)
-            assertEquals(LoopMixSession.GridSource.CLOCK, session.inGridSource)
+            assertEquals(GridSource.TRACKED, session.outGridSource)
+            assertEquals(GridSource.CLOCK, session.inGridSource)
             val knots = LoopCrownFixtures.knots(p, session.clock, outAnalysis, inAnalysis)
             assertEquals(knots.outGridSource, session.outGridSource)
             assertEquals(knots.inGridSource, session.inGridSource)
@@ -231,8 +231,8 @@ class LoopCrownNativeSessionTest {
         try {
             assertEquals(false, straightSession.configuredOutLoops)
             assertEquals(false, straightSession.configuredInLoops)
-            assertEquals(LoopMixSession.GridSource.TRACKED, straightSession.outGridSource)
-            assertEquals(LoopMixSession.GridSource.TRACKED, straightSession.inGridSource)
+            assertEquals(GridSource.TRACKED, straightSession.outGridSource)
+            assertEquals(GridSource.TRACKED, straightSession.inGridSource)
         } finally {
             straightSession.close()
             assertFalse(straightSession.renderer.isValid)

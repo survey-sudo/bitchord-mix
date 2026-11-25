@@ -6,7 +6,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.music.bitchord.data.settings.AppSettings
-import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
+import com.music.bitchord.playback.djmix.DjmixServices
 import com.music.bitchord.playback.djmix.diagnostics.FlagsSnapshot
 import com.music.bitchord.playback.djmix.npu.AddonState
 import com.music.bitchord.playback.djmix.npu.CpuOrtBackend
@@ -120,27 +120,9 @@ internal class NpuAndStemBridge(
     /** vc70-safe application context: recomputed on every access, never cached. */
     private fun npuAppContext(): Context? = runCatching { context.applicationContext }.getOrNull()
 
-    private val djmixFlagsLock = Any()
-    @Volatile private var djmixFlagsSource: DjmixFlags? = null
-
-    /**
-     * The [DjmixFlags] source for the M6 gates, built off the pre-attach window.
-     * A failed first build must not freeze null forever (the same reason
-     * [npuLibDir] documents), so this recomputes until one sticks.
-     */
-    private fun djmixFlagsOrNull(): DjmixFlags? {
-        djmixFlagsSource?.let { return it }
-        val app = npuAppContext() ?: return null
-        synchronized(djmixFlagsLock) {
-            djmixFlagsSource?.let { return it }
-            djmixFlagsSource = runCatching { DjmixFlags(app) }.getOrNull()
-            return djmixFlagsSource
-        }
-    }
-
-    /** Effective automix flag snapshot; code defaults when the flag source is unavailable. */
+    /** Reads the live process owner without creating it, caching a separate source, or doing I/O. */
     private fun djmixFlagsSnapshot(): FlagsSnapshot =
-        djmixFlagsOrNull()?.flags?.value ?: FlagsSnapshot.defaults()
+        DjmixServices.processFlagsSnapshot()
 
     /** models.json catalogue (bundled assets + verified filesDir override). */
     @Volatile private var npuCatalogue: List<ModelEntry>? = null
@@ -198,6 +180,10 @@ internal class NpuAndStemBridge(
             return
         }
         try {
+            if (!NpuRuntime.RUNTIME_AVAILABLE || !NpuRuntime.runtimeEnabled()) {
+                deferNpuBridgeSetup(NPU_SETUP_RETRY_SLOW_MS)
+                return
+            }
             if (npuCatalogue == null) npuCatalogue = ModelRegistry.load(app)
             if (npuAppVersionCode <= 0L) npuAppVersionCode = npuAppVersionCodeOf(app)
             val addon = OrchardNpuBridge.resolveAddon(app)
@@ -245,14 +231,18 @@ internal class NpuAndStemBridge(
     private fun runNpuSelfTest(app: Context, addon: NpuAddon) {
         runCatching {
             val entries = npuCatalogue ?: ModelRegistry.load(app).also { npuCatalogue = it }
-            val spec = verifiedNpuModelSpec(entries, "beat")
-            if (spec == null) {
+            val cpuSpec = verifiedNpuModelSpec(entries, "beat", "cpu-ort")
+            val qnnSpec = verifiedNpuModelSpec(entries, "beat", "qnn-v73")
+            if (cpuSpec == null || qnnSpec == null ||
+                cpuSpec.inputName != qnnSpec.inputName || cpuSpec.inputShape.contentEquals(qnnSpec.inputShape).not() ||
+                cpuSpec.outputName != qnnSpec.outputName
+            ) {
                 Log.w(TAG, "BitChordNPU self-test skipped: no SHA-256 verified CPU beat model")
                 return@runCatching
             }
-            CpuOrtBackend().open(spec).use { cpu ->
-                QnnAddonBackend(app) { npuAddonSnapshot ?: addon }.open(spec).use { qnn ->
-                    val record = NpuSelfTestRunner.run(app, cpu, qnn, spec, addon.versionCode)
+            CpuOrtBackend().open(cpuSpec).use { cpu ->
+                QnnAddonBackend(app) { npuAddonSnapshot ?: addon }.open(qnnSpec).use { qnn ->
+                    val record = NpuSelfTestRunner.run(app, cpu, qnn, cpuSpec, addon.versionCode)
                     npuSelfTestRecord = record
                     NpuSelfTestRunner.save(app, record)
                     Log.i(
@@ -272,17 +262,33 @@ internal class NpuAndStemBridge(
      * identity and handing back only the SHA-256-verified on-disk copy, so a
      * tampered catalogue can never redirect inference to an unverified file.
      */
-    private fun verifiedNpuModelSpec(entries: List<ModelEntry>, role: String): ModelSpec? {
+    private fun verifiedNpuModelSpec(entries: List<ModelEntry>, role: String, backend: String): ModelSpec? {
         val entry = entries.firstOrNull {
-            it.role == role && "cpu-ort" in it.backends &&
+            it.role == role && backend in it.backends &&
                 !it.inputName.isNullOrBlank() && !it.outputName.isNullOrBlank() && it.inputShape != null
         } ?: return null
+        if (backend == "qnn-v73") {
+            val expected = when (role) {
+                "beat" -> OrchardNpuBridge.QNN_NIROVI_ASSET
+                "vocal" -> OrchardNpuBridge.QNN_SYVENU_ASSET
+                else -> return null
+            }
+            if (entry.id != (if (role == "beat") "nirovi-qnn" else "syvenu-qnn") || entry.fileName != expected) return null
+            return ModelSpec(
+                id = entry.id,
+                fileName = entry.fileName,
+                file = File(entry.fileName),
+                inputName = entry.inputName!!,
+                inputShape = entry.inputShape!!,
+                outputName = entry.outputName!!,
+            )
+        }
         val model = when (role) {
             "beat" -> AutomixModels.NIROVI
             "vocal" -> AutomixModels.SYVENU
             else -> return null
         }
-        if (entry.fileName != model.fileName) return null
+        if (entry.id != (if (role == "beat") "nirovi-cpu" else "syvenu-cpu") || entry.fileName != model.fileName) return null
         if (!entry.sha256.equals(model.sha256, ignoreCase = true)) return null
         val verifiedPath = AutomixModels.verifiedPathOrNull(model) ?: return null
         return ModelSpec(
@@ -330,6 +336,10 @@ internal class NpuAndStemBridge(
      * cached state: no I/O, no session is opened here.
      */
     fun selectInferenceBackend(role: String): InferenceBackend {
+        if (!NpuRuntime.RUNTIME_AVAILABLE || !NpuRuntime.runtimeEnabled()) {
+            npuStatusReason = "ep=CPU (NPU runtime gate is closed)"
+            return CpuOrtBackend()
+        }
         val app = npuAppContext()
         val entries = npuCatalogue
         if (app == null || entries == null) {

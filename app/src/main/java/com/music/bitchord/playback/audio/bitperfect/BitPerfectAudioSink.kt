@@ -11,7 +11,6 @@ package com.music.bitchord.playback.audio.bitperfect
 
 import android.media.AudioTrack
 import android.os.SystemClock
-import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.AuxEffectInfo
@@ -22,8 +21,10 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.exoplayer.audio.AudioSink
+import com.music.bitchord.playback.djmix.AudioThread
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
@@ -52,6 +53,12 @@ import kotlin.math.abs
  * that exact frame on a reopened device.
  *
  * All calls arrive on the playback thread, as Media3 guarantees for a sink.
+ * [handleBuffer] also owns the lazy-open, drained-format-change and paused-device
+ * control boundaries. Those are deliberately outside [writePcmBuffer]'s realtime
+ * region: transports require one playback-thread owner. No lifecycle method may
+ * be entered while that region is active; every steady-state call uses the
+ * already-open transport and preallocated storage. This does not claim the
+ * Media3 lifecycle adapter or a device open/recovery is a realtime operation.
  */
 @OptIn(UnstableApi::class)
 internal class BitPerfectAudioSink(
@@ -97,6 +104,21 @@ internal class BitPerfectAudioSink(
     private var current: Input? = null
     private var transport: BitPerfectTransport? = null
     private var transportStarted = false
+    private var processingPcm = false
+    private val processedBuffers = AtomicLong()
+    private val transportFailures = AtomicLong()
+    @Volatile private var lastTransportFailure: BitPerfectTransportException? = null
+
+    /** Read/allocate snapshots off the PCM callback. Counters never allocate while writing. */
+    data class Diagnostics(val buffers: Long, val failures: Long, val lastFailure: String?)
+
+    fun diagnosticSnapshot(): Diagnostics =
+        Diagnostics(processedBuffers.get(), transportFailures.get(), lastTransportFailure?.message)
+
+    /** Both metadata variants are built at open, never when a sample first proves inexact. */
+    private var exactStatus: BitPerfectOutput.Status? = null
+    private var inexactStatus: BitPerfectOutput.Status? = null
+    private var statusDirty = false
 
     /** Set only while [transport] could not be opened at the track's own format. */
     private var converter: DacFormatConverter? = null
@@ -169,6 +191,7 @@ internal class BitPerfectAudioSink(
         if (canAccept(format)) AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY else AudioSink.SINK_FORMAT_UNSUPPORTED
 
     override fun configure(audioSinkConfig: AudioSink.AudioSinkConfig) {
+        check(!processingPcm)
         val format = audioSinkConfig.format
         val mapping = audioSinkConfig.outputChannelMapping
         if (mapping != null && (0 until mapping.length()).any { mapping[it] != it }) {
@@ -188,7 +211,10 @@ internal class BitPerfectAudioSink(
         encodedAccessUnitCount: Int,
     ): Boolean {
         pendingFailure?.let { pendingFailure = null; throw writeException(it) }
-        releaseIfIdle()
+        // Device control is allowed only before entering the PCM region, and
+        // only at idle/initial-open/drained-stream boundaries. No worker is
+        // allowed to race this playback-thread-owned transport or retained tail.
+        if (!playing) releaseIfIdle()
         val input = configured ?: return true
         if (suspended) {
             // Media3 keeps offering buffers while paused; the device stays released until play.
@@ -215,6 +241,22 @@ internal class BitPerfectAudioSink(
             currentInput = buffer
             syncTimestamp(input, presentationTimeUs)
         }
+        check(!processingPcm)
+        processingPcm = true
+        try {
+            return writePcmBuffer(buffer, input)
+        } finally {
+            processingPcm = false
+            // Starting a newly primed device and publishing changed metadata are
+            // control work; neither is reachable from the annotated PCM region.
+            startIfReady()
+            if (statusDirty) publishStatus()
+        }
+    }
+
+    /** Drains only a preopened transport; lifecycle, resize and logging are forbidden here. */
+    @AudioThread
+    private fun writePcmBuffer(buffer: ByteBuffer, input: Input): Boolean {
         try {
             if (!writeResumeTail()) return false
             if (output.hasRemaining()) {
@@ -241,16 +283,19 @@ internal class BitPerfectAudioSink(
         // A trailing partial frame cannot be played; drop it rather than stall.
         buffer.position(buffer.limit())
         currentInput = null
+        processedBuffers.incrementAndGet()
         return true
     }
 
     override fun play() {
+        check(!processingPcm)
         playing = true
         pausedAtMs = NOT_PAUSED
         startIfReady()
     }
 
     override fun pause() {
+        check(!processingPcm)
         playing = false
         transportStarted = false
         pausedAtMs = clock()
@@ -262,6 +307,7 @@ internal class BitPerfectAudioSink(
     }
 
     override fun playToEndOfStream() {
+        check(!processingPcm)
         endOfStream = true
         releaseIfIdle()
         if (suspended) {
@@ -308,6 +354,7 @@ internal class BitPerfectAudioSink(
     }
 
     override fun flush() {
+        check(!processingPcm)
         runCatching { transport?.flush() }
         transportStarted = false
         resetCounters()
@@ -346,6 +393,7 @@ internal class BitPerfectAudioSink(
     override fun disableTunneling() = Unit
 
     private fun open(input: Input) {
+        check(!processingPcm && transport == null)
         val opened = try {
             outputs.open(input.sampleRate, input.channelCount, input.sourceBits, this)
         } catch (error: BitPerfectTransportException) {
@@ -392,17 +440,13 @@ internal class BitPerfectAudioSink(
         }
         exact = true
         resetCounters()
-        Log.i(
-            TAG,
-            "Opened ${opened.driver.label} on ${opened.deviceName}: ${opened.sampleRate} Hz, " +
-                "${input.sourceBits}-bit source as ${opened.outputBits}-bit" +
-                if (converter != null) " (DAC limit, source ${input.sampleRate} Hz)" else "",
-        )
+        prepareStatuses(opened)
         publishStatus()
         startIfReady()
     }
 
     private fun closeTransport() {
+        check(!processingPcm)
         suspended = false
         suspendedWire = null
         resumeTail = null
@@ -415,6 +459,9 @@ internal class BitPerfectAudioSink(
         converter = null
         transportStarted = false
         output.clear().limit(0)
+        exactStatus = null
+        inexactStatus = null
+        statusDirty = false
     }
 
     /** Releases the device once playing has been stopped for [IDLE_RELEASE_MS]. */
@@ -435,6 +482,7 @@ internal class BitPerfectAudioSink(
      * reopened device before anything new.
      */
     private fun suspend() {
+        check(!processingPcm && !playing)
         val active = transport ?: return
         val history = recent ?: return
         val played = runCatching { active.playedFrames() }.getOrDefault(0L).coerceIn(0L, transportFrames)
@@ -450,7 +498,6 @@ internal class BitPerfectAudioSink(
         resumeTail = tail.takeIf { it.hasRemaining() }
         suspendedWire = Wire(active)
         suspended = true
-        Log.i(TAG, "Released ${active.driver.label} after a long pause, keeping ${tail.remaining() / outputFrameBytes} frames")
         runCatching { active.release() }
         outputs.release(this)
         outputs.publishIdle()
@@ -463,6 +510,7 @@ internal class BitPerfectAudioSink(
      * or a seek since dropped it), the next buffer opens as any new stream does.
      */
     private fun resume() {
+        check(!processingPcm && transport == null)
         val wire = suspendedWire
         suspended = false
         suspendedWire = null
@@ -486,16 +534,16 @@ internal class BitPerfectAudioSink(
         recent?.clear()
         // stop() went to the device just released; a stream already ended must be told again.
         stopped = false
-        Log.i(TAG, "Reopened ${opened.driver.label} on ${opened.deviceName} after a long pause")
+        prepareStatuses(opened)
         publishStatus()
     }
 
     /** Gives the reopened device what [suspend] kept; true once all of it is in. */
+    @AudioThread
     private fun writeResumeTail(): Boolean {
         val tail = resumeTail ?: return true
         val active = transport ?: return false
         handOver(active, tail)
-        startIfReady()
         if (tail.hasRemaining()) return false
         resumeTail = null
         return true
@@ -509,6 +557,7 @@ internal class BitPerfectAudioSink(
      * reopen it. Returns true once nothing of it is left to hear.
      */
     private fun drainForReconfiguration(): Boolean {
+        check(!processingPcm)
         val active = transport ?: return true
         try {
             if (!flushOutput()) return false
@@ -524,26 +573,32 @@ internal class BitPerfectAudioSink(
 
     /** Hands the transport everything still held on this side of it; true once that is all of it. */
     private fun flushOutput(): Boolean {
-        if (!writeResumeTail()) return false
-        while (true) {
-            if (output.hasRemaining()) writeOutput()
-            if (output.hasRemaining()) return false
-            val converter = converter ?: return true
-            output.clear()
-            val done = converter.drain(output)
-            output.flip()
-            if (done && !output.hasRemaining()) return true
+        check(!processingPcm)
+        try {
+            if (!writeResumeTail()) return false
+            while (true) {
+                if (output.hasRemaining()) writeOutput()
+                if (output.hasRemaining()) return false
+                val converter = converter ?: return true
+                output.clear()
+                val done = converter.drain(output)
+                output.flip()
+                if (done && !output.hasRemaining()) return true
+            }
+        } finally {
+            startIfReady()
         }
     }
 
+    @AudioThread
     private fun writeOutput() {
         val active = transport ?: return
         val taken = handOver(active, output)
         if (taken > 0) writtenFrames += taken / outputFrameBytes
-        startIfReady()
     }
 
     /** Writes what [active] takes of [buffer], keeping a copy in [recent] for a later [suspend]. */
+    @AudioThread
     private fun handOver(active: BitPerfectTransport, buffer: ByteBuffer): Int {
         val start = buffer.position()
         val taken = active.write(buffer)
@@ -556,6 +611,7 @@ internal class BitPerfectAudioSink(
 
     /** Starts the device once it is both wanted and has something to play. */
     private fun startIfReady() {
+        check(!processingPcm)
         val active = transport ?: return
         if (!playing || transportStarted || transportFrames == 0L) return
         try {
@@ -588,28 +644,34 @@ internal class BitPerfectAudioSink(
         }
     }
 
+    @AudioThread
     private fun markInexact() {
         if (!exact) return
         exact = false
-        Log.i(TAG, "Source is not integer PCM; samples are rounded to the DAC's depth")
-        publishStatus()
+        statusDirty = true
+    }
+
+    private fun prepareStatuses(active: BitPerfectTransport) {
+        check(!processingPcm)
+        exactStatus = BitPerfectOutput.Status(
+            active = true,
+            driver = active.driver.label,
+            deviceName = active.deviceName,
+            sampleRateHz = active.sampleRate,
+            outputBits = if (converter != null) active.validBits else active.outputBits,
+            sourceBits = current?.sourceBits ?: 0,
+            sourceRateHz = current?.sampleRate ?: 0,
+            exact = converter == null,
+            dacLimited = converter != null,
+        )
+        inexactStatus = exactStatus?.copy(exact = false)
     }
 
     private fun publishStatus() {
-        val active = transport ?: return
-        outputs.publish(
-            BitPerfectOutput.Status(
-                active = true,
-                driver = active.driver.label,
-                deviceName = active.deviceName,
-                sampleRateHz = active.sampleRate,
-                outputBits = if (converter != null) active.validBits else active.outputBits,
-                sourceBits = current?.sourceBits ?: 0,
-                sourceRateHz = current?.sampleRate ?: 0,
-                exact = exact && converter == null,
-                dacLimited = converter != null,
-            ),
-        )
+        check(!processingPcm)
+        val status = (if (exact) exactStatus else inexactStatus) ?: return
+        outputs.publish(status)
+        statusDirty = false
     }
 
     private fun resetCounters() {
@@ -632,16 +694,17 @@ internal class BitPerfectAudioSink(
     }
 
     private fun writeException(error: BitPerfectTransportException): AudioSink.WriteException {
-        Log.w(TAG, "Bit-perfect output stopped: ${error.message}")
+        transportFailures.incrementAndGet()
+        lastTransportFailure = error
         return AudioSink.WriteException(
             AudioTrack.ERROR_DEAD_OBJECT,
-            current?.format ?: configured?.format ?: Format.Builder().build(),
+            current?.format ?: configured?.format ?: EMPTY_FORMAT,
             /* isRecoverable = */ true,
         )
     }
 
     companion object {
-        private const val TAG = "BitPerfectAudioSink"
+        private val EMPTY_FORMAT = Format.Builder().build()
         private const val OUTPUT_CHUNK_FRAMES = 4096
         private const val MAX_TIMESTAMP_DRIFT_US = 200_000L
 
@@ -665,18 +728,17 @@ internal class RecentBytes(val capacity: Int) {
     }
 
     /** Records [count] bytes of [source] from index [from], leaving its position as it is. */
+    @AudioThread
     fun record(source: ByteBuffer, from: Int, count: Int) {
         if (capacity == 0) return
         var left = minOf(count, capacity)
         var at = from + count - left
         size = minOf(capacity, size + left)
-        val view = source.duplicate()
         while (left > 0) {
             val n = minOf(left, capacity - end)
-            view.limit(at + n)
-            view.position(at)
-            ring.position(end)
-            ring.put(view)
+            // Absolute reads preserve the caller's position, limit and mark;
+            // unlike duplicate(), they create no per-write ByteBuffer view.
+            for (i in 0 until n) ring.put(end + i, source.get(at + i))
             end = (end + n) % capacity
             at += n
             left -= n
@@ -689,12 +751,9 @@ internal class RecentBytes(val capacity: Int) {
         if (count == 0) return
         var at = (end - count + capacity) % capacity
         var left = count
-        val view = ring.duplicate()
         while (left > 0) {
             val n = minOf(left, capacity - at)
-            view.limit(at + n)
-            view.position(at)
-            target.put(view)
+            for (i in 0 until n) target.put(ring.get(at + i))
             at = (at + n) % capacity
             left -= n
         }

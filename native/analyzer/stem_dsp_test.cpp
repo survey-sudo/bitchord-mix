@@ -4,8 +4,7 @@
 // known, so the test proves the front end, the chunk crossfades, the Wiener
 // post-filter, the inverse STFT and the mixture-consistency step together.
 //
-//   g++ -std=c++17 -O2 -I native native/analyzer/stem_dsp_test.cpp \
-//       native/analyzer/stem_dsp.cpp -o /tmp/stem_dsp_test && /tmp/stem_dsp_test
+//   g++ -std=c++17 -O2 -I native native/analyzer/stem_dsp_test.cpp native/analyzer/stem_dsp.cpp -o /tmp/stem_dsp_test && /tmp/stem_dsp_test
 //
 // Exit 0 means every check passed.
 #include "analyzer/stem_dsp.h"

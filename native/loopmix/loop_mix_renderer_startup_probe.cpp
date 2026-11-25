@@ -1,10 +1,7 @@
 // Standalone startup-priming probe for the held incoming deck.
 //
 // Host build from the repository root:
-//   g++ -std=c++17 -O2 -I native -I native/third_party \
-//     native/loopmix/loop_mix_renderer.cpp \
-//     native/loopmix/loop_mix_renderer_startup_probe.cpp \
-//     -o /tmp/loopmix_startup_probe
+//   g++ -std=c++17 -O2 -I native -I native/third_party native/loopmix/loop_mix_renderer.cpp native/loopmix/loop_mix_renderer_startup_probe.cpp -o /tmp/loopmix_startup_probe
 //   /tmp/loopmix_startup_probe
 
 #include "loopmix/loop_mix_renderer.h"

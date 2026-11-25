@@ -196,7 +196,7 @@ class RecipesTest {
         }
 
         // Festival fallback ladder: low beat confidence + 30% tempo jump + no stems + zero v2 caps
-        // must STILL stay in Festival (F2/F5), never dropping to Subtle/Club.
+        // uses the musical F5/C2 fallback pool while preserving the requested Festival level.
         val badPlan = plan(88.0, 128.0, bars = 4, beatMatched = false)
         val badOut = track("b1", 88.0, key = "C major", beatConfidence = 0.2, vocal = 0.8)
         val badIn = track("b2", 128.0, key = "F# major", beatConfidence = 0.2, vocal = 0.8)
@@ -210,7 +210,7 @@ class RecipesTest {
             ),
         )
         assertEquals(DjLevel.FESTIVAL, festFallback1.level)
-        assertTrue(festFallback1.recipeId in listOf("F2", "F5", "C2"), "Expected F2, F5, or C2 fallback, got ${festFallback1.recipeId}")
+        assertTrue(festFallback1.recipeId in listOf("F5", "C2"), "Expected F5 or C2 fallback, got ${festFallback1.recipeId}")
         assertTrue(festFallback1.fxCount >= 2, "Festival fallback should preserve >= 2 vc80 FX, got ${festFallback1.fxCount}")
 
         // Second consecutive fallback transition alternates without repeating back-to-back (ADR 0010 musical fallback F5/C2).
@@ -226,7 +226,7 @@ class RecipesTest {
             ),
         )
         assertEquals(DjLevel.FESTIVAL, festFallback2.level)
-        assertTrue(festFallback2.recipeId in listOf("F2", "F5", "C2"), "Expected F2, F5, or C2 fallback, got ${festFallback2.recipeId}")
+        assertTrue(festFallback2.recipeId in listOf("F5", "C2"), "Expected F5 or C2 fallback, got ${festFallback2.recipeId}")
         assertNotEquals(festFallback1.recipeId, festFallback2.recipeId)
     }
 

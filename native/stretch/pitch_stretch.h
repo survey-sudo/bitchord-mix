@@ -25,6 +25,14 @@ class PitchStretch {
   void setTempo(float tempo);
   void process(float* interleaved, int frames);
 
+  /**
+   * Channel count accepted by the last configure(), or 0 before any.
+   * process() walks frames * configuredChannels() samples, so callers that
+   * hand it an interleaved buffer must supply that same count. Read-only,
+   * no allocation. A concurrent configure() racing process() is not covered.
+   */
+  int configuredChannels() const;
+
  private:
   struct State;
   State* state_;

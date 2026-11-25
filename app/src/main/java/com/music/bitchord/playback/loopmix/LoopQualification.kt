@@ -1,252 +1,63 @@
 package com.music.bitchord.playback.loopmix
 
 import com.music.bitchord.playback.djmix.StraightRateMode
-import com.music.bitchord.playback.smart.HandoffStatus
 import com.music.bitchord.playback.smart.LoopMix
 import com.music.bitchord.playback.smart.TrackAnalysis
 import com.music.bitchord.playback.smart.choreo.AutomixV2Choreo
 import com.music.bitchord.playback.smart.choreo.DjLevel
-import com.music.bitchord.playback.smart.qualifyMusicalHandoff
-import kotlin.math.abs
-import kotlin.math.max
+import java.util.concurrent.atomic.AtomicReference
 
-/** Incoming deck coordinate contract computed before JNI/session preparation. */
-internal data class IncomingGeometry(
-    val loops: Boolean,
-    val releaseTrack: Double,
-    val handoverTrack: Double,
-    val requiredEnd: Double,
-)
-
-/**
- * Qualification and physical PCM coverage checks extracted from [LoopMixSession]
- * (M9 slice L-1). Every tolerance and edge condition is preserved verbatim.
- */
+/** Platform facade for shared qualification and prepared-coverage diagnostics. */
 internal object LoopQualification {
 
+    /** One regional, peak-safe gain shared by canonical geometry and native IN setup. */
+    internal fun regionalIncomingLevel(
+        plan: LoopMix.Plan, out: LoopRegion, inn: LoopRegion, sampleRate: Int, fallback: Float,
+    ): Float = PlaybackGeometryQualification.regionalIncomingLevel(plan, out, inn, sampleRate, fallback)
+
+    /** Last non-user-visible geometry failure class, readable by diagnostics/tests only. */
+    private val geometryFailureClass = AtomicReference<String?>(null)
+    internal fun lastPreparedGeometryFailureClass(): String? = geometryFailureClass.get()
+    internal fun recordPreparedGeometryFailure(error: Throwable) {
+        geometryFailureClass.set(error.javaClass.name)
+    }
+
     /** Interpolate the exact arrays supplied to native, in source seconds. */
-    internal fun knotSourceAt(frames: DoubleArray, positions: DoubleArray, mixSec: Double, sampleRate: Int): Double? {
-        if (sampleRate <= 0 || !mixSec.isFinite() || frames.size != positions.size || frames.size < 2 ||
-            frames.any { !it.isFinite() } || positions.any { !it.isFinite() } ||
-            (1 until frames.size).any { frames[it] <= frames[it - 1] }) return null
-        val frame = mixSec * sampleRate
-        if (frame < frames.first() - 1e-6 || frame > frames.last() + 1e-6) return null
-        val right = frames.indexOfFirst { it >= frame }
-        if (right <= 0) return positions.first()
-        val f = (frame - frames[right - 1]) / (frames[right] - frames[right - 1])
-        return positions[right - 1] + f * (positions[right] - positions[right - 1])
-    }
+    internal fun knotSourceAt(frames: DoubleArray, positions: DoubleArray, mixSec: Double, sampleRate: Int): Double? =
+        PlaybackGeometryQualification.knotSourceAt(frames, positions, mixSec, sampleRate)
 
-    /** A contract is checked against emitted coordinates before any decoder or JNI work. */
     internal fun qualifyHandoffKnots(
-        plan: LoopMix.Plan,
-        clock: LoopMix.Clock,
-        sampleRate: Int,
-        knots: LoopMixSession.Companion.DeckKnots,
-    ): String? {
-        val h = plan.handoff ?: return null
-        if (qualifyMusicalHandoff(h, null, null, null, null).status == HandoffStatus.UNSAFE) {
-            return "handoff_invalid_geometry"
-        }
-        if (sampleRate <= 0 || plan.outLoops || plan.inLoops || !plan.nativeIncoming ||
-            abs(clock.incomingHoldSec - h.inHoldMixSec) > 1e-8 ||
-            h.inLanding.mixSec > clock.releaseAt + 1e-8 || h.outDryEnd.mixSec > clock.releaseAt + 1e-8) {
-            return "handoff_plan_geometry"
-        }
-        val tolerance = 0.5 / sampleRate
-        fun agrees(frames: DoubleArray, positions: DoubleArray, source: (Double) -> Double): Boolean {
-            if (knotSourceAt(frames, positions, 0.0, sampleRate) == null || frames.first() != 0.0) return false
-            return frames.indices.all { abs(positions[it] - source(frames[it] / sampleRate)) <= tolerance }
-        }
-        if (!agrees(knots.outFrames, knots.outPositionsSec) { plan.out.loopStart + it }) return "handoff_out_knot_mapping"
-        if (!agrees(knots.inFrames, knots.inPositionsSec) {
-                h.inCueSourceSec + (it - h.inHoldMixSec).coerceAtLeast(0.0)
-            }) return "handoff_in_knot_mapping"
-        if (knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inHoldMixSec, sampleRate)
-                ?.let { abs(it - h.inCueSourceSec) > tolerance } != false) return "handoff_in_hold_mapping"
-        val outEvents = listOf(h.outCaptureStart, h.outDryFallStart, h.outDryEnd, h.outSendClose)
-        val inEvents = listOf(h.inAudibleStart, h.inLanding)
-        if (outEvents.any { p ->
-                knotSourceAt(knots.outFrames, knots.outPositionsSec, p.mixSec, sampleRate)
-                    ?.let { abs(it - p.sourceSec) > tolerance } != false
-            }) return "handoff_out_event_mapping"
-        if (inEvents.any { p ->
-                knotSourceAt(knots.inFrames, knots.inPositionsSec, p.mixSec, sampleRate)
-                    ?.let { abs(it - p.sourceSec) > tolerance } != false
-            }) return "handoff_in_event_mapping"
-        return null
-    }
+        plan: LoopMix.Plan, clock: LoopMix.Clock, sampleRate: Int, knots: DeckKnots,
+    ): String? = PlaybackGeometryQualification.qualifyHandoffKnots(plan, clock, sampleRate, knots)
 
-    /** Verifies decoded OUT and IN buffers cover the handoff contract bounds. */
     internal fun coversHandoffPcm(
-        plan: LoopMix.Plan,
-        sampleRate: Int,
-        knots: LoopMixSession.Companion.DeckKnots,
-        out: LoopRegion,
-        inn: LoopRegion,
-    ): Boolean {
-        val h = plan.handoff ?: return true
-        val dryEnd = knotSourceAt(knots.outFrames, knots.outPositionsSec, h.outDryEnd.mixSec, sampleRate) ?: return false
-        val entry = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inAudibleStart.mixSec, sampleRate) ?: return false
-        val landing = knotSourceAt(knots.inFrames, knots.inPositionsSec, h.inLanding.mixSec, sampleRate) ?: return false
-        // OUT may exhaust after dry end, while the effect continues to drain.
-        return coversPhysical(out, sampleRate, h.outCaptureStart.sourceSec, dryEnd) &&
-            coversPhysical(inn, sampleRate, minOf(h.inCueSourceSec, entry), landing + 1.0 / sampleRate)
-    }
+        plan: LoopMix.Plan, sampleRate: Int, knots: DeckKnots, out: LoopRegion, inn: LoopRegion,
+    ): Boolean = PlaybackGeometryQualification.coversHandoffPcm(plan, sampleRate, knots, out, inn)
 
-    /**
-     * Qualify the actual buildDeckKnots output, in unwrapped track seconds,
-     * before PCM/JNI. This deliberately does not repair or clamp a knot.
-     * Native prepare() finds the first position > 0.5 sample from p0 and
-     * stays silent up to the preceding knot (renderer.cpp:673-689, 778-785).
-     * Only a declared IN hold at p0 may use that initial activation contract;
-     * after the first advance, neither deck may park or move backwards.
-     */
     internal fun qualifyCrownKnots(
-        plan: LoopMix.Plan,
-        clock: LoopMix.Clock,
-        sampleRate: Int,
-        knots: LoopMixSession.Companion.DeckKnots,
-    ): LoopMixSession.Companion.CrownKnotQualification {
-        if (!plan.outLoops || !plan.inLoops) return LoopMixSession.Companion.CrownKnotQualification(true)
-        if (sampleRate <= 0 || !clock.incomingHoldSec.isFinite() || clock.incomingHoldSec < 0.0) {
-            return LoopMixSession.Companion.CrownKnotQualification(false, "crown_actual_geometry")
-        }
-        data class DeckResult(val refusal: String?, val minRate: Double?, val maxRate: Double?)
-        fun deck(frames: DoubleArray, positions: DoubleArray, start: Double,
-            expectedSize: Int, side: String, initialHoldSec: Double): DeckResult {
-            var low: Double? = null
-            var high: Double? = null
-            fun result(reason: String?) = DeckResult(reason?.let { "crown_actual_${side}_$it" }, low, high)
-            if (frames.size != expectedSize || frames.size != positions.size || frames.size < 2 ||
-                !start.isFinite() || start < 0.0 || frames.first() != 0.0 || positions.first() != start ||
-                frames.any { !it.isFinite() || it < 0.0 } ||
-                positions.any { !it.isFinite() || it < start }
-            ) return result("geometry")
-            var active = false
-            for (i in 1 until frames.size) {
-                val outputAdvance = frames[i] - frames[i - 1]
-                val sourceAdvance = positions[i] - positions[i - 1]
-                if (!outputAdvance.isFinite() || outputAdvance <= 0.0 || !sourceAdvance.isFinite()) {
-                    return result("geometry")
-                }
-                if (sourceAdvance == 0.0 && !active && initialHoldSec > 1e-9 &&
-                    positions[i] == start && frames[i] / sampleRate <= initialHoldSec
-                ) continue
-                if (sourceAdvance <= 0.0) return result("nonadvancing")
-                active = true
-                val rate = sampleRate.toDouble() * sourceAdvance / outputAdvance
-                if (!rate.isFinite()) return result("geometry")
-                low = low?.let { minOf(it, rate) } ?: rate
-                high = high?.let { maxOf(it, rate) } ?: rate
-                // Round-off at an exact endpoint is not a new rate envelope.
-                if (rate < LoopMix.CROWN_MIN_EXECUTION_RATE - 1e-9 ||
-                    rate > LoopMix.CROWN_MAX_EXECUTION_RATE + 1e-9
-                ) return result("rate")
-            }
-            return result(if (active) null else "nonadvancing")
-        }
-        val out = deck(knots.outFrames, knots.outPositionsSec, plan.out.loopStart,
-            clock.beats + 1, "out", 0.0)
-        val inn = deck(knots.inFrames, knots.inPositionsSec, plan.inn.loopStart,
-            clock.beats + clock.settleBeats + 1, "in", clock.incomingHoldSec)
-        val reason = out.refusal ?: inn.refusal
-        return LoopMixSession.Companion.CrownKnotQualification(
-            reason == null, reason,
-            out.minRate, out.maxRate, inn.minRate, inn.maxRate,
-        )
-    }
+        plan: LoopMix.Plan, clock: LoopMix.Clock, sampleRate: Int, knots: DeckKnots,
+    ): CrownKnotQualification = PlaybackGeometryQualification.qualifyCrownKnots(plan, clock, sampleRate, knots)
 
-    /** Extracts a contiguous tracked-beat array starting near [anchorStart] when coherent. */
     internal fun trackedBeatsInWindow(
-        sideBeats: List<Double>?,
-        anchorStart: Double,
-        count: Int,
-        beatSec: Double,
-    ): DoubleArray? {
-        if (sideBeats.isNullOrEmpty() || count <= 0 || !beatSec.isFinite() || beatSec <= 0.05) return null
-        var bestIdx = -1
-        var bestDist = Double.POSITIVE_INFINITY
-        for (i in sideBeats.indices) {
-            val b = sideBeats[i]
-            if (!b.isFinite()) continue
-            val d = abs(b - anchorStart)
-            if (d < bestDist) {
-                bestDist = d
-                bestIdx = i
-            }
-        }
-        val maxPhaseGate = minOf(0.08, maxOf(LoopMix.PHASE_GATE_MS / 1000.0, beatSec * 0.15))
-        if (bestIdx < 0 || bestDist > maxPhaseGate || bestIdx + count >= sideBeats.size) return null
-        val out = DoubleArray(count + 1)
-        out[0] = anchorStart
-        for (k in 1..count) {
-            val prev = sideBeats[bestIdx + k - 1]
-            val cur = sideBeats[bestIdx + k]
-            if (!cur.isFinite() || cur <= prev) return null
-            val dt = cur - prev
-            if (dt <= 0.05 || abs(dt / beatSec - 1.0) > 0.18) return null
-            out[k] = cur
-        }
-        return out
-    }
+        sideBeats: List<Double>?, anchorStart: Double, count: Int, beatSec: Double,
+    ): DoubleArray? = PlaybackGeometryQualification.trackedBeatsInWindow(sideBeats, anchorStart, count, beatSec)
 
     /** Coordinates here remain track seconds; native subtracts region.start. */
-    internal fun incomingGeometry(
-        plan: LoopMix.Plan,
-        clock: LoopMix.Clock,
-        knots: LoopMixSession.Companion.DeckKnots,
-    ): IncomingGeometry {
-        val handoff = plan.handoff
-        val release = handoff?.let {
-            it.inCueSourceSec + max(0.0, clock.releaseAt - it.inHoldMixSec)
-        } ?: if (knots.sampleRate > 0) {
-            requireNotNull(knotSourceAt(knots.inFrames, knots.inPositionsSec, clock.releaseAt, knots.sampleRate))
-        } else knots.inPositionsSec[clock.beats]
-        val loops = plan.inLoops && !plan.nativeIncoming && release >= plan.inn.loopEnd
-        fun physical(position: Double) = if (loops) LoopMix.physicalTrackTime(
-            position, plan.inn.loopStart, plan.inn.loopEnd, release,
-        ) else position
-        val handover = physical(knots.inPositionsSec.last())
-        // Entire repeated body plus the 8 ms seam continuation must exist;
-        // post-release music extends through the 25 ms renderer fade.
-        val required = maxOf(knots.inPositionsSec.maxOf(::physical), handover + 0.025,
-            if (loops) plan.inn.loopEnd + 0.008 else plan.inn.loopStart)
-        return IncomingGeometry(loops, release, handover, required)
-    }
+    internal fun incomingGeometry(plan: LoopMix.Plan, clock: LoopMix.Clock, knots: DeckKnots): IncomingGeometry =
+        PlaybackGeometryQualification.incomingGeometry(plan, clock, knots)
 
-    /** True when decoded stereo PCM [region] covers `[requiredStart, requiredEnd]` within 1 sample. */
     internal fun coversPhysical(region: LoopRegion, sampleRate: Int, requiredStart: Double, requiredEnd: Double): Boolean =
-        sampleRate > 0 && region.start.isFinite() && requiredStart.isFinite() && requiredEnd.isFinite() &&
-            region.left.isNotEmpty() && region.left.size == region.right.size && region.start <= requiredStart &&
-            region.start + region.left.size.toDouble() / sampleRate + 1.0 / sampleRate >= requiredEnd
+        PlaybackGeometryQualification.coversPhysical(region, sampleRate, requiredStart, requiredEnd)
 
-    /** OUT loop completeness only; straight OUT may reach real EOF during FX drain. */
     internal fun coversOutgoingStartAndLoop(region: LoopRegion, sampleRate: Int, plan: LoopMix.Plan): Boolean =
-        coversPhysical(region, sampleRate, plan.out.loopStart,
-            if (plan.outLoops) plan.out.loopEnd + 0.008 else plan.out.loopStart) &&
-            region.start + region.left.size.toDouble() / sampleRate > plan.out.loopStart
+        PlaybackGeometryQualification.coversOutgoingStartAndLoop(region, sampleRate, plan)
 
     /** Exact build request, including actual tracked/straight knots and handover tail. */
     internal fun decodeRequirements(
         plan: LoopMix.Plan, sampleRate: Int, outAnalysis: TrackAnalysis?, inAnalysis: TrackAnalysis?,
         straightRateMode: StraightRateMode? = null, level: DjLevel = AutomixV2Choreo.level,
-    ): LoopMix.RegionBounds {
-        val clock = LoopMix.Clock(plan)
-        val nominal = LoopMix.regionBounds(plan)
-        val stop = clock.releaseAt + 0.05 + (if (plan.echoTail) plan.out.beatSec * 8 else 0.0) + plan.exitTailSeconds
-        val tailRate = if (clock.beats >= 1) plan.out.beatSec /
-            (clock.beatTimes[clock.beats] - clock.beatTimes[clock.beats - 1]).coerceAtLeast(1e-6) else 1.0
-        val knots = DeckKnotBuilder.buildDeckKnots(plan, clock, sampleRate, outAnalysis, inAnalysis,
-            !plan.outLoops && stop > clock.releaseAt + 1e-6, stop, tailRate, straightRateMode, level)
-        val geometry = incomingGeometry(plan, clock, knots)
-        return LoopMix.RegionBounds(
-            maxOf(0.0, nominal.outFrom),
-            if (straightRateMode != null) knots.outPositionsSec.maxOrNull()!! + 0.5 else nominal.outTo,
-            maxOf(0.0, nominal.inFrom),
-            maxOf(nominal.inTo, geometry.handoverTrack + nominal.inTo - clock.elementTrackTime, geometry.requiredEnd),
-        )
-    }
+    ): LoopMix.RegionBounds =
+        PlaybackGeometryQualification.decodeRequirements(plan, sampleRate, outAnalysis, inAnalysis, straightRateMode, level)
 
     /** PREPARED means complete, usable PCM on the same geometry/rate contract as build. */
     internal fun preparedCoverageRefusal(
@@ -256,13 +67,13 @@ internal object LoopQualification {
     ): String? {
         if (sampleRate <= 0) return "prepared_invalid_sample_rate"
         if (out == null || inn == null) return "prepared_pcm_missing"
-        val bounds = runCatching { decodeRequirements(plan, sampleRate, outAnalysis, inAnalysis, straightRateMode, level) }
-            .getOrNull() ?: return "prepared_invalid_geometry"
-        val eof = outAnalysis?.duration?.takeIf { it.isFinite() && it > plan.out.loopStart }
-        val outEnd = if (!plan.outLoops && eof != null) minOf(bounds.outTo, eof) else bounds.outTo
-        if (!coversPhysical(out, sampleRate, bounds.outFrom, outEnd) ||
-            !coversOutgoingStartAndLoop(out, sampleRate, plan)) return "prepared_out_pcm_incomplete"
-        if (!coversPhysical(inn, sampleRate, bounds.inFrom, bounds.inTo)) return "prepared_in_pcm_incomplete"
-        return null
+        val bounds = try {
+            decodeRequirements(plan, sampleRate, outAnalysis, inAnalysis, straightRateMode, level)
+                .also { geometryFailureClass.set(null) }
+        } catch (error: Throwable) {
+            recordPreparedGeometryFailure(error)
+            return "prepared_invalid_geometry"
+        }
+        return PlaybackGeometryQualification.preparedCoverageRefusal(plan, sampleRate, out, inn, outAnalysis, bounds)
     }
 }

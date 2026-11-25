@@ -367,6 +367,8 @@ object ChoreoGuard {
  * guard-passing script (falling back within the level), and populate [ChoreoScript].
  */
 object Choreographer {
+    private const val LOW_CONFIDENCE_FALLBACK_THRESHOLD = 0.45
+
     /** Every allowed recipe candidate in [inputs.level], best first, plus why others were skipped. */
     fun rankRecipes(
         inputs: ChoreoInputs,
@@ -431,9 +433,10 @@ object Choreographer {
     ): ChoreoScript? {
         val c = PairContext(inputs)
         var ranked = rankRecipes(inputs, log, forced = forced)
-        if (forced == null && inputs.level == DjLevel.FESTIVAL) {
+        if (forced == null && inputs.level == DjLevel.FESTIVAL && c.beatConf < LOW_CONFIDENCE_FALLBACK_THRESHOLD) {
             // ADR 0010: Festival low-confidence fallback is musical, never a
             // brake slam: F5 (Tunnel) and C2 (Filter wash + echo).
+            ranked = ranked.filterNot { it.recipeId == RecipeId.F2 }
             val presentIds = ranked.map { it.recipeId }.toSet()
             val fallbacks = listOf(RecipeId.F5, RecipeId.C2).filter { it !in presentIds && it !in inputs.excludedRecipes }
             if (fallbacks.isNotEmpty()) {
@@ -536,36 +539,8 @@ object Choreographer {
      * Only ever skips forward into the incoming intro, by at most
      * [DjLevel.maxEntrySkipSec]; the outgoing geometry is never touched.
      */
-    fun dropRetimeStart(inputs: ChoreoInputs): Double? {
-        if (!AutomixV2Choreo.retimeEntry) return null
-        val level = inputs.level
-        if (level.maxEntrySkipSec <= 0.0 || level == DjLevel.SUBTLE) return null
-        val plan = inputs.plan
-        if (!plan.nativeIncoming || plan.inLoops) return null
-        val c = PairContext(inputs)
-        if ((c.genre != GenreClass.DANCE && c.genre != GenreClass.POP) ||
-            c.beatConf < 0.5 || c.tempoGap > level.maxStretch
-        ) return null
-        if (MoveCatalog.dropBeat(c) != null) return null
-        val drops = inputs.inStructure.drops.sorted()
-        if (drops.isEmpty()) return null
-        val grid = if (plan.fold < 1.0) 8 else 4
-        val first = max(c.kIn, 8)
-        val duration = inputs.inn?.duration ?: 0.0
-        for (d in drops) {
-            if (duration > 0.0 && d > duration - 20.0) continue
-            var k = c.kRel - 1
-            while (k >= first) {
-                if ((k - c.kIn) % grid == 0) {
-                    val start = d - (c.t(k) - c.inAudibleAt)
-                    val skip = start - plan.inn.loopStart
-                    if (start >= 0.0 && skip > 0.0 && skip <= level.maxEntrySkipSec) return start
-                }
-                k--
-            }
-        }
-        return null
-    }
+    fun dropRetimeStart(inputs: ChoreoInputs): Double? =
+        PlaybackChoreoPreparation.dropRetimeStart(inputs, AutomixV2Choreo.retimeEntry)
 
     /** [plan] with its (straight, native) incoming cue moved to [newStart]. */
     fun withIncomingStart(plan: LoopMix.Plan, newStart: Double): LoopMix.Plan =

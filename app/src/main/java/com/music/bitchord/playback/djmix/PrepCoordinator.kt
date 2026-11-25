@@ -114,7 +114,10 @@ internal interface PrepCoordinatorHost : CoordinatorCallbacks {
 /** Coordinates preparation requests and controller-thread player and executor callbacks. */
 @MainThread
 @OptIn(UnstableApi::class)
-internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
+internal class PrepCoordinator(
+    private val host: PrepCoordinatorHost,
+    private val callbackAdmission: () -> Boolean = { true },
+) {
     private var incomingPreparedAt = 0L
 
     private var prepListener: Player.Listener? = null
@@ -127,6 +130,7 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
             incomingPreparedAt = nowMs()
             val listener = object : Player.Listener {
                 override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (!callbackAdmission()) return
                     if (playbackState != Player.STATE_READY || incomingPreparedAt == 0L) return
                     val prep = nowMs() - incomingPreparedAt
                     incomingPreparedAt = 0L
@@ -201,6 +205,7 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
                     minExitMs = minExitMs,
                     preferNoStemVariant = preferNoStemVariant,
                     excludedRecipes = excluded,
+                    excludedRecipeIds = excludedRecipeIds.toSet(),
                     machineGeneration = generation,
                 ),
                 force = true,
@@ -306,11 +311,16 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
 
     fun onControllerThread( block: () -> Unit) {
         with(host) {
+            if (!callbackAdmission()) return
+            val admittedGeneration = mixExecutor.currentState().generation
+            fun invokeIfCurrent() {
+                if (callbackAdmission() && mixExecutor.currentState().generation == admittedGeneration) block()
+            }
             val looperThread = runCatching { active().applicationLooper.thread }.getOrNull()
             if (looperThread == null || Thread.currentThread() === looperThread) {
-                block()
+                invokeIfCurrent()
             } else {
-                scope.launch { block() }
+                scope.launch { invokeIfCurrent() }
             }
         }
     }
@@ -448,6 +458,7 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
             newPosition: Player.PositionInfo,
             reason: Int,
         ) {
+            if (!callbackAdmission()) return
             // The listener moving the playhead. djmix13: never silently
             // fire a stale plan or double-fire the incoming deck.
             if (reason == Player.DISCONTINUITY_REASON_SEEK) {
@@ -543,12 +554,14 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
         }
 
         override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+            if (!callbackAdmission()) return
             if (reason != Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED) return
             this@PrepCoordinator.onPlaylistChanged(timeline)
             this@PrepCoordinator.notifyPairPreparer()
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            if (!callbackAdmission()) return
             tempoEngine.cancelPendingSpeedChange()
             when (reason) {
                 Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> bail()
@@ -568,6 +581,7 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            if (!callbackAdmission()) return
             AutomixTelemetry.event("mix.error", mapOf("error" to error.message.orEmpty(), "phase" to phaseName))
             mixExecutor.dispatch(
                 MixEvent.RendererError(
@@ -580,6 +594,7 @@ internal class PrepCoordinator(private val host: PrepCoordinatorHost) {
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            if (!callbackAdmission()) return
             if (!playWhenReady) tempoEngine.cancelPendingSpeedChange()
             lastPlayWhenReadyChangeReason = reason
             when {

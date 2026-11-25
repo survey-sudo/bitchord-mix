@@ -7,6 +7,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.music.bitchord.playback.djmix.PrepThermalGate
 import com.music.bitchord.playback.smart.AnalysisLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -39,23 +40,23 @@ object QueuePrepRegistry {
  * to `FULL` and plan + stem-prep the next 2 pairs, so cold pairs mostly start
  * READY. Runs on [Dispatchers.IO] at background priority with no network
  * constraint; per-item failures are logged and skipped, never retried.
+ * New items wait at SEVERE until MODERATE or cooler; active work/mixes are untouched.
  */
 class QueueAnalysisWorker(appContext: Context, params: WorkerParameters) :
     CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val ids = inputData.getStringArray(KEY_TRACK_IDS)
-            ?.filter { it.isNotBlank() }
-            ?.take(QUEUE_ANALYSIS_BUDGET)
-            .orEmpty()
+        val ids = analysisTargets(inputData.getStringArray(KEY_TRACK_IDS)?.toList().orEmpty())
         if (ids.isEmpty()) return Result.success()
         val delegate = QueuePrepRegistry.delegate ?: return Result.success()
         withContext(Dispatchers.IO) {
             for (id in ids) {
+                if (!awaitThermalBudget()) return@withContext
                 runCatching { delegate.ensureFullAnalysis(id) }
                     .onFailure { AnalysisLog.warn("djmix queue worker: analysis failed for $id", it) }
             }
-            for ((outId, inId) in ids.zipWithNext().take(PAIR_PREP_BUDGET)) {
+            for ((outId, inId) in pairTargets(ids)) {
+                if (!awaitThermalBudget()) return@withContext
                 runCatching { delegate.preparePairAndStems(outId, inId) }
                     .onFailure { AnalysisLog.warn("djmix queue worker: pair prep failed for $outId->$inId", it) }
             }
@@ -64,6 +65,11 @@ class QueueAnalysisWorker(appContext: Context, params: WorkerParameters) :
         // a poisoned track would otherwise make WorkManager loop on it.
         return Result.success()
     }
+
+    private suspend fun awaitThermalBudget(): Boolean = PrepThermalGate.awaitReady(
+        status = { PrepThermalGate.currentStatus(applicationContext) },
+        isAborted = { isStopped },
+    )
 
     companion object {
         const val UNIQUE_WORK_NAME = "djmix_queue_analysis"
@@ -75,12 +81,20 @@ class QueueAnalysisWorker(appContext: Context, params: WorkerParameters) :
         /** How many upcoming pairs one run plans and stem-preps. */
         const val PAIR_PREP_BUDGET = 2
 
+        /** Upcoming tracks one run lifts to FULL: non-blank, first [QUEUE_ANALYSIS_BUDGET]. Pure; unit-tested. */
+        fun analysisTargets(queueTrackIds: List<String>): List<String> =
+            queueTrackIds.filter { it.isNotBlank() }.take(QUEUE_ANALYSIS_BUDGET)
+
+        /** Upcoming pairs one run plans and stem-preps, in queue order. Pure; unit-tested. */
+        fun pairTargets(queueTrackIds: List<String>): List<Pair<String, String>> =
+            analysisTargets(queueTrackIds).zipWithNext().take(PAIR_PREP_BUDGET)
+
         /**
          * Enqueues a queue-scan run, replacing any still-waiting one so the
          * newest queue always wins. No-op for an empty queue.
          */
         fun enqueue(context: Context, queueTrackIds: List<String>) {
-            val ids = queueTrackIds.filter { it.isNotBlank() }.take(QUEUE_ANALYSIS_BUDGET)
+            val ids = analysisTargets(queueTrackIds)
             if (ids.isEmpty()) return
             val request = OneTimeWorkRequestBuilder<QueueAnalysisWorker>()
                 .setInputData(workDataOf(KEY_TRACK_IDS to ids.toTypedArray()))

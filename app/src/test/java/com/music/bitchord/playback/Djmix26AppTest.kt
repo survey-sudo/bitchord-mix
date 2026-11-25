@@ -8,6 +8,7 @@ import com.music.bitchord.playback.smart.DeckBudget
 import com.music.bitchord.playback.smart.EnergySample
 import com.music.bitchord.playback.smart.PhrasePlanner
 import com.music.bitchord.playback.smart.SeekAction
+import com.music.bitchord.playback.loopmix.DeckKnots
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.BeatSide
 import com.music.bitchord.playback.smart.CurveWindow
@@ -358,7 +359,7 @@ class Djmix26AppTest {
         val incoming = region(0.0, 20.0)
         assertFalse(LoopMixSession.coversHandoffPcm(plan, 48000, knots, region(99.0, 102.3), incoming))
         assertTrue(LoopMixSession.coversHandoffPcm(plan, 48000, knots, region(99.0, 102.5), incoming))
-        val bad = LoopMixSession.Companion.DeckKnots(knots.outFrames, knots.outPositionsSec.map { it + 0.04 }.toDoubleArray(),
+        val bad = DeckKnots(knots.outFrames, knots.outPositionsSec.map { it + 0.04 }.toDoubleArray(),
             knots.inFrames, knots.inPositionsSec)
         assertEquals("handoff_out_knot_mapping", LoopMixSession.qualifyHandoffKnots(plan, clock, 48000, bad))
     }

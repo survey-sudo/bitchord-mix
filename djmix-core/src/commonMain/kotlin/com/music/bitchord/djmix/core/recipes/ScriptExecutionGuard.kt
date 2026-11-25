@@ -25,15 +25,17 @@ object ScriptExecutionGuard {
     fun validate(
         script: TransitionScriptV1,
         availableCapabilities: Set<FxCapability> = FxCapability.entries.toSet(),
+        beatSec: Double? = null,
     ): MixOutcome<TransitionScriptV1> {
         geometryRefusal(script)?.let { return it }
-        contentRefusal(script, availableCapabilities)?.let { return it }
-        val g = script.renderGeometry ?: return invalid("render_geometry_missing")
-        ChoreoGuard.checkExecutionLanes(script, g.handoverMixSec, g.out.stopAtMixSec)?.let {
+        val normalized = normalizeSpinback(script, beatSec) ?: return choreography("spinback_missing_compiled_silence_gap_sec")
+        contentRefusal(normalized, availableCapabilities, beatSec)?.let { return it }
+        val g = normalized.renderGeometry ?: return invalid("render_geometry_missing")
+        ChoreoGuard.checkExecutionLanes(normalized, g.handoverMixSec, g.out.stopAtMixSec)?.let {
             return choreography(it)
         }
-        physicalRefusal(script)?.let { return it }
-        return MixOutcome.Ok(script)
+        physicalRefusal(normalized)?.let { return it }
+        return MixOutcome.Ok(normalized)
     }
 
     /** Additionally checks frozen identity, declared hold, plan anchors and level FX budget. */
@@ -43,12 +45,13 @@ object ScriptExecutionGuard {
         availableCapabilities: Set<FxCapability> = FxCapability.entries.toSet(),
     ): MixOutcome<TransitionScriptV1> {
         geometryRefusal(script, plan)?.let { return it }
-        when (val result = validate(script, availableCapabilities)) {
-            is MixOutcome.Ok -> Unit
+        val beatSec = (plan.barDurationMs / 4.0) / 1000.0
+        val normalized = when (val result = validate(script, availableCapabilities, beatSec)) {
+            is MixOutcome.Ok -> result.value
             is MixOutcome.Refused -> return result
             is MixOutcome.Failed -> return result
         }
-        return ChoreoGuard.validate(script, plan)
+        return ChoreoGuard.validate(normalized, plan)
     }
 
     internal fun geometryRefusal(script: TransitionScriptV1, plan: TransitionPlanV1? = null): MixOutcome.Refused? {
@@ -222,7 +225,11 @@ object ScriptExecutionGuard {
         return null
     }
 
-    private fun contentRefusal(script: TransitionScriptV1, caps: Set<FxCapability>): MixOutcome.Refused? {
+    private fun contentRefusal(
+        script: TransitionScriptV1,
+        caps: Set<FxCapability>,
+        beatSec: Double? = null,
+    ): MixOutcome.Refused? {
         val g = script.renderGeometry ?: return invalid("render_geometry_missing")
         val fx = script.fxParams
         val required = mutableSetOf<FxCapability>()
@@ -254,7 +261,7 @@ object ScriptExecutionGuard {
         if (fx.brake?.enabled == true || fx.tapeStop?.enabled == true) required += FxCapability.BRAKE
         if (fx.spinback?.enabled == true) required += FxCapability.SPINBACK
         (required - caps).firstOrNull()?.let { return choreography("capability_missing:$it") }
-        fxRefusal(fx, script.sampleRateHz, g)?.let { return it }
+        fxRefusal(fx, script.sampleRateHz, g, beatSec)?.let { return it }
         fun lane(deck: DeckTarget, kind: EnvelopeKind) = script.envelopes.any { it.deck == deck && it.kind == kind }
         if (fx.phaser?.let { it.enabled && !lane(it.deck, EnvelopeKind.PHASER_WET) } == true ||
             fx.gate?.let { it.enabled && !lane(it.deck, EnvelopeKind.GATE_DEPTH) } == true ||
@@ -315,7 +322,26 @@ object ScriptExecutionGuard {
         else -> true
     }
 
-    private fun fxRefusal(fx: ScriptFxParams, sr: Int, g: RenderGeometryV1): MixOutcome.Refused? {
+    private fun normalizeSpinback(script: TransitionScriptV1, beatSec: Double?): TransitionScriptV1? {
+        val spin = script.fxParams.spinback ?: return script
+        val missingCompiledSec = spin.enabled && spin.silenceGapSec == 0.0 && spin.silenceGapBeats > 0.0
+        if (!missingCompiledSec) return script
+        val bs = beatSec
+        if (bs == null || !bs.isFinite() || bs <= 0.0) return null
+        val compiledSec = spin.silenceGapBeats * bs
+        return script.copy(
+            fxParams = script.fxParams.copy(
+                spinback = spin.copy(silenceGapSec = compiledSec),
+            ),
+        )
+    }
+
+    private fun fxRefusal(
+        fx: ScriptFxParams,
+        sr: Int,
+        g: RenderGeometryV1,
+        beatSec: Double? = null,
+    ): MixOutcome.Refused? {
         fun horizon(deck: DeckTarget) = if (deck == DeckTarget.OUT) g.out.stopAtMixSec else g.handoverMixSec
         fun interval(start: Double, end: Double, deck: DeckTarget) = nonnegative(start) && positive(end) && end > start && end <= horizon(deck)
         fun finite(vararg xs: Double) = xs.all { it.isFinite() }
@@ -401,8 +427,33 @@ object ScriptExecutionGuard {
             ) return choreography("tape_stop_parameters")
         }
         fx.spinback?.let { s ->
+            // Backward compat: older enabled scripts may carry silenceGapBeats but omit compiled silenceGapSec (default 0.0).
+            // Derive/refuse only for enabled spinback; disabled objects preserve old parameter-bounds behavior.
+            val hasSourceGap = s.silenceGapBeats > 0.0
+            val missingCompiledSec = s.enabled && s.silenceGapSec == 0.0 && hasSourceGap
+            val resolvedSilenceGapSec = if (missingCompiledSec) {
+                val bs = beatSec
+                if (bs == null || !bs.isFinite() || bs <= 0.0) {
+                    return choreography("spinback_missing_compiled_silence_gap_sec")
+                }
+                s.silenceGapBeats * bs
+            } else {
+                s.silenceGapSec
+            }
+            if (s.enabled && hasSourceGap && !missingCompiledSec) {
+                val bs = beatSec
+                if (bs != null && bs.isFinite() && bs > 0.0) {
+                    val expected = s.silenceGapBeats * bs
+                    // Consistency check against authoritative frozen clock only; no alternate BPM.
+                    if (abs(s.silenceGapSec - expected) > 1e-6 * max(1.0, abs(expected))) {
+                        return choreography("spinback_compiled_silence_gap_sec_mismatch")
+                    }
+                }
+            }
             if (!interval(s.startMixSec, s.startMixSec + s.lengthSec, s.deck) || s.lengthSec !in 0.02..3.0 ||
-                !s.peakReverseSpeed.isFinite() || s.peakReverseSpeed !in 1.0..6.0 || !nonnegative(s.silenceGapBeats)
+                !s.peakReverseSpeed.isFinite() || s.peakReverseSpeed !in 1.0..6.0 ||
+                !nonnegative(s.silenceGapBeats) || !resolvedSilenceGapSec.isFinite() || resolvedSilenceGapSec < 0.0 ||
+                resolvedSilenceGapSec > 4.0
             ) return choreography("spinback_parameters")
         }
         if (listOf(fx.brake?.enabled, fx.tapeStop?.enabled, fx.spinback?.enabled).count { it == true } > 1) return choreography("conflicting_brake_processors")

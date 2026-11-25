@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <new>
 
 namespace bitchord::loopmix {
 
@@ -779,18 +780,49 @@ void Renderer::prepare() {
   // Must run before heldStartup pre-priming so deck.v2.stemsOn is already known.
   prepareV2();
 
-  if (captureEnabled_) {
-    const int cap = std::clamp(sampleRate_ * 40, 48000, 192000 * 40);
-    if (int(captureRing_.size()) < cap * 2) {
-      captureRing_.assign(size_t(cap) * 2, 0.f);
-    } else {
-      std::fill(captureRing_.begin(), captureRing_.end(), 0.f);
-    }
-    captureCapFrames_ = cap;
-    captureWriteFrames_.store(0, std::memory_order_release);
+  // Capture configuration is frozen by prepare(); post-prepare setCaptureEnabled is refused.
+  // Allocation/clearing happens here (worker/setup thread), never on audio thread.
+  // If a frozen snapshot is present, preserve it for readers; do not rearm/clear/reuse buffers.
+  const auto prevCaptureState = captureState_.load(std::memory_order_acquire);
+  if (prevCaptureState == CaptureState::kFrozen) {
+    captureConfigFrozen_.store(true, std::memory_order_release);
   } else {
-    captureCapFrames_ = 0;
-    captureWriteFrames_.store(0, std::memory_order_release);
+    captureConfigFrozen_.store(true, std::memory_order_release);
+    bool captureRequested = captureEnabled_.load(std::memory_order_acquire);
+    int cap = 0;
+    if (captureRequested) {
+      cap = std::clamp(sampleRate_ * 40, 48000, 192000 * 40);
+      if (int(captureRing_.size()) < cap * 2) {
+        try {
+          captureRing_.assign(size_t(cap) * 2, 0.f);
+        } catch (const std::bad_alloc&) {
+          // Capture is optional: finish playback setup with capture disabled for this session.
+          captureEnabled_.store(false, std::memory_order_release);
+          captureRequested = false;
+        }
+      } else {
+        std::fill(captureRing_.begin(), captureRing_.end(), 0.f);
+      }
+    }
+    if (captureRequested) {
+      captureCapFrames_ = cap;
+      captureWriteFrames_.store(0, std::memory_order_release);
+      captureFreezeRequested_.store(false, std::memory_order_release);
+      captureSessionStartMixFrame_ = -1;  // set on first actual capture write
+      captureFrozenTotalWritten_ = 0;
+      captureFrozenStartMixFrame_ = -1;
+      captureSnapshotId_ = 0;
+      captureState_.store(CaptureState::kArmed, std::memory_order_release);
+    } else {
+      captureCapFrames_ = 0;
+      captureWriteFrames_.store(0, std::memory_order_release);
+      captureFreezeRequested_.store(false, std::memory_order_release);
+      captureSessionStartMixFrame_ = -1;
+      captureFrozenTotalWritten_ = 0;
+      captureFrozenStartMixFrame_ = -1;
+      captureSnapshotId_ = 0;
+      captureState_.store(CaptureState::kDisabled, std::memory_order_release);
+    }
   }
 
   for (Deck& deck : decks_) {
@@ -874,15 +906,39 @@ void Renderer::render(int64_t frame, float* interleaved, int frames) {
       interleaved[2 * (offset + i)] = mixLeft_[i];
       interleaved[2 * (offset + i) + 1] = mixRight_[i];
     }
-    if (captureEnabled_ && captureCapFrames_ > 0 && !captureRing_.empty()) {
-      int64_t wp = captureWriteFrames_.load(std::memory_order_relaxed);
-      for (int i = 0; i < chunk; ++i) {
-        const size_t idx = size_t(wp % captureCapFrames_) * 2;
-        captureRing_[idx] = mixLeft_[i];
-        captureRing_[idx + 1] = mixRight_[i];
-        ++wp;
+    if (captureCapFrames_ > 0 && !captureRing_.empty()) {
+      const auto state = captureState_.load(std::memory_order_acquire);
+      if (state == CaptureState::kArmed) {
+        const bool freezeRequested = captureFreezeRequested_.load(std::memory_order_acquire);
+        int64_t wp = captureWriteFrames_.load(std::memory_order_relaxed);
+        if (wp == 0 && captureSessionStartMixFrame_ < 0) {
+          captureSessionStartMixFrame_ = frame + offset;
+        }
+        for (int i = 0; i < chunk; ++i) {
+          const size_t idx = static_cast<size_t>(wp % captureCapFrames_) * 2;
+          captureRing_[idx] = mixLeft_[i];
+          captureRing_[idx + 1] = mixRight_[i];
+          ++wp;
+        }
+        captureWriteFrames_.store(wp, std::memory_order_release);
+        if (freezeRequested) {
+          // Freeze acknowledgement at safe block boundary: all capture writes for this chunk
+          // are complete and published by the captureWriteFrames_ release above. Write snapshot
+          // metadata before publishing kFrozen with release so readers observing kFrozen (acquire)
+          // see a consistent snapshot description.
+          const int64_t totalWritten = wp;
+          const int64_t avail = std::min<int64_t>(totalWritten, int64_t(captureCapFrames_));
+          captureFrozenTotalWritten_ = totalWritten;
+          captureFrozenStartMixFrame_ =
+              (avail > 0 && captureSessionStartMixFrame_ >= 0)
+                  ? (captureSessionStartMixFrame_ + (totalWritten - avail))
+                  : -1;
+          captureSnapshotId_ += 1;
+          captureState_.store(CaptureState::kFrozen, std::memory_order_release);
+        }
       }
-      captureWriteFrames_.store(wp, std::memory_order_release);
+      // kFrozen/kDisabled: no ring writes. If renderer stops before acknowledgement, state remains
+      // Armed and readers observe Pending/unavailable (no fabricated completion).
     }
     offset += chunk;
   }
@@ -898,8 +954,12 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
     // region are built so this can never trip; a violation is recorded to
     // telemetry as proof the guarantee held or broke.
     if (!deck.gain.empty() && deck.gain.at(blockStart) > 0.001f) {
-      // Completed vinyl brake / tape-stop / spinback or beat-1 loop-roll stop is already silent at stopAt.
+      // A completed physical fade is silent even when the canonical gain lane stays neutral.
+      const double fadeAt = deck.fadeOutAt.load(std::memory_order_relaxed);
+      const bool fadeComplete = fadeAt >= 0.0 && deck.heardPos >= fadeAt + kFadeSeconds * sr;
+      // Completed physical fade, vinyl brake / tape-stop / spinback, or beat-1 loop-roll stop.
       if (!(deck.v2.brake.enabled && deck.v2.brake.done) &&
+          !fadeComplete &&
           !(deck.rollFxActive && deck.rollStopOnDownbeat && blockStart >= deck.rollReleaseMixSec)) {
         exitGateViolations_.fetch_add(1, std::memory_order_relaxed);
       }
@@ -1762,27 +1822,77 @@ void Renderer::setTruePeakCeilingDb(float ceilingDbtp) {
   truePeakCeiling_ = float(std::pow(10.0, double(db) / 20.0));
 }
 
-int64_t Renderer::capturedFrames() const {
-  if (!captureEnabled_ || captureCapFrames_ <= 0) return 0;
-  return std::min<int64_t>(captureWriteFrames_.load(std::memory_order_acquire), int64_t(captureCapFrames_));
+void Renderer::setCaptureEnabled(bool enabled) {
+  // Post-prepare rearm/reconfiguration is refused to avoid racing render-thread capture writes.
+  if (captureConfigFrozen_.load(std::memory_order_acquire)) return;
+  const auto state = captureState_.load(std::memory_order_acquire);
+  if (state != CaptureState::kDisabled) return;
+  captureEnabled_.store(enabled, std::memory_order_release);
 }
 
-int Renderer::readCapturedAudio(float* outInterleaved, int maxFrames) const {
-  if (!captureEnabled_ || captureCapFrames_ <= 0 || outInterleaved == nullptr || maxFrames <= 0 || captureRing_.empty()) {
-    return 0;
+void Renderer::requestCaptureFreeze() {
+  const auto state = captureState_.load(std::memory_order_acquire);
+  if (state != CaptureState::kArmed) return;
+  captureFreezeRequested_.store(true, std::memory_order_release);
+}
+
+Renderer::CaptureSnapshotInfo Renderer::getCaptureSnapshotInfo() const {
+  CaptureSnapshotInfo info;
+  info.sampleRate = sampleRate_;
+  info.channels = 2;
+  const auto state = captureState_.load(std::memory_order_acquire);
+  if (state == CaptureState::kDisabled || !captureEnabled_ || captureCapFrames_ <= 0) {
+    info.status = CaptureReadStatus::kUnavailable;
+    return info;
   }
-  const int64_t totalWritten = captureWriteFrames_.load(std::memory_order_acquire);
+  if (state == CaptureState::kArmed) {
+    // Freeze requested but not yet acknowledged, or armed without freeze request: pending/not-ready.
+    info.status = CaptureReadStatus::kPending;
+    info.totalWrittenFrames = captureWriteFrames_.load(std::memory_order_acquire);
+    return info;
+  }
+  // kFrozen: metadata fields were written by render thread before publishing kFrozen with release.
+  const int64_t totalWritten = captureFrozenTotalWritten_;
   const int64_t avail = std::min<int64_t>(totalWritten, int64_t(captureCapFrames_));
-  const int count = int(std::min<int64_t>(avail, int64_t(maxFrames)));
+  info.snapshotId = captureSnapshotId_;
+  info.totalWrittenFrames = totalWritten;
+  info.frameCount = static_cast<int>(avail);
+  if (avail <= 0) {
+    info.status = CaptureReadStatus::kNoData;
+    info.firstMixFrame = -1;
+    info.lastMixFrame = -1;
+    return info;
+  }
+  info.status = CaptureReadStatus::kFrozen;
+  info.firstMixFrame = captureFrozenStartMixFrame_;
+  info.lastMixFrame = (info.firstMixFrame >= 0) ? (info.firstMixFrame + avail - 1) : -1;
+  return info;
+}
+
+int Renderer::readFrozenCapture(float* outInterleaved, int maxFrames) const {
+  if (outInterleaved == nullptr || maxFrames <= 0) return 0;
+  const auto state = captureState_.load(std::memory_order_acquire);
+  if (state != CaptureState::kFrozen) return 0;
+  if (captureCapFrames_ <= 0 || captureRing_.empty()) return 0;
+  const int64_t totalWritten = captureFrozenTotalWritten_;
+  const int64_t avail = std::min<int64_t>(totalWritten, int64_t(captureCapFrames_));
+  const int count = static_cast<int>(std::min<int64_t>(avail, int64_t(maxFrames)));
   if (count <= 0) return 0;
+  // Ring layout: frame at absolute write position p is at ring[p % cap].
+  // Oldest retained = totalWritten - avail. Snapshot is chronological [oldest, oldest+avail).
   const int64_t oldestPos = totalWritten - avail;
-  const int64_t startPos = oldestPos + (avail - count);
   for (int i = 0; i < count; ++i) {
-    const size_t srcIdx = size_t((startPos + i) % captureCapFrames_) * 2;
+    const size_t srcIdx = size_t((oldestPos + i) % captureCapFrames_) * 2;
     outInterleaved[i * 2] = captureRing_[srcIdx];
     outInterleaved[i * 2 + 1] = captureRing_[srcIdx + 1];
   }
   return count;
+}
+
+int64_t Renderer::capturedFrames() const {
+  const auto info = getCaptureSnapshotInfo();
+  if (info.status == CaptureReadStatus::kFrozen) return info.frameCount;
+  return 0;
 }
 
 void Renderer::setLoudnessMatch(bool enabled, float targetLufs) {

@@ -725,6 +725,9 @@ object RecipeInterpreter {
                 ?: max(0.0, ctx.sSec - 1.5 * ctx.beatSec)
             val endSec = step.endTime?.let { ctx.resolve(it, step.deck) }
                 ?: max(startSec + 0.05, ctx.sSec - ctx.beatSec)
+            val silenceGapBeats = p["silenceGapBeats"] ?: 1.0
+            // Authoritative frozen OUT-bar clock: compiled once, no live bpm recomputation.
+            val silenceGapSec = silenceGapBeats * ctx.beatSec
             fxParams = fxParams.copy(
                 spinback = SpinbackFxParams(
                     enabled = true,
@@ -732,7 +735,8 @@ object RecipeInterpreter {
                     startMixSec = startSec,
                     lengthSec = if (geometry != null) endSec - startSec else max(0.05, endSec - startSec),
                     peakReverseSpeed = p["peakReverseSpeed"] ?: 3.0,
-                    silenceGapBeats = p["silenceGapBeats"] ?: 1.0,
+                    silenceGapBeats = silenceGapBeats,
+                    silenceGapSec = silenceGapSec,
                 ),
             )
             addWetLane(step.deck, EnvelopeKind.BRAKE, rawCurve, scaleDepth = 1f)

@@ -9,6 +9,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.playback.loopmix.LoopMixPort
 import com.music.bitchord.playback.loopmix.LoopMixRenderer
+import com.music.bitchord.playback.loopmix.GridSource
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.CountdownStabilizer
 import com.music.bitchord.playback.smart.CurveWindow
@@ -147,8 +148,8 @@ class LoopCrownControllerRecoveryTest {
         try {
             assertNull(session.configuredOutLoops)
             assertNull(session.configuredInLoops)
-            assertEquals(LoopMixSession.GridSource.UNKNOWN, session.outGridSource)
-            assertEquals(LoopMixSession.GridSource.UNKNOWN, session.inGridSource)
+            assertEquals(GridSource.UNKNOWN, session.outGridSource)
+            assertEquals(GridSource.UNKNOWN, session.inGridSource)
             val fields = r.call("nativeSessionRouteFields", session, null) as Map<*, *>
             assertEquals("unknown-native", fields["technique"])
             assertEquals("unknown", fields["outGridSource"])

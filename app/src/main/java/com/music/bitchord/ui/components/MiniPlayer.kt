@@ -61,7 +61,8 @@ import com.music.bitchord.ui.components.thumbnailBorder
 import com.music.bitchord.ui.haptics.Haptic
 import com.music.bitchord.ui.haptics.rememberHaptics
 import com.music.bitchord.playback.MusicOnlyPlayback
-import com.music.bitchord.ui.player.automixChipLabel
+import com.music.bitchord.ui.player.rememberAutomixChipLabel
+import com.music.bitchord.ui.player.rememberAutomixReducedMotion
 import com.music.bitchord.ui.player.PlayerDock
 import com.music.bitchord.ui.player.PlayerSkipGlyph
 import com.music.bitchord.ui.player.PlayerSkipMotion
@@ -377,7 +378,7 @@ fun MiniPlayer(
 ) {
     val reduceDynamicBlur by AppSettings.reduceDynamicBlur.collectAsStateWithLifecycle()
     val haptics = rememberHaptics()
-    val reduceAnimation by AppSettings.reduceAnimation.collectAsStateWithLifecycle()
+    val reduceAnimation = rememberAutomixReducedMotion()
     val nextMotion = rememberPlayerSkipMotion(active = animationsActive, reduceMotion = reduceAnimation)
     val playPauseMotion = rememberPlayerPlayPauseMotion(
         isPlaying = isPlaying,
@@ -535,7 +536,7 @@ fun MiniPlayer(
 /**
  * Keep the artist line's size, colour and overflow treatment. While Automix
  * is in an active phase the single clean chip text (AE3 / Part A §7 — see
- * [automixChipLabel]) replaces it; one line, no rung/tempo/"locked" tags,
+ * [rememberAutomixChipLabel]) replaces it; one line, no rung/tempo/"locked" tags,
  * no extra buttons on the bar. Shared here so the separate glass-nav
  * consumer can opt in without restyling.
  */
@@ -543,7 +544,7 @@ fun MiniPlayer(
 internal fun MiniPlayerSubtitle(song: Song, style: TextStyle, color: Color) {
     val inspector by AppSettings.mixInspector.collectAsStateWithLifecycle()
     val status by AppSettings.automixStatus.collectAsStateWithLifecycle()
-    val chip = automixChipLabel(status, inspector)
+    val chip = rememberAutomixChipLabel(status, inspector)
     FadingLine(
         text = chip ?: song.artist,
         style = style,

@@ -159,7 +159,9 @@ bool ResamplePolyphase(
       {
         // Reassociated so the sum can be split across vector lanes; the
         // rounding this changes is far below the audio's own.
+#if defined(__clang__)
 #pragma clang fp reassociate(on)
+#endif
         for (long k = 0; k < taps; ++k) sum += row[k] * run[k];
       }
       (*out)[index] = sum;

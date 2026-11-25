@@ -35,6 +35,7 @@ object OrchardNpuBridge {
     private const val CACHE_DIR = "npu_cache"
 
     private val loadLock = Any()
+    private val nativeOpenLock = Any()
     @Volatile private var libraryLoaded = false
     @Volatile private var libraryError: String? = null
 
@@ -122,11 +123,13 @@ object OrchardNpuBridge {
      */
     fun open(addon: NpuAddon, modelFile: File, cache: File): Long {
         if (!libraryLoaded) return 0L
-        return runCatching {
-            nativeOpen(addon.nativeLibraryDir, modelFile.absolutePath, cache.absolutePath, BACKEND_SO_NAME)
-        }.getOrElse {
-            Log.w(TAG, "nativeOpen threw: ${it.message}")
-            0L
+        return synchronized(nativeOpenLock) {
+            runCatching {
+                nativeOpen(addon.nativeLibraryDir, modelFile.absolutePath, cache.absolutePath, BACKEND_SO_NAME)
+            }.getOrElse {
+                Log.w(TAG, "nativeOpen threw: ${it.message}")
+                0L
+            }
         }
     }
 

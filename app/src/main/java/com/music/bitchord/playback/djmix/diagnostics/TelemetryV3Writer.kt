@@ -63,7 +63,16 @@ class TelemetryV3Writer(
             return false
         }
         val nowMs = clock()
-        val line = runCatching { json.encodeToString(MixTelemetryV3.serializer(), record) }
+        // Schema fix (B7.3): `MixMachine` has no wall clock, so machine-emitted
+        // records stamp `timestampMs` with the outgoing deck position. Every
+        // consumer of the persisted JSONL (tools/analyze_telemetry_v3.py,
+        // soak run windows, cross-dialect sorting) reads `timestampMs` as
+        // epoch milliseconds, so implausible values are re-stamped with the
+        // write-time clock; plausible epoch stamps pass through untouched.
+        val stamped =
+            if (record.timestampMs >= MIN_PLAUSIBLE_EPOCH_MS) record
+            else record.copy(timestampMs = nowMs)
+        val line = runCatching { json.encodeToString(MixTelemetryV3.serializer(), stamped) }
             .onFailure { AnalysisLog.warn("djmix telemetry: encode failed", it) }
             .getOrNull() ?: return false
         val bytes = (line + "\n").toByteArray(Charsets.UTF_8)
@@ -176,6 +185,15 @@ class TelemetryV3Writer(
 
         /** Per-file rotation cap: 10 MB. */
         const val DEFAULT_MAX_FILE_BYTES: Long = 10L * 1024L * 1024L
+
+        /**
+         * `timestampMs` values at or above this are treated as epoch
+         * milliseconds and persisted as-is; anything below (deck positions,
+         * synthetic test values) is re-stamped with the write-time clock.
+         * 1e12 ms = 2001-09-09; no track position or elapsed-realtime value
+         * reaches it and no real epoch timestamp is below it.
+         */
+        const val MIN_PLAUSIBLE_EPOCH_MS: Long = 1_000_000_000_000L
 
         /** How long ring-buffer records are kept for "Flag this mix". */
         const val RING_WINDOW_MS: Long = 5L * 60L * 1000L

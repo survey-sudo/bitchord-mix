@@ -215,7 +215,7 @@ internal class WholeTrackPipeline(
         trackId: String,
         uri: Uri,
         durationSeconds: Double,
-        onGridReady: (Double, BeatTracker.Grid?, TrackFeatures.Features?, CurveWindow?) -> Unit = { _, _, _, _ -> },
+        onGridReady: (Double, BeatTracker.Grid?, TrackFeatures.Features?, CurveWindow?, TrackAnalysisProvenance) -> Unit = { _, _, _, _, _ -> },
         shouldAbort: () -> Boolean = { false },
     ): WholeTrack {
         if (!AutomixModels.isReady()) return WholeTrack(null, aborted = true)
@@ -231,7 +231,7 @@ internal class WholeTrackPipeline(
         }
         if (effectiveDuration <= 0) {
             Log.d(TAG, "Skipping $trackId: ${copy.key} has no readable duration")
-            return WholeTrack(empty(trackId, 0.0))
+            return WholeTrack(empty(trackId, 0.0, copy.provenance))
         }
 
         val span = BeatTracker.WINDOW_SECONDS
@@ -243,7 +243,7 @@ internal class WholeTrackPipeline(
             playbackFirst()
             val preHead = analyzeMonoWindow(openSource, 0.0, minOf(effectiveDuration, span), deriveFeatures = true)
             if (preHead != null) {
-                onGridReady(effectiveDuration, preHead.grid, preHead.features, preHead.levelWindow)
+                onGridReady(effectiveDuration, preHead.grid, preHead.features, preHead.levelWindow, copy.provenance)
             }
         }
         if (isStopped()) return WholeTrack(null)
@@ -254,12 +254,12 @@ internal class WholeTrackPipeline(
         val audio = decodeWholeTrack(trackId, uri, copy, effectiveDuration)
         if (isStopped()) return WholeTrack(null)
         if (audio.decodedShort) return WholeTrack(null, decodedShort = true)
-        val featureSamples = audio.featureSamples ?: return WholeTrack(empty(trackId, effectiveDuration))
+        val featureSamples = audio.featureSamples ?: return WholeTrack(empty(trackId, effectiveDuration, copy.provenance))
         if (shouldAbort()) return WholeTrack(null, aborted = true)
 
         val featuresStarted = elapsedNow()
         val features = TrackFeatures.analyze(featureSamples, effectiveDuration)
-            ?: return WholeTrack(empty(trackId, effectiveDuration))
+            ?: return WholeTrack(empty(trackId, effectiveDuration, copy.provenance))
         val featuresMs = elapsedNow() - featuresStarted
         if (isStopped()) return WholeTrack(null)
         if (shouldAbort()) return WholeTrack(null, aborted = true)
@@ -430,6 +430,7 @@ internal class WholeTrackPipeline(
             levelWindows = levelWindows,
             instrumentalWindows = instrumentalWindows,
             vocalPresence50fps = vocalPresence50fps,
+            provenance = copy.provenance,
         )
         if (structureMap != null) {
             val enriched = SongMapEnrichment.enrich(structureMap, analysis)
@@ -510,10 +511,11 @@ internal class WholeTrackPipeline(
     }
 
     /** Recorded ready-but-empty so a track that cannot be decoded is not retried every tick. */
-    private fun empty(trackId: String, durationSeconds: Double) = TrackAnalysis(
+    private fun empty(trackId: String, durationSeconds: Double, provenance: TrackAnalysisProvenance) = TrackAnalysis(
         status = TrackAnalysis.STATUS_READY,
         trackId = trackId,
         duration = durationSeconds,
+        provenance = provenance,
     )
 
     private companion object {

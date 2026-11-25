@@ -320,6 +320,7 @@
       "type": "configure_fx",
       "deck": "IN",
       "fx": "IMPACT",
+      "requiredCap": "RISER",
       "params": {
         "peakDbfs": -6.0,
         "lowThumpHz": 55.0,
@@ -709,6 +710,7 @@
       "type": "configure_fx",
       "deck": "IN",
       "fx": "IMPACT",
+      "requiredCap": "RISER",
       "params": {
         "peakDbfs": -6.0,
         "lowThumpHz": 55.0,

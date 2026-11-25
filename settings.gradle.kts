@@ -20,6 +20,8 @@ include(":shared")
 include(":sharedUi")
 // FORK-HOOK(djmix-modules): AE3 pure KMP automix modules
 include(":djmix-core")
+include(":djmix-render") // Pure JVM Flag-bundle replay; no Android or JNI.
+include(":djmix-analysis") // Standalone host analysis; not an app/shared runtime dependency.
 
 // The Android module only when there is an SDK to build it against. A machine
 // set up for the desktop alone has none, and including it there fails at

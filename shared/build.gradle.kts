@@ -52,6 +52,7 @@ kotlin {
         jvmMain.get().dependsOn(jvmSharedMain)
 
         commonMain.dependencies {
+            api(project(":djmix-core"))
             // Models in this module intentionally have no Android or Compose dependency.
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
         }

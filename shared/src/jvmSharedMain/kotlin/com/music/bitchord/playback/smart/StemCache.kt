@@ -23,6 +23,8 @@ import java.io.DataOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.max
@@ -126,7 +128,7 @@ class StemCache(
         if (l.any { it.size != stems.frames } || r.any { it.size != stems.frames }) return
         val key = Key(trackId, tag, stems.sampleRate, StemMath.samplesAt(stems.regionStartSec, stems.sampleRate), stems.frames)
         val stride = probeStride(stems.frames)
-        val probe = FloatArray((stems.frames + stride - 1) / stride) { left[it * stride] }
+        val probe = FloatArray((stems.frames - 1) / stride + 1) { left[it * stride] }
         val entry = Entry(key, if (stems.stemCount >= 4) 4 else 2, stems.confidence, l, r, stride, probe)
         remember(entry)
         runCatching { writeToDisk(entry) }.onFailure { AnalysisLog.warn("stem disk cache write failed", it) }
@@ -151,8 +153,11 @@ class StemCache(
         }
     }
 
-    private fun contains(key: Key, start: Long, frames: Int): Boolean =
-        start >= key.startSample && start + frames <= key.startSample + key.frames
+    private fun contains(key: Key, start: Long, frames: Int): Boolean {
+        if (frames <= 0 || key.frames < frames || start < key.startSample) return false
+        val offset = start - key.startSample
+        return offset >= 0L && offset <= (key.frames - frames).toLong()
+    }
 
     private fun probeMatches(entry: Entry, offset: Int, left: FloatArray): Boolean {
         val stride = entry.probeStride
@@ -203,53 +208,65 @@ class StemCache(
     private fun fileFor(dir: File, key: Key): File =
         File(dir, prefix(key.trackId, key.tag, key.sampleRate) + "${key.startSample}_${key.frames}$SUFFIX")
 
+    private fun diskBytes(frames: Int, stored: Int, probes: Int): Long =
+        HEADER_BYTES + probes * 4L + stored * 2L * (4L + frames * 2L)
+
     private fun writeToDisk(entry: Entry) {
         val dir = directory() ?: return
-        if (diskBudget() <= 0L) return
+        val expectedBytes = diskBytes(entry.key.frames, entry.left.size, entry.probe.size)
+        if (expectedBytes > diskBudget()) return
         synchronized(diskLock) {
             if (!dir.exists() && !dir.mkdirs()) return
             val target = fileFor(dir, entry.key)
-            val temp = File(dir, target.name + ".tmp")
-            DataOutputStream(BufferedOutputStream(FileOutputStream(temp), 1 shl 16)).use { out ->
-                out.writeInt(MAGIC)
-                out.writeInt(VERSION)
-                out.writeInt(entry.key.sampleRate)
-                out.writeLong(entry.key.startSample)
-                out.writeInt(entry.key.frames)
-                out.writeInt(entry.stemCount)
-                out.writeFloat(entry.confidence)
-                out.writeInt(entry.left.size)
-                out.writeInt(entry.probeStride)
-                out.writeInt(entry.probe.size)
-                for (value in entry.probe) out.writeFloat(value)
-                val bytes = ByteArray(CHUNK * 2)
-                for (i in entry.left.indices) {
-                    for (channel in listOf(entry.left[i], entry.right[i])) {
-                        var peak = 0f
-                        for (value in channel) peak = max(peak, abs(value))
-                        val scale = if (peak > 0f) peak / 32767f else 1f
-                        out.writeFloat(scale)
-                        var position = 0
-                        while (position < channel.size) {
-                            val count = min(CHUNK, channel.size - position)
-                            for (j in 0 until count) {
-                                val v = channel[position + j] / scale
-                                val q = if (v.isNaN()) 0 else v.roundToInt().coerceIn(-32767, 32767)
-                                bytes[2 * j] = (q shr 8).toByte()
-                                bytes[2 * j + 1] = q.toByte()
+            // Each instance has its own diskLock; never share another writer's staging file.
+            val temp = File.createTempFile(target.name + ".", ".tmp", dir)
+            try {
+                FileOutputStream(temp).use { fileOutput ->
+                    DataOutputStream(BufferedOutputStream(fileOutput, 1 shl 16)).use { out ->
+                        out.writeInt(MAGIC)
+                        out.writeInt(VERSION)
+                        out.writeInt(entry.key.sampleRate)
+                        out.writeLong(entry.key.startSample)
+                        out.writeInt(entry.key.frames)
+                        out.writeInt(entry.stemCount)
+                        out.writeFloat(entry.confidence)
+                        out.writeInt(entry.left.size)
+                        out.writeInt(entry.probeStride)
+                        out.writeInt(entry.probe.size)
+                        for (value in entry.probe) out.writeFloat(value)
+                        val bytes = ByteArray(CHUNK * 2)
+                        for (i in entry.left.indices) {
+                            for (channel in listOf(entry.left[i], entry.right[i])) {
+                                var peak = 0f
+                                for (value in channel) peak = max(peak, abs(value))
+                                val scale = if (peak > 0f) peak / 32767f else 1f
+                                out.writeFloat(scale)
+                                var position = 0
+                                while (position < channel.size) {
+                                    val count = min(CHUNK, channel.size - position)
+                                    for (j in 0 until count) {
+                                        val v = channel[position + j] / scale
+                                        val q = if (v.isNaN()) 0 else v.roundToInt().coerceIn(-32767, 32767)
+                                        bytes[2 * j] = (q shr 8).toByte()
+                                        bytes[2 * j + 1] = q.toByte()
+                                    }
+                                    out.write(bytes, 0, count * 2)
+                                    position += count
+                                }
                             }
-                            out.write(bytes, 0, count * 2)
-                            position += count
                         }
+                        out.flush()
+                        fileOutput.fd.sync()
                     }
                 }
-            }
-            runCatching { target.delete() }
-            if (!temp.renameTo(target)) {
+                check(temp.length() == expectedBytes) { "Incomplete stem cache entry" }
+                if (expectedBytes > diskBudget()) return
+                // Fail closed if atomic replacement is unsupported; never delete the old entry.
+                Files.move(temp.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                evictDisk(dir)
+            } finally {
                 runCatching { temp.delete() }
-                return
             }
-            evictDisk(dir)
         }
     }
 
@@ -286,10 +303,8 @@ class StemCache(
             if (!contains(key, start, frames)) continue
             val file = File(dir, name)
             val entry = runCatching { read(file, key) }.getOrNull()
-            if (entry == null) {
-                runCatching { file.delete() }
-                continue
-            }
+            // A failed read must not unlink a valid replacement from another cache instance.
+            if (entry == null) continue
             if (!probeMatches(entry, (start - cachedStart).toInt(), left)) continue
             runCatching { file.setLastModified(System.currentTimeMillis()) }
             return entry
@@ -298,41 +313,48 @@ class StemCache(
     }
 
     private fun read(file: File, key: Key): Entry? {
-        DataInputStream(BufferedInputStream(FileInputStream(file), 1 shl 16)).use { input ->
-            if (input.readInt() != MAGIC || input.readInt() != VERSION) return null
-            if (input.readInt() != key.sampleRate) return null
-            if (input.readLong() != key.startSample) return null
-            val frames = input.readInt()
-            if (frames != key.frames || frames <= 0) return null
-            val stemCount = input.readInt()
-            val confidence = input.readFloat()
-            val stored = input.readInt()
-            if (stored != (if (stemCount >= 4) STORED_FOUR.size else STORED_TWO.size)) return null
-            val stride = input.readInt()
-            val probeCount = input.readInt()
-            if (stride != probeStride(frames) || probeCount != (frames + stride - 1) / stride) return null
-            val probe = FloatArray(probeCount) { input.readFloat() }
-            val bytes = ByteArray(CHUNK * 2)
-            val l = ArrayList<FloatArray>(stored)
-            val r = ArrayList<FloatArray>(stored)
-            repeat(stored) {
-                for (channel in 0 until 2) {
-                    val scale = input.readFloat()
-                    val samples = FloatArray(frames)
-                    var position = 0
-                    while (position < frames) {
-                        val count = min(CHUNK, frames - position)
-                        input.readFully(bytes, 0, count * 2)
-                        for (j in 0 until count) {
-                            val q = ((bytes[2 * j].toInt() shl 8) or (bytes[2 * j + 1].toInt() and 0xff)).toShort()
-                            samples[position + j] = q * scale
+        FileInputStream(file).use { fileInput ->
+            // Inspect the opened file, not a path another instance can atomically replace.
+            val size = fileInput.channel.size()
+            if (size < HEADER_BYTES || size > diskBudget()) return null
+            DataInputStream(BufferedInputStream(fileInput, 1 shl 16)).use { input ->
+                if (input.readInt() != MAGIC || input.readInt() != VERSION) return null
+                if (input.readInt() != key.sampleRate) return null
+                if (input.readLong() != key.startSample) return null
+                val frames = input.readInt()
+                if (frames != key.frames || frames <= 0) return null
+                val stemCount = input.readInt()
+                if (stemCount != 2 && stemCount != 4) return null
+                val confidence = input.readFloat()
+                val stored = input.readInt()
+                if (stored != (if (stemCount >= 4) STORED_FOUR.size else STORED_TWO.size)) return null
+                val stride = input.readInt()
+                val probeCount = input.readInt()
+                if (stride != probeStride(frames) || probeCount != (frames - 1) / stride + 1) return null
+                if (size != diskBytes(frames, stored, probeCount)) return null
+                val probe = FloatArray(probeCount) { input.readFloat() }
+                val bytes = ByteArray(CHUNK * 2)
+                val l = ArrayList<FloatArray>(stored)
+                val r = ArrayList<FloatArray>(stored)
+                repeat(stored) {
+                    for (channel in 0 until 2) {
+                        val scale = input.readFloat()
+                        val samples = FloatArray(frames)
+                        var position = 0
+                        while (position < frames) {
+                            val count = min(CHUNK, frames - position)
+                            input.readFully(bytes, 0, count * 2)
+                            for (j in 0 until count) {
+                                val q = ((bytes[2 * j].toInt() shl 8) or (bytes[2 * j + 1].toInt() and 0xff)).toShort()
+                                samples[position + j] = q * scale
+                            }
+                            position += count
                         }
-                        position += count
+                        if (channel == 0) l += samples else r += samples
                     }
-                    if (channel == 0) l += samples else r += samples
                 }
+                return Entry(key, if (stemCount >= 4) 4 else 2, confidence, l, r, stride, probe)
             }
-            return Entry(key, if (stemCount >= 4) 4 else 2, confidence, l, r, stride, probe)
         }
     }
 
@@ -340,6 +362,7 @@ class StemCache(
         private const val MAGIC = 0x42435354 // "BCST"
         private const val VERSION = 1
         private const val SUFFIX = ".stm"
+        private const val HEADER_BYTES = 44L
         private const val CHUNK = 1 shl 15
         private const val PROBE_TOLERANCE = 1e-4f
         private val STORED_FOUR = listOf(StemKind.VOCALS, StemKind.DRUMS, StemKind.BASS)

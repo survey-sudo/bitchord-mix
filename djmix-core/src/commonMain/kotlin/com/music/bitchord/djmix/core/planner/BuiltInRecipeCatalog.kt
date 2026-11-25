@@ -423,7 +423,7 @@ object BuiltInRecipeCatalog {
         level = DjLevel.FESTIVAL,
         family = RecipeFamily.FX,
         abruptness = AbruptnessClass.PUNCHY,
-        fxTags = setOf(RecipeFxType.PHASER, RecipeFxType.FLANGER, RecipeFxType.REVERB, RecipeFxType.GATE, RecipeFxType.SWEEP),
+        fxTags = setOf(RecipeFxType.PHASER, RecipeFxType.REVERB, RecipeFxType.GATE, RecipeFxType.SWEEP),
         requiredStems = emptySet(),
         hasNoStemVariant = true,
         minGridConfidence = 0.0f,
