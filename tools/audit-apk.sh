@@ -91,26 +91,31 @@ listing=$(unzip -l "$APK") || { echo "unzip failed"; exit 2; }
 # which analysis and planning run several times slower than the release build.
 # That is exactly how 1.10-djmix52's candidate reached the phone, so the shape
 # of a debug build is now a hard release failure on its own.
-if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
-  if "$AAPT" dump xmltree --file AndroidManifest.xml "$APK" 2>/dev/null \
-      | grep -qE 'debuggable.*\(type 0x12\)0xffffffff'; then
-    bad "android:debuggable=true — debug build re-signed as a release"
+#
+# Structural-only runs skip this block: they exist for early smoke checks on
+# partial fixtures, they never print AUDIT PASSED, and their exit code is 3.
+if [ "$STRUCTURAL_ONLY" -eq 0 ]; then
+  if [ -n "${AAPT:-}" ] && [ -x "$AAPT" ]; then
+    if "$AAPT" dump xmltree --file AndroidManifest.xml "$APK" 2>/dev/null \
+        | grep -qE 'debuggable.*\(type 0x12\)0xffffffff'; then
+      bad "android:debuggable=true — debug build re-signed as a release"
+    else
+      ok "not debuggable"
+    fi
   else
-    ok "not debuggable"
+    need_tool "aapt2 not found — cannot verify android:debuggable (set ANDROID_HOME)"
   fi
-else
-  need_tool "aapt2 not found — cannot verify android:debuggable (set ANDROID_HOME)"
-fi
 
-dex_count=$(printf '%s\n' "$listing" | grep -cE 'classes[0-9]*\.dex$')
-dex_bytes=$(printf '%s\n' "$listing" | awk '/classes[0-9]*\.dex$/{s+=$1} END{print s+0}')
-echo "dex:         $dex_count file(s), $dex_bytes bytes"
-[ "$dex_count" -ge 1 ] && [ "$dex_count" -le 6 ] \
-  && ok "dex file count $dex_count <= 6" \
-  || bad "dex file count $dex_count is not 1..6 (debug-shaped multidex)"
-[ "$dex_bytes" -le 40000000 ] \
-  && ok "dex payload $dex_bytes bytes <= 40000000" \
-  || bad "dex payload $dex_bytes bytes exceeds 40000000"
+  dex_count=$(printf '%s\n' "$listing" | grep -cE 'classes[0-9]*\.dex$')
+  dex_bytes=$(printf '%s\n' "$listing" | awk '/classes[0-9]*\.dex$/{s+=$1} END{print s+0}')
+  echo "dex:         $dex_count file(s), $dex_bytes bytes"
+  [ "$dex_count" -ge 1 ] && [ "$dex_count" -le 6 ] \
+    && ok "dex file count $dex_count <= 6" \
+    || bad "dex file count $dex_count is not 1..6 (debug-shaped multidex)"
+  [ "$dex_bytes" -le 40000000 ] \
+    && ok "dex payload $dex_bytes bytes <= 40000000" \
+    || bad "dex payload $dex_bytes bytes exceeds 40000000"
+fi
 
 # AE3 bundles its CPU models as APK assets (Part A section 3.1): Nirovi
 # (beat) + Syvenu (vocal presence), verified against models.json. Still
