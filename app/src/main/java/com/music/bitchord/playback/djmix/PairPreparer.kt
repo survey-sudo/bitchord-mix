@@ -481,7 +481,18 @@ class PairPreparer(
         if (released) return
         val outId = request.outTrack.id
         val inId = request.inTrack.id
-        if (outId.isBlank() || inId.isBlank() || outId == inId) return
+        if (outId.isBlank() || inId.isBlank()) return
+        if (outId == inId) {
+            // A same-track pair is not a mixable pair. Leaving the previous
+            // PreparedPair in place keeps the UI stuck at its stale progress
+            // ("Preparing mix · 25%") forever, because nothing will ever
+            // advance it. Release the pair so the machine can fall back.
+            val cur = _state.value
+            if (cur != null) {
+                publishIfCurrent(cur.generation) { it.copy(state = PrepState.IDLE) }
+            }
+            return
+        }
 
         val current = _state.value
         if (!force && shouldDeduplicate(current, activeRequest, request)) {

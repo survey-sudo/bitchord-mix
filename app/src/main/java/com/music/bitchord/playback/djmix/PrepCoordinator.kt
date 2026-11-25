@@ -953,6 +953,12 @@ internal class PrepCoordinator(
             val nextIndex = player.nextMediaItemIndex
             if (nextIndex == C.INDEX_UNSET || nextIndex >= player.mediaItemCount) return null
             val nextItem = player.getMediaItemAt(nextIndex)
+            // A same-track "pair" can never be prepared: PairPreparer rejects it,
+            // but MixMachine has already entered Preparing and then waits forever
+            // (only the near-EOF watchdog would release it). Leave the classic
+            // crossfade to handle a duplicated queue entry instead of hanging
+            // "Preparing mix" at a stale percentage.
+            if (nextItem.mediaId == currentItem.mediaId) return null
             if (currentItem.isVideoOrigin || nextItem.isVideoOrigin) return null
             val outDurMs = player.duration.takeIf { it != C.TIME_UNSET && it > 0L }
                 ?: queuedDurationMs(currentItem).takeIf { it > 0L }
