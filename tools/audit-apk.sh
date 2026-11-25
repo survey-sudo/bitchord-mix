@@ -235,17 +235,21 @@ fi
 if [ -n "${APKSIGNER:-}" ] && [ -x "$APKSIGNER" ]; then
   if "$APKSIGNER" verify --verbose --print-certs "$APK" >/tmp/bitchord-apksig.txt 2>&1; then
     ok "signature verifies"
-    sed -n 's/^Signer #1 certificate DN: /        cert: /p' /tmp/bitchord-apksig.txt
-    if grep -q "^Signer #1 certificate DN: .*CN=BitChord loop fix" /tmp/bitchord-apksig.txt; then
+    # build-tools 35/36 print "Signer #1 certificate DN: ..."; 37 prints
+    # "V3.0 Signer: certificate DN: ...". Strip whatever precedes "certificate",
+    # so the gate tests the certificate rather than the wording of the tool.
+    cert_dn=$(sed -n 's/^.*certificate DN: //p' /tmp/bitchord-apksig.txt | head -1)
+    cert_sha=$(sed -n 's/^.*certificate SHA-256 digest: //p' /tmp/bitchord-apksig.txt | head -1)
+    printf '%s\n' "$cert_dn" | sed 's/^/        cert: /'
+    if printf '%s\n' "$cert_dn" | grep -q 'CN=BitChord loop fix'; then
       ok "certificate DN is $EXPECTED_CERT_DN"
     else
       bad "certificate DN is not $EXPECTED_CERT_DN (signed with the wrong key?)"
     fi
-    cert_sha=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' /tmp/bitchord-apksig.txt | head -1)
     [ "$cert_sha" = "$EXPECTED_CERT_SHA256" ] && ok "certificate SHA-256 matches the fork key" || bad "certificate SHA-256 ${cert_sha:-?}, expected $EXPECTED_CERT_SHA256"
-    grep -q 'Verified using v2 scheme (APK Signature Scheme v2): true' /tmp/bitchord-apksig.txt \
+    grep -qE 'Verified using v2 scheme \(APK Signature Scheme v2\): true' /tmp/bitchord-apksig.txt \
       && ok "v2 signature scheme verified" || bad "v2 signature scheme NOT verified"
-    grep -q 'Verified using v3 scheme (APK Signature Scheme v3): true' /tmp/bitchord-apksig.txt \
+    grep -qE 'Verified using v3 scheme \(APK Signature Scheme v3\): true' /tmp/bitchord-apksig.txt \
       && ok "v3 signature scheme verified" || bad "v3 signature scheme NOT verified"
   else
     bad "signature does not verify (unsigned or wrong key?)"
