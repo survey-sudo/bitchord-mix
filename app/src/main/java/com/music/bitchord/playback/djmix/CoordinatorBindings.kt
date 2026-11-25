@@ -580,7 +580,7 @@ internal class CoordinatorBindings(private val host: CoordinatorBindingsHost) {
         override fun positionMs(player: ExoPlayer): Double = host.positionMs(player)
         override fun isSmartFadeActive(): Boolean = smartFadeActive
         override fun isHandedOff(): Boolean = handedOff
-        override fun isIdle(): Boolean = isIdle()
+        override fun isIdle(): Boolean = host.isIdle()
         override val outgoingAnalysis: TrackAnalysis get() = host.outgoingAnalysis
         override val incomingAnalysis: TrackAnalysis get() = host.incomingAnalysis
         override val planInFlight: TransitionPlan? get() = host.planInFlight
@@ -595,9 +595,9 @@ internal class CoordinatorBindings(private val host: CoordinatorBindingsHost) {
     }
 
     val mixEventHost: MixEventHost = with(host) { object : MixEventHost {
-        override val phaseName: String get() = phaseName
+        override val phaseName: String get() = host.phaseName
         override val scrubEpoch: Long get() = host.scrubEpoch
-        override fun isIdle(): Boolean = isIdle()
+        override fun isIdle(): Boolean = host.isIdle()
         override fun active(): ExoPlayer = host.active()
         override val outgoingPlayer: ExoPlayer? get() = outgoing
         override fun setOutgoingPlayer(player: ExoPlayer?) {
