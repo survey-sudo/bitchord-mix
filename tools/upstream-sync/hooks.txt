@@ -1,5 +1,5 @@
 # <hook-id>|<file>|<min count of "FORK-HOOK(<hook-id>)">
-# Filled in by the refactor (docs/AUTOMIX_ENGINE_REFACTOR.md §3). Each hook is a single marked line or a
+# Filled in by the refactor (archive/docs/ae3-b12-12/AUTOMIX_ENGINE_REFACTOR.md §3). Each hook is a single marked line or a
 # short marked block that calls into a fork-owned file. Add a row whenever you add a hook.
 version|build.gradle.kts|1
 gradle-djmix|app/build.gradle.kts|1

@@ -38,7 +38,8 @@ upstream release.
 cd ~/bitchord-unified && git checkout -b fork/sync-kit master
 cp -r ~/av2/upstream-sync-kit/tools/upstream-sync tools/
 cp ~/av2/upstream-sync-kit/.github/workflows/upstream-sync.yml .github/workflows/
-cp ~/av2/upstream-sync-kit/docs/AUTOMIX_ENGINE_REFACTOR.md docs/
+mkdir -p archive/docs/ae3-b12-12
+cp ~/av2/upstream-sync-kit/docs/AUTOMIX_ENGINE_REFACTOR.md archive/docs/ae3-b12-12/
 cp ~/av2/upstream-sync-kit/UPSTREAM_SYNC_PLAYBOOK.md docs/UPSTREAM_SYNC_PLAYBOOK.md
 chmod +x tools/upstream-sync/*.sh
 git add -A && git commit -m "fork: upstream sync kit (scripts, workflow, playbook)"
@@ -61,7 +62,7 @@ hundreds of changed files: that would mean the fork did not start from exactly v
 `.upstream-base` reads `v1.9.1`.
 
 ## 4. Shrink the fork footprint (once; no behaviour change)
-Follow `docs/AUTOMIX_ENGINE_REFACTOR.md` §3.1–3.6, making one commit per extraction. Then:
+Follow the [archived refactor specification](../archive/docs/ae3-b12-12/AUTOMIX_ENGINE_REFACTOR.md) §3.1–3.6, making one commit per extraction. Then:
 ```bash
 bash tools/upstream-sync/hooks-check.sh
 git diff --stat v1.9.1 HEAD -- $(grep -vE '^\s*(#|$)' tools/upstream-sync/hotspots.txt)

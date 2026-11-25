@@ -83,7 +83,7 @@ Source: `m0-metrics.json` and `analyze-djmix52-vc94-combined.md`. "n/a" means th
 
 ## 6. Reconciliation with the 1.10-djmix52 plan claims
 
-- Part A §1 context ("SCNet ~9.0 s per 11 s chunk", "Beat This ~1.35 s per 30 s chunk"): the vc94 live run emitted **no SCNet stem-chunk timing** (stems were not built in the v2-native path). The Beat This `infer` timing in vc94 is ~0.95 s mean (live), not 1.35 s. vc93 numbers stay in `docs/DJMIX52_BASELINE.md`.
+- Part A §1 context ("SCNet ~9.0 s per 11 s chunk", "Beat This ~1.35 s per 30 s chunk"): the vc94 live run emitted **no SCNet stem-chunk timing** (stems were not built in the v2-native path). The Beat This `infer` timing in vc94 is ~0.95 s mean (live), not 1.35 s. vc93 numbers stay in the [archived DJMIX52 baseline](../archive/docs/ae3-b12-12/DJMIX52_BASELINE.md).
 - `waiting on analysis` plan rejections were common in vc94 (234 `mix.plan.rejected` in the vc94 slice, mostly preparer-planning gaps). The exact counts are in the analyzer output.
 
 ## 7. Known gaps and next steps (owner action)

@@ -1,6 +1,6 @@
 # AE3 progress ledger — BitChord Automix Engine 3
 
-**Release:** `1.10-djmix53` / versionCode **95**, engine version **AE 3.0.0** (shown in Settings → About and in every telemetry record).
+**Release target:** `1.10-djmix53` / versionCode **95**, engine version **AE 3.0.0**. This is not a claim that the current checkout or an APK has been bumped and accepted.
 **Base:** `djmix52` `b3408283` → branch `ae3` (merged to `master` at release). This ledger lives on `ae3`.
 **Master plan:** `BitChord Automix Engine 3 (AE3): the baseline master plan` (Part A = fix djmix52, Part B = mature baseline, Part C = milestones M0–M11, Part D = untangle pass).
 **Handover:** `/home/hfzhkn/Bitchord/AE3_HANDOVER.md` (living doc; repo truth, runbook, remaining work).
@@ -24,7 +24,47 @@
 | M10 Sync + release engineering + docs | doing | `ec7251b6`, `0f5b7bcd`, `30bdcfe4`, `77a0fcaf`, `34eac976`, `dd86c746`, `f0ba8bb8`, `56b64546` | CI/release/`npu-addon` workflows, v1+v2+v3 signing, `bumpDjmix` (`34eac976`), `soak.sh` (22/22 smoke, `[PENDING DEVICE RUN]`), `check_audiothread_alloc.py` (exit 0), B12 docs + `CHANGELOG.md` (`77a0fcaf`), 0-conflict dry run (`21356206`), `hooks-check.sh` (32/32); **B11.1 fail-closed release gates (`56b64546`):** `tools/release/release-gates.sh` + `tools/release/test-release-gates.py` (**50/50 PASS**), strict signing secret checks, explicit single-APK & report hashing, untrusted tag rejection; **Stage 8 `dvb` Gates 1–3 (`f0ba8bb8`):** Gate 1 PASS (`1m 30s`, `:djmix-core:jvmTest` 23/23); Gate 2 `1,569/1,590` PASS (all AE3 suites green: `PairPreparerTest` 6/6, `DjmixStoreContractTest` 6/6, `StuckStateRecoveryTest` 4/4, `Djmix18–32` 88/88; 21 failures in 7 legacy Bucket C suites reserved for M9 D1); Gate 3 `:app:assembleProdDebug` PASS (`3m 54s`, `app-prod-arm64-v8a-debug.apk` `105,858,834` B) | Gate remaining: GitHub CI green after push; M9 cleanup + Bucket C tests LAST; `bumpDjmix` + release APK after M9. |
 | M11 Release `1.10-djmix53` (AE 3.0.0) | todo | — | — | C3 checklist; gate owner final listening verdict. |
 
-## 2026-11-25 evidence correction and active acceptance batch
+## 2026-11-25 latest integration checkpoint
+
+This checkpoint supersedes the historical source locations and line counts below;
+it does not promote unexecuted integration work to a passed milestone.
+
+- `496b5469` and `19da5aac` landed the coordinator extraction and explicit host
+  dispatch repair. Committed `CrossfadeController.kt` is **2,381** lines. Its helper
+  size gate is satisfied in that committed scope; the broader M9/D4 and integrated
+  runtime gates remain open. Subsequent service-lifecycle edits are a separate batch.
+- R2 canonical runtime sources are frozen: the two confirmed app compile defects
+  are repaired, six canonical-only recipe IDs no longer need legacy aliases/previews,
+  regional peak-safe gain precedes compilation, and same-recipe no-stem geometry is
+  retained. Parent verified all ten recorded file hashes/line counts. **17 new R2
+  tests await execution**; R4 owns the remaining inspector/remix and production
+  executor/history/learning/Flag-context wiring.
+- Core gate2 configures the corrected JavaExec classpath. Core gate3 actually runs
+  recipe lint: **26 RecipeV2 definitions PASS**. Core tests do not yet have acceptance:
+  their CLI test driver failed compilation on an array variance mismatch. The
+  one-line type repair retains all four tests/assertions and is assigned to the
+  serialized gate4, along with the two inference-wrapper return fixes.
+- `djmix-analysis` and `djmix-render` exist but their reconciled APIs, root module
+  registration, real shared geometry/pipeline reuse, and `djmix-android` boundary
+  remain implementation/integration work. A synthetic or explicit frozen-input
+  replay is not arbitrary-pair production audition or device bit-exact parity.
+- This archival commit preserves **ten byte-identical historical payloads** and
+  repairs active baseline/playbook/hook/ownership references. Parent whitespace
+  check returned RC0 and hooks **32/32** after the reference repair. B12.12 remains
+  **doing**: the retained upstream-sync playbook still requires its coordinated
+  absorption/current-version cleanup, rather than pretending all old instructions
+  are authoritative or gone.
+- No new device, QNN, latency, soak, owner listening, release APK, or full-suite
+  acceptance is claimed. D1 legacy-test cleanup stays **last**.
+
+Evidence: `../Bitchord/work/ae3-batch-reconciliation-20261125.md`,
+`../Bitchord/evidence/ae3-resume-20261125/r2-parent-hash-verification.json`,
+`validation-core-gate2-owner-handoff.md`, `validation-core-gate3-owner-handoff.md`,
+`recipe-cli-test-type-fix.json`, `archive-identity.json`, and
+`archive-reference-checks.json` in that evidence directory. Older results below
+apply only to their recorded immutable source snapshots.
+
+## 2026-11-25 historical evidence correction and earlier acceptance batch
 
 The milestone and item statuses below remain gated statuses. File existence, component-local wiring,
 an uploaded audition pack, and generated `.class` timestamps do not establish working production
@@ -160,7 +200,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B1.2.1 MixExecutor owns transitions | doing | `49d40a7f` | `MixExecutor` owns arming/starting/running/handover/retiring via `MixMachine`; controller forwards `MixEvent.Tick`/`NextKnown`/`QueueEdited` | Device gate pending (M3). |
 | B1.2.2 Controller keeps pre-automix only | doing | `49d40a7f` | First strangler slice landed (9,835 → 9,065); pre-automix decisions route via `MixExecutor`, classic only when native unavailable | Full cutover continues (M9 size gate). |
 | B1.2.3 Strangler slices | doing | `49d40a7f` | Slice 1 moved planning to `djmix-core` + preparer, deleted `decideTransition`/`checkShownWatchdog`/`straightRescue` in the same commit; no dead-but-reachable legacy in touched paths | Soak (B6.5) + remaining slices in M9. |
-| B1.2.4 Size targets | todo | — | 9,065 lines measured 2026-11-24 (−770 from 9,835); target 2,500 | `CrossfadeController.kt` at or under 2,500 lines; no `djmix-*` file over 1,500 lines except Recipes data; 178 fields become `MixMachine.State` plus handles. |
+| B1.2.4 Size targets | doing | `496b5469`, `19da5aac` | Committed controller **2,381** lines; coordinator helpers <=1,500; explicit host dispatch regression test added. Current R2 ten-file sizes/hashes verified in `../Bitchord/evidence/ae3-resume-20261125/r2-parent-hash-verification.json`. | Controller extraction is landed; final integrated size/dependency/D4 sweep and native host split remain open. Do not reuse the earlier 9,065-line measurement as current. |
 | B1.2.5 Survive list as tests | done | `4d92f84b` | `:djmix-core:jvmTest` 14 passed, wall-clock 27 s | Sticky pause, surviving-deck-never-retired, no-stem-fallback-preserves-level, commit 4 bars/6 s encoded in `MixCoreMatrixAndContractsTest` + property/replay suites. |
 | B1.3.1 TrackAnalysis v3 | done | `4d92f84b` | JSON round-trip in `MixCoreMatrixAndContractsTest` (14 passed, 27 s) | Beats/downbeats/confidence/BPM/key/loudness/energy/vocal 50 fps/structure/models shipped as `TrackAnalysisV3` (schema 3); planner/store/inspector wiring in M3. |
 | B1.3.2 TransitionPlan v1 | done | `4d92f84b` | JSON round-trip in `MixCoreMatrixAndContractsTest` (14 passed, 27 s) | Frozen exit/entry/geometry/knots/swap/recipe+params/stems/reasons/top-3/generation shipped as `TransitionPlanV1` (schema 1). |
@@ -229,7 +269,7 @@ Every numbered / lettered / bulleted item is a row. This bootstrap step marks on
 | B12.9 TUNING.md | done | docs commit | `docs/TUNING.md` created in Stage 7 (`7C`) | Symptom-to-knob table updated for AE3. |
 | B12.10 adr/ 0001–0011 | done | ae3 bootstrap, `7e1b1241` | ADRs 0001–0011 created (including ADR 0011 lossless canonical script geometry, `7e1b1241`) | Full ADR set covers architecture, contracts, and geometry. |
 | B12.11 AE3_LEDGER.md | done | ae3 bootstrap | `docs/AE3_LEDGER.md` (this file) | Created this step with Tables 1–3 covering all M0–M11 and A/B items. |
-| B12.12 Archive contradictions | todo | — | — | Delete or archive anything contradicting B12 docs, including old handover and parity vc80-era statements. |
+| B12.12 Archive contradictions | doing | this archival commit | `archive/docs/AE3_B12_12_ARCHIVAL.md`; ten payloads byte-identical to HEAD originals (`../Bitchord/evidence/ae3-resume-20261125/archive-identity.json`); active reference repair with whitespace RC0 and hooks 32/32 (`archive-reference-checks.json`). | Root build guide, obsolete handover/parity/refactor/recovery narratives and grokbox kit archived; baseline/playbook/hook/ownership paths repaired. Retained upstream-sync instructions still need coordinated absorption/current-version cleanup; not full B12.12 acceptance. |
 | B13.1 Delete vc93 NPU leftovers | done | `c6970dbc` | `NpuQnnSession.kt`, `NpuSelfTest.kt`, `NpuQdqSelfTest.kt` deleted; `NpuSession` routing & describe verified (`c6970dbc`) | Completed in Wave 2. |
 | B13.2 Delete vc91 rungs | todo | — | — | Unreachable rungs after planner moves into `djmix-core`. |
 | B13.3 Delete CountdownStabilizer | todo | — | — | Paths superseded by MixMachine. |
