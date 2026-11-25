@@ -416,7 +416,9 @@ fun SettingsScreen(
     val djmixServices = remember(context) { (context.applicationContext as BitChordApplication).djmixServices }
     val djmixFlags = requireNotNull(djmixServices.flags)
     val developerFlags by djmixFlags.flags.collectAsStateWithLifecycle()
-    val djmixStore = requireNotNull(djmixServices.store)
+    // Null only when djmix.db could not be opened and was not recoverable; History
+    // then shows nothing instead of taking the settings sheet down with it.
+    val djmixStore = djmixServices.store
     // Populate the cached NPU line once; a stored verdict wins over
     // recomputation so a later self-test is never clobbered here.
     LaunchedEffect(Unit) {
@@ -2609,7 +2611,9 @@ fun SettingsScreen(
         ) {
             var records by remember { mutableStateOf<List<TransitionRecord>>(emptyList()) }
             LaunchedEffect(djmixServices, mixHistoryTick) {
-                records = withContext(Dispatchers.IO) { djmixStore.recentTransitions(100) }
+                records = withContext(Dispatchers.IO) {
+                    djmixStore?.recentTransitions(100).orEmpty()
+                }
             }
             MixHistoryScreen(
                 records = records,

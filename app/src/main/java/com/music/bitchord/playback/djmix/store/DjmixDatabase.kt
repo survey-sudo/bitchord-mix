@@ -3,6 +3,7 @@ package com.music.bitchord.playback.djmix.store
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.util.Log
 import com.music.bitchord.playback.smart.AnalysisLog
 
 /**
@@ -48,14 +49,52 @@ class DjmixDatabase(context: Context) :
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        // v1 is the first shipped schema; there is nothing to migrate yet.
-        // Future bumps must preserve track_analysis rows (staleness is lazy,
-        // never a wipe) — see DjmixAnalysisStore.getAnalysis.
+        // This database is a disposable cache; incompatible schemas are rebuilt.
+        db.execSQL("DROP TABLE IF EXISTS $TABLE_TRACK_ANALYSIS")
+        db.execSQL("DROP TABLE IF EXISTS $TABLE_STEM_INDEX")
+        db.execSQL("DROP TABLE IF EXISTS $TABLE_TRANSITION_HISTORY")
+        db.execSQL("DROP TABLE IF EXISTS $TABLE_PREFERENCE")
+        onCreate(db)
+    }
+
+    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        onUpgrade(db, oldVersion, newVersion)
     }
 
     companion object {
         const val DB_NAME = "djmix.db"
         const val SCHEMA_VERSION = 1
+
+        /** Blocking: call on an I/O worker before publishing the analysis store. */
+        fun openOrNull(context: Context): DjmixDatabase? {
+            var helper: DjmixDatabase? = null
+            fun closeFailedHelper() {
+                runCatching { helper?.close() }
+                    .onFailure { Log.w("BitChordMix", "djmix.db failed helper could not close", it) }
+                helper = null
+            }
+            fun open(): DjmixDatabase = DjmixDatabase(context).also {
+                helper = it
+                // SQLiteOpenHelper construction alone does not open the file.
+                it.writableDatabase
+            }
+
+            return runCatching { open() }
+                .recoverCatching { error ->
+                    Log.w("BitChordMix", "djmix.db open failed; deleting cache and retrying once", error)
+                    closeFailedHelper()
+                    // Context.deleteDatabase also removes SQLite journal/WAL sidecars.
+                    check(context.deleteDatabase(DB_NAME) || !context.getDatabasePath(DB_NAME).exists()) {
+                        "djmix.db cache could not be deleted"
+                    }
+                    open()
+                }
+                .onFailure { error ->
+                    Log.w("BitChordMix", "djmix.db unavailable; continuing without cached analysis", error)
+                    closeFailedHelper()
+                }
+                .getOrNull()
+        }
 
         const val TABLE_TRACK_ANALYSIS = "track_analysis"
         const val TABLE_STEM_INDEX = "stem_index"

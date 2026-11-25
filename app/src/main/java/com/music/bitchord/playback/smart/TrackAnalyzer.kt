@@ -71,6 +71,7 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.max
@@ -371,8 +372,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
         playbackFirst = ::playbackFirst,
         analysisUriFor = ::analysisUriFor,
         captureProvenance = ::producerProvenance,
-        analyzeMonoWindow = { openSource, startSeconds, endSeconds, deriveFeatures, includeVocals ->
-            wholeTrackPipeline.analyzeMonoWindow(openSource, startSeconds, endSeconds, deriveFeatures, includeVocals)
+        analyzeMonoWindow = { openSource, startSeconds, endSeconds, deriveFeatures, includeVocals, timings ->
+            wholeTrackPipeline.analyzeMonoWindow(openSource, startSeconds, endSeconds, deriveFeatures, includeVocals, timings)
         },
     )
 
@@ -417,7 +418,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                     return@withTimeoutOrNull false
                 }
                 val job = currentCoroutineContext().job
-                request(trackId, source.uri, source.durationSeconds) { job.isActive && !backgroundRefused() }
+                request(trackId, source.uri, source.durationSeconds, backgroundActive = { job.isActive && !backgroundRefused() })
                 awaitBackgroundPass(trackId)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -481,6 +482,38 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
     }
 
     private val executor = wholeTrackExecutor()
+    private val lookaheadQueued = AtomicBoolean(false)
+
+    /** One optional next+1 pass, admitted only after foreground analyses drain. */
+    fun requestLookahead(trackId: String, uri: Uri, durationSeconds: Double): Boolean {
+        if (trackId.isBlank() || lookaheadRefused() || running.isNotEmpty() ||
+            results[trackId]?.isUsable == true || !lookaheadQueued.compareAndSet(false, true)) return false
+        val foregroundSequence = requestSeq.get()
+        return runCatching {
+            executor.execute {
+                try {
+                    if (requestSeq.get() == foregroundSequence && running.isEmpty() && !lookaheadRefused()) {
+                        val analysisUri = if (uri.authority == "source" && uri.getQueryParameter("v") == null) {
+                            sourceAnalysisUris[trackId] ?: return@execute
+                        } else uri
+                        request(trackId, analysisUri, durationSeconds, { !lookaheadRefused() }, lookahead = true)
+                    }
+                } finally {
+                    lookaheadQueued.set(false)
+                }
+            }
+            true
+        }.getOrElse {
+            lookaheadQueued.set(false)
+            false
+        }
+    }
+
+    private fun lookaheadRefused(): Boolean {
+        if (released || stopped || !AutomixModels.isReady()) return true
+        val status = PrepThermalGate.currentStatus(context) ?: return true
+        return status >= PowerManager.THERMAL_STATUS_MODERATE || PrepThermalGate.shouldPause(status)
+    }
 
     /**
      * The next track's opening. It does not wait behind a whole-song decode.
@@ -740,7 +773,13 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
      */
     fun request(trackId: String, uri: Uri, durationSeconds: Double) = request(trackId, uri, durationSeconds, null)
 
-    private fun request(trackId: String, uri: Uri, durationSeconds: Double, backgroundActive: (() -> Boolean)?) {
+    private fun request(
+        trackId: String,
+        uri: Uri,
+        durationSeconds: Double,
+        backgroundActive: (() -> Boolean)?,
+        lookahead: Boolean = false,
+    ) {
         val requireFull = backgroundActive != null
         if (trackId.isBlank()) return
         if (requireFull && backgroundActive?.invoke() != true) return
@@ -818,6 +857,8 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                 runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
             }
             try {
+                // A newly requested current pair always supersedes queued lookahead.
+                if (lookahead && (requestSeq.get() != seqAtQueue || running.any { it != trackId })) return@execute
                 if (!AutomixModels.isReady()) {
                     headRendition?.let { headAnalyzer.headAttempts.remove(it.key) }
                     return@execute
@@ -854,6 +895,7 @@ class TrackAnalyzer(private val context: Context, private val cache: AudioCache)
                             },
                             shouldAbort = {
                                 stopped || trackId in cancelled || (requireFull && backgroundActive?.invoke() != true) ||
+                                    (lookahead && requestSeq.get() != seqAtQueue) ||
                                     (requestSeq.get() != seqAtQueue && lastRequestedTrackId != trackId && results[trackId]?.isUsable == true) ||
                                     (elapsedNow() - startedAtElapsed > WHOLE_TRACK_DEADLINE_MS)
                             },

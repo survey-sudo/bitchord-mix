@@ -1,5 +1,6 @@
 package com.music.bitchord.playback.djmix
 
+import android.util.Log
 import com.music.bitchord.djmix.core.contracts.DeckTarget
 import com.music.bitchord.djmix.core.contracts.DjLevel
 import com.music.bitchord.djmix.core.contracts.ENGINE_VERSION
@@ -153,6 +154,7 @@ class MixExecutor(
 
     private var state: MixState = MixState.Idle(generation = initialGeneration)
     private var closed = false
+    private var shownCountdown: ShownCountdown? = null
 
     internal fun capturePreparationEpoch(): Long? = synchronized(lock) {
         playerEpoch?.takeIf { !closed && callbackAdmission() && captureIntentProvider() }
@@ -323,6 +325,9 @@ class MixExecutor(
                     }
                 }
             }
+
+            // Observe after effects; Start is only a request, not proof of a fire.
+            runCatching { checkShownCountdown(event, effects) }
 
             // AE3 M8: recent-event ring for "Flag this mix", implicit taste
             // signals from user events, and terminal records.
@@ -541,6 +546,53 @@ class MixExecutor(
                     "detail" to "positionMs=${event.positionMs} armAtMs=${previous.armAtMs} driftMs=$driftMs toleranceMs=${config.countdownToleranceMs}",
                 ),
             )
+        }
+    }
+
+    /**
+     * Watch the deadline actually advertised in READY/ARMED, including a Start
+     * whose adapter never fires. The UI projection clamps its text to >= 1s;
+     * shown=0 denotes that advertised deadline expiring, not a synthetic UI edit.
+     * Use the existing post-deadline playback ticks, with no timer or recovery.
+     */
+    private fun checkShownCountdown(event: MixEvent, effects: List<MixEffect>) {
+        if (event is MixEvent.UserSeek || event is MixEvent.UserSkip || event is MixEvent.QueueEdited ||
+            state is MixState.Idle || state is MixState.Suspended
+        ) {
+            shownCountdown = null
+            return
+        }
+        val pending = shownCountdown
+        if (pending != null && !pending.resolved && state.pair == pending.pair && state.generation == pending.generation) {
+            val fire = MixFireObservation.latest(pending.pair)?.takeIf {
+                it.sequence > pending.fireSequence &&
+                    (it.generation == null || it.generation == pending.generation) &&
+                    (it.planId.isNullOrBlank() || it.planId == pending.planId)
+            }
+            val positionMs = fire?.positionMs ?: (event as? MixEvent.Tick)?.positionMs
+            val playingTick = event is MixEvent.Tick && event.isPlaying && !state.userPaused
+            // Let this dispatch's Start reach the existing controller fire seam first.
+            val overdue = positionMs != null && positionMs - pending.targetMs > COUNTDOWN_FIRE_GRACE_MS
+            if (overdue && (fire != null || (playingTick && effects.none { it is MixEffect.Start }))) {
+                pending.resolved = true
+                Log.i("BitChordMix", "BitChordMix countdown.broken shown=0 state=${state.stateKind.name}")
+            }
+            if (fire != null) pending.resolved = true
+        }
+        val ui = _uiState.value
+        val targetMs = when (val current = state) {
+            is MixState.Ready -> current.plan.frozenExitMs
+            is MixState.Armed -> current.armAtMs
+            else -> null
+        }
+        val plan = state.plan
+        val pair = state.pair
+        if (ui.countdownVisible && ui.countdownSec != null && targetMs != null && plan != null && pair != null) {
+            if (pending == null || pending.planId != plan.planId || pending.generation != state.generation || pending.targetMs != targetMs) {
+                shownCountdown = ShownCountdown(pair, plan.planId, state.generation, targetMs, MixFireObservation.latest(pair)?.sequence ?: 0L)
+            }
+        } else if (state !is MixState.Running && state !is MixState.HandingOver) {
+            shownCountdown = null
         }
     }
 
@@ -880,7 +932,18 @@ class MixExecutor(
         const val RECENT_EVENT_LIMIT = 256
         const val TERMINAL_DEDUPE_LIMIT = 512
         const val TERMINAL_QUEUE_CAPACITY = 64
+        // Diagnostic grace only; do not change the machine's countdownToleranceMs.
+        const val COUNTDOWN_FIRE_GRACE_MS = 50L
     }
+
+    private data class ShownCountdown(
+        val pair: PairKey,
+        val planId: String,
+        val generation: Long,
+        val targetMs: Long,
+        val fireSequence: Long,
+        var resolved: Boolean = false,
+    )
 
     private data class TastePersistenceSnapshot(val epoch: Long, val weights: Map<String, Double>)
     private data class TerminalWrite(
@@ -892,4 +955,21 @@ class MixExecutor(
         val path: String,
         val createdAtMs: Long,
     )
+}
+
+/** Bounded diagnostic-only bridge from the two existing actual-fire markers. */
+internal object MixFireObservation {
+    data class Fire(val sequence: Long, val positionMs: Long?, val planId: String?, val generation: Long?)
+    private val fires = LinkedHashMap<PairKey, Fire>()
+    private var sequence = 0L
+
+    @Synchronized
+    fun record(pair: PairKey, positionMs: Long?, planId: String?, generation: Long?) {
+        fires.remove(pair)
+        fires[pair] = Fire(++sequence, positionMs, planId, generation)
+        while (fires.size > 64) fires.remove(fires.keys.first())
+    }
+
+    @Synchronized
+    fun latest(pair: PairKey): Fire? = fires[pair]
 }

@@ -90,7 +90,7 @@ class TrackStoreBridge(
 
     /**
      * Current declared model constants, captured only for a new producer pass
-     * and compared with recorded declarations on restore. These do not identify
+     * and retained as declarations on restore. These do not identify
      * executed model bytes, an inference session, provider, or runtime.
      */
     fun currentModelVersions(): Map<String, String> = mapOf(
@@ -116,7 +116,12 @@ class TrackStoreBridge(
                 val result = activeStore.getAnalysis(trackId, hash, emptyMap())
                 val row = (result as? AnalysisLookupResult.Fresh)?.analysis ?: return result
                 val declared = TrackAnalysisProvenance.declaredModels(row.modelVersions)
-                val current = currentModelVersions()
+                // Beat This! and Nirovi grids remain valid across model upgrades.
+                // Keep their original declarations; schema/grid validation still applies.
+                val compatibleBeatModel = declared["beat"] == AutomixModels.BEAT.sha256 ||
+                    declared["beat_this"] == AutomixModels.BEAT.sha256 ||
+                    declared["nirovi"] == AutomixModels.NIROVI.sha256
+                val current = if (compatibleBeatModel) emptyMap() else currentModelVersions()
                 val stale = DjmixAnalysisStore.staleReason(row.schema, declared, current)
                 return if (stale == null) result else AnalysisLookupResult.Stale(reason = stale)
             }

@@ -148,9 +148,9 @@ interface TastePersistence {
  * the reset epoch captured with that model mutation. No I/O runs on this monitor or an audio lane.
  */
 class DjmixServices(
-    private val persistence: TastePersistence,
-    val database: DjmixDatabase? = null,
-    val store: DjmixAnalysisStore? = null,
+    persistence: TastePersistence,
+    database: DjmixDatabase? = null,
+    store: DjmixAnalysisStore? = null,
     val flags: DjmixFlags? = null,
     val tasteModel: TasteModel = TasteModel(),
     val telemetryWriter: TelemetryV3Writer? = null,
@@ -162,6 +162,20 @@ class DjmixServices(
     private val transitionRecorder: ((TerminalTransitionRecord) -> Long)? = null,
     private val captureDirectory: File? = null,
 ) : AutoCloseable {
+    private data class CacheState(
+        val database: DjmixDatabase?,
+        val store: DjmixAnalysisStore?,
+        val persistence: TastePersistence,
+    )
+
+    @Volatile private var cacheState = CacheState(database, store, persistence)
+    @Volatile private var cacheInitializer: (() -> CacheState)? = null
+    /** Null while the Android cache is opening, or when it is unavailable. */
+    val database: DjmixDatabase? get() = cacheState.database
+    /** Null while opening or unavailable; hydration completion marks a stable cache result. */
+    val store: DjmixAnalysisStore? get() = cacheState.store
+    private val persistence: TastePersistence get() = cacheState.persistence
+
     private val workerJob: CompletableJob = SupervisorJob()
     private val scope = CoroutineScope(workerJob + ioDispatcher)
     private var policyJob: Job? = null
@@ -203,6 +217,12 @@ class DjmixServices(
         scope.launch {
             for (command in commands) {
                 try {
+                    // Android cache opening precedes hydration and every persistence command.
+                    // This receiver runs on ioDispatcher; create() never waits for SQLite.
+                    cacheInitializer?.let { initialize ->
+                        cacheState = initialize()
+                        cacheInitializer = null
+                    }
                     when (command) {
                         is Command.Hydrate -> hydrate(command)
                         is Command.Persist -> persist(command)
@@ -694,18 +714,28 @@ class DjmixServices(
         internal fun processFlagsSnapshot(): FlagsSnapshot =
             processInstance?.flagsSnapshot() ?: FlagsSnapshot.defaults()
 
-        /** One owner per Android process. The application can update the user policy immediately. */
+        /** Returns the owner immediately; its I/O worker opens the cache before hydration. */
         fun create(context: Context): DjmixServices = processInstance ?: synchronized(this) {
             processInstance ?: run {
                 val app = context.applicationContext
-                val database = DjmixDatabase(app)
-                val store = DjmixAnalysisStore(database)
+                val memoryPersistence = InMemoryTastePersistence()
                 val owner = DjmixServices(
-                    persistence = SqliteTastePersistence(database, store), database = database, store = store,
+                    persistence = memoryPersistence, database = null, store = null,
                     flags = DjmixFlags(app), telemetryWriter = TelemetryV3Writer(File(app.noBackupFilesDir, "djmix/telemetry")),
                     diagnosticsBundler = DiagnosticsBundler(File(app.getExternalFilesDir(null) ?: app.filesDir, "djmix-reports")),
                     captureDirectory = File(app.noBackupFilesDir, "djmix/captures"),
                 )
+                owner.cacheInitializer = {
+                    val database = DjmixDatabase.openOrNull(app)
+                    val store = database?.let { DjmixAnalysisStore(it) }
+                    val persistence = if (database != null && store != null) {
+                        SqliteTastePersistence(database, store)
+                    } else {
+                        owner.reportFailure("djmix cache unavailable; taste is session-only", null)
+                        memoryPersistence
+                    }
+                    CacheState(database, store, persistence)
+                }
                 owner.releaseFlagsJob = owner.scope.launch {
                     ReleaseFlagsUpdater(app, checkNotNull(owner.flags)).refresh()
                 }
@@ -719,6 +749,26 @@ class DjmixServices(
             json.parseToJsonElement(timings).jsonObject["generation"]?.jsonPrimitive?.longOrNull
         }.getOrNull()
     }
+}
+
+/** Used only after cache opening fails; calls are serialized by the process worker. */
+private class InMemoryTastePersistence : TastePersistence {
+    private var weights: Map<String, Double> = emptyMap()
+
+    override fun readPreferences(): Map<String, Double> = weights.toMap()
+
+    override fun replacePreferences(weights: Map<String, Double>): Boolean {
+        this.weights = weights.toMap()
+        return true
+    }
+
+    override fun resetPreferences(): Boolean {
+        weights = emptyMap()
+        return true
+    }
+
+    override fun readTransition(recordId: Long): TransitionRecord? = null
+    override fun updateRating(recordId: Long, rating: Int): Boolean = false
 }
 
 /**

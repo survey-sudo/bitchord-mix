@@ -412,10 +412,9 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
     //
     // Legacy on-disk layout (read-only reference, see shared/.../smart):
     // - AnalysisStore: `filesDir/smart_analysis/<hash>_<len>.json`, Stored has
-    //   no trackId field and SCHEMA_VERSION = 5. Entries cannot be keyed into
-    //   track_analysis(track_id, content_hash) and are stale for V3 by
-    //   definition, so they are counted stale and deleted — the same fate
-    //   AnalysisStore.load gives them on read (ADR 0009).
+    //   no trackId field, so entries cannot be re-keyed into track_analysis.
+    //   Leave them available for AnalysisStore.load, which validates their
+    //   own schema/provenance. A new beat model does not invalidate old grids.
     // - StemCache: `cacheDir/stems/<trackHash>_<tag>_<sampleRate>_<startSample>_
     //   <frames>.stm`. NOT `filesDir/stems` — that is StemModelStore's ONNX
     //   weights and stays untouched. Valid files move to
@@ -430,14 +429,6 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
         val appContext = context.applicationContext
         if (isMigrationDone()) return LegacyMigrationResult(alreadyMigrated = true)
         val nowMs = System.currentTimeMillis()
-
-        // Legacy analysis JSON: every entry is stale for V3 by definition, so
-        // it is counted and deleted (same fate AnalysisStore.load gives them
-        // on read, ADR 0009).
-        val analysis = runCatching {
-            cleanLegacyAnalysisDir(File(appContext.filesDir, LEGACY_ANALYSIS_DIR))
-        }.onFailure { AnalysisLog.warn("djmix migration: legacy analysis cleanup failed", it) }
-            .getOrDefault(LegacyDirCleanup())
 
         // Legacy StemCache files: valid ones move under noBackupFilesDir/stems
         // and are indexed; junk is deleted.
@@ -456,8 +447,8 @@ class DjmixAnalysisStore(private val db: DjmixDatabase) {
         markMigrationDone(nowMs)
         return LegacyMigrationResult(
             migratedStems = stems.migratedStems,
-            staleAnalysis = analysis.staleAnalysis,
-            deletedLegacyFiles = analysis.deletedFiles + stems.deletedFiles,
+            staleAnalysis = 0,
+            deletedLegacyFiles = stems.deletedFiles,
         )
     }
 

@@ -1,6 +1,9 @@
 package com.music.bitchord
 
 import android.app.Application
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.compose.ui.ComposeUiFlags
 import androidx.compose.ui.ExperimentalComposeUiApi
@@ -33,6 +36,7 @@ import com.music.bitchord.playback.LastPlayed
 import com.music.bitchord.playback.BoundedContextPersistence
 import com.music.bitchord.playback.OriginalVersion
 import com.music.bitchord.playback.djmix.DjmixServices
+import com.music.bitchord.playback.djmix.diagnostics.DjmixFlags
 import com.music.bitchord.data.innertube.Innertube
 import com.music.bitchord.data.innertube.AndroidStreamHooks
 import com.music.bitchord.data.listentogether.ListenTogether
@@ -51,6 +55,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import kotlin.concurrent.thread
 
 class BitChordApplication : Application(), SingletonImageLoader.Factory, Configuration.Provider {
@@ -92,6 +97,7 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
             }
             previousHandler?.uncaughtException(thread, error)
         }
+        installAutomixCrashLoopGuard()
         // The player is drawn by the shared UI module; this is what it reads
         // underneath — settings, the Canvas decoder, outputs, the party.
         AndroidStreamHooks.installEarly()
@@ -251,6 +257,64 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
         backgroundInit.join()
     }
 
+    private fun installAutomixCrashLoopGuard() {
+        // Share the flag store: one snapshot and one asynchronous preference edit.
+        // The real Safe flag is read when DjmixServices is created below.
+        val prefs = getSharedPreferences(DjmixFlags.PREFS_NAME, MODE_PRIVATE)
+        val saved = prefs.all
+        val startedAt = System.currentTimeMillis()
+        val previousStart = saved[KEY_AUTOMIX_START] as? Long
+        val rapidRestart = previousStart != null && startedAt >= previousStart &&
+            startedAt - previousStart < AUTOMIX_HEALTHY_UPTIME_MS
+        val consecutive = if (rapidRestart) {
+            ((saved[KEY_AUTOMIX_RAPID_RESTARTS] as? Int ?: 0).coerceIn(0, 2) + 1).coerceAtMost(2)
+        } else {
+            0
+        }
+        val previousSafeMode = saved[KEY_AUTOMIX_PREVIOUS_SAFE_MODE] as? String
+        val safeModeForSession = consecutive >= 2
+        val edit = prefs.edit()
+            .putLong(KEY_AUTOMIX_START, startedAt)
+            .putInt(KEY_AUTOMIX_RAPID_RESTARTS, consecutive)
+        if (previousSafeMode != null || safeModeForSession) {
+            val overrides = runCatching {
+                JSONObject(saved[DjmixFlags.KEY_DEV_OVERRIDES] as? String ?: "{}")
+            }.getOrElse {
+                Log.w("BitChordMix", "Automix crash guard ignored invalid developer flags", it)
+                JSONObject()
+            }
+            // Restore only the previous Safe value; retain edits to other flags.
+            when (previousSafeMode) {
+                "true" -> overrides.put("safeMode", true)
+                "false" -> overrides.put("safeMode", false)
+                "null" -> overrides.put("safeMode", JSONObject.NULL)
+                "absent" -> overrides.remove("safeMode")
+            }
+            if (safeModeForSession) {
+                val original = when (overrides.opt("safeMode")) {
+                    true -> "true"
+                    false -> "false"
+                    JSONObject.NULL -> "null"
+                    else -> "absent"
+                }
+                edit.putString(KEY_AUTOMIX_PREVIOUS_SAFE_MODE, original)
+                overrides.put("safeMode", true)
+                Log.w("BitChordMix", "Repeated early restarts; Automix Safe mode enabled for this session")
+            } else {
+                edit.remove(KEY_AUTOMIX_PREVIOUS_SAFE_MODE)
+            }
+            edit.putString(DjmixFlags.KEY_DEV_OVERRIDES, overrides.toString())
+        }
+        edit.apply()
+        Handler(Looper.getMainLooper()).postDelayed({
+            prefs.edit()
+                .remove(KEY_AUTOMIX_START)
+                .remove(KEY_AUTOMIX_RAPID_RESTARTS)
+                .apply()
+            // Keep Safe mode for this session; restore its prior value on next launch.
+        }, AUTOMIX_HEALTHY_UPTIME_MS)
+    }
+
     /**
      * Coil's own transport, separate from [Http][com.music.bitchord.data.Http]'s
      * playback-tuned client.
@@ -357,6 +421,11 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
     }
 
     companion object {
+        private const val AUTOMIX_HEALTHY_UPTIME_MS = 60_000L
+        private const val KEY_AUTOMIX_START = "automix_start_timestamp_ms"
+        private const val KEY_AUTOMIX_RAPID_RESTARTS = "automix_consecutive_early_restarts"
+        private const val KEY_AUTOMIX_PREVIOUS_SAFE_MODE = "automix_crash_previous_safe_mode"
+
         lateinit var authStore: AuthStore
             private set
 

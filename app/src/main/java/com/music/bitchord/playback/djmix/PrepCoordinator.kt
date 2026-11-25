@@ -998,6 +998,25 @@ internal class PrepCoordinator(
                 fallbackSeconds = fallbackSeconds,
                 lyricsOut = lyricSpans[currentItem.mediaId]?.cues.orEmpty().toList(),
                 lyricsIn = lyricSpans[nextItem.mediaId]?.cues.orEmpty().toList(),
+                // The one extra track the warm-up is allowed to analyse: next+1,
+                // captured here on the player thread. PairPreparer admits it only
+                // after the current pair drains and below MODERATE heat.
+                lookaheadTrack = (nextIndex + 1)
+                    .takeIf { it < player.mediaItemCount }
+                    ?.let { index -> player.getMediaItemAt(index) }
+                    ?.takeIf { !it.isVideoOrigin }
+                    ?.let { item ->
+                        com.music.bitchord.playback.djmix.PrepTrack(
+                            id = item.mediaId,
+                            durationSec = nextItemDurationMs(nextIndex + 1, item).coerceAtLeast(0L) / 1000.0,
+                            title = item.mediaMetadata.title?.toString().orEmpty(),
+                            artist = item.mediaMetadata.artist?.toString().orEmpty(),
+                            albumTitle = item.mediaMetadata.albumTitle?.toString().orEmpty(),
+                            trackNumber = item.mediaMetadata.trackNumber ?: 0,
+                            mediaItem = item,
+                            uri = item.localConfiguration?.uri,
+                        )
+                    },
             )
         }
     }

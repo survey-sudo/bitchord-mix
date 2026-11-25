@@ -3,6 +3,7 @@ package com.music.bitchord.playback.smart
 import android.content.ContentResolver
 import android.media.MediaDataSource
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.media3.common.util.UnstableApi
 import com.music.bitchord.playback.AudioCache
@@ -49,6 +50,7 @@ internal class HeadAnalyzer(
         endSeconds: Double,
         deriveFeatures: Boolean,
         includeVocals: Boolean,
+        timings: AnalysisStageTimings,
     ) -> AnalysisRegion?,
 ) {
     /**
@@ -186,6 +188,8 @@ internal class HeadAnalyzer(
         durationSeconds: Double,
         rendition: AudioCache.Rendition,
     ): TrackAnalysis? {
+        val started = SystemClock.elapsedRealtime()
+        val timings = AnalysisStageTimings()
         val provenance = captureProvenance(trackId, uri, rendition)
         fun openSource(): MediaDataSource? = cache.renditionDataSource(uri, rendition)
 
@@ -212,7 +216,7 @@ internal class HeadAnalyzer(
 
         playbackFirst()
         val window = BeatTracker.WINDOW_SECONDS
-        val head = analyzeMonoWindow(::openSource, 0.0, window, true, false)
+        val head = analyzeMonoWindow(::openSource, 0.0, window, true, false, timings)
             ?: run {
                 if (isStopped()) return null
                 Log.d(TAG, "Head pass for $trackId could not decode rendition ${rendition.key}")
@@ -238,7 +242,7 @@ internal class HeadAnalyzer(
                 "over ${"%.1f".format(Locale.ROOT, head.seconds)}s",
         )
 
-        return TrackAnalysis(
+        val analysis = TrackAnalysis(
             status = TrackAnalysis.STATUS_READY,
             trackId = trackId,
             duration = durationSeconds,
@@ -259,6 +263,8 @@ internal class HeadAnalyzer(
             levelWindows = listOfNotNull(head.levelWindow),
             provenance = provenance,
         )
+        timings.log(trackId, "HEAD_TAIL", totalMs = SystemClock.elapsedRealtime() - started)
+        return analysis
     }
 
     /**

@@ -100,7 +100,9 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
     // Inspector, History and playback all use the application's process owner.
     private val djmixServices: DjmixServices get() = (app as BitChordApplication).djmixServices
     val djmixFlags: DjmixFlags get() = requireNotNull(djmixServices.flags)
-    val djmixStore: DjmixAnalysisStore get() = requireNotNull(djmixServices.store)
+
+    /** Null only when djmix.db could not be opened; history reads then return empty. */
+    val djmixStore: DjmixAnalysisStore? get() = djmixServices.store
 
     init {
         // :sharedUi cannot import app/ and PlayerHost has no rating/flag
@@ -142,7 +144,7 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
 
     /** Newest-first transition history for Settings → History (last 100). */
     suspend fun historyRecords(limit: Int = 100): List<TransitionRecord> =
-        withContext(Dispatchers.IO) { djmixStore.recentTransitions(limit) }
+        withContext(Dispatchers.IO) { djmixStore?.recentTransitions(limit).orEmpty() }
 
     /** Re-rate a history row; `1` up, `-1` down, `0` clear. */
     suspend fun updateHistoryRating(id: Long, rating: Int): Boolean {

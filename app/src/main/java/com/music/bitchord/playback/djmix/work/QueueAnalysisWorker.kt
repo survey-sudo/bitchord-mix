@@ -76,7 +76,7 @@ class QueueAnalysisWorker(appContext: Context, params: WorkerParameters) :
         const val KEY_TRACK_IDS = "track_ids"
 
         /** How many upcoming tracks one run lifts to FULL analysis. */
-        const val QUEUE_ANALYSIS_BUDGET = 5
+        const val QUEUE_ANALYSIS_BUDGET = 1
 
         /** How many upcoming pairs one run plans and stem-preps. */
         const val PAIR_PREP_BUDGET = 2

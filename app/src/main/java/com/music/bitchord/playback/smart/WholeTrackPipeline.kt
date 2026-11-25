@@ -40,6 +40,22 @@ internal class WholeTrackAudio(
     val decodeMs: Long = 0L,
 )
 
+/** Per-pass wall timings, including opening/windowed work; never shared between passes. */
+internal class AnalysisStageTimings {
+    var decodeMs = 0L
+    var melMs = 0L
+    var niroviMs = 0L
+    var syvenuMs = 0L
+
+    fun log(trackId: String, level: String, structureMs: Long = 0L, totalMs: Long) {
+        Log.i(
+            "BitChordTrackAnalyzer",
+            "analysis.stage track=$trackId level=$level decode=$decodeMs mel=$melMs " +
+                "nirovi=$niroviMs syvenu=$syvenuMs structure=$structureMs total=$totalMs",
+        )
+    }
+}
+
 /**
  * Whole-track mono decode, Nirovi/Syvenu shared-spectrogram inference, StructureV2 enrichment,
  * and single-window analysis pipeline extracted from [TrackAnalyzer] (M9 slice T-5).
@@ -218,6 +234,8 @@ internal class WholeTrackPipeline(
         onGridReady: (Double, BeatTracker.Grid?, TrackFeatures.Features?, CurveWindow?, TrackAnalysisProvenance) -> Unit = { _, _, _, _, _ -> },
         shouldAbort: () -> Boolean = { false },
     ): WholeTrack {
+        val started = elapsedNow()
+        val timings = AnalysisStageTimings()
         if (!AutomixModels.isReady()) return WholeTrack(null, aborted = true)
         val copy = copyToRead(trackId, uri, durationSeconds) ?: return WholeTrack(null)
         // Recorded before the outcome is known: a missing analysis stays unretryable
@@ -241,7 +259,7 @@ internal class WholeTrackPipeline(
         // Pass-1 before whole-track Pass-2: mono opening grid + light DSP (no vocal pass).
         if (!isStopped()) {
             playbackFirst()
-            val preHead = analyzeMonoWindow(openSource, 0.0, minOf(effectiveDuration, span), deriveFeatures = true)
+            val preHead = analyzeMonoWindow(openSource, 0.0, minOf(effectiveDuration, span), deriveFeatures = true, timings = timings)
             if (preHead != null) {
                 onGridReady(effectiveDuration, preHead.grid, preHead.features, preHead.levelWindow, copy.provenance)
             }
@@ -250,17 +268,15 @@ internal class WholeTrackPipeline(
         if (shouldAbort()) return WholeTrack(null, aborted = true)
 
         playbackFirst()
-        val wholeStarted = elapsedNow()
         val audio = decodeWholeTrack(trackId, uri, copy, effectiveDuration)
+        timings.decodeMs += audio.decodeMs
         if (isStopped()) return WholeTrack(null)
         if (audio.decodedShort) return WholeTrack(null, decodedShort = true)
         val featureSamples = audio.featureSamples ?: return WholeTrack(empty(trackId, effectiveDuration, copy.provenance))
         if (shouldAbort()) return WholeTrack(null, aborted = true)
 
-        val featuresStarted = elapsedNow()
         val features = TrackFeatures.analyze(featureSamples, effectiveDuration)
             ?: return WholeTrack(empty(trackId, effectiveDuration, copy.provenance))
-        val featuresMs = elapsedNow() - featuresStarted
         if (isStopped()) return WholeTrack(null)
         if (shouldAbort()) return WholeTrack(null, aborted = true)
 
@@ -281,6 +297,7 @@ internal class WholeTrackPipeline(
             val specStarted = elapsedNow()
             val spec = MelSpectrogram.compute(modelPcm)
             melMs = elapsedNow() - specStarted
+            timings.melMs += melMs
             audio.modelSamples = null
 
             if (isStopped()) return WholeTrack(null)
@@ -288,7 +305,12 @@ internal class WholeTrackPipeline(
 
             val rawGrid = spec?.let {
                 synchronized(beatLock) {
-                    if (yieldOrStopped()) null else tracker.track(it, offsetSeconds = 0.0, melMs = melMs)
+                    if (yieldOrStopped()) null else {
+                        val inferStarted = elapsedNow()
+                        tracker.track(it, offsetSeconds = 0.0, melMs = melMs).also {
+                            timings.niroviMs += elapsedNow() - inferStarted
+                        }
+                    }
                 }
             }
             fullGrid = rawGrid?.let { AudioMath.snapGrid(it, audio.onsets) }
@@ -298,7 +320,10 @@ internal class WholeTrackPipeline(
 
             presence50fps = spec?.let {
                 synchronized(presenceLock) {
-                    if (yieldOrStopped()) null else vocalPresence.track(it)
+                    if (yieldOrStopped()) null else {
+                        val inferStarted = elapsedNow()
+                        vocalPresence.track(it).also { timings.syvenuMs += elapsedNow() - inferStarted }
+                    }
                 }
             }
             if (isStopped()) return WholeTrack(null)
@@ -336,7 +361,7 @@ internal class WholeTrackPipeline(
             for ((from, to) in AudioMath.modelWindows(headEnd, tailStart, effectiveDuration, span)) {
                 if (isStopped()) return WholeTrack(null)
                 if (shouldAbort()) return WholeTrack(null, aborted = true)
-                analyzeMonoWindow(openSource, from, to, deriveFeatures = false, includeVocals = true)
+                analyzeMonoWindow(openSource, from, to, deriveFeatures = false, includeVocals = true, timings = timings)
                     ?.let(regions::add)
             }
             if (isStopped()) return WholeTrack(null)
@@ -369,18 +394,11 @@ internal class WholeTrackPipeline(
             dspMask = features.vocalActivityMask,
         )
 
-        val totalMs = elapsedNow() - wholeStarted
         val vocalMode = when {
             presence50fps != null -> "syvenu-whole"
             vocalWindows.isNotEmpty() -> "syvenu-windowed"
             else -> "dsp"
         }
-        Log.i(
-            TAG,
-            "analysis.ms=$totalMs model=${tracker.lastModelTag} " +
-                "decode=${audio.decodeMs}ms dsp=${featuresMs}ms mel=${melMs}ms struct=${structWallMs}ms " +
-                "vocals=$vocalMode track=$trackId dur=${"%.1f".format(Locale.ROOT, effectiveDuration)}s",
-        )
         Log.d(
             TAG,
             "Analysed $trackId: bpm=${leading?.bpm ?: features.bpm} " +
@@ -442,6 +460,7 @@ internal class WholeTrackPipeline(
                 Log.d(TAG, "SongMap enrichment skipped for $trackId: bpm mismatch base=${structureMap.bpm} analysis=${analysis.bpm}")
             }
         }
+        timings.log(trackId, "FULL", structureMs = structWallMs, totalMs = elapsedNow() - started)
         return WholeTrack(analysis)
     }
 
@@ -458,13 +477,16 @@ internal class WholeTrackPipeline(
         endSeconds: Double,
         deriveFeatures: Boolean = false,
         includeVocals: Boolean = false,
+        timings: AnalysisStageTimings? = null,
     ): AnalysisRegion? {
         playbackFirst()
+        val decodeStarted = elapsedNow()
         val decoded = openSource()?.use { AudioDecoder.decodeRegion(it, startSeconds, endSeconds) { yieldOrStopped() } }
             ?: run {
                 Log.d(TAG, "Region [$startSeconds, $endSeconds) would not open")
                 return null
             }
+        timings?.let { it.decodeMs += elapsedNow() - decodeStarted }
         val (pcm, actualStart) = decoded
         if (pcm.samples.size < pcm.sampleRate) {
             Log.d(TAG, "Region [$startSeconds, $endSeconds) decoded ${pcm.samples.size} frames; too few")
@@ -478,15 +500,26 @@ internal class WholeTrackPipeline(
         val specStarted = elapsedNow()
         val spec = inputs.forModel?.let { MelSpectrogram.compute(it) }
         val melMs = elapsedNow() - specStarted
+        if (inputs.forModel != null) timings?.let { it.melMs += melMs }
 
         val rawGrid = spec?.let {
             synchronized(beatLock) {
-                if (yieldOrStopped()) null else tracker.track(it, offsetSeconds = actualStart, melMs = melMs)
+                if (yieldOrStopped()) null else {
+                    val inferStarted = elapsedNow()
+                    tracker.track(it, offsetSeconds = actualStart, melMs = melMs).also {
+                        timings?.let { it.niroviMs += elapsedNow() - inferStarted }
+                    }
+                }
             }
         }
         val vocalValues = if (includeVocals && spec != null) {
             synchronized(presenceLock) {
-                if (yieldOrStopped()) null else vocalPresence.track(spec)
+                if (yieldOrStopped()) null else {
+                    val inferStarted = elapsedNow()
+                    vocalPresence.track(spec).also {
+                        timings?.let { it.syvenuMs += elapsedNow() - inferStarted }
+                    }
+                }
             }
         } else {
             null

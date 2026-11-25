@@ -1,6 +1,7 @@
 package com.music.bitchord.playback.djmix
 
 import android.os.Process
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
 import com.music.bitchord.djmix.core.contracts.AnalysisLevel
@@ -153,6 +154,8 @@ data class PrepRequest(
     val machineGeneration: Long? = null,
     /** Exact registry IDs, including canonical recipes that have no legacy enum entry. */
     val excludedRecipeIds: Set<String> = emptySet(),
+    /** Optional next+1 item captured with the pair on the player thread. */
+    val lookaheadTrack: PrepTrack? = null,
 )
 
 data class PreparedPair(
@@ -318,6 +321,7 @@ class PairPreparer(
     private val inspectorLearningEnabled: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow(),
     private val plannerWeightsProvider: (genreClass: String) -> Map<String, Double> = { emptyMap() },
     private val thermalStatus: () -> Int? = { null },
+    private val requestLookaheadAnalysis: (PrepTrack) -> Boolean = { false },
 ) {
     private val _state = MutableStateFlow<PreparedPair?>(null)
     val state: StateFlow<PreparedPair?> = _state.asStateFlow()
@@ -337,6 +341,7 @@ class PairPreparer(
     @Volatile private var activeRequest: PrepRequest? = null
     @Volatile private var activeGeneration: Long = 0L
     @Volatile private var released = false
+    private var lookaheadGeneration: Long = Long.MIN_VALUE
     @Volatile private var retainedMixOwner: DjmixServices? = null
     private var retainedPlayerEpoch = 0L
 
@@ -582,11 +587,12 @@ class PairPreparer(
         val req = activeRequest ?: return
         if (trackId != req.outTrack.id && trackId != req.inTrack.id) return
         val current = _state.value ?: return
-        if (current.state in ACTIVE_EXECUTION_STATES) return
+        if (current.state in ACTIVE_EXECUTION_STATES && req.lookaheadTrack == null) return
         val targetGen = current.generation
         runCatching {
             executor.execute {
-                refineOnAnalysisUpdate(targetGen, req)
+                requestLookaheadIfReady(targetGen, req)
+                if (_state.value?.state !in ACTIVE_EXECUTION_STATES) refineOnAnalysisUpdate(targetGen, req)
             }
         }
     }
@@ -869,7 +875,7 @@ class PairPreparer(
         runCatching {
             if (!awaitThermalBudget(gen)) return
 
-            // --- Stage 1: Non-blocking HEAD_TAIL/FULL check (never stall 15 s in awaitAnalysis) ---
+            // HEAD_TAIL is sufficient immediately; FULL only refines through analysis updates.
             requestAnalysis(request.outTrack)
             if (!awaitThermalBudget(gen)) return
             requestAnalysis(request.inTrack)
@@ -920,6 +926,7 @@ class PairPreparer(
                 return
             }
 
+            requestLookaheadIfReady(gen, request)
             stemWindowPlanner.planDecodeAndLaunchStems(
                 gen = gen,
                 request = request,
@@ -929,6 +936,17 @@ class PairPreparer(
                 reuseFrom = reuseFrom,
             )
         }
+    }
+
+    private fun requestLookaheadIfReady(gen: Long, request: PrepRequest) {
+        if (released || generation.get() != gen || lookaheadGeneration == gen) return
+        val track = request.lookaheadTrack ?: return
+        if (track.id.isBlank() || track.id == request.outTrack.id || track.id == request.inTrack.id) return
+        val status = thermalStatus() ?: return
+        if (status >= PowerManager.THERMAL_STATUS_MODERATE || PrepThermalGate.shouldPause(status)) return
+        if (!analysisFor(request.outTrack.id).isUsable || !analysisFor(request.inTrack.id).isUsable ||
+            analysisRunningFor(request.outTrack.id) || analysisRunningFor(request.inTrack.id)) return
+        if (requestLookaheadAnalysis(track)) lookaheadGeneration = gen
     }
 
     private fun refineOnAnalysisUpdate(targetGen: Long, request: PrepRequest) {
@@ -1274,7 +1292,7 @@ class PairPreparer(
 
     companion object {
         private const val DEFAULT_ANALYSIS_WAIT_MS = 15_000L
-        private const val DEFAULT_FULL_PREFERRED_WAIT_MS = 3_000L
+        private const val DEFAULT_FULL_PREFERRED_WAIT_MS = 0L
         private const val RECIPE_HISTORY_CAP = 12
         private val ABRUPT_RECIPE_IDS = setOf("F2", "F7", "F9")
         private val ACTIVE_EXECUTION_STATES = setOf(
@@ -1288,7 +1306,14 @@ class PairPreparer(
                 runCatching {
                     Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND + Process.THREAD_PRIORITY_MORE_FAVORABLE)
                 }
-                runnable.run()
+                // The engine must never kill playback. A Throwable escaping a
+                // prep task used to reach the process's uncaught-exception
+                // handler, which takes the whole app down — that is how a
+                // main-thread-only player getter on this thread crashed the app
+                // in the field. Nothing here is worth the song.
+                runCatching { runnable.run() }.onFailure { error ->
+                    android.util.Log.w("BitChordMix", "djmix-prep task failed; playback continues", error)
+                }
             }, "djmix-prep").apply { isDaemon = true }
         }
 
@@ -1297,7 +1322,11 @@ class PairPreparer(
                 runCatching {
                     Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND + Process.THREAD_PRIORITY_MORE_FAVORABLE)
                 }
-                runnable.run()
+                // Stems are optional; a stem failure falls back to the plain
+                // crossfade path. It must not take the process with it either.
+                runCatching { runnable.run() }.onFailure { error ->
+                    android.util.Log.w("BitChordMix", "djmix-stems task failed; playback continues", error)
+                }
             }, "djmix-stems").apply { isDaemon = true }
         }
 

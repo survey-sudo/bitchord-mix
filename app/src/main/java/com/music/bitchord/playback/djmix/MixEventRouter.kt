@@ -6,6 +6,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import com.music.bitchord.djmix.core.machine.PairKey
 import com.music.bitchord.playback.AutomixTelemetry
 import com.music.bitchord.playback.loopmix.LoopMixSession
 import com.music.bitchord.playback.smart.LocalBlendAdmission
@@ -90,6 +91,7 @@ internal class MixEventRouter(private val host: MixEventHost) {
     var routingFallback = false
     var nativeBinding: NativeBinding? = null
     val routingEvidenceKeys = mutableSetOf<String>()
+    private val loggedFireKeys = LinkedHashSet<String>()
 
     // ---- Sleep fade execution -----------------------------------------------
 
@@ -237,6 +239,37 @@ internal class MixEventRouter(private val host: MixEventHost) {
 
     fun mixEvent(name: String, fields: Map<String, Any?>, context: Opportunity? = opportunity) {
         AutomixTelemetry.event(name, opportunityFields(context) + mapOf("planRevision" to planRevision) + fields)
+        // These markers follow native takeover / the classic incoming-player start.
+        // Never log from a plan, readiness event, failure, or executor Start request.
+        if (name == "mix.fire" && fields["stage"] == "executed") runCatching {
+            val path = when (fields["executionMarker"]) {
+                "native-takeover-observed" -> "prepared"
+                "classic-fade-fired" -> "classic"
+                else -> return@runCatching
+            }
+            val key = context?.attemptId ?: "${fields["trackIndex"]}:${fields["actualStartMs"]}"
+            if (!loggedFireKeys.add(key)) return@runCatching
+            while (loggedFireKeys.size > 64) loggedFireKeys.remove(loggedFireKeys.first())
+            if (context != null) MixFireObservation.record(
+                PairKey(context.outId, context.inId),
+                (fields["actualStartMs"] as? Number)?.toLong(),
+                fields["planId"] as? String,
+                (fields["preparationGeneration"] as? Number)?.toLong()?.takeIf { it > 0L },
+            )
+            val recipe = (fields["recipeId"] as? String)?.takeIf { it.isNotBlank() } ?: "none"
+            val level = (fields["level"] as? String)?.takeIf { it.isNotBlank() } ?: "none"
+            val stems = (fields["stems"] as? Number)?.toInt() ?: 0
+            val prepLeadSec = fields["preparedLeadSec"] as? Number ?: 0
+            val buildMs = fields["buildMs"] as? Number ?: 0
+            val rawReason = (fields["fallbackReason"] as? String)?.takeIf { it.isNotBlank() } ?: "none"
+            val reason = when (rawReason) {
+                "no renderer", "no output port", "this output can't take it", "no standby sink",
+                "renderer_unavailable", "native-renderer-unavailable" -> "renderer-unavailable"
+                "safe_mode" -> "safe-mode"
+                else -> rawReason // Preserve other real classic paths for the owner's gate audit.
+            }
+            Log.i("BitChordMix", "BitChordMix fire path=$path recipe=$recipe level=$level stems=$stems prepLeadSec=$prepLeadSec buildMs=$buildMs reason=$reason")
+        }
     }
 
     fun nativeRouteFields(
@@ -306,6 +339,8 @@ internal class MixEventRouter(private val host: MixEventHost) {
             // The real execution path, not the planned one: straight routes must be distinguishable.
             "path" to session.executionPath,
             "preparationGeneration" to session.preparationGeneration,
+            "planId" to session.planId,
+            "recipeId" to session.choreoRecipeId,
         )
 
     fun classicRouteFields(plan: TransitionPlan?): Map<String, Any?> = mapOf(

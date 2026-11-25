@@ -73,6 +73,7 @@ import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
+import androidx.work.WorkManager
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -155,8 +156,6 @@ import com.music.bitchord.data.sources.SourceResolver
 import com.music.bitchord.data.sources.SourceStream
 import com.music.bitchord.data.sources.StreamFormat
 import com.music.bitchord.data.sources.TrackMatcher
-import com.music.bitchord.playback.djmix.work.QueueAnalysisWorker
-import com.music.bitchord.playback.djmix.work.LibraryAnalysisWorker
 import com.music.bitchord.playback.djmix.work.QueuePrepRegistry
 import com.music.bitchord.playback.djmix.DjmixServices
 import com.music.bitchord.playback.smart.AutomixAnalysisSource
@@ -1421,15 +1420,6 @@ class PlaybackService : MediaLibraryService() {
                 // its old seed memoized. Detect that state at its source and
                 // make the current track eligible for a fresh load.
                 refreshAutoplayIfQueueEmpty()
-                // FORK-HOOK(djmix-queue-worker): enqueue the next 5 queue ids for FULL analysis (non-blocking, best-effort)
-                runCatching {
-                    val start = exoPlayer.currentMediaItemIndex.coerceIn(0, exoPlayer.mediaItemCount)
-                    val upcomingIds = (start until exoPlayer.mediaItemCount)
-                        .map { exoPlayer.getMediaItemAt(it).mediaId }
-                        .filter { it.isNotBlank() }
-                        .take(QueueAnalysisWorker.QUEUE_ANALYSIS_BUDGET)
-                    QueueAnalysisWorker.enqueue(applicationContext, upcomingIds)
-                }
             }
         }
     }
@@ -1600,6 +1590,14 @@ class PlaybackService : MediaLibraryService() {
         localBitrateCache.clear()
         measuredBitrateCache.clear()
         QualityUpgrade.forgetLastSession()
+
+        // AE3: cancel leftover WorkManager analysis jobs from prior builds.
+        runCatching {
+            val workManager = WorkManager.getInstance(applicationContext)
+            workManager.cancelUniqueWork("djmix_library_analysis_periodic")
+            workManager.cancelUniqueWork("djmix_library_analysis_once")
+            workManager.cancelUniqueWork("djmix_queue_analysis")
+        }
 
         setMediaNotificationProvider(
             DefaultMediaNotificationProvider.Builder(this)
@@ -2154,8 +2152,6 @@ class PlaybackService : MediaLibraryService() {
 
         // FORK-HOOK(service-wiring): initialize AutomixTelemetry + v2 controller wiring
         AutomixTelemetry.init(this)
-        // B3.2.2: keep the full-library analysis backlog wired without making it part of playback.
-        runCatching { LibraryAnalysisWorker.enqueuePeriodic(applicationContext) }
         // AE3 queue worker: TrackAnalyzer is the QueuePrepDelegate (ensureFullAnalysis).
         QueuePrepRegistry.delegate = trackAnalyzer.queuePrepDelegate
         val controller = createCrossfadeController()
@@ -2332,11 +2328,19 @@ class PlaybackService : MediaLibraryService() {
                 }
             },
             onArtworkPrefetch = ::prefetchAutoMixIncoming,
+            // One optional next+1 pass, admitted by PairPreparer only after the
+            // current pair's analysis has drained and the device is below
+            // MODERATE heat. Same executor as the foreground work.
+            requestLookaheadAnalysis = { track ->
+                val uri = (track.uri as? Uri) ?: track.mediaItem?.let(::analysisUriForItem)
+                uri != null && trackAnalyzer.requestLookahead(track.id, uri, track.durationSec)
+            },
             // Thread-confined: PairPreparer invokes this on djmix-prep, where
             // calling player.currentPosition throws IllegalStateException
             // (ExoPlayer is main-thread confined). Read the main-thread
             // snapshot instead; its refresh is the only player access.
             positionSecProvider = { playerPositionMsSnapshot.get().coerceAtLeast(0L) / 1000.0 },
+            fullPreferredWaitMs = 0L,
             store = processDjmixServices?.store,
             inspectorLearningEnabled = processDjmixServices?.effectiveLearningEnabledFlow
                 ?: kotlinx.coroutines.flow.MutableStateFlow(false).asStateFlow(),
