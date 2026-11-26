@@ -7,12 +7,17 @@ Owner decision, November 26, 2026: **BitChord Mix** is the project name and
 | --- | --- |
 | Git URL | `https://github.com/survey-sudo/bitchord-mix.git` |
 | Default development branch | `ae3` |
-| Local source checkout | `/home/hfzhkn/Bitchord/source/bitchord-mix` |
+| Local reference/sync mirror | `/home/hfzhkn/Bitchord/source/bitchord-mix` |
 | Local convenience path | `/home/hfzhkn/bitchord-mix` (same checkout) |
 | Cloud project / target | `bitchord-mix` / `bitchord-mix` |
-| Cloud checkout | `/home/boxes/bitchord-mix` |
+| Primary Android development checkout | `/home/boxes/bitchord-mix` |
 | Fork remote for fetch and push | `origin` |
 | Original upstream | `upstream`, `kushagrasinghx/BitChord` |
+
+Owner cloud-only decision, November 26, 2026: all Android source edits,
+dependency installation, builds, tests and signing happen inside DVB. The
+PC keeps reference source/docs, evidence and ADB; do not recreate local
+Android toolchains, build caches or development worktrees.
 
 The newer GitHub repository was renamed from `bitchord-unified` to
 `bitchord-mix`. Its branches, tags and `models-v1` release assets stay together.

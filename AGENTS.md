@@ -8,9 +8,12 @@
 - Preserve dirty files, worktrees, historical evidence, signing material and
   device data. Never use a forced push, destructive reset, uninstall or data
   clear as part of repository synchronization.
-- Android/Gradle/NDK builds run on the cloud project `bitchord-mix`, target
-  `bitchord-mix`, checkout `/home/boxes/bitchord-mix`; never build locally.
-  Repository synchronization does not authorize a build or installation.
+- All Android development, including source edits, dependency installation,
+  builds, tests and signing, happens inside DVB: project `bitchord-mix`,
+  target `bitchord-mix`, checkout `/home/boxes/bitchord-mix`. The PC checkout
+  is a reference/sync mirror only. Do not create Android build outputs or
+  development worktrees on the PC. Repository housekeeping does not authorize
+  a build or installation.
 - User model preference: **never delegate to Gemini 4 Hydrogen**. Use the free
   `opencode/hy4-flash-free` model with its highest available variant (`high`
   as verified November 26, 2026), unless the user specifies another model.
