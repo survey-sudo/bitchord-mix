@@ -19,3 +19,8 @@
   as verified November 26, 2026), unless the user specifies another model.
   Look up supported IDs/variants before changing models; do not silently fall
   back to Hydrogen.
+
+- For PC cleanup, retain one APK for each of the last three versions. Delete
+  obsolete compiled APKs locally; do not bulk-upload historical APKs or
+  source-upload bundles without an explicit request. Preserve source/docs,
+  evidence logs, signing/ADB keys and the retained APKs.
