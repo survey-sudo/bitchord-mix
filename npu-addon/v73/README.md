@@ -26,7 +26,7 @@ This directory is a standalone Gradle project. It is **not** included in
 the root `settings.gradle.kts` (Part B4.3: separate build).
 
 ```bash
-cd ~/bitchord-unified
+cd ~/bitchord-mix
 ./gradlew -p npu-addon/v73 :assembleRelease
 ```
 

@@ -4,7 +4,7 @@
 # After this, `git merge v1.10` uses v1.9.1 as the merge base, so only upstream's 1.9.1→1.10 changes
 # are replayed onto the fork instead of a 270-commit unrelated-history mess.
 set -euo pipefail
-MAIN="${1:-master}"
+MAIN="${1:-ae3}"
 UP_BASE_TAG="v1.9.1"
 UP_BASE_SHA="7f45c768a461fd7e68bf4613f71e8a767e643d4c"
 cd "$(git rev-parse --show-toplevel)"

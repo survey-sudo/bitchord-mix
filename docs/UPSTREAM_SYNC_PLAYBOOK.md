@@ -1,6 +1,14 @@
 # BitChord fork: upstream sync playbook (for the build agent)
 
-Purpose: keep `survey-sudo/bitchord-unified` current with upstream `kushagrasinghx/BitChord` releases while the fork's
+Repository consolidation, November 26, 2026: the only active repository is
+`survey-sudo/bitchord-mix`, default branch `ae3` (see `../REPOSITORY.md`).
+Sections 1–7 below describe the historical bootstrap; do not rerun them on
+the existing repository. For recurring upstream sync, use section 8 with
+`ae3` wherever the historical instructions say `master`. The executable
+workflow and script defaults now target `ae3`. Version facts below are
+historical; read current version values from `build.gradle.kts`.
+
+Purpose: keep `survey-sudo/bitchord-mix` current with upstream `kushagrasinghx/BitChord` releases while the fork's
 automix engine keeps evolving. Run the phases below top to bottom the first time. After that, only §8 repeats for each
 upstream release.
 
@@ -24,18 +32,18 @@ upstream release.
 ## 1. Prerequisites
 1. **vc93 (Automix v2) is accepted by the user** and its branch `automix-v2` is the fork's main line.
    ```bash
-   cd ~/bitchord-unified && git fetch --all --prune
+   cd ~/bitchord-mix && git fetch --all --prune
    git merge-base --is-ancestor origin/master automix-v2 && git checkout master && git merge --ff-only automix-v2 && git push origin master
    ```
    If the `--is-ancestor` check fails, **stop and ask the user** which branch should become `master`. Do not
    force-push. Also make sure `android-ci.yml` triggers on `master` pushes and on PRs.
 2. **The user adds the repository secret `SYNC_TOKEN`:** GitHub → Settings → Developer settings → Fine-grained token,
-   scoped to `survey-sudo/bitchord-unified` only, with Contents, Pull requests, Issues and Workflows set to Read and
+   scoped to `survey-sudo/bitchord-mix` only, with Contents, Pull requests, Issues and Workflows set to Read and
    write. Then paste it into repo → Settings → Secrets and variables → Actions → New secret `SYNC_TOKEN`.
 
 ## 2. Install the kit
 ```bash
-cd ~/bitchord-unified && git checkout -b fork/sync-kit master
+cd ~/bitchord-mix && git checkout -b fork/sync-kit master
 cp -r ~/av2/upstream-sync-kit/tools/upstream-sync tools/
 cp ~/av2/upstream-sync-kit/.github/workflows/upstream-sync.yml .github/workflows/
 mkdir -p archive/docs/ae3-b12-12
@@ -109,7 +117,7 @@ are already known:
 | `dd102c2` fix(player): smooth AutoMix artwork, Spotify Canvas handling, opt-in toggles | Controller parts only (the UI parts merged by themselves): advance the reveal from the smoothed audio clock rather than the controller tick; hold the reveal until the incoming artwork is prepared when a seek arms the mix late; draw the player glass flat while a mix is armed or running. |
 | "prefetch next track artwork for AutoMix transitions" | Call upstream's artwork prefetch when the fork planner commits a plan, at the `primeLoopDecks` / plan-ready point. |
 | PR #1554 merge (find with `git log v1.9.1..v1.10 --merges -- app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt`) | Inspect it and port any non-UI behaviour. |
-| `1db2b0c` reduce apk size (TrackAnalyzer + native) | Adopt upstream's mechanism: the Automix model downloads the first time Automix is turned on. Route **all** fork models through the same downloader with SHA-256 pins (`beat_this_final0_q8.onnx`, `vocals_umxhq_int8.onnx`, `scnet.int8.onnx`, `beat_this_final0_qdq.onnx`). Host them on a fork release (`survey-sudo/bitchord-unified`, tag `models-v1`) and remove them from `app/src/main/assets`. `StemModelStore` already supports `url` + `sha256`. Expect the APK to drop by about 35–45 MB. |
+| `1db2b0c` reduce apk size (TrackAnalyzer + native) | Adopt upstream's mechanism: the Automix model downloads the first time Automix is turned on. Route **all** fork models through the same downloader with SHA-256 pins (`beat_this_final0_q8.onnx`, `vocals_umxhq_int8.onnx`, `scnet.int8.onnx`, `beat_this_final0_qdq.onnx`). Host them on a fork release (`survey-sudo/bitchord-mix`, tag `models-v1`) and remove them from `app/src/main/assets`. `StemModelStore` already supports `url` + `sha256`. Expect the APK to drop by about 35–45 MB. |
 | shared/sharedUi "keep the AutoMix dissolve when skipping onto the mix" | UI side, merged normally. Verify it works with the visual state the fork now publishes. |
 
 **Known 1.10 runtime caveat (not a merge problem):** the new **Google Drive backup** signs in with an OAuth client tied

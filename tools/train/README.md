@@ -1,7 +1,7 @@
 # Track N — Kite & Lark training pipeline
 
 Clean training scaffold for the two on-device students used by BitChord's
-`bitchord-unified/tools/train/` pipeline. Copy this whole directory into that
+`bitchord-mix/tools/train/` pipeline. Copy this whole directory into that
 location in Step 7.
 
 **License compliance (§4.5 / §8.2).** Every `.py` file here is 100% original

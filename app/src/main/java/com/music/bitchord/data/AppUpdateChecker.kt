@@ -44,7 +44,7 @@ object AppUpdateChecker {
 
     // FORK-HOOK(updater): point update checks at the fork repo and rank -djmixN builds
     private const val LATEST_RELEASE_URL =
-        "https://api.github.com/repos/survey-sudo/bitchord-unified/releases/latest"
+        "https://api.github.com/repos/survey-sudo/bitchord-mix/releases/latest"
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -66,7 +66,7 @@ object AppUpdateChecker {
     @Volatile
     private var downloadCancelled = false
 
-    /** Fork builds self-update from survey-sudo/bitchord-unified when an APK asset is attached. */
+    /** Fork builds self-update from survey-sudo/bitchord-mix when an APK asset is attached. */
     private const val UPDATE_CHECKS_ENABLED = true
 
     suspend fun check() = withContext(Dispatchers.IO) {

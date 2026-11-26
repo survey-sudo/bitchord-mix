@@ -133,6 +133,6 @@ internal class ReleaseFlagsUpdater(context: Context, private val flags: DjmixFla
     }
 
     private companion object {
-        const val RELEASE_URL = "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/"
+        const val RELEASE_URL = "https://github.com/survey-sudo/bitchord-mix/releases/download/models-v1/"
     }
 }

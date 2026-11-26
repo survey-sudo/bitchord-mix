@@ -92,7 +92,7 @@ object AutomixModels : StemModelCoordinator {
      */
     const val BUNDLED_ASSETS_ACTIVE = false
     private const val RELEASE_URL =
-        "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/"
+        "https://github.com/survey-sudo/bitchord-mix/releases/download/models-v1/"
 
     val NIROVI = Model(
         "nirovi_int8.ort", 7_948_784L,

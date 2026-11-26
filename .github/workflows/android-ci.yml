@@ -1,7 +1,7 @@
 name: Android CI
 
 # Upstream shipped a workflow that triggers on `main` and runs a bare
-# `assembleProdRelease`. This fork's branch is `master`, the phone build needs
+# `assembleProdRelease`. This fork's default branch is `ae3`, the phone build needs
 # `-Pbitchord.bundleWear=false`, and the exact NDK/CMake versions the release
 # was verified against are not on the runner image. All three are fixed here.
 #

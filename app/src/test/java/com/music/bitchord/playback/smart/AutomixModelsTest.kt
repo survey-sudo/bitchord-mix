@@ -63,7 +63,7 @@ class AutomixModelsTest {
     fun `every pin points at the release asset with no url prefix`() {
         for (model in listOf(AutomixModels.BEAT, AutomixModels.VOCALS, AutomixModels.SCNET)) {
             assertEquals(
-                "https://github.com/survey-sudo/bitchord-unified/releases/download/models-v1/${model.fileName}",
+                "https://github.com/survey-sudo/bitchord-mix/releases/download/models-v1/${model.fileName}",
                 model.url,
             )
         }

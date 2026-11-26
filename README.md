@@ -27,11 +27,14 @@
 
 </div>
 
+**Canonical source:** `survey-sudo/bitchord-mix`, development branch `ae3`.
+See [REPOSITORY.md](REPOSITORY.md) for local/cloud paths and the repository consolidation.
+
 > [!IMPORTANT]
 > BitChord is not affiliated with, endorsed by, or connected to YouTube or Google in any way. Use it at your own discretion.
 
 > [!NOTE]
-> **This is a private fork** of [BitChord](https://github.com/kushagrasinghx/BitChord) **v1.9.1** (commit `7f45c768a461fd7e68bf4613f71e8a767e643d4c`) by Kushagra Singh, under the same **GPL-3.0-or-later** license (see `LICENSE`). It is not the official app: the package is `com.music.bitchord.loopfix` and the label is **"BitChord Mix"**. The upstream in-app updater does not offer these builds.
+> **This is the BitChord Mix fork** of [BitChord](https://github.com/kushagrasinghx/BitChord), based on upstream **v1.10**, by Kushagra Singh, under the same **GPL-3.0-or-later** license (see `LICENSE`). It is not the official app: the package is `com.music.bitchord.loopfix` and the label is **"BitChord Mix"**. Fork update checks use `survey-sudo/bitchord-mix`.
 >
 > Everything upstream ships is here. What this fork adds is one thing done properly: **AutoMix** — the transition engine was rebuilt so songs mix at musically correct points, beatmatch on both decks, skip silent intros, and separate vocals instead of filtering them.
 

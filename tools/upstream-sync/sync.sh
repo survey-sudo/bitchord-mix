@@ -6,7 +6,7 @@
 # Always writes PORT_LIST.md: upstream commits inside fork-owned paths that must be PORTED by hand.
 set -euo pipefail
 TAG="${1:?upstream tag, e.g. v1.11}"
-MAIN="${2:-master}"
+MAIN="${2:-ae3}"
 cd "$(git rev-parse --show-toplevel)"
 KIT=tools/upstream-sync
 readlist() { grep -vE '^\s*(#|$)' "$1" || true; }

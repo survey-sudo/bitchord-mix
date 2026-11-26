@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ae3
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
@@ -64,7 +64,7 @@ jobs:
           set -uo pipefail
           git config user.name  "bitchord-sync-bot"
           git config user.email "bitchord-sync-bot@users.noreply.github.com"
-          bash tools/upstream-sync/sync.sh "${{ steps.t.outputs.tag }}" master
+          bash tools/upstream-sync/sync.sh "${{ steps.t.outputs.tag }}" ae3
           RC=$?
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
           [ "$RC" -eq 0 ] || [ "$RC" -eq 2 ] || exit "$RC"
@@ -79,7 +79,7 @@ jobs:
           B="sync/upstream-$TAG"
           git push -f origin "$B"
           { sed "s/{{TAG}}/$TAG/g; s/{{BASE}}/${{ steps.t.outputs.base }}/g" tools/upstream-sync/PR_BODY.md; echo; cat PORT_LIST.md; } > /tmp/body.md
-          gh pr create --base master --head "$B" --title "Sync upstream BitChord $TAG" --body-file /tmp/body.md
+          gh pr create --base ae3 --head "$B" --title "Sync upstream BitChord $TAG" --body-file /tmp/body.md
 
       - name: Open issue for a manual merge
         if: steps.t.outputs.skip == '0' && steps.m.outputs.rc == '2'
@@ -92,8 +92,8 @@ jobs:
             echo "The automatic merge of upstream **$TAG** hit conflicts. On the devbox:"
             echo
             echo '```bash'
-            echo "cd ~/bitchord-unified && git fetch --all && git checkout master && git pull --ff-only"
-            echo "bash tools/upstream-sync/sync.sh $TAG master   # resolve per docs/UPSTREAM_SYNC_PLAYBOOK.md §5"
+            echo "cd ~/bitchord-mix && git fetch origin && git checkout ae3 && git pull --ff-only"
+            echo "bash tools/upstream-sync/sync.sh $TAG ae3   # resolve per docs/UPSTREAM_SYNC_PLAYBOOK.md §5"
             echo '```'
             echo
             cat CONFLICTS.txt

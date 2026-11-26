@@ -41,7 +41,7 @@ class AppUpdateCheckerTest {
         assertNull(
             AppUpdateChecker.selectUpdate(
                 tag = "models-v1",
-                releaseUrl = "https://github.com/survey-sudo/bitchord-unified/releases/tag/models-v1",
+                releaseUrl = "https://github.com/survey-sudo/bitchord-mix/releases/tag/models-v1",
                 apkUrl = null,
                 notes = "Model weights only",
                 currentVersion = "1.10-djmix52",
@@ -50,7 +50,7 @@ class AppUpdateCheckerTest {
         assertNull(
             AppUpdateChecker.selectUpdate(
                 tag = "v1.10-djmix53",
-                releaseUrl = "https://github.com/survey-sudo/bitchord-unified/releases/tag/v1.10-djmix53",
+                releaseUrl = "https://github.com/survey-sudo/bitchord-mix/releases/tag/v1.10-djmix53",
                 apkUrl = null,
                 notes = "Draft without APK",
                 currentVersion = "1.10-djmix52",
@@ -58,8 +58,8 @@ class AppUpdateCheckerTest {
         )
         val available = AppUpdateChecker.selectUpdate(
             tag = "v1.10-djmix53",
-            releaseUrl = "https://github.com/survey-sudo/bitchord-unified/releases/tag/v1.10-djmix53",
-            apkUrl = "https://github.com/survey-sudo/bitchord-unified/releases/download/v1.10-djmix53/BitChord-1.10-djmix53.apk",
+            releaseUrl = "https://github.com/survey-sudo/bitchord-mix/releases/tag/v1.10-djmix53",
+            apkUrl = "https://github.com/survey-sudo/bitchord-mix/releases/download/v1.10-djmix53/BitChord-1.10-djmix53.apk",
             notes = "Release notes",
             currentVersion = "1.10-djmix52",
         )
